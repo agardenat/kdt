@@ -1,0 +1,94 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod ai;
+mod cli;
+mod clip;
+mod config;
+mod diagnostic;
+mod enrich;
+mod events;
+mod extract;
+mod lang;
+mod pdf;
+mod ui;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::Parser;
+use kube::Client;
+use tracing_subscriber::EnvFilter;
+
+async fn build_client(context: Option<&str>) -> Result<Client> {
+    use kube::config::{Config, KubeConfigOptions};
+    let config = match context {
+        Some(ctx) => {
+            let opts = KubeConfigOptions {
+                context: Some(ctx.to_string()),
+                ..KubeConfigOptions::default()
+            };
+            Config::from_kubeconfig(&opts).await?
+        }
+        None => Config::infer().await?,
+    };
+    Ok(Client::try_from(config)?)
+}
+
+fn log_file_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KDT_LOG").or_else(|_| std::env::var("KEV_LOG")) {
+        return PathBuf::from(p);
+    }
+    if let Ok(home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(home).join("kdt").join("kdt.log");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local").join("state").join("kdt").join("kdt.log");
+    }
+    PathBuf::from("/tmp/kdt.log")
+}
+
+fn init_logging() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let path = log_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(file) = std::fs::File::options().create(true).append(true).open(&path) {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(|| std::io::sink())
+            .try_init();
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls ring CryptoProvider");
+
+    init_logging();
+
+    let args = cli::Args::parse();
+    let client = build_client(args.context.as_deref()).await?;
+
+    let ns = if args.all_namespaces { None } else { args.namespace.clone() };
+    let ns_label = match &ns { Some(n) => n.clone(), None => "all".to_string() };
+    let ctx_label = args.context.clone().unwrap_or_else(|| "default".to_string());
+    let buffer = events::new_buffer();
+    let log_state = events::new_log_state();
+    let status_state = events::new_status_state();
+    let watcher = events::spawn_watcher(client.clone(), ns, buffer.clone(), args.buffer_size);
+
+    let ai_state = ai::new_ai_state();
+    let file_config = config::load();
+    let app = ui::App::new(buffer, ns_label, ctx_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config);
+    ui::run(app).await
+}

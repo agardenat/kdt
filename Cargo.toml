@@ -1,0 +1,32 @@
+[package]
+name = "kdt"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "rustls-tls", "socks5"] }
+k8s-openapi = { version = "0.27", features = ["latest"] }
+ratatui = "0.30"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mimalloc = { version = "0.1", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+base64 = "0.22"
+typst = "0.14"
+typst-pdf = "0.14"
+typst-as-lib = { version = "0.15", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
