@@ -49,6 +49,7 @@ La connexion au cluster utilise le kubeconfig standard (inféré, ou contexte ex
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
 | `l` | Bascule langue IA (FR/EN) |
+| `m` | Fournisseur IA suivant |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
 
@@ -111,6 +112,33 @@ Fichier JSON optionnel chargé depuis (par ordre de priorité) :
 ```
 
 `language` accepte `fr`/`french`/`français` ou `en`/`english`/`anglais`.
+
+### Plusieurs fournisseurs IA
+
+Définir une liste `providers` permet de basculer entre plusieurs modèles/endpoints. Chaque entrée a un `name`, et optionnellement `base_url`, `api_key`, `model` (valeurs par défaut : `https://api.openai.com/v1` et `gpt-4o-mini`). `active_provider` choisit le fournisseur utilisé au démarrage (sinon le premier de la liste).
+
+```json
+{
+  "language": "fr",
+  "active_provider": "openai",
+  "providers": [
+    {
+      "name": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-...",
+      "model": "gpt-4o"
+    },
+    {
+      "name": "local",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "model": "qwen2.5-coder"
+    }
+  ]
+}
+```
+
+En cours d'exécution, la touche `m` fait défiler les fournisseurs configurés ; le fournisseur actif est affiché dans le bandeau du panneau IA (`[FR · openai]`). Les champs `openai_*` et les variables d'environnement restent pris en charge comme fournisseur `default` (rétrocompatibilité) ; ils s'ajoutent à la liste si présents.
 
 ### Variables d'environnement
 

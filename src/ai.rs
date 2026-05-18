@@ -55,6 +55,71 @@ impl AiLanguage {
     }
 }
 
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_MODEL: &str = "gpt-4o-mini";
+
+#[derive(Debug, Clone)]
+pub struct AiProviderResolved {
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderResolved> {
+    let mut out: Vec<AiProviderResolved> = file
+        .providers
+        .iter()
+        .map(|p| AiProviderResolved {
+            name: p.name.clone(),
+            base_url: p.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: p.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: p.api_key.clone(),
+        })
+        .collect();
+
+    let legacy_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| file.openai_api_key.clone());
+    let legacy_base = std::env::var("OPENAI_BASE_URL").ok()
+        .or_else(|| std::env::var("OPENAI_API_BASE").ok())
+        .or_else(|| file.openai_base_url.clone());
+    let legacy_model = std::env::var("OPENAI_MODEL").ok().or_else(|| file.openai_model.clone());
+
+    let want_default = file.providers.is_empty()
+        || legacy_key.is_some()
+        || legacy_base.is_some()
+        || legacy_model.is_some();
+    if want_default && !out.iter().any(|p| p.name == "default") {
+        out.push(AiProviderResolved {
+            name: "default".to_string(),
+            base_url: legacy_base.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: legacy_model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: legacy_key,
+        });
+    }
+
+    if out.is_empty() {
+        out.push(AiProviderResolved {
+            name: "default".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            api_key: None,
+        });
+    }
+    out
+}
+
+pub fn default_provider_index(
+    file: &crate::config::FileConfig,
+    providers: &[AiProviderResolved],
+) -> usize {
+    if let Some(name) = &file.active_provider {
+        if let Some(i) = providers.iter().position(|p| &p.name == name) {
+            return i;
+        }
+    }
+    0
+}
+
 #[derive(Debug, Clone)]
 pub struct AiConfig {
     pub base_url: String,
@@ -63,21 +128,17 @@ pub struct AiConfig {
 }
 
 impl AiConfig {
-    pub fn from_env_and_file(file: &crate::config::FileConfig) -> Result<Self, String> {
-        let api_key = std::env::var("OPENAI_API_KEY").ok()
-            .or_else(|| file.openai_api_key.clone())
-            .ok_or_else(|| format!(
-                "OPENAI_API_KEY non définie (env OPENAI_API_KEY ou {})",
-                crate::config::config_path_display(),
-            ))?;
-        let base_url = std::env::var("OPENAI_BASE_URL").ok()
-            .or_else(|| std::env::var("OPENAI_API_BASE").ok())
-            .or_else(|| file.openai_base_url.clone())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let model = std::env::var("OPENAI_MODEL").ok()
-            .or_else(|| file.openai_model.clone())
-            .unwrap_or_else(|| "gpt-4o-mini".to_string());
-        Ok(Self { base_url, api_key, model })
+    pub fn from_resolved(p: &AiProviderResolved) -> Result<Self, String> {
+        let api_key = p.api_key.clone().ok_or_else(|| format!(
+            "Clé API absente pour le fournisseur '{}' (env OPENAI_API_KEY ou {})",
+            p.name,
+            crate::config::config_path_display(),
+        ))?;
+        Ok(Self {
+            base_url: p.base_url.clone(),
+            api_key,
+            model: p.model.clone(),
+        })
     }
 }
 

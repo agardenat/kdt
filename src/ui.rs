@@ -14,7 +14,10 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, P
 use ratatui::DefaultTerminal;
 use tokio::task::JoinHandle;
 
-use crate::ai::{query_ai, update_sections_count, update_stage, AiConfig, AiLanguage, SharedAi};
+use crate::ai::{
+    default_provider_index, query_ai, resolve_providers, update_sections_count, update_stage,
+    AiConfig, AiLanguage, AiProviderResolved, SharedAi,
+};
 use crate::config::{self, FileConfig};
 use crate::diagnostic::{
     format_diagnostic_for_ai, new_diagnostic_state, run_diagnostic, DiagStatus, DiagnosticStep,
@@ -123,7 +126,8 @@ pub struct App {
     pub ai_language: AiLanguage,
     pub related_state: SharedRelated,
     pub last_related_key: Option<String>,
-    pub file_config: FileConfig,
+    pub ai_providers: Vec<AiProviderResolved>,
+    pub ai_provider_idx: usize,
     pub return_mode: Mode,
     pub node_list_state: SharedNodeList,
     pub node_cursor: usize,
@@ -153,6 +157,8 @@ impl App {
         file_config: FileConfig,
     ) -> Self {
         let initial_lang = config::initial_language(&file_config).unwrap_or(AiLanguage::Fr);
+        let ai_providers = resolve_providers(&file_config);
+        let ai_provider_idx = default_provider_index(&file_config, &ai_providers);
         Self {
             buffer,
             filter: Filter::All,
@@ -182,7 +188,8 @@ impl App {
             ai_language: initial_lang,
             related_state: new_related_state(),
             last_related_key: None,
-            file_config,
+            ai_providers,
+            ai_provider_idx,
             return_mode: Mode::Selection,
             node_list_state: new_node_list_state(),
             node_cursor: 0,
@@ -398,6 +405,26 @@ impl App {
         self.mode = Mode::Live;
     }
 
+    fn current_ai_config(&self) -> Result<AiConfig, String> {
+        match self.ai_providers.get(self.ai_provider_idx) {
+            Some(p) => AiConfig::from_resolved(p),
+            None => Err("aucun fournisseur IA configuré".to_string()),
+        }
+    }
+
+    fn ai_provider_name(&self) -> &str {
+        self.ai_providers
+            .get(self.ai_provider_idx)
+            .map(|p| p.name.as_str())
+            .unwrap_or("-")
+    }
+
+    fn cycle_ai_provider(&mut self) {
+        if self.ai_providers.len() > 1 {
+            self.ai_provider_idx = (self.ai_provider_idx + 1) % self.ai_providers.len();
+        }
+    }
+
     fn enter_ai_panel(&mut self) {
         let source_mode = if self.mode == Mode::AiPanel { self.return_mode } else { self.mode };
         let rec = match source_mode {
@@ -434,7 +461,7 @@ impl App {
             self.return_mode = self.mode;
         }
 
-        let config = match AiConfig::from_env_and_file(&self.file_config) {
+        let config = match self.current_ai_config() {
             Ok(c) => c,
             Err(e) => {
                 let key = format!("err-{}", rec.uid);
@@ -676,7 +703,7 @@ impl App {
             s.running
         };
         if !already_running {
-            let config = match AiConfig::from_env_and_file(&self.file_config) {
+            let config = match self.current_ai_config() {
                 Ok(c) => c,
                 Err(e) => {
                     let mut s = self.extract_state.lock().expect("extract poisoned");
@@ -1100,6 +1127,7 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
         (KeyCode::Home, _, _) => app.h_scroll = 0,
         (KeyCode::Char('q'), _, _) => app.should_quit = true,
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
+        (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
 
         (KeyCode::Char('n'), _, Mode::Live) => app.enter_ns_picker(),
         (KeyCode::Char('s'), _, Mode::Live) => app.enter_selection(visible_rows),
@@ -2021,13 +2049,15 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|m| format!("  · ✂ {}", m))
         .unwrap_or_default();
     let title = format!(
-        " {} [{}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}{}  c copier  Esc {}{}{} ",
+        " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}  m {}{}  c copier  Esc {}{}{} ",
         st.title_ai_analysis,
         app.ai_language.label(),
+        app.ai_provider_name(),
         st.k_scroll,
         st.k_page,
         st.k_top_bot,
         st.k_lang,
+        st.k_provider,
         extra_keys,
         st.k_close,
         export_suffix,

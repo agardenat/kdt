@@ -4,6 +4,14 @@ use serde::Deserialize;
 
 use crate::ai::AiLanguage;
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiProvider {
+    pub name: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FileConfig {
@@ -11,6 +19,8 @@ pub struct FileConfig {
     pub openai_api_key: Option<String>,
     pub openai_model: Option<String>,
     pub language: Option<String>,
+    pub providers: Vec<AiProvider>,
+    pub active_provider: Option<String>,
 }
 
 pub fn load() -> FileConfig {
