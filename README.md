@@ -160,6 +160,18 @@ En cours d'exécution, la touche `m` fait défiler les fournisseurs configurés 
 3. `~/.local/state/kdt/kdt.log`
 4. `/tmp/kdt.log`
 
+## Packaging (RPM / DEB)
+
+Scripts dans [packaging/](packaging/) — tout se déroule dans le répertoire du projet, sortie dans `dist/`, aucun privilège root requis.
+
+```bash
+packaging/build-deb.sh     # → dist/kdt_<version>_amd64.deb
+packaging/build-rpm.sh     # → dist/x86_64/kdt-<version>-1.x86_64.rpm
+packaging/build-all.sh     # les deux
+```
+
+Chaque script lance `cargo build --release`, récupère le binaire statique musl, et assemble le paquet (`/usr/bin/kdt`). Nom/version sont lus depuis `Cargo.toml`. Prérequis : `dpkg-deb` (deb), `rpmbuild` (rpm) — `rpmbuild` utilise un `_topdir` sous `dist/rpmbuild`, rien n'est écrit dans `~/rpmbuild`.
+
 ## Exports
 
 Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downloads`, nommés `kdt-extract-<contexte>-<timestamp>.pdf`. Le rendu PDF est généré via Typst (`typst` / `typst-pdf` / `typst-as-lib`, polices embarquées).

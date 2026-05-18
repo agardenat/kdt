@@ -420,9 +420,13 @@ impl App {
     }
 
     fn cycle_ai_provider(&mut self) {
-        if self.ai_providers.len() > 1 {
+        let msg = if self.ai_providers.len() > 1 {
             self.ai_provider_idx = (self.ai_provider_idx + 1) % self.ai_providers.len();
-        }
+            format!("IA: {}", self.ai_provider_name())
+        } else {
+            format!("IA: {} (seul fournisseur)", self.ai_provider_name())
+        };
+        self.clipboard_status = Some((std::time::Instant::now(), msg));
     }
 
     fn enter_ai_panel(&mut self) {
@@ -1004,6 +1008,13 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
     match (k.code, k.modifiers, app.mode) {
+        (KeyCode::Char('m'), _, Mode::AiPanel) => {
+            app.cycle_ai_provider();
+            app.enter_ai_panel();
+        }
+        (KeyCode::Char('m'), _, Mode::NsPicker) => {}
+        (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
+
         (KeyCode::Up, _, Mode::NsPicker) => {
             if app.ns_cursor > 0 { app.ns_cursor -= 1; }
         }
@@ -1127,7 +1138,6 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
         (KeyCode::Home, _, _) => app.h_scroll = 0,
         (KeyCode::Char('q'), _, _) => app.should_quit = true,
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
-        (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
 
         (KeyCode::Char('n'), _, Mode::Live) => app.enter_ns_picker(),
         (KeyCode::Char('s'), _, Mode::Live) => app.enter_selection(visible_rows),
@@ -1318,7 +1328,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
 
     let kbg = Style::default().fg(Color::Black).bg(Color::White);
-    let footer_spans = match draw_mode {
+    let mut footer_spans = match draw_mode {
         Mode::Live => vec![
             Span::styled(" q ", kbg), Span::raw(format!(" {}   ", st.k_quit)),
             Span::styled(" a ", kbg), Span::raw(" "),
@@ -1380,6 +1390,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         ],
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
     };
+    footer_spans.push(Span::raw("   "));
+    footer_spans.push(Span::styled(" m ", kbg));
+    footer_spans.push(Span::raw(format!(" {}:{}", st.k_provider, app.ai_provider_name())));
+    if let Some(msg) = app.clipboard_status_active() {
+        footer_spans.push(Span::raw("   "));
+        footer_spans.push(Span::styled(
+            msg.to_string(),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(footer_spans)), footer_a);
 
     if app.mode == Mode::NsPicker {
