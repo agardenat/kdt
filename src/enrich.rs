@@ -14,6 +14,44 @@ use crate::events::EventRecord;
 const MAX_SECTION_CHARS: usize = 8000;
 const MAX_BINDINGS: usize = 5;
 
+fn strip_noise(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.remove("managedFields");
+            map.remove("resourceVersion");
+            map.remove("uid");
+            map.remove("generation");
+            map.remove("selfLink");
+            map.remove("creationTimestamp");
+            if let Some(serde_json::Value::Object(ann)) = map.get_mut("annotations") {
+                ann.remove("kubectl.kubernetes.io/last-applied-configuration");
+            }
+            if map
+                .get("annotations")
+                .map(|a| a.as_object().map(|o| o.is_empty()).unwrap_or(false))
+                .unwrap_or(false)
+            {
+                map.remove("annotations");
+            }
+            for child in map.values_mut() {
+                strip_noise(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                strip_noise(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clean_json<T: serde::Serialize>(v: &T) -> Result<String, serde_json::Error> {
+    let mut val = serde_json::to_value(v)?;
+    strip_noise(&mut val);
+    serde_json::to_string(&val)
+}
+
 pub async fn gather_extra_context(client: &Client, rec: &EventRecord) -> Vec<(String, String)> {
     gather_extra_context_with_progress(client, rec, |_, _| {}).await
 }
@@ -155,7 +193,7 @@ async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String
 
     let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), &sa_ns);
     if let Ok(sa) = sa_api.get(&sa_name).await {
-        if let Ok(json) = serde_json::to_string_pretty(&sa) {
+        if let Ok(json) = clean_json(&sa) {
             out.push((format!("[rbac] ServiceAccount {}/{}", sa_ns, sa_name), json));
         }
     } else {
@@ -174,14 +212,14 @@ async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String
             count += 1;
             let rb_name = rb.metadata.name.clone().unwrap_or_default();
             let role_ref = rb.role_ref.clone();
-            if let Ok(json) = serde_json::to_string_pretty(&rb) {
+            if let Ok(json) = clean_json(&rb) {
                 out.push((format!("[rbac] RoleBinding {}/{}", sa_ns, rb_name), json));
             }
             match role_ref.kind.as_str() {
                 "Role" => {
                     let api: Api<Role> = Api::namespaced(client.clone(), &sa_ns);
                     if let Ok(r) = api.get(&role_ref.name).await {
-                        if let Ok(json) = serde_json::to_string_pretty(&r) {
+                        if let Ok(json) = clean_json(&r) {
                             out.push((format!("[rbac] Role {}/{}", sa_ns, role_ref.name), json));
                         }
                     }
@@ -189,7 +227,7 @@ async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String
                 "ClusterRole" => {
                     let api: Api<ClusterRole> = Api::all(client.clone());
                     if let Ok(r) = api.get(&role_ref.name).await {
-                        if let Ok(json) = serde_json::to_string_pretty(&r) {
+                        if let Ok(json) = clean_json(&r) {
                             out.push((format!("[rbac] ClusterRole {}", role_ref.name), json));
                         }
                     }
@@ -208,13 +246,13 @@ async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String
             count += 1;
             let crb_name = crb.metadata.name.clone().unwrap_or_default();
             let role_ref = crb.role_ref.clone();
-            if let Ok(json) = serde_json::to_string_pretty(&crb) {
+            if let Ok(json) = clean_json(&crb) {
                 out.push((format!("[rbac] ClusterRoleBinding {}", crb_name), json));
             }
             if role_ref.kind == "ClusterRole" {
                 let api: Api<ClusterRole> = Api::all(client.clone());
                 if let Ok(r) = api.get(&role_ref.name).await {
-                    if let Ok(json) = serde_json::to_string_pretty(&r) {
+                    if let Ok(json) = clean_json(&r) {
                         out.push((format!("[rbac] ClusterRole {}", role_ref.name), json));
                     }
                 }
@@ -238,7 +276,7 @@ async fn cert_manager_context(client: &Client, rec: &EventRecord) -> Vec<(String
 
     let obj = fetch_dynamic_obj(client, &api_ver, &rec.kind, &rec.namespace, &rec.name).await;
     if let Some(o) = &obj {
-        if let Ok(json) = serde_json::to_string_pretty(o) {
+        if let Ok(json) = clean_json(o) {
             let title = if rec.namespace.is_empty() {
                 format!("[cert-manager] {} {}", rec.kind, rec.name)
             } else {
@@ -298,7 +336,7 @@ async fn velero_context(client: &Client, rec: &EventRecord) -> Vec<(String, Stri
 
     let obj = fetch_dynamic_obj(client, &api_ver, &rec.kind, &rec.namespace, &rec.name).await;
     if let Some(o) = &obj {
-        if let Ok(json) = serde_json::to_string_pretty(o) {
+        if let Ok(json) = clean_json(o) {
             out.push((format!("[velero] {} {}/{}", rec.kind, rec.namespace, rec.name), json));
         }
     }
@@ -334,13 +372,13 @@ async fn ingress_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
         Ok(i) => i,
         Err(_) => return out,
     };
-    if let Ok(json) = serde_json::to_string_pretty(&ing) {
+    if let Ok(json) = clean_json(&ing) {
         out.push((format!("[{}] Ingress {}/{}", tag, rec.namespace, rec.name), json));
     }
     if let Some(class_name) = ing.spec.as_ref().and_then(|s| s.ingress_class_name.clone()) {
         let cls_api: Api<IngressClass> = Api::all(client.clone());
         if let Ok(cls) = cls_api.get(&class_name).await {
-            if let Ok(json) = serde_json::to_string_pretty(&cls) {
+            if let Ok(json) = clean_json(&cls) {
                 out.push((format!("[{}] IngressClass {}", tag, class_name), json));
             }
         }
@@ -398,7 +436,7 @@ async fn storage_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
     if rec.kind == "PersistentVolumeClaim" {
         let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &rec.namespace);
         let Ok(pvc) = api.get(&rec.name).await else { return out; };
-        if let Ok(json) = serde_json::to_string_pretty(&pvc) {
+        if let Ok(json) = clean_json(&pvc) {
             out.push((format!("[storage] PersistentVolumeClaim {}/{}", rec.namespace, rec.name), json));
         }
         let sc_name = pvc.spec.as_ref().and_then(|s| s.storage_class_name.clone());
@@ -406,7 +444,7 @@ async fn storage_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
         if let Some(sc) = sc_name {
             let sc_api: Api<StorageClass> = Api::all(client.clone());
             if let Ok(scobj) = sc_api.get(&sc).await {
-                if let Ok(json) = serde_json::to_string_pretty(&scobj) {
+                if let Ok(json) = clean_json(&scobj) {
                     out.push((format!("[storage] StorageClass {}", sc), json));
                 }
             }
@@ -414,7 +452,7 @@ async fn storage_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
         if let Some(volume_name) = volume_name {
             let pv_api: Api<PersistentVolume> = Api::all(client.clone());
             if let Ok(pv) = pv_api.get(&volume_name).await {
-                if let Ok(json) = serde_json::to_string_pretty(&pv) {
+                if let Ok(json) = clean_json(&pv) {
                     out.push((format!("[storage] PersistentVolume {}", volume_name), json));
                 }
             }
@@ -424,13 +462,13 @@ async fn storage_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
     if rec.kind == "PersistentVolume" {
         let api: Api<PersistentVolume> = Api::all(client.clone());
         let Ok(pv) = api.get(&rec.name).await else { return out; };
-        if let Ok(json) = serde_json::to_string_pretty(&pv) {
+        if let Ok(json) = clean_json(&pv) {
             out.push((format!("[storage] PersistentVolume {}", rec.name), json));
         }
         if let Some(sc) = pv.spec.as_ref().and_then(|s| s.storage_class_name.clone()) {
             let sc_api: Api<StorageClass> = Api::all(client.clone());
             if let Ok(scobj) = sc_api.get(&sc).await {
-                if let Ok(json) = serde_json::to_string_pretty(&scobj) {
+                if let Ok(json) = clean_json(&scobj) {
                     out.push((format!("[storage] StorageClass {}", sc), json));
                 }
             }
@@ -439,7 +477,7 @@ async fn storage_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
             if let (Some(ns), Some(name)) = (&claim_ref.namespace, &claim_ref.name) {
                 let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
                 if let Ok(pvc) = pvc_api.get(name).await {
-                    if let Ok(json) = serde_json::to_string_pretty(&pvc) {
+                    if let Ok(json) = clean_json(&pvc) {
                         out.push((format!("[storage] PersistentVolumeClaim {}/{}", ns, name), json));
                     }
                 }
@@ -467,7 +505,7 @@ async fn argocd_context(client: &Client, rec: &EventRecord) -> Vec<(String, Stri
 
     let obj = fetch_dynamic_obj(client, &api_ver, &rec.kind, &rec.namespace, &rec.name).await;
     if let Some(o) = &obj {
-        if let Ok(json) = serde_json::to_string_pretty(o) {
+        if let Ok(json) = clean_json(o) {
             out.push((format!("[argocd] {} {}/{}", rec.kind, rec.namespace, rec.name), json));
         }
     }
@@ -502,7 +540,7 @@ async fn fluxcd_context(client: &Client, rec: &EventRecord) -> Vec<(String, Stri
     let mut out = Vec::new();
     let obj = fetch_dynamic_obj(client, &rec.api_version, &rec.kind, &rec.namespace, &rec.name).await;
     if let Some(o) = &obj {
-        if let Ok(json) = serde_json::to_string_pretty(o) {
+        if let Ok(json) = clean_json(o) {
             out.push((format!("[fluxcd] {} {}/{}", rec.kind, rec.namespace, rec.name), json));
         }
     }
@@ -619,5 +657,5 @@ async fn fetch_dynamic_pretty(
     name: &str,
 ) -> Option<String> {
     let obj = fetch_dynamic_obj(client, api_version, kind, namespace, name).await?;
-    serde_json::to_string_pretty(&obj).ok()
+    clean_json(&obj).ok()
 }
