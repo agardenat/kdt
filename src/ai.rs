@@ -170,6 +170,29 @@ struct ChoiceMessage {
     content: String,
 }
 
+pub fn normalize_ai_content(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('n') => { chars.next(); out.push('\n'); }
+            Some('t') => { chars.next(); out.push('\t'); }
+            Some('r') => { chars.next(); }
+            Some('"') => { chars.next(); out.push('"'); }
+            Some('\\') => { chars.next(); out.push('\\'); }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
 pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: String, state: SharedAi) {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = ChatRequest {
@@ -214,7 +237,7 @@ pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: S
             match resp.json::<ChatResponse>().await {
                 Ok(r) => {
                     let content = r.choices.into_iter().next()
-                        .map(|c| c.message.content)
+                        .map(|c| normalize_ai_content(&c.message.content))
                         .unwrap_or_default();
                     let mut s = state.lock().expect("ai state poisoned");
                     if s.current_key.as_deref() != Some(&key) { return; }
@@ -273,6 +296,6 @@ pub async fn query_ai_direct(
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
+        .map(|c| normalize_ai_content(&c.message.content))
         .unwrap_or_default())
 }

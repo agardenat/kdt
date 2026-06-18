@@ -39,31 +39,34 @@ La connexion au cluster utilise le kubeconfig standard (inféré, ou contexte ex
 
 ## Raccourcis clavier
 
-### Vue live
+### Vue principale (évènements + détail)
+
+L'application démarre directement sur cette vue : le tableau des évènements défile en
+direct et le panneau détail (Logs / Status / Related) est toujours affiché. Par défaut
+le curseur **suit** l'évènement le plus récent. Naviguer vers le haut **ancre** le curseur
+sur un évènement précis (qui reste sélectionné même quand le flux continue de défiler) ;
+revenir tout en bas réactive le suivi. L'indicateur `↻` du bandeau signale que le
+défilement live est actif.
+
 | Touche | Action |
 |---|---|
+| `↑` / `↓` / `PgUp` / `PgDn` | Navigation (ancre le curseur en remontant) |
+| `s` | Geler / dégeler le défilement |
+| `Esc` | Revenir au suivi du plus récent (et dégeler) |
+| `Enter` | Détail plein écran |
+| `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
+| `Shift-↑/↓`, `Ctrl-U/D` | Scroll du détail |
+| `g` / `G` | Haut / bas du détail |
 | `a` / `w` / `e` | Filtre All / Warnings / Errors |
 | `n` | Sélecteur de namespace |
-| `s` | Mode sélection |
-| `N` | Vue Nodes |
+| `N` | Nodes du pod sélectionné |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
+| `i` | Panneau IA |
 | `l` | Bascule langue IA (FR/EN) |
 | `m` | Fournisseur IA suivant |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
-
-### Mode sélection / détail
-| Touche | Action |
-|---|---|
-| `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
-| `Enter` | Détail plein écran |
-| `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
-| `Shift-↑/↓`, `Ctrl-U/D` | Scroll du détail |
-| `g` / `G` | Haut / bas |
-| `N` | Nodes du pod sélectionné |
-| `i` | Panneau IA |
-| `s` / `Esc` | Quitter le mode |
 
 ### Nodes / Node usage
 | Touche | Action |

@@ -43,6 +43,8 @@ pub struct Strings {
     pub k_filter_all: &'static str,
     pub k_filter_warn: &'static str,
     pub k_filter_err: &'static str,
+    pub k_freeze: &'static str,
+    pub k_unfreeze: &'static str,
 
     pub title_node_usage: &'static str,
     pub title_diagnostic: &'static str,
@@ -150,6 +152,8 @@ pub const FR: Strings = Strings {
     k_filter_all: "tous",
     k_filter_warn: "avert.",
     k_filter_err: "err.",
+    k_freeze: "geler",
+    k_unfreeze: "dégeler",
 
     title_node_usage: "Usage du noeud",
     title_diagnostic: "Diagnostic cluster",
@@ -257,6 +261,8 @@ pub const EN: Strings = Strings {
     k_filter_all: "all",
     k_filter_warn: "warn",
     k_filter_err: "err",
+    k_freeze: "freeze",
+    k_unfreeze: "unfreeze",
 
     title_node_usage: "Node usage",
     title_diagnostic: "Cluster diagnostic",

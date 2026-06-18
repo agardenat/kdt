@@ -63,7 +63,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Live, Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeUsageSort { MemReq, CpuReq, Alpha }
@@ -141,6 +141,8 @@ pub struct App {
     pub node_refresh_handle: Option<JoinHandle<()>>,
     pub clipboard_status: Option<(std::time::Instant, String)>,
     pub pending_node_select: Option<String>,
+    pub scroll_frozen: bool,
+    pub selected_uid: Option<String>,
 }
 
 impl App {
@@ -165,7 +167,7 @@ impl App {
             namespace_label,
             context_label,
             should_quit: false,
-            mode: Mode::Live,
+            mode: Mode::Selection,
             table_state: TableState::default(),
             snapshot: Vec::new(),
             last_pod_key: None,
@@ -203,53 +205,58 @@ impl App {
             node_refresh_handle: None,
             clipboard_status: None,
             pending_node_select: None,
+            scroll_frozen: false,
+            selected_uid: None,
         }
     }
 
 
-    fn enter_selection(&mut self, visible_rows: usize) {
+    fn reset_to_follow(&mut self) {
+        self.mode = Mode::Selection;
+        self.scroll_frozen = false;
+        self.selected_uid = None;
+        self.reset_scroll();
+    }
+
+    fn refresh_live_snapshot(&mut self) {
         let snap: Vec<EventRecord> = {
             let buf = self.buffer.lock().expect("buffer poisoned");
-            let mut v: Vec<EventRecord> = buf
-                .iter()
+            buf.iter()
                 .filter(|r| self.filter.matches(r))
-                .rev()
-                .take(visible_rows)
                 .cloned()
-                .collect();
-            v.reverse();
-            v
+                .collect()
         };
         if snap.is_empty() { return; }
-        self.table_state.select(Some(snap.len() - 1));
+        let last = snap.len() - 1;
+        let idx = match self.selected_uid.as_ref() {
+            Some(uid) => snap.iter().position(|r| &r.uid == uid),
+            None => Some(last),
+        };
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                self.selected_uid = None;
+                last
+            }
+        };
         self.snapshot = snap;
-        self.mode = Mode::Selection;
-        self.detail_tab = DetailTab::Logs;
-        self.reset_scroll();
+        self.table_state.select(Some(idx));
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
         self.maybe_fetch_related();
     }
 
-    fn exit_selection(&mut self) {
-        self.mode = Mode::Live;
-        self.snapshot.clear();
-        self.table_state.select(None);
-        self.last_pod_key = None;
-        self.last_status_key = None;
-        self.last_related_key = None;
-        self.reset_scroll();
-        self.clear_log_state();
-        self.clear_status_state();
-        self.clear_related_state();
-    }
-
     fn move_selection(&mut self, delta: i32) {
         if self.snapshot.is_empty() { return; }
-        let cur = self.table_state.selected().unwrap_or(0) as i32;
-        let max = self.snapshot.len() as i32 - 1;
-        let new = (cur + delta).clamp(0, max) as usize;
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(last) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
         self.table_state.select(Some(new));
+        self.selected_uid = if new == last {
+            None
+        } else {
+            self.snapshot.get(new).map(|r| r.uid.clone())
+        };
         self.reset_scroll();
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
@@ -288,24 +295,10 @@ impl App {
         self.detail_h_scroll = 0;
     }
 
-    fn clear_log_state(&self) {
-        let mut s = self.log_state.lock().expect("log state poisoned");
-        s.current_key = None;
-        s.lines.clear();
-        s.error = None;
-        s.loading = false;
-    }
     fn clear_status_state(&self) {
         let mut s = self.status_state.lock().expect("status state poisoned");
         s.current_key = None;
         s.lines.clear();
-        s.error = None;
-        s.loading = false;
-    }
-    fn clear_related_state(&self) {
-        let mut s = self.related_state.lock().expect("related state poisoned");
-        s.current_key = None;
-        s.sections.clear();
         s.error = None;
         s.loading = false;
     }
@@ -402,7 +395,7 @@ impl App {
     }
 
     fn exit_ns_picker(&mut self) {
-        self.mode = Mode::Live;
+        self.mode = Mode::Selection;
     }
 
     fn current_ai_config(&self) -> Result<AiConfig, String> {
@@ -561,7 +554,7 @@ impl App {
     }
 
     fn exit_diagnostic(&mut self) {
-        self.mode = Mode::Live;
+        self.mode = Mode::Selection;
     }
 
     fn refresh_diagnostic(&self) {
@@ -738,7 +731,7 @@ impl App {
         if running {
             return;
         }
-        self.mode = if matches!(self.return_mode, Mode::Extract) { Mode::Live } else { self.return_mode };
+        self.mode = if matches!(self.return_mode, Mode::Extract) { Mode::Selection } else { self.return_mode };
     }
 
     fn set_export_status(&self, msg: &str) {
@@ -804,8 +797,9 @@ impl App {
     }
 
     fn exit_nodes_mode(&mut self) {
-        self.mode = Mode::Live;
+        self.mode = Mode::Selection;
         self.last_node_status_key = None;
+        self.last_status_key = None;
         self.stop_node_auto_refresh();
         self.clear_status_state();
     }
@@ -972,7 +966,15 @@ impl App {
             self.buffer.clone(),
             self.buffer_capacity,
         );
-        self.mode = Mode::Live;
+        self.mode = Mode::Selection;
+        self.scroll_frozen = false;
+        self.selected_uid = None;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
     }
 }
 
@@ -989,12 +991,15 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut visible_rows: usize = 20;
 
     loop {
+        if app.mode == Mode::Selection && !app.scroll_frozen {
+            app.refresh_live_snapshot();
+        }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
         tokio::select! {
             _ = ticker.tick() => {}
             maybe = events.next() => match maybe {
-                Some(Ok(ev)) => handle_event(app, ev, visible_rows),
+                Some(Ok(ev)) => handle_event(app, ev),
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
             },
@@ -1004,7 +1009,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
+fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
     match (k.code, k.modifiers, app.mode) {
@@ -1067,7 +1072,7 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
         (KeyCode::Char('l'), _, Mode::DetailFull) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('g'), _, Mode::DetailFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::DetailFull) => app.scroll_detail_bottom(),
-        (KeyCode::Char('s'), _, Mode::DetailFull) => app.exit_selection(),
+        (KeyCode::Char('s'), _, Mode::DetailFull) => app.scroll_frozen = !app.scroll_frozen,
 
         (KeyCode::Up, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
@@ -1139,17 +1144,7 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
         (KeyCode::Char('q'), _, _) => app.should_quit = true,
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
 
-        (KeyCode::Char('n'), _, Mode::Live) => app.enter_ns_picker(),
-        (KeyCode::Char('s'), _, Mode::Live) => app.enter_selection(visible_rows),
-        (KeyCode::Esc, _, Mode::Live) => {}
-        (KeyCode::Char('a' | 'A'), _, Mode::Live) => app.filter = Filter::All,
-        (KeyCode::Char('w' | 'W'), _, Mode::Live) => app.filter = Filter::Warnings,
-        (KeyCode::Char('e' | 'E'), _, Mode::Live) => app.filter = Filter::Errors,
-        (KeyCode::Char('l'), _, Mode::Live) => app.ai_language = app.ai_language.toggle(),
-        (KeyCode::Char('N'), _, Mode::Live) => app.enter_nodes_mode(),
-        (KeyCode::Char('D'), _, Mode::Live) => app.enter_diagnostic(),
         (KeyCode::Char('D'), _, Mode::Selection) => app.enter_diagnostic(),
-        (KeyCode::Char('X'), _, Mode::Live) => app.enter_extract(),
         (KeyCode::Char('X'), _, Mode::Selection) => app.enter_extract(),
 
         (KeyCode::Esc, _, Mode::Diagnostic) => app.exit_diagnostic(),
@@ -1171,8 +1166,12 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
         (KeyCode::Char('c'), _, Mode::Extract) => app.copy_current_view(),
         (_, _, Mode::Extract) => {}
 
-        (KeyCode::Char('s'), _, Mode::Selection) => app.exit_selection(),
-        (KeyCode::Esc, _, Mode::Selection) => app.exit_selection(),
+        (KeyCode::Char('s'), _, Mode::Selection) => app.scroll_frozen = !app.scroll_frozen,
+        (KeyCode::Esc, _, Mode::Selection) => app.reset_to_follow(),
+        (KeyCode::Char('n'), _, Mode::Selection) => app.enter_ns_picker(),
+        (KeyCode::Char('a' | 'A'), _, Mode::Selection) => app.filter = Filter::All,
+        (KeyCode::Char('w' | 'W'), _, Mode::Selection) => app.filter = Filter::Warnings,
+        (KeyCode::Char('e' | 'E'), _, Mode::Selection) => app.filter = Filter::Errors,
         (KeyCode::Char('N'), _, Mode::Selection) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('N'), _, Mode::DetailFull) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('i'), _, Mode::Selection) => app.enter_ai_panel(),
@@ -1197,24 +1196,20 @@ fn handle_event(app: &mut App, ev: Event, visible_rows: usize) {
 fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let area = f.area();
     let draw_mode = match app.mode {
-        Mode::NsPicker => Mode::Live,
+        Mode::NsPicker => Mode::Selection,
         Mode::AiPanel => match app.return_mode {
             Mode::NodeUsage => Mode::Nodes,
-            Mode::Diagnostic => Mode::Live,
-            Mode::Extract => Mode::Live,
+            Mode::Diagnostic => Mode::Selection,
+            Mode::Extract => Mode::Selection,
             m => m,
         },
         Mode::NodeUsage => Mode::Nodes,
-        Mode::Diagnostic => Mode::Live,
-        Mode::Extract => Mode::Live,
+        Mode::Diagnostic => Mode::Selection,
+        Mode::Extract => Mode::Selection,
         m => m,
     };
 
     let layout = match draw_mode {
-        Mode::Live => Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
-            .split(area),
         Mode::Selection => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1245,7 +1240,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     };
 
     let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
-        Mode::Live => (layout[0], None, Some(layout[1]), layout[2]),
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
@@ -1255,7 +1249,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
 
     let st = lang::t(app.ai_language);
     let mode_label = match app.mode {
-        Mode::Live => st.mode_live,
         Mode::Selection => st.mode_selection,
         Mode::NsPicker => st.mode_ns,
         Mode::AiPanel => st.mode_ai,
@@ -1269,11 +1262,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let header = Paragraph::new(Line::from(vec![
         Span::styled(" kdt ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "  ctx={}  ns={}  filter={}  mode={}  lang={}",
+            "  ctx={}  ns={}  filter={}  mode={}{}  lang={}",
             app.context_label,
             app.namespace_label,
             app.filter.label(),
             mode_label,
+            if app.mode == Mode::Selection && !app.scroll_frozen { "↻" } else { "" },
             app.ai_language.label(),
         )),
     ]));
@@ -1289,18 +1283,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_nodes_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
-                Mode::Live => {
-                    let buf = app.buffer.lock().expect("buffer poisoned");
-                    buf.iter()
-                        .filter(|r| app.filter.matches(r))
-                        .rev()
-                        .take(visible_rows)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|r| row_for(r, app.h_scroll))
-                        .collect()
-                }
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
                 Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
             };
@@ -1329,7 +1311,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
 
     let kbg = Style::default().fg(Color::Black).bg(Color::White);
     let mut footer_spans = match draw_mode {
-        Mode::Live => vec![
+        Mode::Selection => vec![
             Span::styled(" q ", kbg), Span::raw(format!(" {}   ", st.k_quit)),
             Span::styled(" a ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_all, app.filter == Filter::All),
@@ -1340,22 +1322,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" e ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_err, app.filter == Filter::Errors),
             Span::raw("   "),
-            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
-            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_select)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", if app.scroll_frozen { st.k_unfreeze } else { st.k_freeze })),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_namespace)),
             Span::styled(" N ", kbg), Span::raw(format!(" {}   ", st.k_nodes)),
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
-            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
-        ],
-        Mode::Selection => vec![
-            Span::styled(" s/Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
-            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
-            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
-            Span::styled(" N ", kbg), Span::raw(format!(" {}   ", st.k_nodes)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -2094,7 +2070,7 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else if content.is_empty() {
         (vec![Line::from("(réponse vide)")], DIM)
     } else {
-        (render_markdown_lines(&content), Color::Cyan)
+        (render_markdown_lines(&content, popup_width.saturating_sub(2) as usize), Color::Cyan)
     };
 
     let inner_h = popup_height.saturating_sub(2) as usize;
@@ -2564,11 +2540,22 @@ fn colorize_json_line(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Gray)))
 }
 
-fn render_markdown_lines(content: &str) -> Vec<Line<'static>> {
+fn render_markdown_lines(content: &str, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut in_code_block = false;
+    let mut table_buf: Vec<String> = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
+
+        if !in_code_block && trimmed.starts_with('|') && trimmed[1..].contains('|') {
+            table_buf.push(trimmed.to_string());
+            continue;
+        }
+        if !table_buf.is_empty() {
+            render_table_block(&table_buf, width, &mut out);
+            table_buf.clear();
+        }
+
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
             out.push(Line::from(Span::styled(line.to_string(), Style::default().fg(DIM))));
@@ -2619,7 +2606,147 @@ fn render_markdown_lines(content: &str) -> Vec<Line<'static>> {
         spans.extend(render_inline_spans(trimmed));
         out.push(Line::from(spans));
     }
+    if !table_buf.is_empty() {
+        render_table_block(&table_buf, width, &mut out);
+    }
     out
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    let s = line.trim();
+    let s = s.strip_prefix('|').unwrap_or(s);
+    let s = s.strip_suffix('|').unwrap_or(s);
+    s.split('|')
+        .map(|c| c.trim().split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+fn is_table_separator(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let t = c.trim();
+            !t.is_empty() && t.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+        })
+}
+
+fn wrap_cell(text: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        if word.chars().count() > w {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == w {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            cur = chunk;
+            continue;
+        }
+        let add = if cur.is_empty() { word.chars().count() } else { cur.chars().count() + 1 + word.chars().count() };
+        if add > w {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn render_table_block(buf: &[String], width: usize, out: &mut Vec<Line<'static>>) {
+    let rows: Vec<Vec<String>> = buf.iter().map(|l| split_table_row(l)).collect();
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return;
+    }
+    let body: Vec<&Vec<String>> = rows.iter().filter(|r| !is_table_separator(r)).collect();
+    if body.is_empty() {
+        return;
+    }
+
+    let mut natural = vec![0usize; ncols];
+    for r in &body {
+        for (i, c) in r.iter().enumerate() {
+            natural[i] = natural[i].max(c.chars().count());
+        }
+    }
+
+    let sep = " │ ";
+    let overhead = sep.chars().count() * ncols.saturating_sub(1);
+    let budget = width.saturating_sub(overhead).max(ncols * 4);
+    let total: usize = natural.iter().sum();
+    let col_w: Vec<usize> = if total <= budget {
+        natural.clone()
+    } else {
+        let mut w: Vec<usize> = natural
+            .iter()
+            .map(|&n| ((n * budget) / total.max(1)).max(6))
+            .collect();
+        let mut over = w.iter().sum::<usize>().saturating_sub(budget);
+        while over > 0 {
+            if let Some((idx, _)) = w.iter().enumerate().max_by_key(|(_, &v)| v) {
+                if w[idx] <= 6 {
+                    break;
+                }
+                w[idx] -= 1;
+                over -= 1;
+            } else {
+                break;
+            }
+        }
+        w
+    };
+
+    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    for (ri, row) in body.iter().enumerate() {
+        let is_header = ri == 0;
+        let wrapped: Vec<Vec<String>> = (0..ncols)
+            .map(|i| {
+                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                wrap_cell(cell, col_w[i])
+            })
+            .collect();
+        let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
+        for h in 0..height {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for i in 0..ncols {
+                if i > 0 {
+                    spans.push(Span::styled(sep.to_string(), Style::default().fg(DIM)));
+                }
+                let txt = wrapped[i].get(h).cloned().unwrap_or_default();
+                let pad = col_w[i].saturating_sub(txt.chars().count());
+                let padded = format!("{}{}", txt, " ".repeat(pad));
+                if is_header {
+                    spans.push(Span::styled(padded, header_style));
+                } else {
+                    spans.push(Span::raw(padded));
+                }
+            }
+            out.push(Line::from(spans));
+        }
+        if is_header {
+            let total_w: usize = col_w.iter().sum::<usize>() + overhead;
+            out.push(Line::from(Span::styled(
+                "─".repeat(total_w.min(width.max(1))),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+    out.push(Line::from(""));
 }
 
 fn render_inline_spans_with_first_bold(s: &str) -> Vec<Span<'static>> {
