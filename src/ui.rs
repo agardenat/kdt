@@ -25,14 +25,16 @@ use crate::diagnostic::{
 };
 use crate::clip;
 use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
+use crate::flux::{fetch_flux, new_flux_state, FluxReady, FluxResource, SharedFlux};
 use crate::lang;
 use crate::pdf;
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 use crate::events::{
-    fetch_logs, fetch_namespaces, fetch_node_usage, fetch_nodes, fetch_status,
-    format_cpu_milli, format_memory_bytes, new_node_list_state, new_node_usage_state,
-    new_ns_list_state, spawn_watcher, EventRecord, LineColor, Severity, SharedBuffer, SharedLog,
-    SharedNodeList, SharedNodeUsage, SharedNsList, SharedStatus,
+    fetch_cluster_info, fetch_logs, fetch_namespaces, fetch_node_usage, fetch_nodes, fetch_status,
+    format_cpu_milli, format_memory_bytes, new_cluster_info_state, new_node_list_state,
+    new_node_usage_state, new_ns_list_state, spawn_watcher, EventRecord, LineColor, Severity,
+    SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList, SharedNodeUsage, SharedNsList,
+    SharedStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +65,42 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull }
+
+const COMMANDS: &[(&str, &[&str])] = &[
+    ("events", &["ev", "event"]),
+    ("namespace", &["ns", "namespaces"]),
+    ("nodes", &["no", "node"]),
+    ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
+    ("quit", &["q"]),
+];
+
+fn resolve_command(input: &str) -> Option<&'static str> {
+    let q = input.trim().to_lowercase();
+    if q.is_empty() { return None; }
+    for (name, aliases) in COMMANDS {
+        if *name == q || aliases.contains(&q.as_str()) {
+            return Some(name);
+        }
+    }
+    let matches: Vec<&'static str> = COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(&q))
+        .map(|(name, _)| *name)
+        .collect();
+    if matches.len() == 1 { Some(matches[0]) } else { None }
+}
+
+fn command_suggestions(input: &str) -> Vec<&'static str> {
+    let q = input.trim().to_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|(name, aliases)| {
+            q.is_empty() || name.starts_with(&q) || aliases.iter().any(|a| a.starts_with(&q))
+        })
+        .map(|(name, _)| *name)
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeUsageSort { MemReq, CpuReq, Alpha }
@@ -143,6 +180,12 @@ pub struct App {
     pub pending_node_select: Option<String>,
     pub scroll_frozen: bool,
     pub selected_uid: Option<String>,
+    pub command_input: String,
+    pub command_return_mode: Mode,
+    pub flux_state: SharedFlux,
+    pub last_flux_sel_uid: Option<String>,
+    pub flux_refresh_handle: Option<JoinHandle<()>>,
+    pub cluster_info: SharedClusterInfo,
 }
 
 impl App {
@@ -207,7 +250,26 @@ impl App {
             pending_node_select: None,
             scroll_frozen: false,
             selected_uid: None,
+            command_input: String::new(),
+            command_return_mode: Mode::Selection,
+            flux_state: new_flux_state(),
+            last_flux_sel_uid: None,
+            flux_refresh_handle: None,
+            cluster_info: new_cluster_info_state(),
         }
+    }
+
+    fn spawn_cluster_info_refresh(&self) {
+        let client = self.client.clone();
+        let state = self.cluster_info.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                fetch_cluster_info(client.clone(), state.clone()).await;
+            }
+        });
     }
 
 
@@ -848,6 +910,207 @@ impl App {
         self.maybe_fetch_node_status();
     }
 
+    fn enter_command(&mut self) {
+        if self.mode == Mode::Command { return; }
+        self.command_return_mode = self.mode;
+        self.command_input.clear();
+        self.mode = Mode::Command;
+    }
+
+    fn exit_command(&mut self) {
+        self.mode = self.command_return_mode;
+        self.command_input.clear();
+    }
+
+    fn command_push(&mut self, c: char) {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '/' {
+            self.command_input.push(c.to_ascii_lowercase());
+        }
+    }
+
+    fn command_backspace(&mut self) {
+        self.command_input.pop();
+    }
+
+    fn command_autocomplete(&mut self) {
+        let suggestions = command_suggestions(&self.command_input);
+        if let Some(first) = suggestions.first() {
+            self.command_input = first.to_string();
+        }
+    }
+
+    fn command_run(&mut self) {
+        let Some(cmd) = resolve_command(&self.command_input) else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("commande inconnue: {}", self.command_input.trim()),
+            ));
+            self.exit_command();
+            return;
+        };
+        let origin = self.command_return_mode;
+        self.command_input.clear();
+        match cmd {
+            "quit" => self.should_quit = true,
+            "events" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.reset_to_follow();
+            }
+            "namespace" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_ns_picker();
+            }
+            "nodes" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_nodes_mode();
+            }
+            "flux" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_flux_mode();
+            }
+            _ => self.exit_command(),
+        }
+    }
+
+    fn leave_special_modes(&mut self) {
+        match self.mode {
+            Mode::Nodes | Mode::NodesFull | Mode::NodeUsage => {
+                self.stop_node_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Flux | Mode::FluxFull => {
+                self.stop_flux_auto_refresh();
+                self.clear_status_state();
+            }
+            _ => {}
+        }
+        self.mode = Mode::Selection;
+    }
+
+    fn enter_flux_mode(&mut self) {
+        self.mode = Mode::Flux;
+        self.detail_tab = DetailTab::Status;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_flux_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_flux();
+        self.start_flux_auto_refresh();
+        self.refresh_flux_snapshot();
+    }
+
+    fn exit_flux_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_flux_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_flux_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn refresh_flux_snapshot(&mut self) {
+        let recs: Vec<EventRecord> = {
+            let s = self.flux_state.lock().expect("flux poisoned");
+            s.resources.iter().map(synthetic_flux_record).collect()
+        };
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_flux_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_flux_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_flux_sel_uid = Some(cur_uid);
+            self.maybe_fetch_logs();
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn enter_flux_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
+        self.mode = Mode::FluxFull;
+    }
+
+    fn exit_flux_full(&mut self) {
+        self.mode = Mode::Flux;
+    }
+
+    fn refresh_flux(&self) {
+        {
+            let mut s = self.flux_state.lock().expect("flux poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.flux_state.clone();
+        tokio::spawn(async move { fetch_flux(client, state).await; });
+    }
+
+    fn start_flux_auto_refresh(&mut self) {
+        self.stop_flux_auto_refresh();
+        let client = self.client.clone();
+        let state = self.flux_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_flux(client.clone(), state.clone()).await;
+            }
+        });
+        self.flux_refresh_handle = Some(handle);
+    }
+
+    fn stop_flux_auto_refresh(&mut self) {
+        if let Some(h) = self.flux_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    fn move_flux_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_flux_sel_uid = self.selected_uid.clone();
+        self.reset_scroll();
+        self.maybe_fetch_logs();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
+    }
+
     fn refresh_nodes(&self) {
         {
             let mut s = self.node_list_state.lock().expect("node list poisoned");
@@ -980,6 +1243,7 @@ impl App {
 
 pub async fn run(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
+    app.spawn_cluster_info_refresh();
     let result = run_loop(&mut terminal, &mut app).await;
     ratatui::restore();
     result
@@ -993,6 +1257,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         if app.mode == Mode::Selection && !app.scroll_frozen {
             app.refresh_live_snapshot();
+        }
+        if matches!(app.mode, Mode::Flux | Mode::FluxFull) {
+            app.refresh_flux_snapshot();
         }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
@@ -1013,6 +1280,19 @@ fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
     match (k.code, k.modifiers, app.mode) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
+
+        (KeyCode::Esc, _, Mode::Command) => app.exit_command(),
+        (KeyCode::Enter, _, Mode::Command) => app.command_run(),
+        (KeyCode::Tab, _, Mode::Command) => app.command_autocomplete(),
+        (KeyCode::Backspace, _, Mode::Command) => app.command_backspace(),
+        (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
+        (_, _, Mode::Command) => {}
+
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull) => {
+            app.enter_command();
+        }
+
         (KeyCode::Char('m'), _, Mode::AiPanel) => {
             app.cycle_ai_provider();
             app.enter_ai_panel();
@@ -1128,6 +1408,44 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::NodesFull) => app.enter_ai_panel(),
         (KeyCode::Char('l'), _, Mode::NodesFull) => app.ai_language = app.ai_language.toggle(),
 
+        (KeyCode::Up, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Up, _, Mode::Flux) => app.move_flux_selection(-1),
+        (KeyCode::Down, _, Mode::Flux) => app.move_flux_selection(1),
+        (KeyCode::PageUp, _, Mode::Flux) => app.move_flux_selection(-10),
+        (KeyCode::PageDown, _, Mode::Flux) => app.move_flux_selection(10),
+        (KeyCode::Tab, _, Mode::Flux) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::Flux) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::Flux) => app.enter_flux_full(),
+        (KeyCode::Esc, _, Mode::Flux) => app.exit_flux_mode(),
+        (KeyCode::Char('r'), _, Mode::Flux) => app.refresh_flux(),
+        (KeyCode::Char('i'), _, Mode::Flux) => app.enter_ai_panel(),
+        (KeyCode::Char('g'), _, Mode::Flux) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::Flux) => app.scroll_detail_bottom(),
+        (KeyCode::Char('l'), _, Mode::Flux) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Flux) => {}
+
+        (KeyCode::Up, m, Mode::FluxFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::FluxFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::FluxFull) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::FluxFull) => app.scroll_detail(-10),
+        (KeyCode::Left, m, Mode::FluxFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5);
+        }
+        (KeyCode::Right, m, Mode::FluxFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_add(5);
+        }
+        (KeyCode::Home, _, Mode::FluxFull) => app.detail_h_scroll = 0,
+        (KeyCode::Tab, _, Mode::FluxFull) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::FluxFull) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::FluxFull) => app.exit_flux_full(),
+        (KeyCode::Esc, _, Mode::FluxFull) => app.exit_flux_full(),
+        (KeyCode::Char('g'), _, Mode::FluxFull) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::FluxFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('i'), _, Mode::FluxFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::FluxFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::FluxFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -1142,7 +1460,6 @@ fn handle_event(app: &mut App, ev: Event) {
         }
         (KeyCode::Home, _, _) => app.h_scroll = 0,
         (KeyCode::Char('q'), _, _) => app.should_quit = true,
-        (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
 
         (KeyCode::Char('D'), _, Mode::Selection) => app.enter_diagnostic(),
         (KeyCode::Char('X'), _, Mode::Selection) => app.enter_extract(),
@@ -1206,6 +1523,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::NodeUsage => Mode::Nodes,
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
+        Mode::Command => match app.command_return_mode {
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull => app.command_return_mode,
+            _ => Mode::Selection,
+        },
         m => m,
     };
 
@@ -1213,7 +1534,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(area.height / 2),
                 Constraint::Min(3),
                 Constraint::Length(1),
@@ -1221,30 +1542,40 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             .split(area),
         Mode::DetailFull => Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+            .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
         Mode::Nodes => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(area.height / 2),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull => Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+            .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
+        Mode::Flux => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(area.height / 2),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
     };
 
     let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
+        Mode::NodesFull | Mode::FluxFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
     };
 
     let st = lang::t(app.ai_language);
@@ -1258,19 +1589,24 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::NodeUsage => st.mode_node_usage,
         Mode::Diagnostic => st.mode_diagnostic,
         Mode::Extract => st.mode_extract,
+        Mode::Command => st.mode_command,
+        Mode::Flux | Mode::FluxFull => st.mode_flux,
     };
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(" kdt ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "  ctx={}  ns={}  filter={}  mode={}{}  lang={}",
-            app.context_label,
-            app.namespace_label,
-            app.filter.label(),
-            mode_label,
-            if app.mode == Mode::Selection && !app.scroll_frozen { "↻" } else { "" },
-            app.ai_language.label(),
-        )),
-    ]));
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" kdt ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "  ctx={}  ns={}  filter={}  mode={}{}  lang={}",
+                app.context_label,
+                app.namespace_label,
+                app.filter.label(),
+                mode_label,
+                if app.mode == Mode::Selection && !app.scroll_frozen { "↻" } else { "" },
+                app.ai_language.label(),
+            )),
+        ]),
+        cluster_banner_line(app),
+    ]);
     f.render_widget(header, header_a);
 
     if let Some(da) = detail_a {
@@ -1281,10 +1617,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if let Some(ta) = table_a {
         if draw_mode == Mode::Nodes {
             draw_nodes_table(f, app, ta);
+        } else if draw_mode == Mode::Flux {
+            draw_flux_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -1313,6 +1651,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let mut footer_spans = match draw_mode {
         Mode::Selection => vec![
             Span::styled(" q ", kbg), Span::raw(format!(" {}   ", st.k_quit)),
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" a ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_all, app.filter == Filter::All),
             Span::raw("   "),
@@ -1364,7 +1703,28 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract => unreachable!(),
+        Mode::Flux => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::FluxFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
     };
     footer_spans.push(Span::raw("   "));
     footer_spans.push(Span::styled(" m ", kbg));
@@ -1396,6 +1756,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.mode == Mode::AiPanel {
         draw_ai_panel_popup(f, app, area);
+    }
+    if app.mode == Mode::Command {
+        draw_command_popup(f, app, area);
     }
 
     visible_rows
@@ -1850,6 +2213,54 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
     ]
 }
 
+fn cluster_banner_line(app: &App) -> Line<'static> {
+    let info = app.cluster_info.lock().expect("cluster info poisoned").clone();
+    let label = Style::default().fg(SYS_DIM);
+    let val = Style::default().fg(Color::Gray);
+
+    if !info.loaded {
+        return Line::from(Span::styled("   cluster: chargement des infos…", label));
+    }
+
+    let version = info.server_version.clone().unwrap_or_else(|| "?".to_string());
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled("   cluster ", label),
+        Span::styled(app.context_label.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled("   k8s ", label),
+        Span::styled(version, val),
+        Span::styled("   nodes ", label),
+        Span::styled(
+            format!("{}/{} ready", info.nodes_ready, info.node_count),
+            Style::default().fg(if info.nodes_ready == info.node_count { Color::Green } else { Color::Yellow }),
+        ),
+    ];
+
+    if info.metrics_available {
+        let cpu_pct = pct_local(info.cpu_use_milli, info.cpu_alloc_milli);
+        let mem_pct = pct_local(info.mem_use_bytes, info.mem_alloc_bytes);
+        spans.push(Span::styled("   CPU ", label));
+        spans.push(Span::styled(
+            format!("{}/{}", format_cpu_milli(info.cpu_use_milli), format_cpu_milli(info.cpu_alloc_milli)),
+            val,
+        ));
+        spans.push(Span::styled(format!(" ({}%)", cpu_pct), Style::default().fg(pct_color(cpu_pct))));
+        spans.push(Span::styled("   MEM ", label));
+        spans.push(Span::styled(
+            format!("{}/{}", format_memory_bytes(info.mem_use_bytes), format_memory_bytes(info.mem_alloc_bytes)),
+            val,
+        ));
+        spans.push(Span::styled(format!(" ({}%)", mem_pct), Style::default().fg(pct_color(mem_pct))));
+    } else {
+        spans.push(Span::styled("   CPU alloc ", label));
+        spans.push(Span::styled(format_cpu_milli(info.cpu_alloc_milli), val));
+        spans.push(Span::styled("   MEM alloc ", label));
+        spans.push(Span::styled(format_memory_bytes(info.mem_alloc_bytes), val));
+        spans.push(Span::styled("   (metrics-server indispo)", label));
+    }
+
+    Line::from(spans)
+}
+
 fn pct_local(v: i64, total: i64) -> i64 {
     if total > 0 { v.saturating_mul(100) / total } else { 0 }
 }
@@ -2206,6 +2617,142 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
+    let (severity, reason) = match (r.suspended, r.ready) {
+        (true, _) => (Severity::Normal, "Suspended".to_string()),
+        (false, FluxReady::Ready) => (Severity::Normal, "Ready".to_string()),
+        (false, FluxReady::Failed) => (Severity::Warning, "ReconciliationFailed".to_string()),
+        (false, FluxReady::Unknown) => (Severity::Warning, "Unknown".to_string()),
+    };
+    let message = if r.message.is_empty() {
+        format!("{} {}/{}", r.kind, r.namespace, r.name)
+    } else {
+        r.message.clone()
+    };
+    EventRecord {
+        uid: format!("flux|{}|{}/{}", r.kind, r.namespace, r.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: r.api_version.clone(),
+        kind: r.kind.clone(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "flux".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (resources, loading, error, counts) = {
+        let s = app.flux_state.lock().expect("flux poisoned");
+        (s.resources.clone(), s.loading, s.error.clone(), s.counts())
+    };
+
+    let (ready, failed, unknown, suspended) = counts;
+    let title = if let Some(e) = &error {
+        format!("flux (erreur: {})", e)
+    } else if loading && resources.is_empty() {
+        "flux (chargement...)".to_string()
+    } else {
+        format!(
+            "flux ({} · ✓{} ✗{} ?{} ⏸{})",
+            resources.len(), ready, failed, unknown, suspended
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("KIND"), Cell::from("NAMESPACE"), Cell::from("NAME"),
+        Cell::from("READY"), Cell::from("REVISION"), Cell::from("AGE"), Cell::from("MESSAGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = resources.iter().map(|r| {
+        let (ready_txt, ready_color) = if r.suspended {
+            ("Suspended", Color::Yellow)
+        } else {
+            match r.ready {
+                FluxReady::Ready => ("Ready", Color::Green),
+                FluxReady::Failed => ("Failed", Color::Red),
+                FluxReady::Unknown => ("Unknown", Color::Yellow),
+            }
+        };
+        let row_style = match (r.suspended, r.ready) {
+            (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+            (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+            (true, _) => Style::default().fg(DIM),
+            (false, FluxReady::Ready) => Style::default(),
+        };
+        let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
+        Row::new(vec![
+            Cell::from(r.kind.clone()).style(Style::default().fg(Color::Cyan)),
+            Cell::from(r.namespace.clone()),
+            Cell::from(r.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+            Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
+            Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+            Cell::from(r.message.clone()).style(Style::default().fg(msg_color)),
+        ])
+        .style(row_style)
+    }).collect();
+
+    let widths = [
+        Constraint::Length(16), Constraint::Length(22), Constraint::Length(28),
+        Constraint::Length(10), Constraint::Length(20), Constraint::Length(6), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let suggestions = command_suggestions(&app.command_input);
+    let resolved = resolve_command(&app.command_input);
+
+    let popup_w = 56.min(area.width.saturating_sub(2)).max(20);
+    let popup_h = 4 + suggestions.len().min(6) as u16;
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(":", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(app.command_input.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(""));
+    if suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (aucune commande)",
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        for name in suggestions.iter().take(6) {
+            let selected = resolved == Some(*name);
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(format!("  {} ", name), style)));
+        }
+    }
+
+    let st = lang::t(app.ai_language);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} · Tab={} Enter={} Esc ", st.mode_command, "autocomplete", st.k_confirm));
+    f.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
 fn loading_lines(
     stage: &str,
     started_at: Option<std::time::Instant>,
@@ -2276,7 +2823,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
     let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage));
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Nodes | Mode::NodesFull));
     let title = if is_node_mode {
         let name = {
             let s = app.node_list_state.lock().expect("node list poisoned");

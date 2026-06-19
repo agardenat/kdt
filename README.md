@@ -58,6 +58,7 @@ défilement live est actif.
 | `Shift-↑/↓`, `Ctrl-U/D` | Scroll du détail |
 | `g` / `G` | Haut / bas du détail |
 | `a` / `w` / `e` | Filtre All / Warnings / Errors |
+| `:` | Palette de commandes (style k9s) |
 | `n` | Sélecteur de namespace |
 | `N` | Nodes du pod sélectionné |
 | `D` | Diagnostic cluster |
@@ -68,10 +69,44 @@ défilement live est actif.
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
 
+### Palette de commandes (`:`)
+
+Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` complète,
+`Enter` valide, `Esc` annule.
+
+| Commande | Alias | Action |
+|---|---|---|
+| `events` | `ev` | Revenir à la vue évènements |
+| `namespace` | `ns` | Sélecteur de namespace |
+| `nodes` | `no`, `node` | Vue Nodes |
+| `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
+| `quit` | `q` | Quitter |
+
+### FluxCD (`:flux`)
+
+Vue globale de l'état Flux sur tout le cluster : `Kustomization`, `HelmRelease` et sources
+(`GitRepository`, `OCIRepository`, `HelmRepository`, `HelmChart`, `Bucket`). Les ressources
+en échec sont remontées en tête, puis `Unknown`, puis suspendues, puis `Ready`. Le bandeau
+résume `✓ready ✗failed ?unknown ⏸suspended`.
+
+Même logique de détail que la vue évènements : panneau à onglets **Logs / Status / Related**,
+scroll, et envoi à l'IA (`i`) sur la ressource sélectionnée (utile pour analyser une
+`HelmRelease` ou `Kustomization` en échec).
+
+| Touche | Action |
+|---|---|
+| `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
+| `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
+| `Enter` | Détail plein écran |
+| `Shift-↑/↓`, `g` / `G` | Scroll du détail |
+| `i` | Panneau IA |
+| `r` | Rafraîchir (auto toutes les 10 s) |
+| `Esc` | Retour |
+
 ### Nodes / Node usage
 | Touche | Action |
 |---|---|
-| `N` | Entrer / sortir de la vue Nodes |
+| `:nodes` ou `N` | Entrer dans la vue Nodes |
 | `u` | Vue usage (CPU/mémoire) |
 | `s` | Changer le tri (usage) |
 | `r` | Rafraîchir |
@@ -186,6 +221,7 @@ Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downl
 | `main.rs` | Bootstrap : client kube, logging, lancement TUI |
 | `cli.rs` | Parsing des arguments (clap) |
 | `events.rs` | Watcher d'évènements, logs, status, nœuds, usage |
+| `flux.rs` | Inventaire FluxCD (Kustomizations, HelmReleases, sources) |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
 | `diagnostic.rs` | Étapes de diagnostic cluster |
 | `extract.rs` | Extraction complète → rapport |

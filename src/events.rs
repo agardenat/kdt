@@ -1181,6 +1181,82 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
     s.alloc_mem_bytes = alloc_mem;
 }
 
+#[derive(Default, Debug, Clone)]
+pub struct ClusterInfo {
+    pub server_version: Option<String>,
+    pub node_count: usize,
+    pub nodes_ready: usize,
+    pub cpu_alloc_milli: i64,
+    pub cpu_use_milli: i64,
+    pub mem_alloc_bytes: i64,
+    pub mem_use_bytes: i64,
+    pub metrics_available: bool,
+    pub loaded: bool,
+}
+
+pub type SharedClusterInfo = Arc<Mutex<ClusterInfo>>;
+
+pub fn new_cluster_info_state() -> SharedClusterInfo {
+    Arc::new(Mutex::new(ClusterInfo::default()))
+}
+
+pub async fn fetch_cluster_info(client: Client, state: SharedClusterInfo) {
+    let version = client
+        .apiserver_version()
+        .await
+        .ok()
+        .map(|i| i.git_version);
+
+    let node_api: Api<Node> = Api::all(client.clone());
+    let (mut cpu_alloc, mut mem_alloc, mut count, mut ready) = (0_i64, 0_i64, 0_usize, 0_usize);
+    if let Ok(list) = node_api.list(&ListParams::default()).await {
+        count = list.items.len();
+        for n in &list.items {
+            if let Some(alloc) = n.status.as_ref().and_then(|s| s.allocatable.as_ref()) {
+                cpu_alloc += alloc.get("cpu").and_then(|q| parse_quantity_cpu_milli(&q.0)).unwrap_or(0);
+                mem_alloc += alloc.get("memory").and_then(|q| parse_quantity_memory_bytes(&q.0)).unwrap_or(0);
+            }
+            let is_ready = n.status.as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|cs| cs.iter().find(|c| c.type_ == "Ready"))
+                .map(|c| c.status == "True")
+                .unwrap_or(false);
+            if is_ready { ready += 1; }
+        }
+    }
+
+    let (cpu_use, mem_use, metrics_available) = match fetch_node_metrics_total(&client).await {
+        Some((c, m)) => (c, m, true),
+        None => (0, 0, false),
+    };
+
+    let mut s = state.lock().expect("cluster info poisoned");
+    s.server_version = version;
+    s.node_count = count;
+    s.nodes_ready = ready;
+    s.cpu_alloc_milli = cpu_alloc;
+    s.mem_alloc_bytes = mem_alloc;
+    s.cpu_use_milli = cpu_use;
+    s.mem_use_bytes = mem_use;
+    s.metrics_available = metrics_available;
+    s.loaded = true;
+}
+
+async fn fetch_node_metrics_total(client: &Client) -> Option<(i64, i64)> {
+    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
+    let (ar, _) = discovery::pinned_kind(client, &gvk).await.ok()?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    let list = api.list(&ListParams::default()).await.ok()?;
+    let mut cpu = 0_i64;
+    let mut mem = 0_i64;
+    for item in list.items {
+        let usage = item.data.get("usage");
+        cpu += usage.and_then(|u| u.get("cpu")).and_then(|v| v.as_str()).and_then(parse_quantity_cpu_milli).unwrap_or(0);
+        mem += usage.and_then(|u| u.get("memory")).and_then(|v| v.as_str()).and_then(parse_quantity_memory_bytes).unwrap_or(0);
+    }
+    Some((cpu, mem))
+}
+
 async fn fetch_pod_metrics_map(client: &Client) -> Option<std::collections::HashMap<(String, String, String), (i64, i64)>> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
     let (ar, _) = discovery::pinned_kind(client, &gvk).await.ok()?;

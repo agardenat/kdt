@@ -9,6 +9,7 @@ mod diagnostic;
 mod enrich;
 mod events;
 mod extract;
+mod flux;
 mod lang;
 mod pdf;
 mod ui;
