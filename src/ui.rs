@@ -139,6 +139,7 @@ pub struct App {
     pub filter: Filter,
     pub namespace_label: String,
     pub context_label: String,
+    pub cluster_label: String,
     pub should_quit: bool,
     pub mode: Mode,
     pub table_state: TableState,
@@ -193,6 +194,7 @@ impl App {
         buffer: SharedBuffer,
         namespace_label: String,
         context_label: String,
+        cluster_label: String,
         client: kube::Client,
         log_state: SharedLog,
         status_state: SharedStatus,
@@ -209,6 +211,7 @@ impl App {
             filter: Filter::All,
             namespace_label,
             context_label,
+            cluster_label,
             should_quit: false,
             mode: Mode::Selection,
             table_state: TableState::default(),
@@ -2225,7 +2228,7 @@ fn cluster_banner_line(app: &App) -> Line<'static> {
     let version = info.server_version.clone().unwrap_or_else(|| "?".to_string());
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled("   cluster ", label),
-        Span::styled(app.context_label.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(app.cluster_label.clone(), Style::default().fg(Color::Cyan)),
         Span::styled("   k8s ", label),
         Span::styled(version, val),
         Span::styled("   nodes ", label),

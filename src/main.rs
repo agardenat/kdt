@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
 
     let ns = if args.all_namespaces { None } else { args.namespace.clone() };
     let ns_label = match &ns { Some(n) => n.clone(), None => "all".to_string() };
-    let ctx_label = args.context.clone().unwrap_or_else(|| "default".to_string());
+    let (ctx_label, cluster_label) = resolve_context_labels(args.context.as_deref());
     let buffer = events::new_buffer();
     let log_state = events::new_log_state();
     let status_state = events::new_status_state();
@@ -90,6 +90,23 @@ async fn main() -> Result<()> {
 
     let ai_state = ai::new_ai_state();
     let file_config = config::load();
-    let app = ui::App::new(buffer, ns_label, ctx_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config);
+    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config);
     ui::run(app).await
+}
+
+fn resolve_context_labels(explicit: Option<&str>) -> (String, String) {
+    use kube::config::Kubeconfig;
+    let kc = Kubeconfig::read().ok();
+    let ctx_name = explicit
+        .map(String::from)
+        .or_else(|| kc.as_ref().and_then(|k| k.current_context.clone()))
+        .unwrap_or_else(|| "default".to_string());
+    let cluster = kc
+        .as_ref()
+        .and_then(|k| k.contexts.iter().find(|c| c.name == ctx_name))
+        .and_then(|c| c.context.as_ref())
+        .map(|c| c.cluster.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ctx_name.clone());
+    (ctx_name, cluster)
 }
