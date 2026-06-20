@@ -39,6 +39,10 @@ use crate::flux::{
 };
 use crate::lang;
 use crate::pdf;
+use crate::pods::{
+    fetch_pods, fetch_workload_pods, new_pods_state, run_force_recycle, run_restart, run_scale,
+    OwnerRef, PodResource, SharedPods, WorkloadResource,
+};
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 use crate::events::{
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
@@ -77,13 +81,14 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull }
 
 // Command palette entries: (canonical name, aliases). Drives `:` palette resolution/completion.
 const COMMANDS: &[(&str, &[&str])] = &[
     ("events", &["ev", "event"]),
     ("namespace", &["ns", "namespaces"]),
     ("nodes", &["no", "node"]),
+    ("pods", &["po", "pod"]),
     ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("quit", &["q"]),
@@ -224,6 +229,13 @@ pub struct App {
     pub last_flux_sel_uid: Option<String>,
     pub flux_refresh_handle: Option<JoinHandle<()>>,
     pub cluster_info: SharedClusterInfo,
+    pub pods_state: SharedPods,
+    pub pods_focus: Option<OwnerRef>,
+    pub pods_saved_replicas: std::collections::HashMap<String, i32>,
+    pub pods_refresh_handle: Option<JoinHandle<()>>,
+    pub last_pods_sel_uid: Option<String>,
+    // When the namespace picker was opened from the pods view, return to it (not the events view).
+    pub ns_return_pods: bool,
 }
 
 impl App {
@@ -306,6 +318,12 @@ impl App {
             last_flux_sel_uid: None,
             flux_refresh_handle: None,
             cluster_info: new_cluster_info_state(),
+            pods_state: new_pods_state(),
+            pods_focus: None,
+            pods_saved_replicas: std::collections::HashMap::new(),
+            pods_refresh_handle: None,
+            last_pods_sel_uid: None,
+            ns_return_pods: false,
         }
     }
 
@@ -564,6 +582,7 @@ impl App {
             s.namespaces.clear();
             s.error = None;
         }
+        self.ns_return_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
         self.ns_cursor = 0;
         self.mode = Mode::NsPicker;
         let client = self.client.clone();
@@ -574,7 +593,12 @@ impl App {
     }
 
     fn exit_ns_picker(&mut self) {
-        self.mode = Mode::Selection;
+        if self.ns_return_pods {
+            self.ns_return_pods = false;
+            self.mode = Mode::Pods;
+        } else {
+            self.mode = Mode::Selection;
+        }
     }
 
     fn current_ai_config(&self) -> Result<AiConfig, String> {
@@ -834,7 +858,7 @@ impl App {
 
     pub fn clipboard_status_active(&self) -> Option<&str> {
         self.clipboard_status.as_ref().and_then(|(t, msg)| {
-            if t.elapsed().as_secs() < 3 { Some(msg.as_str()) } else { None }
+            if t.elapsed().as_secs() < 6 { Some(msg.as_str()) } else { None }
         })
     }
 
@@ -1090,6 +1114,11 @@ impl App {
                 self.leave_special_modes();
                 self.enter_nodes_mode();
             }
+            "pods" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_pods_mode();
+            }
             "flux" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -1115,6 +1144,10 @@ impl App {
             }
             Mode::Flux | Mode::FluxFull => {
                 self.stop_flux_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Pods | Mode::PodsFull => {
+                self.stop_pods_auto_refresh();
                 self.clear_status_state();
             }
             _ => {}
@@ -1426,6 +1459,337 @@ impl App {
         tokio::spawn(async move { fetch_nodes(client, state).await; });
     }
 
+    // The namespace scope for pod listing: None means "all namespaces" (the "all" label).
+    fn current_ns_opt(&self) -> Option<String> {
+        if self.namespace_label == "all" { None } else { Some(self.namespace_label.clone()) }
+    }
+
+    fn enter_pods_mode(&mut self) {
+        self.mode = Mode::Pods;
+        self.pods_focus = None;
+        self.detail_tab = DetailTab::Logs;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pods_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_pods();
+        self.start_pods_auto_refresh();
+        self.refresh_pods_snapshot();
+    }
+
+    fn exit_pods_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_pods_auto_refresh();
+        self.pods_focus = None;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pods_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_pods_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.mode = Mode::PodsFull;
+    }
+
+    fn exit_pods_full(&mut self) {
+        self.mode = Mode::Pods;
+    }
+
+    // Kick off a one-shot pod fetch for the current scope (flat list or focused workload).
+    fn refresh_pods(&self) {
+        {
+            let mut s = self.pods_state.lock().expect("pods poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.pods_state.clone();
+        match self.pods_focus.clone() {
+            Some(owner) => {
+                tokio::spawn(async move { fetch_workload_pods(client, owner, state).await; });
+            }
+            None => {
+                let ns = self.current_ns_opt();
+                tokio::spawn(async move { fetch_pods(client, ns, state).await; });
+            }
+        }
+    }
+
+    // Restarts the 5 s auto-refresh, capturing the current scope (flat vs. focused). Must be called
+    // again whenever the focus changes so the ticker fetches the right set.
+    fn start_pods_auto_refresh(&mut self) {
+        self.stop_pods_auto_refresh();
+        let client = self.client.clone();
+        let state = self.pods_state.clone();
+        let focus = self.pods_focus.clone();
+        let ns = self.current_ns_opt();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match &focus {
+                    Some(owner) => fetch_workload_pods(client.clone(), owner.clone(), state.clone()).await,
+                    None => fetch_pods(client.clone(), ns.clone(), state.clone()).await,
+                }
+            }
+        });
+        self.pods_refresh_handle = Some(handle);
+    }
+
+    fn stop_pods_auto_refresh(&mut self) {
+        if let Some(h) = self.pods_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // One-shot refresh after a short delay, so a scale/restart action is reflected in the list before
+    // the next regular tick (gives quick visual feedback that the action took effect).
+    fn schedule_pods_refresh(&self, after_ms: u64) {
+        let client = self.client.clone();
+        let state = self.pods_state.clone();
+        let focus = self.pods_focus.clone();
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(after_ms)).await;
+            match focus {
+                Some(owner) => fetch_workload_pods(client, owner, state).await,
+                None => fetch_pods(client, ns, state).await,
+            }
+        });
+    }
+
+    // Rebuild the visible snapshot from the shared pod state. In the flat list every row is a pod; in
+    // the focused (hierarchical) view row 0 is the workload object and the rest are its pods. The
+    // snapshot carries real api_version/kind/ns/name so the shared detail tabs (Logs/Status/Related)
+    // work per pod and per workload without extra plumbing.
+    fn refresh_pods_snapshot(&mut self) {
+        let recs: Vec<EventRecord> = {
+            let s = self.pods_state.lock().expect("pods poisoned");
+            if self.pods_focus.is_some() {
+                let mut recs: Vec<EventRecord> = Vec::with_capacity(s.pods.len() + 1);
+                if let Some(w) = &s.owner {
+                    recs.push(synthetic_workload_record(w));
+                    // Remember the initial replica count once, so rescale/recycle can restore it.
+                    if let Some(r) = w.replicas {
+                        self.pods_saved_replicas.entry(w.uid.clone()).or_insert(r);
+                    }
+                }
+                recs.extend(s.pods.iter().map(synthetic_pod_record));
+                recs
+            } else {
+                s.pods.iter().map(synthetic_pod_record).collect()
+            }
+        };
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_pods_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_pods_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_pods_sel_uid = Some(cur_uid);
+            self.maybe_fetch_logs();
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_pods_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_pods_sel_uid = self.selected_uid.clone();
+        self.reset_scroll();
+        self.maybe_fetch_logs();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
+    }
+
+    // Switch from the selected pod to its originating workload, showing the workload + all its pods.
+    fn focus_owner(&mut self) {
+        let owner = self
+            .table_state
+            .selected()
+            .and_then(|i| self.pods_state.lock().expect("pods poisoned").pods.get(i).and_then(|p| p.owner.clone()));
+        let Some(owner) = owner else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "pas d'objet d'origine pour ce pod".to_string(),
+            ));
+            return;
+        };
+        self.pods_focus = Some(owner);
+        self.enter_pods_scope();
+    }
+
+    // Return from the hierarchical view to the flat pod list.
+    fn unfocus_owner(&mut self) {
+        self.pods_focus = None;
+        self.enter_pods_scope();
+    }
+
+    // Shared reset when the pod scope changes (focus on / off): clear selection, refetch, restart
+    // the auto-refresh so it targets the new scope.
+    fn enter_pods_scope(&mut self) {
+        self.last_pods_sel_uid = None;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.reset_scroll();
+        {
+            let mut s = self.pods_state.lock().expect("pods poisoned");
+            s.pods.clear();
+            s.owner = None;
+        }
+        self.snapshot.clear();
+        self.refresh_pods();
+        self.start_pods_auto_refresh();
+        self.refresh_pods_snapshot();
+    }
+
+    fn focus_workload(&self) -> Option<WorkloadResource> {
+        self.pods_state.lock().expect("pods poisoned").owner.clone()
+    }
+
+    // Scale the focused workload by a relative delta (clamped at 0).
+    fn pods_scale(&mut self, delta: i32) {
+        let Some(w) = self.focus_workload() else {
+            self.pods_scale_hint();
+            return;
+        };
+        let Some(cur) = w.replicas else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("scale non supporté pour {}", w.kind),
+            ));
+            return;
+        };
+        let target = (cur + delta).max(0);
+        self.spawn_scale(&w, target);
+    }
+
+    // Scale the focused workload to zero (its initial count is already memorised for restore).
+    fn pods_scale_zero(&mut self) {
+        let Some(w) = self.focus_workload() else {
+            self.pods_scale_hint();
+            return;
+        };
+        if w.replicas.is_none() {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("scale non supporté pour {}", w.kind),
+            ));
+            return;
+        }
+        self.spawn_scale(&w, 0);
+    }
+
+    // Rescale to the memorised initial count. `force` first scales to 0 then back up, bypassing the
+    // rolling update for a hard recycle of all pods.
+    fn pods_rescale(&mut self, force: bool) {
+        let Some(w) = self.focus_workload() else {
+            self.pods_scale_hint();
+            return;
+        };
+        if w.replicas.is_none() {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("scale non supporté pour {}", w.kind),
+            ));
+            return;
+        }
+        let target = self
+            .pods_saved_replicas
+            .get(&w.uid)
+            .copied()
+            .or(w.replicas)
+            .unwrap_or(1);
+        let owner = w.as_owner();
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        if force {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("♻ recyclage {}/{} (0 → {})…", w.kind, w.name, target),
+            ));
+            tokio::spawn(async move { run_force_recycle(client, owner, target, status).await; });
+            // Force-recycle scales to 0 then back up (~2 s); refresh around each step.
+            self.schedule_pods_refresh(800);
+            self.schedule_pods_refresh(3000);
+        } else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("⇅ rescale {}/{} → {}…", w.kind, w.name, target),
+            ));
+            tokio::spawn(async move { run_scale(client, owner, target, status).await; });
+            self.schedule_pods_refresh(1500);
+        }
+    }
+
+    // Rollout restart of the focused workload (Deployment/StatefulSet/DaemonSet).
+    fn pods_restart(&mut self) {
+        let Some(w) = self.focus_workload() else {
+            self.pods_scale_hint();
+            return;
+        };
+        let owner = w.as_owner();
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            format!("↻ restart {}/{}…", w.kind, w.name),
+        ));
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move { run_restart(client, owner, status).await; });
+        self.schedule_pods_refresh(1500);
+    }
+
+    fn spawn_scale(&mut self, w: &WorkloadResource, target: i32) {
+        let owner = w.as_owner();
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            format!("⇅ scale {}/{} → {}…", w.kind, w.name, target),
+        ));
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move { run_scale(client, owner, target, status).await; });
+        self.schedule_pods_refresh(1500);
+    }
+
+    fn pods_scale_hint(&mut self) {
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            "scale/restart : basculez sur l'objet (o) d'abord".to_string(),
+        ));
+    }
+
     fn maybe_fetch_node_status(&mut self) {
         let name = {
             let s = self.node_list_state.lock().expect("node list poisoned");
@@ -1535,7 +1899,6 @@ impl App {
             self.buffer.clone(),
             self.buffer_capacity,
         );
-        self.mode = Mode::Selection;
         self.scroll_frozen = false;
         self.selected_uid = None;
         self.snapshot.clear();
@@ -1544,6 +1907,13 @@ impl App {
         self.last_status_key = None;
         self.last_related_key = None;
         self.reset_scroll();
+        if self.ns_return_pods {
+            // Re-enter the pods view scoped to the freshly selected namespace.
+            self.ns_return_pods = false;
+            self.enter_pods_mode();
+        } else {
+            self.mode = Mode::Selection;
+        }
     }
 }
 
@@ -1576,6 +1946,10 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 app.maybe_fetch_inventory(true);
             }
         }
+        if matches!(app.mode, Mode::Pods | Mode::PodsFull) {
+            app.refresh_pods_snapshot();
+            app.drain_reconcile_status();
+        }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
         tokio::select! {
@@ -1606,7 +1980,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull) => {
             app.enter_command();
         }
 
@@ -1786,6 +2160,55 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('L'), _, Mode::FluxLogs) => app.exit_flux_logs(),
         (_, _, Mode::FluxLogs) => {}
 
+        (KeyCode::Up, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Up, _, Mode::Pods) => app.move_pods_selection(-1),
+        (KeyCode::Down, _, Mode::Pods) => app.move_pods_selection(1),
+        (KeyCode::PageUp, _, Mode::Pods) => app.move_pods_selection(-10),
+        (KeyCode::PageDown, _, Mode::Pods) => app.move_pods_selection(10),
+        (KeyCode::Tab, _, Mode::Pods) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::Pods) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::Pods) => app.enter_pods_full(),
+        (KeyCode::Esc, _, Mode::Pods) => {
+            if app.pods_focus.is_some() { app.unfocus_owner(); } else { app.exit_pods_mode(); }
+        }
+        (KeyCode::Char('o'), _, Mode::Pods) => {
+            if app.pods_focus.is_some() { app.unfocus_owner(); } else { app.focus_owner(); }
+        }
+        (KeyCode::Char('n'), _, Mode::Pods) => app.enter_ns_picker(),
+        (KeyCode::Char('+'), _, Mode::Pods) => app.pods_scale(1),
+        (KeyCode::Char('-'), _, Mode::Pods) => app.pods_scale(-1),
+        (KeyCode::Char('0'), _, Mode::Pods) => app.pods_scale_zero(),
+        (KeyCode::Char('r'), _, Mode::Pods) => app.pods_rescale(false),
+        (KeyCode::Char('f'), _, Mode::Pods) => app.pods_rescale(true),
+        (KeyCode::Char('R'), _, Mode::Pods) => app.pods_restart(),
+        (KeyCode::Char('i'), _, Mode::Pods) => app.enter_ai_panel(),
+        (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
+        (KeyCode::Char('l'), _, Mode::Pods) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Pods) => {}
+
+        (KeyCode::Up, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::PodsFull) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::PodsFull) => app.scroll_detail(-10),
+        (KeyCode::Left, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5);
+        }
+        (KeyCode::Right, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_add(5);
+        }
+        (KeyCode::Home, _, Mode::PodsFull) => app.detail_h_scroll = 0,
+        (KeyCode::Tab, _, Mode::PodsFull) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::PodsFull) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::PodsFull) => app.exit_pods_full(),
+        (KeyCode::Esc, _, Mode::PodsFull) => app.exit_pods_full(),
+        (KeyCode::Char('g'), _, Mode::PodsFull) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::PodsFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('i'), _, Mode::PodsFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::PodsFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::PodsFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -1869,7 +2292,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -1898,11 +2321,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::Flux => Layout::default()
+        Mode::Flux | Mode::Pods => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -1918,8 +2341,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -1937,6 +2360,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Command => st.mode_command,
         Mode::Flux | Mode::FluxFull => st.mode_flux,
         Mode::FluxLogs => st.mode_flux,
+        Mode::Pods | Mode::PodsFull => st.mode_pods,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -1966,6 +2390,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if let Some(ta) = table_a {
         if draw_mode == Mode::Nodes {
             draw_nodes_table(f, app, ta);
+        } else if draw_mode == Mode::Pods {
+            if app.pods_focus.is_some() {
+                draw_pods_tree(f, app, ta);
+            } else {
+                draw_pods_table(f, app, ta);
+            }
         } else if draw_mode == Mode::Flux {
             if app.flux_tree {
                 draw_flux_tree(f, app, ta);
@@ -1975,7 +2405,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -2083,6 +2513,43 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" F ", kbg), Span::raw(format!(" {}   ", st.k_sync_root)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::Pods => {
+            let mut spans = vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_namespace)),
+            ];
+            if app.pods_focus.is_some() {
+                spans.extend(vec![
+                    footer_sep(),
+                    Span::styled(" + ", kbg), Span::raw(format!(" {}   ", st.k_scale_up)),
+                    Span::styled(" - ", kbg), Span::raw(format!(" {}   ", st.k_scale_down)),
+                    Span::styled(" 0 ", kbg), Span::raw(format!(" {}   ", st.k_scale_zero)),
+                    Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_rescale)),
+                    Span::styled(" f ", kbg), Span::raw(format!(" {}   ", st.k_force)),
+                    Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_restart)),
+                ]);
+            }
+            spans.extend(vec![
+                footer_sep(),
+                Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+                Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+            ]);
+            spans
+        }
+        Mode::PodsFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
@@ -2985,6 +3452,7 @@ fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
     let (severity, reason) = match (r.suspended, r.ready) {
         (true, _) => (Severity::Normal, "Suspended".to_string()),
         (false, FluxReady::Ready) => (Severity::Normal, "Ready".to_string()),
+        (false, FluxReady::Reconciling) => (Severity::Normal, "Reconciling".to_string()),
         (false, FluxReady::Failed) => (Severity::Warning, "ReconciliationFailed".to_string()),
         (false, FluxReady::Unknown) => (Severity::Warning, "Unknown".to_string()),
     };
@@ -3009,21 +3477,216 @@ fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
     }
 }
 
+// Colour for a pod STATUS string: green when settled, red for crash/error states, yellow otherwise.
+fn pod_status_color(status: &str) -> Color {
+    match status {
+        "Running" | "Succeeded" | "Completed" => Color::Green,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
+// Adapt a PodResource into an EventRecord so the Pods view reuses the shared table/detail/AI flow.
+// kind="Pod"/apiVersion="v1" make the Logs/Status/Related tabs work for the selected pod.
+fn synthetic_pod_record(p: &PodResource) -> EventRecord {
+    let severity = match pod_status_color(&p.status) {
+        Color::Green => Severity::Normal,
+        _ => Severity::Warning,
+    };
+    let owner = p
+        .owner
+        .as_ref()
+        .map(|o| format!("  ◂ {}/{}", o.kind, o.name))
+        .unwrap_or_default();
+    EventRecord {
+        uid: p.uid.clone(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: p.status.clone(),
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: p.namespace.clone(),
+        name: p.name.clone(),
+        message: format!("ready={} restarts={} node={}{}", p.ready, p.restarts, p.node, owner),
+        component: String::new(),
+        host: p.node.clone(),
+        count: 1,
+    }
+}
+
+// Adapt a WorkloadResource (the focused object) into an EventRecord. Status/Related tabs work via the
+// real kind/apiVersion; Logs shows "n/a" for non-Pod kinds, which is the existing behaviour.
+fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
+    let replicas = w
+        .replicas
+        .map(|r| format!("{}/{}", w.ready_replicas, r))
+        .unwrap_or_else(|| format!("{} ready", w.ready_replicas));
+    EventRecord {
+        uid: format!("workload|{}", w.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Workload".to_string(),
+        api_version: w.api_version.clone(),
+        kind: w.kind.clone(),
+        namespace: w.namespace.clone(),
+        name: w.name.clone(),
+        message: format!("{} {}/{}  replicas={}  age={}", w.kind, w.namespace, w.name, replicas, w.age),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (pods, loading, error) = {
+        let s = app.pods_state.lock().expect("pods poisoned");
+        (s.pods.clone(), s.loading, s.error.clone())
+    };
+
+    let title = if let Some(e) = &error {
+        format!("pods (erreur: {})", e)
+    } else if loading && pods.is_empty() {
+        "pods (chargement...)".to_string()
+    } else {
+        format!("pods ({}) · ns={}", pods.len(), app.namespace_label)
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
+        Cell::from("STATUS"), Cell::from("RESTARTS"), Cell::from("AGE"),
+        Cell::from("NODE"), Cell::from("ORIGIN"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = pods.iter().map(|p| {
+        let status_color = pod_status_color(&p.status);
+        let row_style = if status_color == Color::Red {
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
+        } else {
+            Style::default()
+        };
+        let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
+        let origin = p
+            .owner
+            .as_ref()
+            .map(|o| format!("{}/{}", o.kind, o.name))
+            .unwrap_or_default();
+        Row::new(vec![
+            Cell::from(p.namespace.clone()),
+            Cell::from(p.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(p.ready.clone()),
+            Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
+            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+            Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
+            Cell::from(origin).style(Style::default().fg(Color::Cyan)),
+        ])
+        .style(row_style)
+    }).collect();
+
+    let widths = [
+        Constraint::Length(20), Constraint::Min(28), Constraint::Length(7),
+        Constraint::Length(18), Constraint::Length(8), Constraint::Length(6),
+        Constraint::Length(22), Constraint::Min(24),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Hierarchical view of a focused workload: the object on the first row (depth 0) followed by its
+// pods (depth 1), mirroring the Flux tree look. Selection (app.table_state) stays aligned with the
+// snapshot, where index 0 is the workload and the rest are the pods, in the same order.
+fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (owner, pods, loading, error) = {
+        let s = app.pods_state.lock().expect("pods poisoned");
+        (s.owner.clone(), s.pods.clone(), s.loading, s.error.clone())
+    };
+
+    let title = if let Some(e) = &error {
+        format!("pods arbre (erreur: {})", e)
+    } else if loading && owner.is_none() {
+        "pods arbre (chargement...)".to_string()
+    } else if let Some(w) = &owner {
+        format!("{} {}/{} ({} pods)", w.kind, w.namespace, w.name, pods.len())
+    } else {
+        "pods arbre".to_string()
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("STATUS"),
+        Cell::from("RESTARTS"), Cell::from("AGE"), Cell::from("NODE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let mut rows: Vec<Row> = Vec::with_capacity(pods.len() + 1);
+    if let Some(w) = &owner {
+        let replicas = w
+            .replicas
+            .map(|r| format!("{}/{}", w.ready_replicas, r))
+            .unwrap_or_else(|| format!("{}", w.ready_replicas));
+        rows.push(Row::new(vec![
+            Cell::from(format!("▾ {} {}", w.kind, w.name)).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from(replicas).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Workload"),
+            Cell::from(String::new()),
+            Cell::from(w.age.clone()).style(Style::default().fg(DIM)),
+            Cell::from(String::new()),
+        ]));
+    }
+    for p in &pods {
+        let status_color = pod_status_color(&p.status);
+        let row_style = if status_color == Color::Red {
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
+        } else {
+            Style::default()
+        };
+        let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
+        rows.push(Row::new(vec![
+            Cell::from(format!("    {}", p.name)),
+            Cell::from(p.ready.clone()),
+            Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
+            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+            Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
+        ])
+        .style(row_style));
+    }
+
+    let widths = [
+        Constraint::Min(40), Constraint::Length(10), Constraint::Length(18),
+        Constraint::Length(8), Constraint::Length(6), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
 fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (resources, loading, error, counts) = {
         let s = app.flux_state.lock().expect("flux poisoned");
         (s.resources.clone(), s.loading, s.error.clone(), s.counts())
     };
 
-    let (ready, failed, unknown, suspended) = counts;
+    let (ready, failed, unknown, suspended, reconciling) = counts;
     let title = if let Some(e) = &error {
         format!("flux (erreur: {})", e)
     } else if loading && resources.is_empty() {
         "flux (chargement...)".to_string()
     } else {
         format!(
-            "flux ({} · ✓{} ✗{} ?{} ⏸{})",
-            resources.len(), ready, failed, unknown, suspended
+            "flux ({} · ✓{} ✗{} ⟳{} ?{} ⏸{})",
+            resources.len(), ready, failed, reconciling, unknown, suspended
         )
     };
 
@@ -3039,6 +3702,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             match r.ready {
                 FluxReady::Ready => ("Ready", Color::Green),
+                FluxReady::Reconciling => ("Reconciling", Color::Cyan),
                 FluxReady::Failed => ("Failed", Color::Red),
                 FluxReady::Unknown => ("Unknown", Color::Yellow),
             }
@@ -3046,6 +3710,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let row_style = match (r.suspended, r.ready) {
             (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
             (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+            (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
             (true, _) => Style::default().fg(DIM),
             (false, FluxReady::Ready) => Style::default(),
         };
@@ -3113,6 +3778,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             } else {
                 match r.ready {
                     FluxReady::Ready => ("Ready", Color::Green),
+                    FluxReady::Reconciling => ("Reconciling", Color::Cyan),
                     FluxReady::Failed => ("Failed", Color::Red),
                     FluxReady::Unknown => ("Unknown", Color::Yellow),
                 }
@@ -3120,6 +3786,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let row_style = match (r.suspended, r.ready) {
                 (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
                 (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+                (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
                 (true, _) => Style::default().fg(DIM),
                 (false, FluxReady::Ready) => Style::default(),
             };

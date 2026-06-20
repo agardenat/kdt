@@ -18,6 +18,8 @@ const RECONCILE_ANNOTATION: &str = "reconcile.fluxcd.io/requestedAt";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluxReady {
     Ready,
+    // Actively reconciling (Ready not yet True but a reconcile is in progress) — not a failure.
+    Reconciling,
     Failed,
     Unknown,
 }
@@ -43,13 +45,14 @@ pub struct FluxResource {
 }
 
 impl FluxResource {
-    // Order failed first, then unknown, then suspended, then ready — so problems surface at the top.
+    // Order failed first, then unknown, reconciling, suspended, ready — so problems surface at the top.
     fn sort_key(&self) -> (u8, &str, &str, &str) {
         let bucket = match (self.suspended, self.ready) {
             (false, FluxReady::Failed) => 0,
             (false, FluxReady::Unknown) => 1,
-            (true, _) => 2,
-            (false, FluxReady::Ready) => 3,
+            (false, FluxReady::Reconciling) => 2,
+            (true, _) => 3,
+            (false, FluxReady::Ready) => 4,
         };
         (bucket, self.kind.as_str(), self.namespace.as_str(), self.name.as_str())
     }
@@ -63,22 +66,25 @@ pub struct FluxState {
 }
 
 impl FluxState {
-    pub fn counts(&self) -> (usize, usize, usize, usize) {
+    // (ready, failed, unknown, suspended, reconciling)
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
         let mut ready = 0;
         let mut failed = 0;
         let mut unknown = 0;
         let mut suspended = 0;
+        let mut reconciling = 0;
         for r in &self.resources {
             if r.suspended {
                 suspended += 1;
             }
             match r.ready {
                 FluxReady::Ready => ready += 1,
+                FluxReady::Reconciling => reconciling += 1,
                 FluxReady::Failed => failed += 1,
                 FluxReady::Unknown => unknown += 1,
             }
         }
-        (ready, failed, unknown, suspended)
+        (ready, failed, unknown, suspended, reconciling)
     }
 }
 
@@ -269,22 +275,36 @@ fn parse_flux(obj: &DynamicObject, kind: &str, api_version: &str) -> FluxResourc
         .unwrap_or(false);
 
     let status = obj.data.get("status");
-    let ready_cond = status
+    let conditions = status
         .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Ready"))
-        });
+        .and_then(|c| c.as_array());
+    let ready_cond = conditions.and_then(|arr| {
+        arr.iter()
+            .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Ready"))
+    });
+    // Flux exposes a `Reconciling` condition (status True) while a reconcile is in flight; some
+    // versions instead keep Ready=False/Unknown with a progressing reason. Either means "in progress",
+    // which must not be shown as a failure.
+    let reconciling_cond = conditions
+        .map(|arr| {
+            arr.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some("Reconciling")
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })
+        })
+        .unwrap_or(false);
 
     let (ready, message) = match ready_cond {
         Some(c) => {
             let st = c.get("status").and_then(|v| v.as_str()).unwrap_or("Unknown");
             let reason = c.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             let msg = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let in_progress = reconciling_cond || is_progressing_reason(reason);
             let r = match st {
                 "True" => FluxReady::Ready,
+                "False" if in_progress => FluxReady::Reconciling,
                 "False" => FluxReady::Failed,
+                _ if in_progress => FluxReady::Reconciling,
                 _ => FluxReady::Unknown,
             };
             let combined = if r == FluxReady::Ready {
@@ -304,6 +324,7 @@ fn parse_flux(obj: &DynamicObject, kind: &str, api_version: &str) -> FluxResourc
             };
             (r, combined)
         }
+        None if reconciling_cond => (FluxReady::Reconciling, "Reconciling".to_string()),
         None => (FluxReady::Unknown, "(pas de condition Ready)".to_string()),
     };
 
@@ -407,6 +428,23 @@ fn shorten_revision(raw: &str) -> String {
 
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Ready-condition reasons that mean "still working", not "failed". Covers the common Flux
+// controllers (kustomize/helm/source) while a reconcile or dependency wait is in progress.
+fn is_progressing_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "Progressing"
+            | "ProgressingWithRetry"
+            | "ReconciliationProgressing"
+            | "Reconciling"
+            | "DependencyNotReady"
+            | "ArtifactUpToDate"
+            | "Upgrading"
+            | "Pending"
+            | "Installing"
+    )
 }
 
 // Group and versions of Flux sources (GitRepository, OCIRepository, etc.), resolved via discovery.

@@ -14,6 +14,7 @@ mod extract;
 mod flux;
 mod lang;
 mod pdf;
+mod pods;
 mod ui;
 
 use std::path::PathBuf;
