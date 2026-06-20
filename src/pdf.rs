@@ -1,3 +1,11 @@
+//! PDF report rendering via an embedded Typst template. Rust builds a Typst input dictionary
+//! (brand, diagnostic, node tables, AI blocks); the template at `TEMPLATE` lays out the document.
+//!
+//! Security note: AI/markdown content is rendered by evaluating Typst markup. `convert_inline_md`
+//! escapes the characters Typst treats as code (`#`, `[`, `]`, `<`, `>`, `@`, `$`, `~`, `\`) so
+//! model output cannot inject Typst function calls; code blocks go through `raw()` which never
+//! evaluates. Keep that escaping in sync with the `eval(...)` calls in the template.
+
 use std::path::{Path, PathBuf};
 
 use typst::foundations::{Array, Dict, Str, Value};
@@ -114,6 +122,7 @@ const TEMPLATE: &str = r###"
       else if b.kind == "h2" { heading(level: 3, b.text) }
       else if b.kind == "h3" { heading(level: 3, b.text) }
       else if b.kind == "code" { raw(b.text, lang: b.lang, block: true) }
+      // b.text is pre-escaped by convert_inline_md, so evaluating it as markup is safe.
       else if b.kind == "list" [
         - #eval("[" + b.text + "]", mode: "markup")
       ]
@@ -458,6 +467,8 @@ impl UsageCell {
     }
 }
 
+// Map a value to a 0–5 heat level based on the share of node allocatable it represents,
+// driving the red-shaded cell backgrounds in the usage table.
 pub fn incidence_level(value: i64, alloc: i64) -> u8 {
     if alloc <= 0 || value <= 0 { return 0; }
     let pct = value.saturating_mul(1000) / alloc;
@@ -521,6 +532,7 @@ pub struct Report {
     pub nodes: Vec<NodeSection>,
 }
 
+// Compile the embedded Typst template with the report inputs and write the resulting PDF to `path`.
 pub fn export_to_pdf(path: &Path, report: &Report) -> Result<(), String> {
     let inputs = build_inputs(report);
     let engine = TypstEngine::builder()
@@ -725,6 +737,9 @@ struct AiBlock {
     lang: String,
 }
 
+// Parse the AI markdown into a sequence of typed blocks (headings, code fences, list items,
+// paragraphs, spacers) that the template renders. Inline content is passed through
+// `convert_inline_md` so it is safe to evaluate as Typst markup.
 fn render_ai_blocks(content: &str) -> Vec<AiBlock> {
     let mut out: Vec<AiBlock> = Vec::new();
     let mut in_code: Option<String> = None;
@@ -805,6 +820,9 @@ fn render_ai_blocks(content: &str) -> Vec<AiBlock> {
     out
 }
 
+// Translate inline markdown to Typst markup while neutralizing injection: characters with special
+// meaning in Typst code are backslash-escaped, `**bold**` is kept and `*italic*` becomes `_italic_`.
+// Text inside backticks is passed through verbatim (rendered as inline raw by the template).
 fn convert_inline_md(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -846,6 +864,7 @@ fn convert_inline_md(s: &str) -> String {
     out
 }
 
+// Target directory for exported reports: ~/Downloads, or /tmp when HOME is unset.
 pub fn downloads_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join("Downloads");

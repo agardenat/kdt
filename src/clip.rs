@@ -1,7 +1,11 @@
+//! Clipboard copy via the OSC 52 terminal escape sequence, which works over SSH and
+//! through multiplexers when the terminal emulator supports it (no system clipboard daemon).
+
 use std::io::{self, Write};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 
+// Emit `ESC ] 52 ; c ; <base64> ESC \` so the terminal stores `text` in its clipboard.
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let encoded = STANDARD.encode(text.as_bytes());
     let mut payload = Vec::with_capacity(encoded.len() + 16);

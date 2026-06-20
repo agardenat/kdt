@@ -1,3 +1,10 @@
+//! ratatui terminal UI: the central `App` state machine, its modes (events, nodes, usage,
+//! diagnostic, flux, AI panel, command palette…), the key dispatcher, and all rendering.
+//!
+//! Background work (log/status/AI/node fetches) is spawned onto tokio and writes into shared
+//! state; each fetch carries a key/id that is re-checked before committing, so results from a
+//! superseded selection are dropped instead of overwriting the current view.
+
 use std::time::Duration;
 
 use anyhow::Result;
@@ -53,6 +60,7 @@ impl Filter {
     }
 }
 
+// Event reasons treated as "errors" by the Errors filter (crash/oom/scheduling/mount failures…).
 fn is_critical_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -67,6 +75,7 @@ fn is_critical_reason(reason: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull }
 
+// Command palette entries: (canonical name, aliases). Drives `:` palette resolution/completion.
 const COMMANDS: &[(&str, &[&str])] = &[
     ("events", &["ev", "event"]),
     ("namespace", &["ns", "namespaces"]),
@@ -75,6 +84,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("quit", &["q"]),
 ];
 
+// Resolve palette input to a command: exact name/alias match, otherwise a unique name prefix.
 fn resolve_command(input: &str) -> Option<&'static str> {
     let q = input.trim().to_lowercase();
     if q.is_empty() { return None; }
@@ -134,6 +144,8 @@ impl DetailTab {
     }
 }
 
+// Central UI state. Fields prefixed `last_*_key` cache the identity of the currently displayed
+// selection to avoid re-fetching; `*_state`/`*_handle` hold shared async results and task handles.
 pub struct App {
     pub buffer: SharedBuffer,
     pub filter: Filter,
@@ -283,6 +295,8 @@ impl App {
         self.reset_scroll();
     }
 
+    // Rebuild the visible event list from the buffer applying the active filter. When following
+    // (no anchored uid) the cursor stays on the newest row; otherwise it tracks the anchored uid.
     fn refresh_live_snapshot(&mut self) {
         let snap: Vec<EventRecord> = {
             let buf = self.buffer.lock().expect("buffer poisoned");
@@ -368,6 +382,8 @@ impl App {
         s.loading = false;
     }
 
+    // Kick off a related-context fetch for the selected object, but only if the selection key
+    // changed since the last fetch (debounce while scrolling). Same pattern in maybe_fetch_logs/status.
     fn maybe_fetch_related(&mut self) {
         let Some(idx) = self.table_state.selected() else { return; };
         let Some(rec) = self.snapshot.get(idx).cloned() else { return; };
@@ -487,6 +503,10 @@ impl App {
         self.clipboard_status = Some((std::time::Instant::now(), msg));
     }
 
+    // Open the AI panel and launch an analysis for the current context. Captures the relevant
+    // local data (logs/status/related, plus node-usage or diagnostic text), builds the prompt in a
+    // background task, and sends it to the active provider. This is the point where cluster data
+    // leaves the machine for the external AI endpoint.
     fn enter_ai_panel(&mut self) {
         let source_mode = if self.mode == Mode::AiPanel { self.return_mode } else { self.mode };
         let rec = match source_mode {
@@ -804,6 +824,8 @@ impl App {
         s.export_status = Some(msg.to_string());
     }
 
+    // Build a placeholder EventRecord so the diagnostic/node views can reuse the event-oriented
+    // AI pipeline (which keys everything off an EventRecord).
     fn synthetic_diagnostic_record(&self) -> EventRecord {
         EventRecord {
             uid: format!(
@@ -1211,6 +1233,8 @@ impl App {
         })
     }
 
+    // Apply the namespace picked in the selector: restart the event watcher scoped to it
+    // (cursor 0 means "all namespaces"), clearing the buffer and current selection.
     fn confirm_ns(&mut self) {
         let ns_opt: Option<String> = {
             let s = self.ns_pick_state.lock().expect("ns list poisoned");
@@ -1252,6 +1276,8 @@ pub async fn run(mut app: App) -> Result<()> {
     result
 }
 
+// Main loop: refresh live snapshots, draw, then await the next input/tick/Ctrl-C. The 250ms ticker
+// drives periodic redraws so async results and live event flow appear without keypresses.
 async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -1279,6 +1305,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+// Central key dispatcher: matches on (key, modifiers, current mode). Mode-specific arms come first;
+// the trailing arms handle keys shared across modes (horizontal scroll, quit…).
 fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
@@ -1513,6 +1541,8 @@ fn handle_event(app: &mut App, ev: Event) {
     }
 }
 
+// Render the current frame and return the number of visible table rows (used for page scrolling).
+// Overlay modes (AI panel, pickers, command palette) reuse a base mode's layout then draw on top.
 fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let area = f.area();
     let draw_mode = match app.mode {
@@ -2620,6 +2650,7 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+// Adapt a FluxResource into an EventRecord so the Flux view reuses the shared table/detail/AI flow.
 fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
     let (severity, reason) = match (r.suspended, r.ready) {
         (true, _) => (Severity::Normal, "Suspended".to_string()),
@@ -3402,10 +3433,13 @@ fn row_for(r: &EventRecord, h_scroll: usize) -> Row<'static> {
     .style(row_style)
 }
 
+// Horizontal scroll helper: return `s` with the first `n` characters dropped.
 fn slice_from(s: &str, n: usize) -> String {
     if n == 0 { s.to_string() } else { s.chars().skip(n).collect() }
 }
 
+// Format a node's usage as a (title, body) prompt section: totals plus per-container detail,
+// limited to containers with an issue and capped at 80 rows.
 fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, String) {
     use crate::events::{format_cpu_milli, format_memory_bytes};
     let mut body = String::new();
@@ -3495,6 +3529,7 @@ fn format_time(r: &EventRecord) -> String {
     }
 }
 
+// Snapshot the last 200 log lines for inclusion in the AI prompt (or a placeholder if unavailable).
 fn capture_logs_text(state: &SharedLog) -> String {
     let s = state.lock().expect("log state poisoned");
     if let Some(e) = &s.error { return format!("(indisponible: {})", e); }
@@ -3513,6 +3548,8 @@ fn capture_status_text(state: &SharedStatus) -> String {
     s.lines.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("\n")
 }
 
+// Collect up to the 50 most recent buffered events for the same object, for the prompt's
+// "related events" section.
 fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
     let buf = buffer.lock().expect("buffer poisoned");
     let mut related: Vec<String> = buf.iter()
@@ -3532,6 +3569,8 @@ fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
     if related.is_empty() { "(aucun)".to_string() } else { related.join("\n") }
 }
 
+// Assemble the full prompt sent to the model: event metadata, object status, recent logs, related
+// events, and enrichment sections. This is the complete payload transmitted to the AI endpoint.
 fn build_ai_prompt(
     rec: &EventRecord,
     ctx_label: &str,

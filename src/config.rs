@@ -1,3 +1,7 @@
+//! Optional JSON config file: AI providers (OpenAI-compatible endpoints) and UI language.
+//! The file may hold API keys in plaintext, so its filesystem permissions are the user's
+//! responsibility.
+
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -23,6 +27,8 @@ pub struct FileConfig {
     pub active_provider: Option<String>,
 }
 
+// Load the config file, falling back to defaults when it is missing or malformed
+// (a parse error is logged but never fatal).
 pub fn load() -> FileConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
@@ -37,6 +43,7 @@ pub fn load() -> FileConfig {
     }
 }
 
+// Resolve the config path: explicit env var, then XDG config dir, then HOME, finally relative.
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("KDT_CONFIG").or_else(|_| std::env::var("KEV_CONFIG")) {
         return PathBuf::from(p);

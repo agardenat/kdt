@@ -1,3 +1,9 @@
+//! Cluster health diagnostic: a fixed sequence of read-only `check_*` steps (API health, nodes,
+//! kube-system, DNS/CNI, webhooks, Rancher, problem pods, PVs, recent warnings). Each step pushes
+//! a "Running" entry, then finishes it with a status and detail lines for the UI/PDF.
+//!
+//! `run_id` is bumped on every run so results from a superseded run are discarded.
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -60,6 +66,8 @@ pub fn new_diagnostic_state() -> SharedDiagnostic {
     Arc::new(Mutex::new(DiagnosticState::default()))
 }
 
+// Append a step in the "Running" state and return its index, or None if this run was superseded
+// (so the caller bails out early instead of doing more work).
 fn push_step(state: &SharedDiagnostic, run_id: u64, title: &str, command: &str) -> Option<usize> {
     let mut s = state.lock().expect("diagnostic poisoned");
     if s.run_id != run_id {
@@ -132,6 +140,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     }
 }
 
+// Probe the apiserver health endpoints directly via raw requests (equivalent to `kubectl get --raw`).
 async fn check_api_health(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     for path in ["/livez", "/readyz", "/healthz"] {
         let title = format!("API server {}", path);
@@ -674,6 +683,7 @@ async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_
     finish_step(state, run_id, idx, status, lines);
 }
 
+// Annotate a fail-closed webhook with the product likely behind it, to explain cluster-wide impact.
 fn highlight_webhook_owner(name: &str) -> String {
     let n = name.to_lowercase();
     let known = [
@@ -696,6 +706,8 @@ fn highlight_webhook_owner(name: &str) -> String {
     String::new()
 }
 
+// Detect how Rancher relates to this cluster (local server, imported via cattle-cluster-agent,
+// or fleet-only) and analyze the relevant pod logs to confirm the management tunnel is healthy.
 async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let Some(idx) = push_step(
         state,
@@ -826,6 +838,8 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
+// Scan the last ~200 lines of cattle-cluster-agent logs and classify failures (DNS/TLS/websocket)
+// vs. a healthy tunnel, returning the worst observed severity.
 async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)>) -> DiagStatus {
     let pods: Api<Pod> = Api::namespaced(client.clone(), "cattle-system");
     let list = match pods.list(&ListParams::default().labels("app=cattle-cluster-agent")).await {
@@ -1220,6 +1234,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
     finish_step(state, run_id, idx, status, lines);
 }
 
+// Flatten the diagnostic steps into a plain-text block suitable for the AI prompt or clipboard.
 pub fn format_diagnostic_for_ai(state: &DiagnosticState) -> String {
     let mut out = String::new();
     out.push_str("Diagnostic cluster automatisé:\n");

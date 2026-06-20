@@ -1,3 +1,7 @@
+//! Cluster data access layer: the live event watcher plus on-demand fetchers for pod logs,
+//! object status, namespaces, nodes, and per-node resource usage. Each fetcher writes into a
+//! shared, mutex-guarded state struct that the UI polls.
+
 use kube::api::DynamicObject;
 use kube::core::GroupVersionKind;
 use kube::discovery::{self, Scope};
@@ -51,6 +55,8 @@ impl EventRecord {
 }
 
 impl EventRecord {
+    // Flatten a Kubernetes Event into our display record, picking the most precise timestamp
+    // available (eventTime > lastTimestamp > firstTimestamp > creationTimestamp > now).
     pub fn from_k8s(ev: K8sEvent) -> Self {
         let uid = ev.metadata.uid.clone().unwrap_or_default();
         let time = ev
@@ -94,6 +100,9 @@ pub fn new_buffer() -> SharedBuffer {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
+// Spawn a background task that watches Events and maintains a bounded ring buffer (`capacity`).
+// On reconnect the watcher re-emits objects, so an existing record with the same uid is replaced
+// in place to keep counts/messages fresh. The outer loop restarts the stream after any error.
 pub fn spawn_watcher(
     client: Client,
     namespace: Option<String>,
@@ -153,6 +162,8 @@ pub fn new_log_state() -> SharedLog {
     Arc::new(Mutex::new(LogState::default()))
 }
 
+// Fetch recent logs for every container (init + regular) of a pod. The `tail` budget is split
+// across containers when there is more than one. `key` guards against a stale write (see AiState).
 pub async fn fetch_logs(
     client: Client,
     namespace: String,
@@ -312,6 +323,8 @@ pub async fn fetch_status(
     }
 }
 
+// Fetch an arbitrary object by GVK (via discovery) and render a generic status summary for kinds
+// without a dedicated formatter.
 async fn fetch_dynamic(
     client: Client,
     api_version: &str,
@@ -428,6 +441,8 @@ fn format_dynamic_status(obj: &DynamicObject, kind: &str) -> Vec<(LineColor, Str
     out
 }
 
+// Decide whether status=True is healthy for a given condition type: most conditions are positive
+// (Ready/Available…) but pressure/failure/unavailable conditions invert that meaning.
 fn condition_true_is_good(typ: &str) -> bool {
     if typ.ends_with("Pressure")
         || typ.ends_with("Unavailable")
@@ -927,6 +942,8 @@ pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
     out
 }
 
+// Sum container requests/limits across active pods on a node and express them as a percentage of
+// the node's allocatable capacity (reservation for requests, over-commit for limits).
 pub fn format_node_reserved(pods: &[Pod], node: &Node) -> Vec<(LineColor, String)> {
     let mut out: Vec<(LineColor, String)> = Vec::new();
     let mut cpu_req = 0_i64; let mut cpu_lim = 0_i64;
@@ -986,6 +1003,7 @@ fn color_for_pct(p: i64) -> LineColor {
     else { LineColor::Plain }
 }
 
+// Parse a Kubernetes CPU quantity into millicores (e.g. "500m"->500, "2"->2000, "1500000n"->1).
 pub fn parse_quantity_cpu_milli(q: &str) -> Option<i64> {
     let q = q.trim();
     if let Some(s) = q.strip_suffix('m') { s.parse::<f64>().ok().map(|v| v as i64) }
@@ -994,6 +1012,8 @@ pub fn parse_quantity_cpu_milli(q: &str) -> Option<i64> {
     else { q.parse::<f64>().ok().map(|v| (v * 1000.0) as i64) }
 }
 
+// Parse a Kubernetes memory quantity into bytes, honoring both binary (Ki/Mi/Gi…) and decimal
+// (K/M/G…) suffixes.
 pub fn parse_quantity_memory_bytes(q: &str) -> Option<i64> {
     let q = q.trim();
     let suffixes: &[(&str, i64)] = &[
@@ -1040,12 +1060,14 @@ pub struct PodUsageRow {
     pub mem_req: Option<i64>,
     pub mem_lim: Option<i64>,
     pub mem_use: Option<i64>,
-    pub _phase: String,
+    pub _phase: String, // captured for completeness; currently not displayed (underscore-prefixed)
     pub ready: bool,
     pub restarts: i32,
     pub is_system: bool,
 }
 
+// Heuristic: namespaces managed by Kubernetes itself or common platform add-ons (cloud CNI/CSI,
+// service mesh, Rancher…), used to separate "system" from "user" workloads in usage views.
 pub fn is_system_namespace(ns: &str) -> bool {
     ns.starts_with("kube-")
         || ns.starts_with("cattle-")
@@ -1084,6 +1106,9 @@ pub fn new_node_usage_state() -> SharedNodeUsage {
     Arc::new(Mutex::new(NodeUsageState::default()))
 }
 
+// Build the per-container usage table for one node: join pod specs (requests/limits) with live
+// metrics from metrics-server (optional) keyed by (namespace, pod, container). Completed pods
+// (Succeeded/Failed) are skipped. `metrics_available` is false when metrics-server is absent.
 pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNodeUsage) {
     {
         let mut s = state.lock().expect("node usage poisoned");
@@ -1242,6 +1267,7 @@ pub async fn fetch_cluster_info(client: Client, state: SharedClusterInfo) {
     s.loaded = true;
 }
 
+// Sum CPU/memory usage across all nodes from metrics-server (metrics.k8s.io). None if unavailable.
 async fn fetch_node_metrics_total(client: &Client) -> Option<(i64, i64)> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
     let (ar, _) = discovery::pinned_kind(client, &gvk).await.ok()?;

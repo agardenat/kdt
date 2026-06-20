@@ -22,3 +22,8 @@ target
 .claude
 # Packaging output
 dist
+
+# Release artifacts (built at repo root by the release workflow / local packaging)
+*.tar.gz
+*.deb
+*.rpm

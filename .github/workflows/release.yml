@@ -41,6 +41,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Get app name
+        run: echo "APP_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" >> $GITHUB_ENV
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools rpm
+
+      - name: Build .deb and .rpm
+        run: |
+          packaging/build-deb.sh
+          packaging/build-rpm.sh
+
+      - name: Package static binary tarball
+        run: tar czf $APP_NAME-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release $APP_NAME
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
+            dist/*.deb
+            dist/**/*.rpm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   update-homebrew:
     runs-on: ubuntu-latest
     needs: build-macos

@@ -1,3 +1,6 @@
+//! Cluster-wide inventory of FluxCD resources (Kustomizations, HelmReleases, sources),
+//! read dynamically so the tool works regardless of which Flux API versions are installed.
+
 use std::sync::{Arc, Mutex};
 
 use kube::api::{Api, DynamicObject, ListParams};
@@ -27,6 +30,7 @@ pub struct FluxResource {
 }
 
 impl FluxResource {
+    // Order failed first, then unknown, then suspended, then ready — so problems surface at the top.
     fn sort_key(&self) -> (u8, &str, &str, &str) {
         let bucket = match (self.suspended, self.ready) {
             (false, FluxReady::Failed) => 0,
@@ -71,6 +75,7 @@ pub fn new_flux_state() -> SharedFlux {
     Arc::new(Mutex::new(FluxState::default()))
 }
 
+// (group, candidate versions newest-first, kind) probed via discovery until one resolves.
 const CANDIDATES: &[(&str, &[&str], &str)] = &[
     ("kustomize.toolkit.fluxcd.io", &["v1", "v1beta2", "v1beta1"], "Kustomization"),
     ("helm.toolkit.fluxcd.io", &["v2", "v2beta2", "v2beta1"], "HelmRelease"),
@@ -81,6 +86,8 @@ const CANDIDATES: &[(&str, &[&str], &str)] = &[
     ("source.toolkit.fluxcd.io", &["v1", "v1beta2"], "Bucket"),
 ];
 
+// List every Flux resource kind present on the cluster. `found_crd` distinguishes "Flux not
+// installed" from "installed but empty/errored" for a clearer message in the UI.
 pub async fn fetch_flux(client: Client, state: SharedFlux) {
     {
         let mut s = state.lock().expect("flux poisoned");
@@ -224,6 +231,7 @@ fn flux_revision(status: Option<&serde_json::Value>) -> String {
     shorten_revision(&raw)
 }
 
+// Collapse a Flux revision like "main@sha256:abcdef..." to "main@abcdef012345" for display.
 fn shorten_revision(raw: &str) -> String {
     let (branch, digest) = match raw.split_once('@') {
         Some((b, d)) => (Some(b), d),

@@ -1,3 +1,5 @@
+//! Entry point: builds the kube client, sets up logging, and launches the TUI.
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -21,6 +23,8 @@ use clap::Parser;
 use kube::Client;
 use tracing_subscriber::EnvFilter;
 
+// Build a kube client from the kubeconfig: an explicit context if given, otherwise inferred
+// (in-cluster service account or current kubeconfig context).
 async fn build_client(context: Option<&str>) -> Result<Client> {
     use kube::config::{Config, KubeConfigOptions};
     let config = match context {
@@ -36,6 +40,7 @@ async fn build_client(context: Option<&str>) -> Result<Client> {
     Ok(Client::try_from(config)?)
 }
 
+// Resolve the log file path: explicit env var, then XDG state dir, HOME, finally /tmp.
 fn log_file_path() -> PathBuf {
     if let Ok(p) = std::env::var("KDT_LOG").or_else(|_| std::env::var("KEV_LOG")) {
         return PathBuf::from(p);
@@ -71,6 +76,7 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 requires a process-wide crypto provider to be installed before any TLS use.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
@@ -94,6 +100,8 @@ async fn main() -> Result<()> {
     ui::run(app).await
 }
 
+// Resolve the (context, cluster) labels shown in the UI banner from the kubeconfig,
+// falling back to the context name when the cluster cannot be determined.
 fn resolve_context_labels(explicit: Option<&str>) -> (String, String) {
     use kube::config::Kubeconfig;
     let kc = Kubeconfig::read().ok();

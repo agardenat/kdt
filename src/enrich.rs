@@ -1,3 +1,10 @@
+//! Gathers extra context related to a Kubernetes event (RBAC, policies, storage, GitOps tools…)
+//! to enrich the AI prompt. Each `*_context` helper is best-effort: failures are swallowed so a
+//! missing CRD or RBAC denial never breaks enrichment.
+//!
+//! Security note: the JSON returned here is forwarded to the external AI endpoint. `strip_noise`
+//! only removes bookkeeping fields (managedFields, uid…), not application data.
+
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, ServiceAccount};
@@ -14,6 +21,7 @@ use crate::events::EventRecord;
 const MAX_SECTION_CHARS: usize = 8000;
 const MAX_BINDINGS: usize = 5;
 
+// Recursively drop high-volume / non-informative metadata so the JSON stays compact in the prompt.
 fn strip_noise(v: &mut serde_json::Value) {
     match v {
         serde_json::Value::Object(map) => {
@@ -56,6 +64,8 @@ pub async fn gather_extra_context(client: &Client, rec: &EventRecord) -> Vec<(St
     gather_extra_context_with_progress(client, rec, |_, _| {}).await
 }
 
+// Run every context probe in sequence, reporting progress via the callback, and cap each section
+// to MAX_SECTION_CHARS. Returns a list of (title, body) sections appended to the AI prompt.
 pub async fn gather_extra_context_with_progress<F>(
     client: &Client,
     rec: &EventRecord,
@@ -163,6 +173,7 @@ async fn kyverno_context(client: &Client, rec: &EventRecord) -> Vec<(String, Str
     out
 }
 
+// Scan an event message for "policy <name>" mentions to locate the offending Kyverno policy.
 fn extract_kyverno_policy_names(msg: &str) -> Vec<String> {
     let mut names = Vec::new();
     let lower = msg.to_lowercase();
@@ -181,6 +192,8 @@ fn extract_kyverno_policy_names(msg: &str) -> Vec<String> {
     names
 }
 
+// On a "forbidden"/RBAC-flavoured message, resolve the ServiceAccount named in it and pull the
+// RoleBindings/ClusterRoleBindings (and their roles) that grant it permissions.
 async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let lower = rec.message.to_lowercase();
@@ -572,6 +585,8 @@ async fn fluxcd_context(client: &Client, rec: &EventRecord) -> Vec<(String, Stri
     out
 }
 
+// Static troubleshooting hints injected when an event matches a known tool (fluent-bit, datadog…),
+// giving the model curated background it might otherwise lack.
 fn tool_hints(rec: &EventRecord) -> Vec<(String, String)> {
     let mut hints = Vec::new();
     let comp = rec.component.to_lowercase();
@@ -613,6 +628,7 @@ fn subjects_contain_sa(subjects: Option<&[Subject]>, sa_ns: &str, sa_name: &str)
     })).unwrap_or(false)
 }
 
+// Parse "system:serviceaccount:<ns>:<name>" out of an error message.
 fn extract_sa(msg: &str) -> Option<(String, String)> {
     let needle = "system:serviceaccount:";
     let start = msg.find(needle)? + needle.len();
@@ -627,6 +643,8 @@ fn extract_sa(msg: &str) -> Option<(String, String)> {
     Some((ns, name))
 }
 
+// Fetch any object by GVK via API discovery, choosing the cluster- or namespace-scoped API
+// based on the resource's scope. Returns None on any discovery/get failure.
 async fn fetch_dynamic_obj(
     client: &Client,
     api_version: &str,

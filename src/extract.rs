@@ -1,3 +1,7 @@
+//! Full cluster extraction: runs the diagnostic and per-node usage collection, asks the AI to
+//! summarize each, and renders everything to a single PDF report under ~/Downloads. Progress is
+//! reported step-by-step; `run_id` guards against overlapping extractions.
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -34,6 +38,8 @@ pub fn new_extract_state() -> SharedExtract {
     Arc::new(Mutex::new(ExtractState::default()))
 }
 
+// Publish progress for the current run; returns false if a newer extraction superseded this one,
+// signalling the caller to stop.
 fn update(state: &SharedExtract, run_id: u64, current: usize, total: usize, msg: &str) -> bool {
     let mut s = state.lock().expect("extract poisoned");
     if s.run_id != run_id {
@@ -208,6 +214,7 @@ pub async fn run_full_extract(
     };
 
     let dir = pdf::downloads_dir();
+    // Sanitize the context name into a safe filename component (no path separators or odd chars).
     let safe_ctx: String = ctx_label
         .chars()
         .map(|c| {
@@ -406,6 +413,8 @@ fn compute_totals(rows: &[PodUsageRow]) -> Totals {
     t
 }
 
+// A container is worth flagging when it hits a limit, is heavily under-using its request,
+// has limits far above requests, or is missing requests/limits entirely.
 fn row_has_issue(r: &PodUsageRow) -> bool {
     let cpu_at_limit = matches!((r.cpu_use, r.cpu_lim), (Some(u), Some(l)) if l > 0 && u >= l);
     let mem_at_limit = matches!((r.mem_use, r.mem_lim), (Some(u), Some(l)) if l > 0 && u >= l);
@@ -424,6 +433,8 @@ fn row_has_issue(r: &PodUsageRow) -> bool {
         || r.mem_lim.is_none()
 }
 
+// Convert a node's raw usage rows into the PDF model: sort containers (user first, by memory
+// request), and attach per-cell incidence levels and markers (▲ at-limit, ▼ under-used, ≫ over-limit).
 pub fn node_section_from(
     name: &str,
     s: &NodeUsageState,

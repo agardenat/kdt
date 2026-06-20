@@ -1,8 +1,17 @@
+//! OpenAI-compatible chat client used for event/diagnostic analysis.
+//!
+//! Security note: the prompt sent here is assembled from live cluster data (event messages,
+//! pod logs, object status, RBAC/Ingress/PV objects, etc.) and is transmitted to the
+//! configured `base_url`. Logs in particular may contain secrets. Use only trusted endpoints;
+//! an `http://` base_url sends the bearer key and payload in cleartext.
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+// Shared progress/result state for the AI panel. `current_key` identifies the in-flight request
+// so that stale background tasks do not overwrite the state of a newer one.
 #[derive(Default, Debug, Clone)]
 pub struct AiState {
     pub current_key: Option<String>,
@@ -66,6 +75,8 @@ pub struct AiProviderResolved {
     pub api_key: Option<String>,
 }
 
+// Build the list of selectable providers from the config, then synthesize a "default" provider
+// from the legacy `OPENAI_*` env vars / `openai_*` config fields for backward compatibility.
 pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderResolved> {
     let mut out: Vec<AiProviderResolved> = file
         .providers
@@ -170,6 +181,8 @@ struct ChoiceMessage {
     content: String,
 }
 
+// Some models emit literal escape sequences (e.g. "\n") inside the JSON string content.
+// Decode the common ones so the markdown renders correctly. Returns input untouched if no '\'.
 pub fn normalize_ai_content(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_string();
@@ -193,6 +206,8 @@ pub fn normalize_ai_content(s: &str) -> String {
     out
 }
 
+// Fire a chat completion and stream progress/result into the shared state. Every state write is
+// guarded by `current_key` so a superseded request silently drops its result instead of clobbering.
 pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: String, state: SharedAi) {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = ChatRequest {
@@ -260,6 +275,8 @@ fn store_error(state: &SharedAi, key: &str, msg: String) {
     s.error = Some(msg);
 }
 
+// Blocking-style variant used by the batch PDF extraction: returns the content directly
+// instead of mutating shared UI state.
 pub async fn query_ai_direct(
     config: &AiConfig,
     lang: AiLanguage,

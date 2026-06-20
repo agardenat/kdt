@@ -1,3 +1,5 @@
+//! Command-line argument parsing (clap).
+
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]

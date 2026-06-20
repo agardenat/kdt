@@ -189,6 +189,14 @@ En cours d'exécution, la touche `m` fait défiler les fournisseurs configurés 
 | `KDT_LOG` / `KEV_LOG` | Chemin du fichier de log |
 | `RUST_LOG` | Filtre de logs (`warn` par défaut) |
 
+## Sécurité / confidentialité
+
+- **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives.
+- **Endpoint** : un `base_url` en `http://` envoie la clé `Authorization: Bearer` et le payload en clair. Préfère `https://` (ou un endpoint local pour de l'inférence offline).
+- **Clé API** : stockée en clair dans `config.json` ; restreins les permissions du fichier (`chmod 600`). La clé n'est jamais journalisée.
+- **Accès cluster** : toutes les requêtes Kubernetes sont en lecture seule (`get`/`list`/`watch`/`logs`) ; aucune mutation, aucun shell-out.
+- **Rendu PDF** : le contenu IA est échappé avant d'être évalué comme markup Typst (`convert_inline_md`), ce qui neutralise l'injection de code Typst ; les blocs de code passent par `raw()` (jamais évalué).
+
 ## Logs
 
 Écrits dans (par ordre de priorité) :

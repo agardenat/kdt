@@ -1,5 +1,9 @@
+//! Static FR/EN UI string tables, selected at runtime via [`t`].
+
 use crate::ai::AiLanguage;
 
+// `dead_code` is allowed because this is a translation table kept complete on purpose:
+// several entries are reserved for UI strings not yet wired up and are intentionally unused.
 #[allow(dead_code)]
 pub struct Strings {
     pub mode_live: &'static str,
@@ -340,6 +344,7 @@ pub const EN: Strings = Strings {
     progress_pdf_done: "PDF generated",
 };
 
+// Return the string table for the active language.
 pub fn t(lang: AiLanguage) -> &'static Strings {
     match lang {
         AiLanguage::Fr => &FR,
