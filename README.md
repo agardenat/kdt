@@ -10,6 +10,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Diagnostic cluster** : batterie de vérifications (version, namespaces système, kube-system, CoreDNS, CNI, webhooks, Rancher, pods en erreur, PV, évènements warning récents…).
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
 - **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais.
+- **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
 ## Build
@@ -80,6 +81,7 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `namespace` | `ns` | Sélecteur de namespace |
 | `nodes` | `no`, `node` | Vue Nodes |
 | `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
+| `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
 | `quit` | `q` | Quitter |
 
 ### FluxCD (`:flux`)
@@ -89,19 +91,50 @@ Vue globale de l'état Flux sur tout le cluster : `Kustomization`, `HelmRelease`
 en échec sont remontées en tête, puis `Unknown`, puis suspendues, puis `Ready`. Le bandeau
 résume `✓ready ✗failed ?unknown ⏸suspended`.
 
-Même logique de détail que la vue évènements : panneau à onglets **Logs / Status / Related**,
-scroll, et envoi à l'IA (`i`) sur la ressource sélectionnée (utile pour analyser une
-`HelmRelease` ou `Kustomization` en échec).
+Panneau de détail à onglets **Logs / Status / Related / Inventory** :
+
+- **Logs** : pour une ressource Flux (qui n'est pas un Pod), affiche les logs du *controller*
+  correspondant (`kustomize-controller`, `helm-controller`, `source-controller`…) filtrés sur
+  l'objet sélectionné.
+- **Status** : le `status` de l'objet (conditions, révision…).
+- **Related** : l'objet et sa source référencée.
+- **Inventory** : pour une `Kustomization`, la liste des objets réellement appliqués
+  (`status.inventory`) avec leur état live (✓ ready / ✗ échec / · inconnu), rafraîchie en continu
+  pour suivre un déploiement. Un `⚠ prune` signale les Kustomizations avec `spec.prune: true`
+  (les objets retirés du git sont supprimés du cluster) — visible aussi dans la table/l'arbre.
+
+#### Réconciliation, suspend, logs
+
+La réconciliation pose l'annotation `reconcile.fluxcd.io/requestedAt` via l'API (pas besoin du
+binaire `flux`) ; le suspend/reprise bascule `spec.suspend` (non destructif).
 
 | Touche | Action |
 |---|---|
 | `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
-| `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
-| `Enter` | Détail plein écran |
+| `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related / Inventory) |
+| `Enter` | Détail plein écran (en mode arbre : plier/déplier le nœud) |
 | `Shift-↑/↓`, `g` / `G` | Scroll du détail |
+| `R` | Réconcilier la ressource sélectionnée |
+| `S` | Réconcilier la ressource **et sa source** (`--with-source`) |
+| `F` | Sync racine : réconcilier `GitRepository/flux-system` |
+| `z` | Suspendre / reprendre la ressource (`spec.suspend`) |
+| `t` | Basculer table ↔ vue arborescente |
+| `L` | Logs globaux de tous les controllers Flux (suivi) |
 | `i` | Panneau IA |
 | `r` | Rafraîchir (auto toutes les 10 s) |
 | `Esc` | Retour |
+
+#### Vue arborescente (`t`)
+
+Affiche la hiérarchie de dépendances : **source → Kustomization/HelmRelease → workloads
+dépendants** (`dependsOn`). `Enter` / `Espace` plie/déplie un nœud ; les actions `R`/`S`/`F`/`z`
+s'appliquent au nœud sélectionné. Le contenu appliqué d'une `Kustomization` reste visible dans
+l'onglet **Inventory**.
+
+#### Logs Flux (`L` ou `:flux-logs`)
+
+Vue plein écran agrégeant les logs de tous les controllers de `flux-system` (suivi ~3 s),
+triés par horodatage. `Esc` pour revenir.
 
 ### Nodes / Node usage
 | Touche | Action |
@@ -228,8 +261,8 @@ Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downl
 |---|---|
 | `main.rs` | Bootstrap : client kube, logging, lancement TUI |
 | `cli.rs` | Parsing des arguments (clap) |
-| `events.rs` | Watcher d'évènements, logs, status, nœuds, usage |
-| `flux.rs` | Inventaire FluxCD (Kustomizations, HelmReleases, sources) |
+| `events.rs` | Watcher d'évènements, logs (pods + controllers Flux), status, nœuds, usage |
+| `flux.rs` | FluxCD : inventaire, réconciliation, suspend, inventaire d'objets, arbre de dépendances |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
 | `diagnostic.rs` | Étapes de diagnostic cluster |
 | `extract.rs` | Extraction complète → rapport |

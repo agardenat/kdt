@@ -32,16 +32,20 @@ use crate::diagnostic::{
 };
 use crate::clip;
 use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
-use crate::flux::{fetch_flux, new_flux_state, FluxReady, FluxResource, SharedFlux};
+use crate::flux::{
+    build_flux_tree, controller_for_kind, fetch_flux, fetch_inventory, flux_tree_uid, new_flux_state,
+    new_inventory_state, new_reconcile_status, reconcile, set_suspend, FlatTreeNode, FluxReady,
+    FluxResource, ReconcileScope, SharedFlux, SharedInventory, SharedReconcile, ALL_CONTROLLERS,
+};
 use crate::lang;
 use crate::pdf;
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 use crate::events::{
-    fetch_cluster_info, fetch_logs, fetch_namespaces, fetch_node_usage, fetch_nodes, fetch_status,
-    format_cpu_milli, format_memory_bytes, new_cluster_info_state, new_node_list_state,
-    new_node_usage_state, new_ns_list_state, spawn_watcher, EventRecord, LineColor, Severity,
-    SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList, SharedNodeUsage, SharedNsList,
-    SharedStatus,
+    fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
+    fetch_nodes, fetch_status, format_cpu_milli, format_memory_bytes, new_cluster_info_state,
+    new_log_state, new_node_list_state, new_node_usage_state, new_ns_list_state, spawn_watcher,
+    EventRecord, LineColor, Severity, SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList,
+    SharedNodeUsage, SharedNsList, SharedStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +77,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs }
 
 // Command palette entries: (canonical name, aliases). Drives `:` palette resolution/completion.
 const COMMANDS: &[(&str, &[&str])] = &[
@@ -81,6 +85,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("namespace", &["ns", "namespaces"]),
     ("nodes", &["no", "node"]),
     ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
+    ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("quit", &["q"]),
 ];
 
@@ -133,14 +138,24 @@ impl NodeUsageSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetailTab { Logs, Status, Related }
+pub enum DetailTab { Logs, Status, Related, Inventory }
 
 impl DetailTab {
     fn next(self) -> Self {
-        match self { Self::Logs => Self::Status, Self::Status => Self::Related, Self::Related => Self::Logs }
+        match self {
+            Self::Logs => Self::Status,
+            Self::Status => Self::Related,
+            Self::Related => Self::Inventory,
+            Self::Inventory => Self::Logs,
+        }
     }
     fn prev(self) -> Self {
-        match self { Self::Logs => Self::Related, Self::Status => Self::Logs, Self::Related => Self::Status }
+        match self {
+            Self::Logs => Self::Inventory,
+            Self::Status => Self::Logs,
+            Self::Related => Self::Status,
+            Self::Inventory => Self::Related,
+        }
     }
 }
 
@@ -165,6 +180,7 @@ pub struct App {
     pub log_scroll: usize,
     pub status_scroll: usize,
     pub related_scroll: usize,
+    pub inventory_scroll: usize,
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
     pub ns_pick_state: SharedNsList,
@@ -196,6 +212,15 @@ pub struct App {
     pub command_input: String,
     pub command_return_mode: Mode,
     pub flux_state: SharedFlux,
+    pub reconcile_status: SharedReconcile,
+    pub flux_logs_state: SharedLog,
+    pub flux_logs_handle: Option<JoinHandle<()>>,
+    pub inventory_state: SharedInventory,
+    pub last_inventory_key: Option<String>,
+    pub last_inventory_tick: std::time::Instant,
+    pub flux_tree: bool,
+    pub flux_collapsed: std::collections::HashSet<String>,
+    pub flux_tree_nodes: Vec<FlatTreeNode>,
     pub last_flux_sel_uid: Option<String>,
     pub flux_refresh_handle: Option<JoinHandle<()>>,
     pub cluster_info: SharedClusterInfo,
@@ -237,6 +262,7 @@ impl App {
             log_scroll: 0,
             status_scroll: 0,
             related_scroll: 0,
+            inventory_scroll: 0,
             h_scroll: 0,
             detail_h_scroll: 0,
             ns_pick_state: new_ns_list_state(),
@@ -268,6 +294,15 @@ impl App {
             command_input: String::new(),
             command_return_mode: Mode::Selection,
             flux_state: new_flux_state(),
+            reconcile_status: new_reconcile_status(),
+            flux_logs_state: new_log_state(),
+            flux_logs_handle: None,
+            inventory_state: new_inventory_state(),
+            last_inventory_key: None,
+            last_inventory_tick: std::time::Instant::now(),
+            flux_tree: false,
+            flux_collapsed: std::collections::HashSet::new(),
+            flux_tree_nodes: Vec::new(),
             last_flux_sel_uid: None,
             flux_refresh_handle: None,
             cluster_info: new_cluster_info_state(),
@@ -342,13 +377,27 @@ impl App {
         self.maybe_fetch_related();
     }
 
+    // The Inventory tab only makes sense for Flux resources, so it is offered only in the Flux views.
+    fn flux_context(&self) -> bool {
+        matches!(self.mode, Mode::Flux | Mode::FluxFull)
+            || (self.mode == Mode::AiPanel && matches!(self.return_mode, Mode::Flux | Mode::FluxFull))
+    }
+
     fn cycle_tab(&mut self) {
         self.detail_tab = self.detail_tab.next();
+        if self.detail_tab == DetailTab::Inventory && !self.flux_context() {
+            self.detail_tab = self.detail_tab.next();
+        }
         if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
+        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
     }
     fn cycle_tab_back(&mut self) {
         self.detail_tab = self.detail_tab.prev();
+        if self.detail_tab == DetailTab::Inventory && !self.flux_context() {
+            self.detail_tab = self.detail_tab.prev();
+        }
         if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
+        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
     }
 
     fn scroll_detail(&mut self, delta: i32) {
@@ -364,6 +413,7 @@ impl App {
             DetailTab::Logs => &mut self.log_scroll,
             DetailTab::Status => &mut self.status_scroll,
             DetailTab::Related => &mut self.related_scroll,
+            DetailTab::Inventory => &mut self.inventory_scroll,
         }
     }
 
@@ -371,6 +421,7 @@ impl App {
         self.log_scroll = 0;
         self.status_scroll = 0;
         self.related_scroll = 0;
+        self.inventory_scroll = 0;
         self.detail_h_scroll = 0;
     }
 
@@ -407,6 +458,27 @@ impl App {
     fn maybe_fetch_logs(&mut self) {
         let Some(idx) = self.table_state.selected() else { return; };
         let Some(rec) = self.snapshot.get(idx) else { return; };
+        // Flux CRDs are not Pods: show the relevant controller's logs filtered to this object.
+        if rec.component == "flux" {
+            let key = format!("flux:{}|{}/{}", rec.kind, rec.namespace, rec.name);
+            if self.last_pod_key.as_deref() == Some(&key) { return; }
+            self.last_pod_key = Some(key.clone());
+            {
+                let mut s = self.log_state.lock().expect("log state poisoned");
+                s.current_key = Some(key.clone());
+                s.lines.clear();
+                s.error = None;
+                s.loading = true;
+            }
+            let client = self.client.clone();
+            let log_state = self.log_state.clone();
+            let controllers = vec![controller_for_kind(&rec.kind).to_string()];
+            let filter = Some((rec.namespace.clone(), rec.name.clone()));
+            tokio::spawn(async move {
+                fetch_flux_logs(client, controllers, filter, key, log_state, 500).await;
+            });
+            return;
+        }
         if rec.kind != "Pod" {
             let mut s = self.log_state.lock().expect("log state poisoned");
             s.current_key = None;
@@ -456,6 +528,32 @@ impl App {
         let name = rec.name.clone();
         tokio::spawn(async move {
             fetch_status(client, api_version, kind, namespace, name, key, status_state).await;
+        });
+    }
+
+    // Loads the selected Kustomization's inventory (applied objects + live status). Re-runs when the
+    // selection changes; forced re-runs (10 s tick during a rollout) pass `force = true`.
+    fn maybe_fetch_inventory(&mut self, force: bool) {
+        let Some(idx) = self.table_state.selected() else { return; };
+        let Some(rec) = self.snapshot.get(idx) else { return; };
+        let key = format!("{}|{}|{}/{}", rec.api_version, rec.kind, rec.namespace, rec.name);
+        if !force && self.last_inventory_key.as_deref() == Some(&key) { return; }
+        self.last_inventory_key = Some(key.clone());
+        {
+            let mut s = self.inventory_state.lock().expect("inventory poisoned");
+            s.current_key = Some(key.clone());
+            if !force { s.items.clear(); }
+            s.error = None;
+            s.loading = true;
+        }
+        let client = self.client.clone();
+        let inv_state = self.inventory_state.clone();
+        let api_version = rec.api_version.clone();
+        let kind = rec.kind.clone();
+        let namespace = rec.namespace.clone();
+        let name = rec.name.clone();
+        tokio::spawn(async move {
+            fetch_inventory(client, api_version, kind, namespace, name, key, inv_state).await;
         });
     }
 
@@ -997,6 +1095,14 @@ impl App {
                 self.leave_special_modes();
                 self.enter_flux_mode();
             }
+            "flux-logs" => {
+                self.mode = origin;
+                if !matches!(self.mode, Mode::Flux | Mode::FluxFull) {
+                    self.leave_special_modes();
+                    self.enter_flux_mode();
+                }
+                self.enter_flux_logs();
+            }
             _ => self.exit_command(),
         }
     }
@@ -1047,9 +1153,22 @@ impl App {
     }
 
     fn refresh_flux_snapshot(&mut self) {
+        // In tree mode the snapshot follows the flattened tree order so selection, detail panes and
+        // actions keep working off snapshot indices; otherwise it is the flat resource list.
         let recs: Vec<EventRecord> = {
             let s = self.flux_state.lock().expect("flux poisoned");
-            s.resources.iter().map(synthetic_flux_record).collect()
+            if self.flux_tree {
+                let flat = build_flux_tree(&s.resources, &self.flux_collapsed);
+                let recs = flat
+                    .iter()
+                    .map(|n| synthetic_flux_record(&s.resources[n.idx]))
+                    .collect();
+                self.flux_tree_nodes = flat;
+                recs
+            } else {
+                self.flux_tree_nodes.clear();
+                s.resources.iter().map(synthetic_flux_record).collect()
+            }
         };
         let prev_uid = self
             .table_state
@@ -1076,6 +1195,7 @@ impl App {
             self.maybe_fetch_logs();
             self.maybe_fetch_status();
             self.maybe_fetch_related();
+            if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
         }
     }
 
@@ -1089,6 +1209,27 @@ impl App {
         self.mode = Mode::Flux;
     }
 
+    // Switches the Flux panel between the flat table and the dependency tree.
+    fn toggle_flux_tree(&mut self) {
+        self.flux_tree = !self.flux_tree;
+        self.refresh_flux_snapshot();
+    }
+
+    // Collapses/expands the selected tree node (no-op if it has no children).
+    fn toggle_flux_node(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return; };
+        let Some(node) = self.flux_tree_nodes.get(sel) else { return; };
+        if !node.has_children { return; }
+        let s = self.flux_state.lock().expect("flux poisoned");
+        let Some(r) = s.resources.get(node.idx) else { return; };
+        let uid = flux_tree_uid(r);
+        drop(s);
+        if !self.flux_collapsed.remove(&uid) {
+            self.flux_collapsed.insert(uid);
+        }
+        self.refresh_flux_snapshot();
+    }
+
     fn refresh_flux(&self) {
         {
             let mut s = self.flux_state.lock().expect("flux poisoned");
@@ -1098,6 +1239,97 @@ impl App {
         let client = self.client.clone();
         let state = self.flux_state.clone();
         tokio::spawn(async move { fetch_flux(client, state).await; });
+    }
+
+    // Requests a Flux reconcile for the chosen scope. RootSync targets the fixed flux-system
+    // GitRepository; other scopes apply to the selected resource. The result arrives asynchronously
+    // in `reconcile_status` and is drained into a toast.
+    fn reconcile_selected(&mut self, scope: ReconcileScope) {
+        let target = match scope {
+            ReconcileScope::RootSync => Some((
+                "source.toolkit.fluxcd.io/v1".to_string(),
+                "GitRepository".to_string(),
+                "flux-system".to_string(),
+                "flux-system".to_string(),
+            )),
+            _ => self
+                .table_state
+                .selected()
+                .and_then(|i| self.snapshot.get(i))
+                .map(|r| {
+                    (
+                        r.api_version.clone(),
+                        r.kind.clone(),
+                        r.namespace.clone(),
+                        r.name.clone(),
+                    )
+                }),
+        };
+        let Some((api_version, kind, ns, name)) = target else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucune ressource sélectionnée".to_string(),
+            ));
+            return;
+        };
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            format!("⟳ reconcile demandé : {}/{}…", kind, name),
+        ));
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move {
+            reconcile(client, scope, api_version, kind, ns, name, status).await;
+        });
+    }
+
+    // Folds the latest reconcile/suspend outcome (success/error) into the shared toast.
+    fn drain_reconcile_status(&mut self) {
+        if let Some(msg) = self.reconcile_status.lock().ok().and_then(|mut s| s.take()) {
+            self.clipboard_status = Some(msg);
+        }
+    }
+
+    // Toggles spec.suspend on the selected resource. The current state comes from the latest flux
+    // snapshot; the patch runs async and its result is drained into the toast.
+    fn toggle_suspend(&mut self) {
+        let Some(rec) = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .cloned()
+        else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucune ressource sélectionnée".to_string(),
+            ));
+            return;
+        };
+        let currently_suspended = {
+            let s = self.flux_state.lock().expect("flux poisoned");
+            s.resources
+                .iter()
+                .find(|r| r.kind == rec.kind && r.namespace == rec.namespace && r.name == rec.name)
+                .map(|r| r.suspended)
+                .unwrap_or(false)
+        };
+        let suspend = !currently_suspended;
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            format!(
+                "{} {}/{}…",
+                if suspend { "⏸ suspend" } else { "▶ resume" },
+                rec.kind,
+                rec.name
+            ),
+        ));
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let (api_version, kind, ns, name) =
+            (rec.api_version.clone(), rec.kind.clone(), rec.namespace.clone(), rec.name.clone());
+        tokio::spawn(async move {
+            set_suspend(client, api_version, kind, ns, name, suspend, status).await;
+        });
     }
 
     fn start_flux_auto_refresh(&mut self) {
@@ -1122,6 +1354,52 @@ impl App {
         }
     }
 
+    // Opens the aggregated, follow-mode log view of every Flux controller (the `flux logs` view).
+    fn enter_flux_logs(&mut self) {
+        self.return_mode = self.mode;
+        self.mode = Mode::FluxLogs;
+        self.reset_scroll();
+        {
+            let mut s = self.flux_logs_state.lock().expect("log state poisoned");
+            s.current_key = Some("flux-logs".to_string());
+            s.lines.clear();
+            s.error = None;
+            s.loading = true;
+        }
+        self.start_flux_logs_auto_refresh();
+    }
+
+    fn exit_flux_logs(&mut self) {
+        self.stop_flux_logs_auto_refresh();
+        self.mode = if matches!(self.return_mode, Mode::Flux | Mode::FluxFull) {
+            self.return_mode
+        } else {
+            Mode::Flux
+        };
+    }
+
+    fn start_flux_logs_auto_refresh(&mut self) {
+        self.stop_flux_logs_auto_refresh();
+        let client = self.client.clone();
+        let state = self.flux_logs_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(3));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let controllers = ALL_CONTROLLERS.iter().map(|c| c.to_string()).collect();
+                fetch_flux_logs(client.clone(), controllers, None, "flux-logs".to_string(), state.clone(), 200).await;
+                ticker.tick().await;
+            }
+        });
+        self.flux_logs_handle = Some(handle);
+    }
+
+    fn stop_flux_logs_auto_refresh(&mut self) {
+        if let Some(h) = self.flux_logs_handle.take() {
+            h.abort();
+        }
+    }
+
     fn move_flux_selection(&mut self, delta: i32) {
         if self.snapshot.is_empty() { return; }
         let last = self.snapshot.len() - 1;
@@ -1134,6 +1412,7 @@ impl App {
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
         self.maybe_fetch_related();
+        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
     }
 
     fn refresh_nodes(&self) {
@@ -1289,6 +1568,13 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if matches!(app.mode, Mode::Flux | Mode::FluxFull) {
             app.refresh_flux_snapshot();
+            app.drain_reconcile_status();
+            if app.detail_tab == DetailTab::Inventory
+                && app.last_inventory_tick.elapsed() >= Duration::from_secs(5)
+            {
+                app.last_inventory_tick = std::time::Instant::now();
+                app.maybe_fetch_inventory(true);
+            }
         }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
@@ -1447,9 +1733,17 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::PageDown, _, Mode::Flux) => app.move_flux_selection(10),
         (KeyCode::Tab, _, Mode::Flux) => app.cycle_tab(),
         (KeyCode::BackTab, _, Mode::Flux) => app.cycle_tab_back(),
+        (KeyCode::Char(' '), _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
+        (KeyCode::Enter, _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
         (KeyCode::Enter, _, Mode::Flux) => app.enter_flux_full(),
         (KeyCode::Esc, _, Mode::Flux) => app.exit_flux_mode(),
         (KeyCode::Char('r'), _, Mode::Flux) => app.refresh_flux(),
+        (KeyCode::Char('R'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::Resource),
+        (KeyCode::Char('S'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::WithSource),
+        (KeyCode::Char('F'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::RootSync),
+        (KeyCode::Char('z'), _, Mode::Flux) => app.toggle_suspend(),
+        (KeyCode::Char('t'), _, Mode::Flux) => app.toggle_flux_tree(),
+        (KeyCode::Char('L'), _, Mode::Flux) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::Flux) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Flux) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Flux) => app.scroll_detail_bottom(),
@@ -1473,9 +1767,24 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Esc, _, Mode::FluxFull) => app.exit_flux_full(),
         (KeyCode::Char('g'), _, Mode::FluxFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::FluxFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('R'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::Resource),
+        (KeyCode::Char('S'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::WithSource),
+        (KeyCode::Char('F'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::RootSync),
+        (KeyCode::Char('z'), _, Mode::FluxFull) => app.toggle_suspend(),
+        (KeyCode::Char('L'), _, Mode::FluxFull) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::FluxFull) => app.enter_ai_panel(),
         (KeyCode::Char('l'), _, Mode::FluxFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::FluxFull) => {}
+
+        (KeyCode::Up, _, Mode::FluxLogs) => app.scroll_detail(1),
+        (KeyCode::Down, _, Mode::FluxLogs) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::FluxLogs) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::FluxLogs) => app.scroll_detail(-10),
+        (KeyCode::Char('g'), _, Mode::FluxLogs) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::FluxLogs) => app.scroll_detail_bottom(),
+        (KeyCode::Esc, _, Mode::FluxLogs) => app.exit_flux_logs(),
+        (KeyCode::Char('L'), _, Mode::FluxLogs) => app.exit_flux_logs(),
+        (_, _, Mode::FluxLogs) => {}
 
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
@@ -1545,6 +1854,9 @@ fn handle_event(app: &mut App, ev: Event) {
 // Overlay modes (AI panel, pickers, command palette) reuse a base mode's layout then draw on top.
 fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let area = f.area();
+    if app.mode == Mode::FluxLogs {
+        return draw_flux_logs(f, app);
+    }
     let draw_mode = match app.mode {
         Mode::NsPicker => Mode::Selection,
         Mode::AiPanel => match app.return_mode {
@@ -1599,7 +1911,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
     let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
@@ -1608,7 +1920,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NodesFull | Mode::FluxFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Flux => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
     let st = lang::t(app.ai_language);
@@ -1624,10 +1936,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Extract => st.mode_extract,
         Mode::Command => st.mode_command,
         Mode::Flux | Mode::FluxFull => st.mode_flux,
+        Mode::FluxLogs => st.mode_flux,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(" kdt ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" kdt v{} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(
                 "  ctx={}  ns={}  filter={}  mode={}{}  lang={}",
                 app.context_label,
@@ -1651,11 +1967,15 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         if draw_mode == Mode::Nodes {
             draw_nodes_table(f, app, ta);
         } else if draw_mode == Mode::Flux {
-            draw_flux_table(f, app, ta);
+            if app.flux_tree {
+                draw_flux_tree(f, app, ta);
+            } else {
+                draw_flux_table(f, app, ta);
+            }
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -1700,8 +2020,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_namespace)),
-            Span::styled(" N ", kbg), Span::raw(format!(" {}   ", st.k_nodes)),
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
@@ -1740,24 +2058,36 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
-            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", if app.flux_tree { st.k_fold } else { st.k_zoom })),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            footer_sep(),
+            Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
+            Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_reconcile_src)),
+            Span::styled(" F ", kbg), Span::raw(format!(" {}   ", st.k_sync_root)),
+            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
+            Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
+            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
         Mode::FluxFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
+            Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_reconcile_src)),
+            Span::styled(" F ", kbg), Span::raw(format!(" {}   ", st.k_sync_root)),
+            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
+            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
+            footer_sep(),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
     footer_spans.push(Span::raw("   "));
     footer_spans.push(Span::styled(" m ", kbg));
@@ -2727,7 +3057,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
             Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
             Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
-            Cell::from(r.message.clone()).style(Style::default().fg(msg_color)),
+            flux_message_cell(r, msg_color),
         ])
         .style(row_style)
     }).collect();
@@ -2744,6 +3074,94 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Renders the Flux dependency tree (source → workload → dependent workloads) with indentation and
+// collapse markers, reusing the same status colouring as the flat table.
+fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (resources, error) = {
+        let s = app.flux_state.lock().expect("flux poisoned");
+        (s.resources.clone(), s.error.clone())
+    };
+
+    let title = if let Some(e) = &error {
+        format!("flux arbre (erreur: {})", e)
+    } else {
+        format!("flux arbre ({} nœuds)", app.flux_tree_nodes.len())
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("REVISION"),
+        Cell::from("AGE"), Cell::from("MESSAGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .flux_tree_nodes
+        .iter()
+        .filter_map(|n| {
+            let r = resources.get(n.idx)?;
+            let marker = if n.has_children {
+                if n.collapsed { "▸" } else { "▾" }
+            } else {
+                " "
+            };
+            let label = format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind, r.name);
+
+            let (ready_txt, ready_color) = if r.suspended {
+                ("Suspended", Color::Yellow)
+            } else {
+                match r.ready {
+                    FluxReady::Ready => ("Ready", Color::Green),
+                    FluxReady::Failed => ("Failed", Color::Red),
+                    FluxReady::Unknown => ("Unknown", Color::Yellow),
+                }
+            };
+            let row_style = match (r.suspended, r.ready) {
+                (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+                (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+                (true, _) => Style::default().fg(DIM),
+                (false, FluxReady::Ready) => Style::default(),
+            };
+            let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
+            Some(
+                Row::new(vec![
+                    Cell::from(label),
+                    Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+                    Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                    flux_message_cell(r, msg_color),
+                ])
+                .style(row_style),
+            )
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Min(40), Constraint::Length(10), Constraint::Length(18),
+        Constraint::Length(6), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Message cell for a Flux row, prefixed with a warning badge when a Kustomization prunes (deletes)
+// objects removed from git (spec.prune = true).
+fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
+    if r.prune == Some(true) {
+        Cell::from(Line::from(vec![
+            Span::styled("⚠ prune ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(r.message.clone(), Style::default().fg(msg_color)),
+        ]))
+    } else {
+        Cell::from(r.message.clone()).style(Style::default().fg(msg_color))
+    }
 }
 
 fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -2869,22 +3287,40 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
     } else {
-        Line::from(vec![
-            tab_span("Logs", app.detail_tab == DetailTab::Logs),
+        // Inventory only applies to Flux resources; outside the Flux views, treat it as Logs.
+        let show_inventory = app.flux_context();
+        let tab = if app.detail_tab == DetailTab::Inventory && !show_inventory {
+            DetailTab::Logs
+        } else {
+            app.detail_tab
+        };
+        let mut spans = vec![
+            tab_span("Logs", tab == DetailTab::Logs),
             Span::raw(" │ "),
-            tab_span("Status", app.detail_tab == DetailTab::Status),
+            tab_span("Status", tab == DetailTab::Status),
             Span::raw(" │ "),
-            tab_span("Related", app.detail_tab == DetailTab::Related),
-        ])
+            tab_span("Related", tab == DetailTab::Related),
+        ];
+        if show_inventory {
+            spans.push(Span::raw(" │ "));
+            spans.push(tab_span("Inventory", tab == DetailTab::Inventory));
+        }
+        Line::from(spans)
     };
 
+    let effective_tab = if app.detail_tab == DetailTab::Inventory && !app.flux_context() {
+        DetailTab::Logs
+    } else {
+        app.detail_tab
+    };
     let lines: Vec<Line<'static>> = if is_node_mode {
         status_lines(app)
     } else {
-        match app.detail_tab {
+        match effective_tab {
             DetailTab::Logs => log_lines(app),
             DetailTab::Status => status_lines(app),
             DetailTab::Related => related_lines(app),
+            DetailTab::Inventory => inventory_lines(app),
         }
     };
 
@@ -2922,6 +3358,11 @@ fn tab_span(label: &str, active: bool) -> Span<'static> {
     }
 }
 
+// Dim vertical divider used to visually separate footer shortcut groups (nav · contextual · global).
+fn footer_sep() -> Span<'static> {
+    Span::styled("│  ", Style::default().fg(DIM))
+}
+
 fn filter_label(label: &str, active: bool) -> Span<'static> {
     let style = if active {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -2940,6 +3381,108 @@ fn log_lines(app: &App) -> Vec<Line<'static>> {
         return vec![Line::from("(loading...)")];
     }
     s.lines.iter().map(|l| colorize_log_line(l)).collect()
+}
+
+// Renders the selected Kustomization's inventory: one line per applied object with a status glyph.
+fn inventory_lines(app: &App) -> Vec<Line<'static>> {
+    let s = app.inventory_state.lock().expect("inventory poisoned");
+    if let Some(e) = &s.error {
+        return vec![Line::from(Span::styled(e.clone(), Style::default().fg(DIM)))];
+    }
+    if s.loading && s.items.is_empty() {
+        return vec![Line::from("(loading...)")];
+    }
+    if s.items.is_empty() {
+        return vec![Line::from(Span::styled("(inventaire vide)".to_string(), Style::default().fg(DIM)))];
+    }
+    let header = format!("{} objets", s.items.len());
+    let mut out = vec![Line::from(Span::styled(header, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))];
+    if s.prune == Some(true) {
+        out.push(Line::from(Span::styled(
+            "⚠ prune activé : les objets retirés du git sont supprimés du cluster".to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    }
+    for it in &s.items {
+        let (glyph, color) = match it.ready {
+            Some(true) => ("✓", Color::Green),
+            Some(false) => ("✗", Color::Red),
+            None => ("·", DIM),
+        };
+        let kind_name = if it.namespace.is_empty() {
+            format!("{} {}", it.kind, it.name)
+        } else {
+            format!("{} {}/{}", it.kind, it.namespace, it.name)
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {} ", glyph), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::raw(kind_name),
+        ];
+        if !it.msg.is_empty() {
+            spans.push(Span::styled(format!("  — {}", it.msg), Style::default().fg(DIM)));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn flux_logs_lines(app: &App) -> Vec<Line<'static>> {
+    let s = app.flux_logs_state.lock().expect("log state poisoned");
+    if let Some(e) = &s.error {
+        return vec![Line::from(Span::styled(e.clone(), Style::default().fg(Color::Red)))];
+    }
+    if s.loading && s.lines.is_empty() {
+        return vec![Line::from("(loading...)")];
+    }
+    s.lines.iter().map(|l| colorize_log_line(l)).collect()
+}
+
+// Full-screen aggregated view of every Flux controller log (the `flux logs` view).
+fn draw_flux_logs(f: &mut ratatui::Frame, app: &mut App) -> usize {
+    let area = f.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" kdt v{} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  ctx={}  flux logs (tous controllers, suivi 3 s)", app.context_label)),
+        ]),
+        cluster_banner_line(app),
+    ]);
+    f.render_widget(header, layout[0]);
+
+    let lines = flux_logs_lines(app);
+    let visible = layout[1].height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible);
+    let scroll_offset = {
+        let target = app.scroll_target();
+        if *target > max_scroll { *target = max_scroll; }
+        *target
+    };
+    let scroll = if total > visible {
+        (total - visible).saturating_sub(scroll_offset) as u16
+    } else {
+        0
+    };
+    let p = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .block(Block::default().borders(Borders::ALL).title("flux logs"));
+    f.render_widget(p, layout[1]);
+
+    let footer = Paragraph::new(Line::from(Span::styled(
+        " ↑↓ / PgUp / PgDn défil · g/G haut/bas · Esc retour ".to_string(),
+        Style::default().fg(DIM),
+    )));
+    f.render_widget(footer, layout[2]);
+
+    visible
 }
 
 fn colorize_log_line(l: &str) -> Line<'static> {

@@ -249,6 +249,110 @@ pub async fn fetch_logs(
     s.error = None;
 }
 
+// Fetch logs from the Flux controllers in flux-system. Controllers emit one JSON object per line
+// (level/ts/msg + the reconciled object's namespace/name); when `filter` is set we keep only the
+// lines about that object, otherwise we aggregate everything (global view). Pods are matched by
+// name prefix to avoid depending on a specific label scheme. Lines are sorted by timestamp.
+pub async fn fetch_flux_logs(
+    client: Client,
+    controllers: Vec<String>,
+    filter: Option<(String, String)>,
+    key: String,
+    state: SharedLog,
+    tail: i64,
+) {
+    let api: Api<Pod> = Api::namespaced(client, "flux-system");
+    let pods = match api.list(&ListParams::default()).await {
+        Ok(l) => l.items,
+        Err(e) => {
+            let mut s = state.lock().expect("log state poisoned");
+            if s.current_key.as_deref() != Some(&key) { return; }
+            s.loading = false;
+            s.lines.clear();
+            s.error = Some(format!("flux-system introuvable: {}", e));
+            return;
+        }
+    };
+
+    let mut collected: Vec<(String, String)> = Vec::new();
+    for p in &pods {
+        let Some(pod_name) = p.metadata.name.as_deref() else { continue };
+        let Some(ctrl) = controllers.iter().find(|c| pod_name.starts_with(c.as_str())) else { continue };
+        let lp = LogParams { tail_lines: Some(tail), ..Default::default() };
+        let Ok(text) = api.logs(pod_name, &lp).await else { continue };
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if let Some((ns, name)) = &filter {
+                if !flux_log_matches(&v, ns, name) { continue; }
+            }
+            collected.push((flux_log_ts(&v), format_flux_log_line(&v, ctrl, filter.is_none())));
+        }
+    }
+
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+    let lines: Vec<String> = collected.into_iter().map(|(_, l)| l).collect();
+
+    let mut s = state.lock().expect("log state poisoned");
+    if s.current_key.as_deref() != Some(&key) { return; }
+    s.loading = false;
+    s.error = if lines.is_empty() {
+        Some("(aucune ligne de log correspondante)".to_string())
+    } else {
+        None
+    };
+    s.lines = lines;
+}
+
+// True if a controller log line refers to the given object, either via top-level name/namespace
+// fields or a nested object (e.g. {"Kustomization": {"name":…, "namespace":…}}).
+fn flux_log_matches(v: &serde_json::Value, ns: &str, name: &str) -> bool {
+    let hit = |obj: &serde_json::Value| {
+        obj.get("name").and_then(|x| x.as_str()) == Some(name)
+            && obj.get("namespace").and_then(|x| x.as_str()) == Some(ns)
+    };
+    if hit(v) {
+        return true;
+    }
+    if let Some(map) = v.as_object() {
+        for val in map.values() {
+            if val.is_object() && hit(val) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn flux_log_ts(v: &serde_json::Value) -> String {
+    v.get("ts")
+        .map(|t| match t {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+// Render a controller log line as "HH:MM:SS [controller] LEVEL — msg"; in the global view the
+// object's namespace/name is appended to keep entries distinguishable.
+fn format_flux_log_line(v: &serde_json::Value, ctrl: &str, global: bool) -> String {
+    let ts = flux_log_ts(v);
+    let hms = ts
+        .split_once('T')
+        .map(|(_, t)| t.get(..8).unwrap_or(t).to_string())
+        .unwrap_or(ts);
+    let level = v.get("level").and_then(|x| x.as_str()).unwrap_or("info");
+    let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("");
+    let mut out = format!("{} [{}] {} — {}", hms, ctrl, level, msg);
+    if global {
+        let ns = v.get("namespace").and_then(|x| x.as_str()).unwrap_or("");
+        let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        if !name.is_empty() {
+            out.push_str(&format!("  ({}/{})", ns, name));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum LineColor { Plain, Ok, Warn, Err, Info, Dim }
 
