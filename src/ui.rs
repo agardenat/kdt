@@ -83,6 +83,37 @@ fn is_critical_reason(reason: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull }
 
+// The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
+#[derive(Clone)]
+enum MenuAction {
+    Rescale,
+    Recycle,
+    Restart,
+    Reconcile(ReconcileScope),
+    ScaleDelta(i32),
+    ScaleZero,
+    ScaleSet,
+}
+
+// One labelled choice in the action menu overlay, with an explanatory line shown under the list.
+struct ActionItem {
+    label: &'static str,
+    desc: &'static str,
+    action: MenuAction,
+}
+
+// Overlay shown over the Pods/Flux views: pick an action from a list, then (for destructive ones)
+// confirm. `confirming` flips the popup into a yes/no prompt; `input` holds the numeric entry buffer
+// while typing a target replica count for `ScaleSet`.
+struct ActionMenu {
+    title: &'static str,
+    items: Vec<ActionItem>,
+    cursor: usize,
+    confirm: bool,
+    confirming: bool,
+    input: Option<String>,
+}
+
 // Command palette entries: (canonical name, aliases). Drives `:` palette resolution/completion.
 const COMMANDS: &[(&str, &[&str])] = &[
     ("events", &["ev", "event"]),
@@ -111,7 +142,7 @@ fn resolve_command(input: &str) -> Option<&'static str> {
     if matches.len() == 1 { Some(matches[0]) } else { None }
 }
 
-fn command_suggestions(input: &str) -> Vec<&'static str> {
+fn command_name_suggestions(input: &str) -> Vec<&'static str> {
     let q = input.trim().to_lowercase();
     COMMANDS
         .iter()
@@ -120,6 +151,21 @@ fn command_suggestions(input: &str) -> Vec<&'static str> {
         })
         .map(|(name, _)| *name)
         .collect()
+}
+
+// Commands that take an optional namespace argument (`:ns/pods/events <name>`).
+fn command_takes_ns(cmd: &str) -> bool {
+    matches!(cmd, "events" | "namespace" | "pods")
+}
+
+// Map a namespace argument to a watcher scope: `all`/`*`/`0`/empty mean "all namespaces".
+fn ns_arg_to_opt(arg: &str) -> Option<String> {
+    let a = arg.trim();
+    if a.is_empty() || a == "all" || a == "*" || a == "0" {
+        None
+    } else {
+        Some(a.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +282,8 @@ pub struct App {
     pub last_pods_sel_uid: Option<String>,
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
+    // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
+    action_menu: Option<ActionMenu>,
 }
 
 impl App {
@@ -324,6 +372,7 @@ impl App {
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
             ns_return_pods: false,
+            action_menu: None,
         }
     }
 
@@ -1062,6 +1111,10 @@ impl App {
         self.command_return_mode = self.mode;
         self.command_input.clear();
         self.mode = Mode::Command;
+        // Prefetch namespaces so `:ns/pods/events <name>` can autocomplete.
+        let client = self.client.clone();
+        let state = self.ns_pick_state.clone();
+        tokio::spawn(async move { fetch_namespaces(client, state).await; });
     }
 
     fn exit_command(&mut self) {
@@ -1070,7 +1123,12 @@ impl App {
     }
 
     fn command_push(&mut self, c: char) {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '/' {
+        // A single space separates the command from its namespace argument.
+        if c == ' ' {
+            if !self.command_input.is_empty() && !self.command_input.ends_with(' ') {
+                self.command_input.push(' ');
+            }
+        } else if c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == '.' {
             self.command_input.push(c.to_ascii_lowercase());
         }
     }
@@ -1079,15 +1137,42 @@ impl App {
         self.command_input.pop();
     }
 
+    // Suggestions for the palette: command names before the space, matching namespaces after it.
+    fn command_suggestions(&self) -> Vec<String> {
+        let input = self.command_input.trim_start();
+        match input.split_once(' ') {
+            None => command_name_suggestions(input).into_iter().map(String::from).collect(),
+            Some((cmd, rest)) => {
+                let Some(name) = resolve_command(cmd) else { return Vec::new(); };
+                if !command_takes_ns(name) { return Vec::new(); }
+                let partial = rest.trim().to_lowercase();
+                let s = self.ns_pick_state.lock().expect("ns list poisoned");
+                let mut out = Vec::new();
+                if "all".starts_with(&partial) { out.push(format!("{} all", name)); }
+                for ns in &s.namespaces {
+                    if ns.to_lowercase().starts_with(&partial) {
+                        out.push(format!("{} {}", name, ns));
+                    }
+                }
+                out
+            }
+        }
+    }
+
     fn command_autocomplete(&mut self) {
-        let suggestions = command_suggestions(&self.command_input);
+        let suggestions = self.command_suggestions();
         if let Some(first) = suggestions.first() {
-            self.command_input = first.to_string();
+            self.command_input = first.clone();
         }
     }
 
     fn command_run(&mut self) {
-        let Some(cmd) = resolve_command(&self.command_input) else {
+        let input = self.command_input.trim().to_string();
+        let (cmd_part, arg) = match input.split_once(' ') {
+            Some((c, rest)) => (c.to_string(), Some(rest.trim().to_string())),
+            None => (input.clone(), None),
+        };
+        let Some(cmd) = resolve_command(&cmd_part) else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
                 format!("commande inconnue: {}", self.command_input.trim()),
@@ -1097,17 +1182,29 @@ impl App {
         };
         let origin = self.command_return_mode;
         self.command_input.clear();
+        // A namespace argument (when the command accepts one) re-scopes the watcher before switching.
+        let ns_arg = arg
+            .as_ref()
+            .filter(|a| !a.is_empty() && command_takes_ns(cmd))
+            .map(|a| ns_arg_to_opt(a));
         match cmd {
             "quit" => self.should_quit = true,
             "events" => {
                 self.mode = origin;
                 self.leave_special_modes();
+                if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
                 self.reset_to_follow();
             }
             "namespace" => {
                 self.mode = origin;
                 self.leave_special_modes();
-                self.enter_ns_picker();
+                match ns_arg {
+                    Some(ns_opt) => {
+                        self.apply_namespace(ns_opt);
+                        self.mode = Mode::Selection;
+                    }
+                    None => self.enter_ns_picker(),
+                }
             }
             "nodes" => {
                 self.mode = origin;
@@ -1117,6 +1214,7 @@ impl App {
             "pods" => {
                 self.mode = origin;
                 self.leave_special_modes();
+                if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
                 self.enter_pods_mode();
             }
             "flux" => {
@@ -1712,6 +1810,22 @@ impl App {
         self.spawn_scale(&w, 0);
     }
 
+    // Scale the focused workload to an exact replica count (clamped at 0).
+    fn pods_scale_set(&mut self, target: i32) {
+        let Some(w) = self.focus_workload() else {
+            self.pods_scale_hint();
+            return;
+        };
+        if w.replicas.is_none() {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("scale non supporté pour {}", w.kind),
+            ));
+            return;
+        }
+        self.spawn_scale(&w, target.max(0));
+    }
+
     // Rescale to the memorised initial count. `force` first scales to 0 then back up, bypassing the
     // rolling update for a hard recycle of all pods.
     fn pods_rescale(&mut self, force: bool) {
@@ -1788,6 +1902,144 @@ impl App {
             std::time::Instant::now(),
             "scale/restart : basculez sur l'objet (o) d'abord".to_string(),
         ));
+    }
+
+    // Opens the workload action menu (rescale / recycle / restart). Requires a focused workload,
+    // otherwise it falls back to the focus hint.
+    fn open_pods_action_menu(&mut self) {
+        if self.focus_workload().is_none() {
+            self.pods_scale_hint();
+            return;
+        }
+        let st = lang::t(self.ai_language);
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_pods_title,
+            items: vec![
+                ActionItem { label: st.k_rescale, desc: st.desc_rescale, action: MenuAction::Rescale },
+                ActionItem { label: st.k_force, desc: st.desc_recycle, action: MenuAction::Recycle },
+                ActionItem { label: st.k_restart, desc: st.desc_restart, action: MenuAction::Restart },
+            ],
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    // Opens the workload scale menu (+1 / -1 / scale 0 / set an exact replica count).
+    fn open_pods_scale_menu(&mut self) {
+        if self.focus_workload().is_none() {
+            self.pods_scale_hint();
+            return;
+        }
+        let st = lang::t(self.ai_language);
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_scale_title,
+            items: vec![
+                ActionItem { label: st.k_scale_up, desc: st.desc_scale_up, action: MenuAction::ScaleDelta(1) },
+                ActionItem { label: st.k_scale_down, desc: st.desc_scale_down, action: MenuAction::ScaleDelta(-1) },
+                ActionItem { label: st.k_scale_zero, desc: st.desc_scale_zero, action: MenuAction::ScaleZero },
+                ActionItem { label: st.k_scale_set, desc: st.desc_scale_set, action: MenuAction::ScaleSet },
+            ],
+            cursor: 0,
+            confirm: false,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    // Opens the Flux reconcile menu (resource / +source / root sync).
+    fn open_flux_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_flux_title,
+            items: vec![
+                ActionItem { label: st.k_reconcile, desc: st.desc_reconcile, action: MenuAction::Reconcile(ReconcileScope::Resource) },
+                ActionItem { label: st.k_reconcile_src, desc: st.desc_reconcile_src, action: MenuAction::Reconcile(ReconcileScope::WithSource) },
+                ActionItem { label: st.k_sync_root, desc: st.desc_sync_root, action: MenuAction::Reconcile(ReconcileScope::RootSync) },
+            ],
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    fn action_menu_move(&mut self, delta: i32) {
+        if let Some(menu) = self.action_menu.as_mut() {
+            if menu.confirming || menu.input.is_some() || menu.items.is_empty() { return; }
+            let len = menu.items.len() as i32;
+            let cur = menu.cursor as i32;
+            menu.cursor = (cur + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    // Enter: arms the confirmation (for destructive menus), opens the numeric entry (`ScaleSet`),
+    // or runs the highlighted action and closes.
+    fn action_menu_activate(&mut self) {
+        let action = match self.action_menu.as_mut() {
+            None => return,
+            // Confirm numeric entry: parse the typed replica count and apply it.
+            Some(menu) if menu.input.is_some() => {
+                let target = menu.input.as_ref().and_then(|s| s.parse::<i32>().ok());
+                let Some(target) = target else { return; };
+                self.action_menu = None;
+                self.pods_scale_set(target);
+                return;
+            }
+            Some(menu)
+                if matches!(
+                    menu.items.get(menu.cursor).map(|it| &it.action),
+                    Some(MenuAction::ScaleSet)
+                ) =>
+            {
+                menu.input = Some(String::new());
+                return;
+            }
+            Some(menu) if menu.confirm && !menu.confirming => {
+                menu.confirming = true;
+                return;
+            }
+            Some(menu) => menu.items.get(menu.cursor).map(|it| it.action.clone()),
+        };
+        self.action_menu = None;
+        match action {
+            Some(MenuAction::Rescale) => self.pods_rescale(false),
+            Some(MenuAction::Recycle) => self.pods_rescale(true),
+            Some(MenuAction::Restart) => self.pods_restart(),
+            Some(MenuAction::Reconcile(scope)) => self.reconcile_selected(scope),
+            Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
+            Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
+            Some(MenuAction::ScaleSet) | None => {}
+        }
+    }
+
+    // Esc: cancels numeric entry, backs out of confirmation, or closes the menu entirely.
+    fn action_menu_back(&mut self) {
+        match self.action_menu.as_mut() {
+            Some(menu) if menu.input.is_some() => menu.input = None,
+            Some(menu) if menu.confirming => menu.confirming = false,
+            _ => self.action_menu = None,
+        }
+    }
+
+    // Digit/backspace handling while the numeric replica entry is open. No-op otherwise.
+    fn action_menu_input(&mut self, c: char) {
+        if let Some(menu) = self.action_menu.as_mut() {
+            if let Some(buf) = menu.input.as_mut() {
+                if c.is_ascii_digit() && buf.len() < 5 {
+                    buf.push(c);
+                }
+            }
+        }
+    }
+
+    fn action_menu_backspace(&mut self) {
+        if let Some(menu) = self.action_menu.as_mut() {
+            if let Some(buf) = menu.input.as_mut() {
+                buf.pop();
+            }
+        }
     }
 
     fn maybe_fetch_node_status(&mut self) {
@@ -1878,15 +2130,10 @@ impl App {
 
     // Apply the namespace picked in the selector: restart the event watcher scoped to it
     // (cursor 0 means "all namespaces"), clearing the buffer and current selection.
-    fn confirm_ns(&mut self) {
-        let ns_opt: Option<String> = {
-            let s = self.ns_pick_state.lock().expect("ns list poisoned");
-            if self.ns_cursor == 0 {
-                None
-            } else {
-                s.namespaces.get(self.ns_cursor - 1).cloned()
-            }
-        };
+    // Scope the event watcher to `ns_opt` (None = all namespaces), clearing the buffer, snapshot and
+    // current selection. Shared by the picker, the `:ns/pods/events <name>` palette args and the `0`
+    // shortcut.
+    fn apply_namespace(&mut self, ns_opt: Option<String>) {
         self.namespace_label = match &ns_opt { Some(n) => n.clone(), None => "all".to_string() };
         self.watcher_handle.abort();
         {
@@ -1907,6 +2154,68 @@ impl App {
         self.last_status_key = None;
         self.last_related_key = None;
         self.reset_scroll();
+    }
+
+    // Scope the filter to the namespace of the currently selected row (event or pod) without
+    // opening the picker — `:ns` stays available for arbitrary selection.
+    fn filter_ns_to_selected(&mut self) {
+        let ns = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.namespace.clone())
+            .filter(|n| !n.is_empty());
+        let Some(ns) = ns else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucun namespace sur l'élément sélectionné".to_string(),
+            ));
+            return;
+        };
+        if self.namespace_label == ns {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("déjà filtré sur {}", ns),
+            ));
+            return;
+        }
+        let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
+        self.apply_namespace(Some(ns));
+        if was_pods {
+            self.enter_pods_mode();
+        } else {
+            self.mode = Mode::Selection;
+        }
+    }
+
+    // Drop the active namespace filter (`0`), refreshing whichever ns-scoped view is open.
+    fn clear_namespace_filter(&mut self) {
+        if self.namespace_label == "all" {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "déjà sur tous les namespaces".to_string(),
+            ));
+            return;
+        }
+        let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
+        self.apply_namespace(None);
+        if was_pods {
+            self.enter_pods_mode();
+        } else {
+            self.mode = Mode::Selection;
+        }
+    }
+
+    fn confirm_ns(&mut self) {
+        let ns_opt: Option<String> = {
+            let s = self.ns_pick_state.lock().expect("ns list poisoned");
+            if self.ns_cursor == 0 {
+                None
+            } else {
+                s.namespaces.get(self.ns_cursor - 1).cloned()
+            }
+        };
+        self.apply_namespace(ns_opt);
         if self.ns_return_pods {
             // Re-enter the pods view scoped to the freshly selected namespace.
             self.ns_return_pods = false;
@@ -1970,6 +2279,20 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
+    // The action menu overlay grabs all input while open (Ctrl-C still quits).
+    if app.action_menu.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.action_menu_activate(),
+            (KeyCode::Esc, _) => app.action_menu_back(),
+            (KeyCode::Backspace, _) => app.action_menu_backspace(),
+            (KeyCode::Char(c), _) if c.is_ascii_digit() => app.action_menu_input(c),
+            (KeyCode::Up | KeyCode::Char('k'), _) => app.action_menu_move(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => app.action_menu_move(1),
+            _ => {}
+        }
+        return;
+    }
     match (k.code, k.modifiers, app.mode) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
 
@@ -2111,10 +2434,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
         (KeyCode::Enter, _, Mode::Flux) => app.enter_flux_full(),
         (KeyCode::Esc, _, Mode::Flux) => app.exit_flux_mode(),
-        (KeyCode::Char('r'), _, Mode::Flux) => app.refresh_flux(),
-        (KeyCode::Char('R'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::Resource),
-        (KeyCode::Char('S'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::WithSource),
-        (KeyCode::Char('F'), _, Mode::Flux) => app.reconcile_selected(ReconcileScope::RootSync),
+        (KeyCode::F(5), _, Mode::Flux) => app.refresh_flux(),
+        (KeyCode::Char('r'), _, Mode::Flux) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::Flux) => app.toggle_suspend(),
         (KeyCode::Char('t'), _, Mode::Flux) => app.toggle_flux_tree(),
         (KeyCode::Char('L'), _, Mode::Flux) => app.enter_flux_logs(),
@@ -2141,9 +2462,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Esc, _, Mode::FluxFull) => app.exit_flux_full(),
         (KeyCode::Char('g'), _, Mode::FluxFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::FluxFull) => app.scroll_detail_bottom(),
-        (KeyCode::Char('R'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::Resource),
-        (KeyCode::Char('S'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::WithSource),
-        (KeyCode::Char('F'), _, Mode::FluxFull) => app.reconcile_selected(ReconcileScope::RootSync),
+        (KeyCode::Char('r'), _, Mode::FluxFull) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::FluxFull) => app.toggle_suspend(),
         (KeyCode::Char('L'), _, Mode::FluxFull) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::FluxFull) => app.enter_ai_panel(),
@@ -2175,13 +2494,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('o'), _, Mode::Pods) => {
             if app.pods_focus.is_some() { app.unfocus_owner(); } else { app.focus_owner(); }
         }
-        (KeyCode::Char('n'), _, Mode::Pods) => app.enter_ns_picker(),
-        (KeyCode::Char('+'), _, Mode::Pods) => app.pods_scale(1),
-        (KeyCode::Char('-'), _, Mode::Pods) => app.pods_scale(-1),
-        (KeyCode::Char('0'), _, Mode::Pods) => app.pods_scale_zero(),
-        (KeyCode::Char('r'), _, Mode::Pods) => app.pods_rescale(false),
-        (KeyCode::Char('f'), _, Mode::Pods) => app.pods_rescale(true),
-        (KeyCode::Char('R'), _, Mode::Pods) => app.pods_restart(),
+        (KeyCode::Char('n'), _, Mode::Pods) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Pods) => app.clear_namespace_filter(),
+        (KeyCode::Char('s'), _, Mode::Pods) => app.open_pods_scale_menu(),
+        (KeyCode::Char('r'), _, Mode::Pods) => app.open_pods_action_menu(),
         (KeyCode::Char('i'), _, Mode::Pods) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
@@ -2248,7 +2564,8 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Char('s'), _, Mode::Selection) => app.scroll_frozen = !app.scroll_frozen,
         (KeyCode::Esc, _, Mode::Selection) => app.reset_to_follow(),
-        (KeyCode::Char('n'), _, Mode::Selection) => app.enter_ns_picker(),
+        (KeyCode::Char('n'), _, Mode::Selection) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Selection) => app.clear_namespace_filter(),
         (KeyCode::Char('a' | 'A'), _, Mode::Selection) => app.filter = Filter::All,
         (KeyCode::Char('w' | 'W'), _, Mode::Selection) => app.filter = Filter::Warnings,
         (KeyCode::Char('e' | 'E'), _, Mode::Selection) => app.filter = Filter::Errors,
@@ -2491,13 +2808,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", if app.flux_tree { st.k_fold } else { st.k_zoom })),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             footer_sep(),
-            Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
-            Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_reconcile_src)),
-            Span::styled(" F ", kbg), Span::raw(format!(" {}   ", st.k_sync_root)),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
-            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             footer_sep(),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
@@ -2508,9 +2823,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
-            Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
-            Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_reconcile_src)),
-            Span::styled(" F ", kbg), Span::raw(format!(" {}   ", st.k_sync_root)),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             footer_sep(),
@@ -2525,17 +2838,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
                 Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
-                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_namespace)),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             ];
             if app.pods_focus.is_some() {
                 spans.extend(vec![
                     footer_sep(),
-                    Span::styled(" + ", kbg), Span::raw(format!(" {}   ", st.k_scale_up)),
-                    Span::styled(" - ", kbg), Span::raw(format!(" {}   ", st.k_scale_down)),
-                    Span::styled(" 0 ", kbg), Span::raw(format!(" {}   ", st.k_scale_zero)),
-                    Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_rescale)),
-                    Span::styled(" f ", kbg), Span::raw(format!(" {}   ", st.k_force)),
-                    Span::styled(" R ", kbg), Span::raw(format!(" {}   ", st.k_restart)),
+                    Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
+                    Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
                 ]);
             }
             spans.extend(vec![
@@ -2590,8 +2899,70 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.mode == Mode::Command {
         draw_command_popup(f, app, area);
     }
+    if app.action_menu.is_some() {
+        draw_action_menu_popup(f, app, area);
+    }
 
     visible_rows
+}
+
+// Renders the action menu overlay: a highlighted list of choices with the selected entry's
+// description, then a confirmation prompt once an entry is armed.
+fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(menu) = app.action_menu.as_ref() else { return; };
+    let st = lang::t(app.ai_language);
+
+    let popup_w = (area.width * 60 / 100).max(48).min(area.width);
+    let popup_h = (menu.items.len() as u16 + 6).min(area.height.saturating_sub(2)).max(8);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let border = if menu.confirming || menu.input.is_some() { Color::Yellow } else { Color::Cyan };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", menu.title))
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+
+    let items: Vec<ListItem> = menu
+        .items
+        .iter()
+        .map(|it| ListItem::new(format!(" {}", it.label)))
+        .collect();
+    let mut list_state = ListState::default();
+    list_state.select(Some(menu.cursor));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    let desc = menu.items.get(menu.cursor).map(|it| it.desc).unwrap_or("");
+    let footer = if let Some(buf) = menu.input.as_ref() {
+        Line::from(Span::styled(
+            st.menu_input_prompt.replace("{n}", buf),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    } else if menu.confirming {
+        Line::from(Span::styled(
+            st.menu_confirm_prompt,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(st.menu_hint, Style::default().fg(DIM)))
+    };
+    let p = Paragraph::new(vec![
+        Line::from(Span::styled(desc, Style::default().fg(Color::Gray))),
+        Line::from(""),
+        footer,
+    ])
+    .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(p, chunks[1]);
 }
 
 fn draw_extract_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -3832,8 +4203,7 @@ fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
 }
 
 fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let suggestions = command_suggestions(&app.command_input);
-    let resolved = resolve_command(&app.command_input);
+    let suggestions = app.command_suggestions();
 
     let popup_w = 56.min(area.width.saturating_sub(2)).max(20);
     let popup_h = 4 + suggestions.len().min(6) as u16;
@@ -3853,9 +4223,8 @@ fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     } else {
-        for name in suggestions.iter().take(6) {
-            let selected = resolved == Some(*name);
-            let style = if selected {
+        for (i, name) in suggestions.iter().take(6).enumerate() {
+            let style = if i == 0 {
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)

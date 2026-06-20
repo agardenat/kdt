@@ -60,7 +60,8 @@ défilement live est actif.
 | `g` / `G` | Haut / bas du détail |
 | `a` / `w` / `e` | Filtre All / Warnings / Errors |
 | `:` | Palette de commandes (style k9s) |
-| `n` | Sélecteur de namespace |
+| `n` | Filtrer sur le namespace de l'évènement sélectionné |
+| `0` | Retirer le filtre namespace (tous namespaces confondus) |
 | `N` | Nodes du pod sélectionné |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
@@ -75,10 +76,15 @@ défilement live est actif.
 Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` complète,
 `Enter` valide, `Esc` annule.
 
+`events`, `namespace` et `pods` acceptent un **nom de namespace** en argument
+(`:ns kube-system`, `:pods istio-system`, `:events monitoring`) avec autocomplétion (`Tab`).
+`all` (ou `*`/`0`) cible tous les namespaces.
+
 | Commande | Alias | Action |
 |---|---|---|
-| `events` | `ev` | Revenir à la vue évènements |
-| `namespace` | `ns` | Sélecteur de namespace |
+| `events [ns]` | `ev` | Vue évènements (optionnellement filtrée sur `ns`) |
+| `namespace [ns]` | `ns` | Sélecteur de namespace (ou bascule directe sur `ns`) |
+| `pods [ns]` | `po`, `pod` | Vue Pods (optionnellement filtrée sur `ns`) |
 | `nodes` | `no`, `node` | Vue Nodes |
 | `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
@@ -114,27 +120,46 @@ binaire `flux`) ; le suspend/reprise bascule `spec.suspend` (non destructif).
 | `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related / Inventory) |
 | `Enter` | Détail plein écran (en mode arbre : plier/déplier le nœud) |
 | `Shift-↑/↓`, `g` / `G` | Scroll du détail |
-| `R` | Réconcilier la ressource sélectionnée |
-| `S` | Réconcilier la ressource **et sa source** (`--with-source`) |
-| `F` | Sync racine : réconcilier `GitRepository/flux-system` |
+| `r` | Menu de réconciliation : ressource / **+source** (`--with-source`) / sync racine (`GitRepository/flux-system`), avec confirmation |
 | `z` | Suspendre / reprendre la ressource (`spec.suspend`) |
 | `t` | Basculer table ↔ vue arborescente |
 | `L` | Logs globaux de tous les controllers Flux (suivi) |
 | `i` | Panneau IA |
-| `r` | Rafraîchir (auto toutes les 10 s) |
+| `F5` | Rafraîchir (auto toutes les 10 s) |
 | `Esc` | Retour |
 
 #### Vue arborescente (`t`)
 
 Affiche la hiérarchie de dépendances : **source → Kustomization/HelmRelease → workloads
-dépendants** (`dependsOn`). `Enter` / `Espace` plie/déplie un nœud ; les actions `R`/`S`/`F`/`z`
-s'appliquent au nœud sélectionné. Le contenu appliqué d'une `Kustomization` reste visible dans
+dépendants** (`dependsOn`). `Enter` / `Espace` plie/déplie un nœud ; les actions `r` (menu
+réconciliation) et `z` s'appliquent au nœud sélectionné. Le contenu appliqué d'une `Kustomization` reste visible dans
 l'onglet **Inventory**.
 
 #### Logs Flux (`L` ou `:flux-logs`)
 
 Vue plein écran agrégeant les logs de tous les controllers de `flux-system` (suivi ~3 s),
 triés par horodatage. `Esc` pour revenir.
+
+### Pods (`:pods`)
+
+Liste des pods du namespace courant ; `o` bascule sur l'**objet d'origine** (workload propriétaire)
+pour le piloter, `Esc`/`o` revient à la liste.
+
+| Touche | Action |
+|---|---|
+| `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
+| `Enter` / `Tab` | Détail plein écran / changer d'onglet |
+| `o` | Basculer sur l'objet d'origine (workload) |
+| `n` | Filtrer sur le namespace du pod sélectionné |
+| `0` | Retirer le filtre namespace |
+| `s` | Menu **scale** : `+1` / `-1` / `0` / définir un nombre exact de répliques |
+| `r` | Menu **actions** : `rescale` / `recyclage` / `restart`, avec confirmation |
+| `i` | Panneau IA |
+
+Le menu `r` (sur l'objet d'origine) propose, avec explication et confirmation :
+**rescale** (rétablit le nombre de répliques initial mémorisé), **recyclage** (scale 0 puis remonte,
+recrée tous les pods) et **restart** (`rollout restart` progressif). Le menu `s` permet le scaling
+incrémental ou la saisie directe d'un nombre de répliques.
 
 ### Nodes / Node usage
 | Touche | Action |
