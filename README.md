@@ -344,3 +344,7 @@ Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downl
 ## Stack
 
 Rust 2021 · `kube` 3.1 (rustls, socks5) · `k8s-openapi` 0.27 · `ratatui` 0.30 · `tokio` · `reqwest` · `typst` 0.14.
+
+## Licence
+
+Distribué sous licence [Apache 2.0](LICENSE).
