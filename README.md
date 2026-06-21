@@ -13,6 +13,41 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
+## Installation
+
+### Homebrew (macOS et Linux x86_64)
+
+```bash
+brew install agardenat/kdt/kdt
+```
+
+Équivaut à `brew tap agardenat/kdt && brew install kdt`. La formula sert le binaire universel macOS (Apple Silicon + Intel) et le binaire statique Linux x86_64 selon la plateforme. Linux arm64 n'est pas distribué via Homebrew (voir packaging).
+
+### Paquets Linux (.deb / .rpm)
+
+Chaque release publie des paquets pour x86_64 :
+
+```bash
+# Debian / Ubuntu
+sudo dpkg -i kdt_<version>_amd64.deb
+
+# RHEL / Fedora / openSUSE
+sudo rpm -i kdt-<version>-1.x86_64.rpm
+```
+
+### Binaire pré-compilé
+
+Télécharger l'archive correspondant à la plateforme depuis la page [Releases](https://github.com/agardenat/kdt/releases), puis :
+
+```bash
+tar xzf kdt-linux-x86_64.tar.gz   # ou kdt-macos-universal.tar.gz
+sudo install -m 0755 kdt /usr/local/bin/kdt
+```
+
+### Depuis les sources
+
+Voir [Build](#build) (nécessite une toolchain Rust stable).
+
 ## Build
 
 ```bash

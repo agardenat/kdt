@@ -77,12 +77,62 @@ jobs:
 
   update-homebrew:
     runs-on: ubuntu-latest
-    needs: build-macos
+    needs: [build-macos, build-linux]
+    permissions:
+      contents: read
     steps:
-      - uses: mislav/bump-homebrew-formula-action@v3
+      - name: Checkout tap
+        uses: actions/checkout@v4
         with:
-          formula-name: kdt
-          homebrew-tap: agardenat/homebrew-kdt
-          download-url: https://github.com/agardenat/kdt/releases/download/${{ github.ref_name }}/kdt-macos-universal.tar.gz
+          repository: agardenat/homebrew-kdt
+          token: ${{ secrets.COMMITTER_TOKEN }}
+          path: tap
+
+      - name: Generate multi-platform formula
         env:
-          COMMITTER_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base="https://github.com/agardenat/kdt/releases/download/${TAG}"
+          gh release download "$TAG" --repo agardenat/kdt \
+            --pattern 'kdt-macos-universal.tar.gz' \
+            --pattern 'kdt-linux-x86_64.tar.gz' \
+            --dir assets
+          macos_sha=$(sha256sum assets/kdt-macos-universal.tar.gz | cut -d' ' -f1)
+          linux_sha=$(sha256sum assets/kdt-linux-x86_64.tar.gz | cut -d' ' -f1)
+          mkdir -p tap/Formula
+          cat > tap/Formula/kdt.rb <<EOF
+          class Kdt < Formula
+            desc "Kubernetes diagnostics, events and logs in a terminal UI"
+            homepage "https://github.com/agardenat/kdt"
+            version "${version}"
+
+            on_macos do
+              url "${base}/kdt-macos-universal.tar.gz"
+              sha256 "${macos_sha}"
+            end
+
+            on_linux do
+              on_intel do
+                url "${base}/kdt-linux-x86_64.tar.gz"
+                sha256 "${linux_sha}"
+              end
+            end
+
+            def install
+              bin.install "kdt"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/kdt --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/kdt.rb
+          git commit -m "kdt ${version}"
+          git push
