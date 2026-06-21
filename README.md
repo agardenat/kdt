@@ -211,7 +211,7 @@ Fichier JSON optionnel chargé depuis (par ordre de priorité) :
 
 ### Plusieurs fournisseurs IA
 
-Définir une liste `providers` permet de basculer entre plusieurs modèles/endpoints. Chaque entrée a un `name`, et optionnellement `base_url`, `api_key`, `model` (valeurs par défaut : `https://api.openai.com/v1` et `gpt-4o-mini`). `active_provider` choisit le fournisseur utilisé au démarrage (sinon le premier de la liste).
+Définir une liste `providers` permet de basculer entre plusieurs modèles/endpoints. Chaque entrée a un `name`, et optionnellement `base_url`, `api_key`, `model` (valeurs par défaut : `https://api.openai.com/v1` et `gpt-4o-mini`), et `context_window`. `active_provider` choisit le fournisseur utilisé au démarrage (sinon le premier de la liste).
 
 ```json
 {
@@ -222,7 +222,8 @@ Définir une liste `providers` permet de basculer entre plusieurs modèles/endpo
       "name": "openai",
       "base_url": "https://api.openai.com/v1",
       "api_key": "sk-...",
-      "model": "gpt-4o"
+      "model": "gpt-4o",
+      "context_window": 128000
     },
     {
       "name": "local",
@@ -236,6 +237,12 @@ Définir une liste `providers` permet de basculer entre plusieurs modèles/endpo
 
 En cours d'exécution, la touche `m` fait défiler les fournisseurs configurés ; le fournisseur actif est affiché dans le bandeau du panneau IA (`[FR · openai]`). Les champs `openai_*` et les variables d'environnement restent pris en charge comme fournisseur `default` (rétrocompatibilité) ; ils s'ajoutent à la liste si présents.
 
+#### `context_window` : budget de contexte
+
+`context_window` est la fenêtre de contexte du modèle **en tokens** (prompt + réponse). Quand il est défini, kdt borne la taille totale du prompt pour qu'elle tienne dans cette limite : il réserve ~4096 tokens pour la réponse et la marge, puis remplit le prompt par priorité (événement et status d'abord, logs, puis ressources contextuelles) et **omet les sections d'enrichissement de plus basse priorité** si le budget est atteint, en le signalant dans le prompt. Sans ce champ, seuls les plafonds par section s'appliquent (comportement historique).
+
+La valeur n'est jamais transmise à l'API : elle ne sert qu'au rognage local. Renseigne la fenêtre **réelle** du modèle ciblé. Avec un proxy qui multiplexe plusieurs modèles (p. ex. Claude Code Router), déclare la fenêtre du **plus petit** modèle que la route peut atteindre — ou crée une entrée provider par route à fenêtre homogène —, car la limite réelle est celle du modèle final, pas celle du proxy. L'estimation chars→tokens est volontairement prudente (≈3 chars/token pour du JSON Kubernetes), donc kdt rogne légèrement tôt plutôt que de risquer un dépassement.
+
 ### Variables d'environnement
 
 | Variable | Rôle |
@@ -243,13 +250,14 @@ En cours d'exécution, la touche `m` fait défiler les fournisseurs configurés 
 | `OPENAI_API_KEY` | Clé API IA (sinon `openai_api_key` du config) |
 | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | Endpoint compatible OpenAI |
 | `OPENAI_MODEL` | Modèle à utiliser |
+| `OPENAI_CONTEXT_WINDOW` | Fenêtre de contexte en tokens du fournisseur `default` (budget de prompt) |
 | `KDT_CONFIG` / `KEV_CONFIG` | Chemin du fichier de config |
 | `KDT_LOG` / `KEV_LOG` | Chemin du fichier de log |
 | `RUST_LOG` | Filtre de logs (`warn` par défaut) |
 
 ## Sécurité / confidentialité
 
-- **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives.
+- **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives. Le payload est compacté avant envoi (JSON sans espaces, lignes répétées des logs/status fusionnées, événements liés dédupliqués) et borné par section, ainsi que globalement quand `context_window` est défini.
 - **Endpoint** : un `base_url` en `http://` envoie la clé `Authorization: Bearer` et le payload en clair. Préfère `https://` (ou un endpoint local pour de l'inférence offline).
 - **Clé API** : stockée en clair dans `config.json` ; restreins les permissions du fichier (`chmod 600`). La clé n'est jamais journalisée.
 - **Accès cluster** : toutes les requêtes Kubernetes sont en lecture seule (`get`/`list`/`watch`/`logs`) ; aucune mutation, aucun shell-out.

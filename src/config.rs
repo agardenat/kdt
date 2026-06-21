@@ -14,6 +14,9 @@ pub struct AiProvider {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    // Model context window in tokens (prompt + completion). When set, the AI prompt is trimmed to
+    // fit so the request does not exceed the model's limit. None disables the global budget.
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

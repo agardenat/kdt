@@ -20,7 +20,7 @@ use kube::runtime::{watcher, WatchStreamExt};
 use kube::{Api, Client};
 use tokio::task::JoinHandle;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
     Normal,
     Warning,

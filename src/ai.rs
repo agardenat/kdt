@@ -73,6 +73,7 @@ pub struct AiProviderResolved {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub context_window: Option<usize>,
 }
 
 // Build the list of selectable providers from the config, then synthesize a "default" provider
@@ -86,6 +87,7 @@ pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderReso
             base_url: p.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model: p.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             api_key: p.api_key.clone(),
+            context_window: p.context_window,
         })
         .collect();
 
@@ -94,6 +96,7 @@ pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderReso
         .or_else(|| std::env::var("OPENAI_API_BASE").ok())
         .or_else(|| file.openai_base_url.clone());
     let legacy_model = std::env::var("OPENAI_MODEL").ok().or_else(|| file.openai_model.clone());
+    let legacy_ctx = std::env::var("OPENAI_CONTEXT_WINDOW").ok().and_then(|v| v.parse::<usize>().ok());
 
     let want_default = file.providers.is_empty()
         || legacy_key.is_some()
@@ -105,6 +108,7 @@ pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderReso
             base_url: legacy_base.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model: legacy_model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             api_key: legacy_key,
+            context_window: legacy_ctx,
         });
     }
 
@@ -114,6 +118,7 @@ pub fn resolve_providers(file: &crate::config::FileConfig) -> Vec<AiProviderReso
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             api_key: None,
+            context_window: None,
         });
     }
     out
@@ -136,6 +141,7 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub context_window: Option<usize>,
 }
 
 impl AiConfig {
@@ -149,6 +155,7 @@ impl AiConfig {
             base_url: p.base_url.clone(),
             api_key,
             model: p.model.clone(),
+            context_window: p.context_window,
         })
     }
 }

@@ -778,7 +778,8 @@ impl App {
             if let Some(d) = diagnostic_extra { extra.insert(0, d); }
             update_sections_count(&state, &key, extra.len());
             update_stage(&state, &key, "Construction du prompt...");
-            let prompt = build_ai_prompt(&rec, &ctx_label, &ns_label, &logs_text, &status_text, &related_text, &extra);
+            let char_budget = prompt_char_budget(config.context_window);
+            let prompt = build_ai_prompt(&rec, &ctx_label, &ns_label, &logs_text, &status_text, &related_text, &extra, char_budget);
             {
                 let mut s = state.lock().expect("ai state poisoned");
                 if s.current_key.as_deref() == Some(&key) {
@@ -5810,6 +5811,40 @@ fn format_time(r: &EventRecord) -> String {
 }
 
 // Snapshot the last 200 log lines for inclusion in the AI prompt (or a placeholder if unavailable).
+// Char budgets for the high-volume free-text prompt sections. Logs and status are kept by their
+// tail (most recent/most diagnostic content) once over budget.
+const MAX_LOGS_CHARS: usize = 12_000;
+const MAX_STATUS_CHARS: usize = 6_000;
+const MAX_RELATED_LINES: usize = 50;
+
+// Collapse runs of identical consecutive lines into "<line>  (xN)" so repeated log/status spam does
+// not eat the token budget verbatim.
+fn collapse_repeats<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Option<(&'a str, usize)> = None;
+    let flush = |out: &mut Vec<String>, line: &str, n: usize| {
+        out.push(if n > 1 { format!("{line}  (x{n})") } else { line.to_string() });
+    };
+    for line in lines {
+        match run {
+            Some((prev, n)) if prev == line => run = Some((prev, n + 1)),
+            Some((prev, n)) => { flush(&mut out, prev, n); run = Some((line, 1)); }
+            None => run = Some((line, 1)),
+        }
+    }
+    if let Some((prev, n)) = run { flush(&mut out, prev, n); }
+    out
+}
+
+// Keep the last `max` chars of `s` (recent content is the most diagnostic for logs/status),
+// aligned to a char boundary and prefixed with an elision marker when truncated.
+fn cap_chars_tail(s: String, max: usize) -> String {
+    if s.len() <= max { return s; }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) { start += 1; }
+    format!("... (tronqué)\n{}", &s[start..])
+}
+
 fn capture_logs_text(state: &SharedLog) -> String {
     let s = state.lock().expect("log state poisoned");
     if let Some(e) = &s.error { return format!("(indisponible: {})", e); }
@@ -5817,7 +5852,8 @@ fn capture_logs_text(state: &SharedLog) -> String {
     if s.lines.is_empty() { return "(aucun log)".to_string(); }
     let n = s.lines.len();
     let start = n.saturating_sub(200);
-    s.lines[start..].join("\n")
+    let collapsed = collapse_repeats(s.lines[start..].iter().map(|l| l.as_str()));
+    cap_chars_tail(collapsed.join("\n"), MAX_LOGS_CHARS)
 }
 
 fn capture_status_text(state: &SharedStatus) -> String {
@@ -5825,32 +5861,97 @@ fn capture_status_text(state: &SharedStatus) -> String {
     if let Some(e) = &s.error { return format!("(indisponible: {})", e); }
     if s.loading && s.lines.is_empty() { return "(en cours de chargement)".to_string(); }
     if s.lines.is_empty() { return "(aucun status)".to_string(); }
-    s.lines.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("\n")
+    let collapsed = collapse_repeats(s.lines.iter().map(|(_, t)| t.as_str()));
+    cap_chars_tail(collapsed.join("\n"), MAX_STATUS_CHARS)
 }
 
-// Collect up to the 50 most recent buffered events for the same object, for the prompt's
-// "related events" section.
+// Aggregate buffered events for the same object into the prompt's "related events" section.
+// Duplicates (same severity/reason/message) collapse into one line, summing their occurrence
+// counts and keeping the most recent timestamp, then the 50 most recent lines are kept.
 fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
     let buf = buffer.lock().expect("buffer poisoned");
-    let mut related: Vec<String> = buf.iter()
-        .filter(|r| r.namespace == rec.namespace && r.name == rec.name && r.kind == rec.kind)
-        .map(|r| format!(
-            "[{}] {} {} (x{}) — {}",
-            r.time,
-            match r.severity { Severity::Warning => "WARN", Severity::Normal => "OK" },
-            r.reason, r.count, r.message,
-        ))
+    use k8s_openapi::jiff::Timestamp;
+    let mut order: Vec<(Severity, String, String)> = Vec::new();
+    let mut agg: std::collections::HashMap<(Severity, String, String), (Timestamp, i64)> =
+        std::collections::HashMap::new();
+    for r in buf.iter().filter(|r| r.namespace == rec.namespace && r.name == rec.name && r.kind == rec.kind) {
+        let key = (r.severity, r.reason.clone(), r.message.clone());
+        match agg.get_mut(&key) {
+            Some((time, count)) => {
+                *count += r.count.max(1) as i64;
+                if r.time > *time { *time = r.time; }
+            }
+            None => {
+                order.push(key.clone());
+                agg.insert(key, (r.time, r.count.max(1) as i64));
+            }
+        }
+    }
+    let mut related: Vec<(Timestamp, String)> = order
+        .into_iter()
+        .map(|key| {
+            let (time, count) = agg[&key];
+            let (sev, reason, message) = key;
+            let line = format!(
+                "[{}] {} {} (x{}) — {}",
+                time,
+                match sev { Severity::Warning => "WARN", Severity::Normal => "OK" },
+                reason, count, message,
+            );
+            (time, line)
+        })
         .collect();
-    let max = 50;
-    if related.len() > max {
-        let drop = related.len() - max;
+    related.sort_by_key(|(t, _)| *t);
+    if related.len() > MAX_RELATED_LINES {
+        let drop = related.len() - MAX_RELATED_LINES;
         related.drain(0..drop);
     }
-    if related.is_empty() { "(aucun)".to_string() } else { related.join("\n") }
+    if related.is_empty() {
+        "(aucun)".to_string()
+    } else {
+        related.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+    }
 }
 
 // Assemble the full prompt sent to the model: event metadata, object status, recent logs, related
 // events, and enrichment sections. This is the complete payload transmitted to the AI endpoint.
+// Rough char/token ratio for dense Kubernetes JSON, and tokens held back for the system prompt,
+// the model's answer, and a safety margin. Used to derive a char budget from the context window.
+const CHARS_PER_TOKEN_EST: usize = 3;
+const COMPLETION_RESERVE_TOKENS: usize = 4096;
+
+// Convert a provider context window (tokens) into a char budget for the whole user prompt.
+fn prompt_char_budget(context_window: Option<usize>) -> Option<usize> {
+    context_window
+        .map(|toks| toks.saturating_sub(COMPLETION_RESERVE_TOKENS).saturating_mul(CHARS_PER_TOKEN_EST))
+}
+
+// Assemble the enrichment sections within `budget` chars, dropping the lowest-priority ones (later
+// in the list) when the budget is exhausted and noting how many were omitted. At least the first
+// (highest-priority) section is always included even if it alone exceeds the budget.
+fn build_extra_block(extra: &[(String, String)], budget: Option<usize>) -> String {
+    if extra.is_empty() { return "(aucun)".to_string(); }
+    let mut out = String::new();
+    let mut omitted = 0;
+    for (i, (title, body)) in extra.iter().enumerate() {
+        let sep = if out.is_empty() { "" } else { "\n\n" };
+        let section = format!("{sep}### {title}\n```json\n{body}\n```");
+        if let Some(b) = budget {
+            if !out.is_empty() && out.len() + section.len() > b {
+                omitted = extra.len() - i;
+                break;
+            }
+        }
+        out.push_str(&section);
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n\n... ({omitted} section(s) contextuelle(s) omise(s) — budget de contexte atteint)"
+        ));
+    }
+    out
+}
+
 fn build_ai_prompt(
     rec: &EventRecord,
     ctx_label: &str,
@@ -5859,21 +5960,27 @@ fn build_ai_prompt(
     status: &str,
     related: &str,
     extra: &[(String, String)],
+    char_budget: Option<usize>,
 ) -> String {
-    let mut extra_block = String::new();
-    if extra.is_empty() {
-        extra_block.push_str("(aucun)");
-    } else {
-        for (i, (title, body)) in extra.iter().enumerate() {
-            if i > 0 { extra_block.push_str("\n\n"); }
-            extra_block.push_str("### ");
-            extra_block.push_str(title);
-            extra_block.push_str("\n```json\n");
-            extra_block.push_str(body);
-            extra_block.push_str("\n```");
-        }
-    }
+    // Two-pass: render the skeleton with a placeholder for the enrichment block, measure the fixed
+    // part, then fill the block with whatever fits in the remaining budget.
+    const PLACEHOLDER: &str = "\u{0}";
+    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, logs, status, related, PLACEHOLDER);
+    let fixed_len = skeleton.len() - PLACEHOLDER.len();
+    let extra_budget = char_budget.map(|b| b.saturating_sub(fixed_len));
+    let extra_block = build_extra_block(extra, extra_budget);
+    skeleton.replace(PLACEHOLDER, &extra_block)
+}
 
+fn build_ai_prompt_inner(
+    rec: &EventRecord,
+    ctx_label: &str,
+    ns_label: &str,
+    logs: &str,
+    status: &str,
+    related: &str,
+    extra_block: &str,
+) -> String {
     format!(
 "# Analyse d'un événement Kubernetes
 
