@@ -15,6 +15,7 @@ mod flux;
 mod lang;
 mod pdf;
 mod pods;
+mod rbac;
 mod ui;
 
 use std::path::PathBuf;

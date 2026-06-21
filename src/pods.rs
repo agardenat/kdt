@@ -1,7 +1,8 @@
 //! Pod inventory plus the workload (Deployment/StatefulSet/DaemonSet/Job/ReplicaSet) a pod
 //! originates from, with scale and rollout-restart actions. Owners are resolved by walking
 //! ownerReferences (Pod → ReplicaSet → Deployment), so the UI can switch from a pod to a
-//! hierarchical view of its workload and all sibling pods.
+//! hierarchical view of its workload and all sibling pods. Each pod also carries its IP and live
+//! CPU/memory usage (metrics-server) against summed container requests/limits, for a k9s-style view.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,13 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams}
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 
-use crate::events::format_age;
+use crate::events::{
+    fetch_pod_usage, format_age, parse_quantity_cpu_milli, parse_quantity_memory_bytes,
+};
 use crate::flux::SharedReconcile;
+
+// Live usage per pod, keyed by (namespace, name): CPU millicores and memory bytes.
+type UsageMap = HashMap<(String, String), (i64, i64)>;
 
 // The workload a pod ultimately belongs to, after resolving ReplicaSet → Deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,8 +39,16 @@ pub struct PodResource {
     pub restarts: i32,
     pub age: String,
     pub node: String,
+    pub ip: String,
     pub owner: Option<OwnerRef>,
     pub uid: String,
+    // Live usage from metrics-server (None when unavailable), and summed container requests/limits.
+    pub cpu_milli: Option<i64>,
+    pub mem_bytes: Option<i64>,
+    pub cpu_req: Option<i64>,
+    pub cpu_lim: Option<i64>,
+    pub mem_req: Option<i64>,
+    pub mem_lim: Option<i64>,
 }
 
 impl PodResource {
@@ -112,11 +126,12 @@ pub async fn fetch_pods(client: Client, namespace: Option<String>, state: Shared
         }
     };
 
+    let usage = fetch_pod_usage(&client).await;
     let mut rs_cache: HashMap<String, Option<OwnerRef>> = HashMap::new();
     let mut pods: Vec<PodResource> = Vec::with_capacity(list.items.len());
     for p in &list.items {
         let owner = resolve_owner(&client, p, &mut rs_cache).await;
-        pods.push(pod_resource(p, owner));
+        pods.push(pod_resource(p, owner, &usage));
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
@@ -148,12 +163,13 @@ pub async fn fetch_workload_pods(client: Client, owner: OwnerRef, state: SharedP
         }
     };
 
+    let usage = fetch_pod_usage(&client).await;
     let mut rs_cache: HashMap<String, Option<OwnerRef>> = HashMap::new();
     let mut pods: Vec<PodResource> = Vec::new();
     for p in &list.items {
         let resolved = resolve_owner(&client, p, &mut rs_cache).await;
         if resolved.as_ref().map(|o| o.kind == owner.kind && o.name == owner.name) == Some(true) {
-            pods.push(pod_resource(p, resolved));
+            pods.push(pod_resource(p, resolved, &usage));
         }
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -249,10 +265,11 @@ async fn replicaset_owner(client: &Client, ns: &str, name: &str) -> Option<Owner
     })
 }
 
-fn pod_resource(p: &Pod, owner: Option<OwnerRef>) -> PodResource {
+fn pod_resource(p: &Pod, owner: Option<OwnerRef>, usage: &UsageMap) -> PodResource {
     let namespace = p.metadata.namespace.clone().unwrap_or_default();
     let name = p.metadata.name.clone().unwrap_or_default();
     let node = p.spec.as_ref().and_then(|s| s.node_name.clone()).unwrap_or_default();
+    let ip = p.status.as_ref().and_then(|s| s.pod_ip.clone()).unwrap_or_default();
     let age = p
         .metadata
         .creation_timestamp
@@ -270,6 +287,12 @@ fn pod_resource(p: &Pod, owner: Option<OwnerRef>) -> PodResource {
         .map(|c| c.iter().map(|cs| cs.restart_count).sum())
         .unwrap_or(0);
 
+    let (cpu_req, cpu_lim, mem_req, mem_lim) = sum_resources(p);
+    let (cpu_milli, mem_bytes) = match usage.get(&(namespace.clone(), name.clone())) {
+        Some((c, m)) => (Some(*c), Some(*m)),
+        None => (None, None),
+    };
+
     PodResource {
         uid: format!("pod|{}/{}", namespace, name),
         status: pod_status(p),
@@ -277,10 +300,40 @@ fn pod_resource(p: &Pod, owner: Option<OwnerRef>) -> PodResource {
         ready,
         age,
         node,
+        ip,
         owner,
+        cpu_milli,
+        mem_bytes,
+        cpu_req,
+        cpu_lim,
+        mem_req,
+        mem_lim,
         namespace,
         name,
     }
+}
+
+// Sum CPU (millicores) and memory (bytes) requests/limits across a pod's regular containers.
+// Returns (cpu_req, cpu_lim, mem_req, mem_lim); a component is None when no container declares it.
+fn sum_resources(p: &Pod) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+    let Some(spec) = p.spec.as_ref() else { return (None, None, None, None) };
+    let mut cpu_req = None;
+    let mut cpu_lim = None;
+    let mut mem_req = None;
+    let mut mem_lim = None;
+    let add = |acc: &mut Option<i64>, v: Option<i64>| {
+        if let Some(v) = v {
+            *acc = Some(acc.unwrap_or(0) + v);
+        }
+    };
+    for c in &spec.containers {
+        let Some(res) = c.resources.as_ref() else { continue };
+        add(&mut cpu_req, res.requests.as_ref().and_then(|m| m.get("cpu")).and_then(|q| parse_quantity_cpu_milli(&q.0)));
+        add(&mut cpu_lim, res.limits.as_ref().and_then(|m| m.get("cpu")).and_then(|q| parse_quantity_cpu_milli(&q.0)));
+        add(&mut mem_req, res.requests.as_ref().and_then(|m| m.get("memory")).and_then(|q| parse_quantity_memory_bytes(&q.0)));
+        add(&mut mem_lim, res.limits.as_ref().and_then(|m| m.get("memory")).and_then(|q| parse_quantity_memory_bytes(&q.0)));
+    }
+    (cpu_req, cpu_lim, mem_req, mem_lim)
 }
 
 // Best-effort STATUS column matching kubectl: a waiting/terminated container reason takes precedence
@@ -310,9 +363,12 @@ fn pod_status(p: &Pod) -> String {
             }
         }
     }
-    status
-        .and_then(|s| s.phase.clone())
-        .unwrap_or_else(|| "Unknown".to_string())
+    match status.and_then(|s| s.phase.as_deref()) {
+        // Match kubectl/k9s wording: a successfully finished pod reads "Completed", not "Succeeded".
+        Some("Succeeded") => "Completed".to_string(),
+        Some(p) => p.to_string(),
+        None => "Unknown".to_string(),
+    }
 }
 
 // (group, candidate versions) for the workload kinds we act on.

@@ -25,6 +25,8 @@ pub struct FileConfig {
     pub language: Option<String>,
     pub providers: Vec<AiProvider>,
     pub active_provider: Option<String>,
+    // Extra namespaces treated as security-critical in the RBAC view, merged with the built-in list.
+    pub critical_namespaces: Vec<String>,
 }
 
 // Load the config file, falling back to defaults when it is missing or malformed

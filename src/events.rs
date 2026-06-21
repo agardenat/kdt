@@ -1410,3 +1410,18 @@ async fn fetch_pod_metrics_map(client: &Client) -> Option<std::collections::Hash
     }
     Some(map)
 }
+
+// Live CPU (millicores) and memory (bytes) usage per pod, summed across its containers, from
+// metrics-server. Empty map when metrics-server is unavailable, so callers degrade gracefully.
+pub async fn fetch_pod_usage(
+    client: &Client,
+) -> std::collections::HashMap<(String, String), (i64, i64)> {
+    let mut out: std::collections::HashMap<(String, String), (i64, i64)> = std::collections::HashMap::new();
+    let Some(per_container) = fetch_pod_metrics_map(client).await else { return out };
+    for ((ns, pod, _c), (cpu, mem)) in per_container {
+        let e = out.entry((ns, pod)).or_insert((0, 0));
+        e.0 += cpu;
+        e.1 += mem;
+    }
+    out
+}

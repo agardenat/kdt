@@ -57,6 +57,8 @@ fn strip_noise(v: &mut serde_json::Value) {
 fn clean_json<T: serde::Serialize>(v: &T) -> Result<String, serde_json::Error> {
     let mut val = serde_json::to_value(v)?;
     strip_noise(&mut val);
+    // Compact on purpose: this body is fed verbatim to the AI prompt, so we minimise tokens (no
+    // whitespace). The Related view re-expands it for display only (see `pretty_json_for_display`).
     serde_json::to_string(&val)
 }
 

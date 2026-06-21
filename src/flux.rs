@@ -608,10 +608,13 @@ async fn resolve_ar(
 // One object owned by a Kustomization (from status.inventory), with its live readiness.
 #[derive(Debug, Clone)]
 pub struct InventoryItem {
+    pub api_version: String,
     pub kind: String,
     pub namespace: String,
     pub name: String,
     pub ready: Option<bool>,
+    // True when the object is actively reconciling/progressing (Ready not yet True but not a failure).
+    pub reconciling: bool,
     pub msg: String,
 }
 
@@ -705,15 +708,16 @@ pub async fn fetch_inventory(
         async move { fetch_item_status(client, egroup, ever, ekind, ens, ename).await }
     });
     let mut items: Vec<InventoryItem> = futures::future::join_all(futs).await;
-    // Surface problems first (failed, then unknown, then ready), then by kind/name.
+    // Surface problems first (failed, reconciling, unknown, ready), then by kind/name.
     items.sort_by(|a, b| {
-        let rank = |r: &Option<bool>| match r {
-            Some(false) => 0,
-            None => 1,
-            Some(true) => 2,
+        let rank = |it: &InventoryItem| match (it.ready, it.reconciling) {
+            (Some(false), _) => 0,
+            (_, true) => 1,
+            (None, false) => 2,
+            (Some(true), _) => 3,
         };
-        rank(&a.ready)
-            .cmp(&rank(&b.ready))
+        rank(a)
+            .cmp(&rank(b))
             .then(a.kind.cmp(&b.kind))
             .then(a.name.cmp(&b.name))
     });
@@ -734,11 +738,14 @@ async fn fetch_item_status(
     ns: String,
     name: String,
 ) -> InventoryItem {
+    let api_version = if group.is_empty() { version.clone() } else { format!("{}/{}", group, version) };
     let mut item = InventoryItem {
+        api_version,
         kind: kind.clone(),
         namespace: ns.clone(),
         name: name.clone(),
         ready: None,
+        reconciling: false,
         msg: String::new(),
     };
     let gvk = GroupVersionKind::gvk(&group, &version, &kind);
@@ -753,8 +760,9 @@ async fn fetch_item_status(
     };
     match api.get(&name).await {
         Ok(o) => {
-            let (ready, msg) = object_readiness(&o, &kind);
+            let (ready, reconciling, msg) = object_readiness(&o, &kind);
             item.ready = ready;
+            item.reconciling = reconciling;
             item.msg = msg;
         }
         Err(_) => {
@@ -765,21 +773,33 @@ async fn fetch_item_status(
     item
 }
 
-// Best-effort readiness for an arbitrary object: a Ready condition when present, otherwise the
-// workload-specific replica counters, otherwise unknown (the object exists / is applied).
-fn object_readiness(obj: &DynamicObject, kind: &str) -> (Option<bool>, String) {
+// Best-effort readiness for an arbitrary object: (ready, reconciling, message). A Ready condition is
+// used when present (Ready=False with a progressing reason, or a Reconciling=True condition, means
+// "in progress", not failed); otherwise workload replica counters; otherwise unknown.
+fn object_readiness(obj: &DynamicObject, kind: &str) -> (Option<bool>, bool, String) {
     let status = obj.data.get("status");
-    if let Some(cond) = status
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array())
+    let conditions = status.and_then(|s| s.get("conditions")).and_then(|c| c.as_array());
+    let reconciling_cond = conditions
+        .map(|arr| {
+            arr.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some("Reconciling")
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })
+        })
+        .unwrap_or(false);
+    if let Some(cond) = conditions
         .and_then(|arr| arr.iter().find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Ready")))
     {
         let st = cond.get("status").and_then(|v| v.as_str()).unwrap_or("Unknown");
+        let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         let msg = cond.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let in_progress = reconciling_cond || is_progressing_reason(reason);
         return match st {
-            "True" => (Some(true), collapse_ws(msg)),
-            "False" => (Some(false), collapse_ws(msg)),
-            _ => (None, collapse_ws(msg)),
+            "True" => (Some(true), false, collapse_ws(msg)),
+            "False" if in_progress => (None, true, collapse_ws(msg)),
+            "False" => (Some(false), false, collapse_ws(msg)),
+            _ if in_progress => (None, true, collapse_ws(msg)),
+            _ => (None, false, collapse_ws(msg)),
         };
     }
     let i64_at = |s: Option<&serde_json::Value>, k: &str| {
@@ -789,20 +809,55 @@ fn object_readiness(obj: &DynamicObject, kind: &str) -> (Option<bool>, String) {
         "Deployment" | "StatefulSet" | "ReplicaSet" => {
             let want = obj.data.get("spec").and_then(|s| s.get("replicas")).and_then(|v| v.as_i64()).unwrap_or(1);
             let ready = i64_at(status, "readyReplicas");
-            (Some(ready >= want && want > 0 || (want == 0)), format!("{}/{} ready", ready, want))
+            let ok = ready >= want && want > 0 || (want == 0);
+            (Some(ok), !ok && want > 0, format!("{}/{} ready", ready, want))
         }
         "DaemonSet" => {
             let want = i64_at(status, "desiredNumberScheduled");
             let ready = i64_at(status, "numberReady");
-            (Some(want > 0 && ready >= want), format!("{}/{} ready", ready, want))
+            let ok = want > 0 && ready >= want;
+            (Some(ok), !ok && want > 0, format!("{}/{} ready", ready, want))
         }
         "Pod" => match status.and_then(|s| s.get("phase")).and_then(|v| v.as_str()) {
-            Some("Running") | Some("Succeeded") => (Some(true), String::new()),
-            Some("Failed") => (Some(false), "Failed".to_string()),
-            Some(p) => (None, p.to_string()),
-            None => (None, String::new()),
+            Some("Running") | Some("Succeeded") => (Some(true), false, String::new()),
+            Some("Failed") => (Some(false), false, "Failed".to_string()),
+            Some("Pending") => (None, true, "Pending".to_string()),
+            Some(p) => (None, false, p.to_string()),
+            None => (None, false, String::new()),
         },
-        _ => (None, String::new()),
+        "Job" => {
+            let has = |t: &str| conditions.map(|a| a.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some(t)
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })).unwrap_or(false);
+            if has("Failed") {
+                (Some(false), false, "Failed".to_string())
+            } else if has("Complete") {
+                (Some(true), false, "Complete".to_string())
+            } else {
+                (None, true, "Running".to_string())
+            }
+        }
+        "PersistentVolumeClaim" => match status.and_then(|s| s.get("phase")).and_then(|v| v.as_str()) {
+            Some("Bound") => (Some(true), false, "Bound".to_string()),
+            Some("Pending") => (None, true, "Pending".to_string()),
+            Some(p) => (Some(false), false, p.to_string()),
+            None => (Some(true), false, String::new()),
+        },
+        "Namespace" => match status.and_then(|s| s.get("phase")).and_then(|v| v.as_str()) {
+            Some("Active") | None => (Some(true), false, String::new()),
+            Some(p) => (Some(false), false, p.to_string()),
+        },
+        "CustomResourceDefinition" => {
+            let established = conditions.map(|a| a.iter().any(|c| {
+                c.get("type").and_then(|v| v.as_str()) == Some("Established")
+                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+            })).unwrap_or(true);
+            (Some(established), false, String::new())
+        }
+        // Resources with no readiness concept (Service, ServiceAccount, NetworkPolicy, ResourceQuota,
+        // ConfigMap, Secret…): a successful GET means they exist, so treat them as applied/healthy.
+        _ => (Some(true), false, String::new()),
     }
 }
 

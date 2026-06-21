@@ -1,5 +1,6 @@
 //! ratatui terminal UI: the central `App` state machine, its modes (events, nodes, usage,
-//! diagnostic, flux, AI panel, command palette…), the key dispatcher, and all rendering.
+//! diagnostic, flux, pods, rbac security, AI panel, command palette…), the key dispatcher, and all
+//! rendering.
 //!
 //! Background work (log/status/AI/node fetches) is spawned onto tokio and writes into shared
 //! state; each fetch carries a key/id that is re-checked before committing, so results from a
@@ -35,13 +36,25 @@ use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
 use crate::flux::{
     build_flux_tree, controller_for_kind, fetch_flux, fetch_inventory, flux_tree_uid, new_flux_state,
     new_inventory_state, new_reconcile_status, reconcile, set_suspend, FlatTreeNode, FluxReady,
-    FluxResource, ReconcileScope, SharedFlux, SharedInventory, SharedReconcile, ALL_CONTROLLERS,
+    FluxResource, InventoryItem, ReconcileScope, SharedFlux, SharedInventory, SharedReconcile,
+    ALL_CONTROLLERS,
 };
+
+// A rendered row of the Flux dependency tree: either a Flux resource node, or one applied object
+// from an expanded Kustomization's inventory (shown as a child, with live readiness).
+pub enum TreeRow {
+    Res(FlatTreeNode),
+    Inv { ks_uid: String, depth: usize, item: InventoryItem },
+}
 use crate::lang;
 use crate::pdf;
 use crate::pods::{
     fetch_pods, fetch_workload_pods, new_pods_state, run_force_recycle, run_restart, run_scale,
     OwnerRef, PodResource, SharedPods, WorkloadResource,
+};
+use crate::rbac::{
+    critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, RbacBinding,
+    Severity as RbacSeverity, SharedRbac,
 };
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 use crate::events::{
@@ -81,7 +94,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull }
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
 #[derive(Clone)]
@@ -122,6 +135,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("pods", &["po", "pod"]),
     ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
+    ("rbac", &["rb", "roles", "bindings", "security", "sec"]),
     ("quit", &["q"]),
 ];
 
@@ -189,23 +203,21 @@ impl NodeUsageSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetailTab { Logs, Status, Related, Inventory }
+pub enum DetailTab { Logs, Status, Related }
 
 impl DetailTab {
     fn next(self) -> Self {
         match self {
             Self::Logs => Self::Status,
             Self::Status => Self::Related,
-            Self::Related => Self::Inventory,
-            Self::Inventory => Self::Logs,
+            Self::Related => Self::Logs,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Self::Logs => Self::Inventory,
+            Self::Logs => Self::Related,
             Self::Status => Self::Logs,
             Self::Related => Self::Status,
-            Self::Inventory => Self::Related,
         }
     }
 }
@@ -231,7 +243,8 @@ pub struct App {
     pub log_scroll: usize,
     pub status_scroll: usize,
     pub related_scroll: usize,
-    pub inventory_scroll: usize,
+    // While true, the Related tab is held at the top (cleared once the user scrolls it).
+    pub related_pin_top: bool,
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
     pub ns_pick_state: SharedNsList,
@@ -266,14 +279,22 @@ pub struct App {
     pub reconcile_status: SharedReconcile,
     pub flux_logs_state: SharedLog,
     pub flux_logs_handle: Option<JoinHandle<()>>,
-    pub inventory_state: SharedInventory,
-    pub last_inventory_key: Option<String>,
     pub last_inventory_tick: std::time::Instant,
     pub flux_tree: bool,
     pub flux_collapsed: std::collections::HashSet<String>,
-    pub flux_tree_nodes: Vec<FlatTreeNode>,
+    // Flattened tree currently displayed (resource nodes + expanded inventory children).
+    pub flux_tree_view: Vec<TreeRow>,
+    // Kustomizations whose inventory is expanded in the tree: uid → (api_version, kind, ns, name).
+    pub flux_inv_expanded: std::collections::HashMap<String, (String, String, String, String)>,
+    // Fetched inventory per expanded Kustomization uid (live status of its applied objects).
+    pub flux_inv: std::collections::HashMap<String, SharedInventory>,
     pub last_flux_sel_uid: Option<String>,
     pub flux_refresh_handle: Option<JoinHandle<()>>,
+    // Set when entering the Flux view: land on the first Kustomization once the list is first loaded.
+    pub flux_select_first_ks: bool,
+    // A flux_tree_uid ("kind|ns/name") to select once the Flux list loads (e.g. jumping from an RBAC
+    // binding to its managing Kustomization/HelmRelease). Takes precedence over first-Kustomization.
+    pub flux_pending_select: Option<String>,
     pub cluster_info: SharedClusterInfo,
     pub pods_state: SharedPods,
     pub pods_focus: Option<OwnerRef>,
@@ -282,6 +303,13 @@ pub struct App {
     pub last_pods_sel_uid: Option<String>,
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
+    pub rbac_state: SharedRbac,
+    pub rbac_cursor: usize,
+    pub rbac_min_sev: RbacSeverity,
+    pub rbac_detail_scroll: usize,
+    pub rbac_refresh_handle: Option<JoinHandle<()>>,
+    // Built-in critical namespaces merged with the user's config overrides.
+    pub critical_ns: Vec<String>,
     // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
     action_menu: Option<ActionMenu>,
 }
@@ -322,7 +350,7 @@ impl App {
             log_scroll: 0,
             status_scroll: 0,
             related_scroll: 0,
-            inventory_scroll: 0,
+            related_pin_top: false,
             h_scroll: 0,
             detail_h_scroll: 0,
             ns_pick_state: new_ns_list_state(),
@@ -357,14 +385,16 @@ impl App {
             reconcile_status: new_reconcile_status(),
             flux_logs_state: new_log_state(),
             flux_logs_handle: None,
-            inventory_state: new_inventory_state(),
-            last_inventory_key: None,
             last_inventory_tick: std::time::Instant::now(),
-            flux_tree: false,
+            flux_tree: true,
             flux_collapsed: std::collections::HashSet::new(),
-            flux_tree_nodes: Vec::new(),
+            flux_tree_view: Vec::new(),
+            flux_inv_expanded: std::collections::HashMap::new(),
+            flux_inv: std::collections::HashMap::new(),
             last_flux_sel_uid: None,
             flux_refresh_handle: None,
+            flux_select_first_ks: false,
+            flux_pending_select: None,
             cluster_info: new_cluster_info_state(),
             pods_state: new_pods_state(),
             pods_focus: None,
@@ -372,6 +402,12 @@ impl App {
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
             ns_return_pods: false,
+            rbac_state: new_rbac_state(),
+            rbac_cursor: 0,
+            rbac_min_sev: RbacSeverity::Info,
+            rbac_detail_scroll: 0,
+            rbac_refresh_handle: None,
+            critical_ns: critical_namespaces(&file_config.critical_namespaces),
             action_menu: None,
         }
     }
@@ -444,43 +480,31 @@ impl App {
         self.maybe_fetch_related();
     }
 
-    // The Inventory tab only makes sense for Flux resources, so it is offered only in the Flux views.
-    fn flux_context(&self) -> bool {
-        matches!(self.mode, Mode::Flux | Mode::FluxFull)
-            || (self.mode == Mode::AiPanel && matches!(self.return_mode, Mode::Flux | Mode::FluxFull))
-    }
-
     fn cycle_tab(&mut self) {
         self.detail_tab = self.detail_tab.next();
-        if self.detail_tab == DetailTab::Inventory && !self.flux_context() {
-            self.detail_tab = self.detail_tab.next();
-        }
         if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
-        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
+        if self.detail_tab == DetailTab::Related { self.related_pin_top = true; }
     }
     fn cycle_tab_back(&mut self) {
         self.detail_tab = self.detail_tab.prev();
-        if self.detail_tab == DetailTab::Inventory && !self.flux_context() {
-            self.detail_tab = self.detail_tab.prev();
-        }
         if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
-        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
+        if self.detail_tab == DetailTab::Related { self.related_pin_top = true; }
     }
 
     fn scroll_detail(&mut self, delta: i32) {
+        self.related_pin_top = false;
         let target = self.scroll_target();
         let cur = *target as i32;
         *target = cur.saturating_add(delta).max(0) as usize;
     }
-    fn scroll_detail_top(&mut self) { *self.scroll_target() = usize::MAX / 2; }
-    fn scroll_detail_bottom(&mut self) { *self.scroll_target() = 0; }
+    fn scroll_detail_top(&mut self) { self.related_pin_top = false; *self.scroll_target() = usize::MAX / 2; }
+    fn scroll_detail_bottom(&mut self) { self.related_pin_top = false; *self.scroll_target() = 0; }
 
     fn scroll_target(&mut self) -> &mut usize {
         match self.detail_tab {
             DetailTab::Logs => &mut self.log_scroll,
             DetailTab::Status => &mut self.status_scroll,
             DetailTab::Related => &mut self.related_scroll,
-            DetailTab::Inventory => &mut self.inventory_scroll,
         }
     }
 
@@ -488,7 +512,6 @@ impl App {
         self.log_scroll = 0;
         self.status_scroll = 0;
         self.related_scroll = 0;
-        self.inventory_scroll = 0;
         self.detail_h_scroll = 0;
     }
 
@@ -508,6 +531,9 @@ impl App {
         let key = format!("{}|{}|{}/{}", rec.api_version, rec.kind, rec.namespace, rec.name);
         if self.last_related_key.as_deref() == Some(&key) { return; }
         self.last_related_key = Some(key.clone());
+        // Related is read top-down: anchor to the top until the user scrolls (re-pinned each frame so
+        // it stays at the top while the content streams in).
+        self.related_pin_top = true;
         {
             let mut s = self.related_state.lock().expect("related state poisoned");
             s.current_key = Some(key.clone());
@@ -598,32 +624,6 @@ impl App {
         });
     }
 
-    // Loads the selected Kustomization's inventory (applied objects + live status). Re-runs when the
-    // selection changes; forced re-runs (10 s tick during a rollout) pass `force = true`.
-    fn maybe_fetch_inventory(&mut self, force: bool) {
-        let Some(idx) = self.table_state.selected() else { return; };
-        let Some(rec) = self.snapshot.get(idx) else { return; };
-        let key = format!("{}|{}|{}/{}", rec.api_version, rec.kind, rec.namespace, rec.name);
-        if !force && self.last_inventory_key.as_deref() == Some(&key) { return; }
-        self.last_inventory_key = Some(key.clone());
-        {
-            let mut s = self.inventory_state.lock().expect("inventory poisoned");
-            s.current_key = Some(key.clone());
-            if !force { s.items.clear(); }
-            s.error = None;
-            s.loading = true;
-        }
-        let client = self.client.clone();
-        let inv_state = self.inventory_state.clone();
-        let api_version = rec.api_version.clone();
-        let kind = rec.kind.clone();
-        let namespace = rec.namespace.clone();
-        let name = rec.name.clone();
-        tokio::spawn(async move {
-            fetch_inventory(client, api_version, kind, namespace, name, key, inv_state).await;
-        });
-    }
-
     fn enter_ns_picker(&mut self) {
         {
             let mut s = self.ns_pick_state.lock().expect("ns list poisoned");
@@ -686,6 +686,10 @@ impl App {
                 None => return,
             },
             Mode::Diagnostic => self.synthetic_diagnostic_record(),
+            Mode::Rbac | Mode::RbacFull => match self.synthetic_rbac_record() {
+                Some(r) => r,
+                None => return,
+            },
             _ => {
                 let Some(idx) = self.table_state.selected() else { return; };
                 let Some(r) = self.snapshot.get(idx).cloned() else { return; };
@@ -1230,6 +1234,11 @@ impl App {
                 }
                 self.enter_flux_logs();
             }
+            "rbac" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_rbac_mode();
+            }
             _ => self.exit_command(),
         }
     }
@@ -1248,6 +1257,9 @@ impl App {
                 self.stop_pods_auto_refresh();
                 self.clear_status_state();
             }
+            Mode::Rbac | Mode::RbacFull => {
+                self.stop_rbac_auto_refresh();
+            }
             _ => {}
         }
         self.mode = Mode::Selection;
@@ -1256,6 +1268,7 @@ impl App {
     fn enter_flux_mode(&mut self) {
         self.mode = Mode::Flux;
         self.detail_tab = DetailTab::Status;
+        self.flux_select_first_ks = true;
         self.snapshot.clear();
         self.table_state.select(None);
         self.selected_uid = None;
@@ -1285,19 +1298,35 @@ impl App {
 
     fn refresh_flux_snapshot(&mut self) {
         // In tree mode the snapshot follows the flattened tree order so selection, detail panes and
-        // actions keep working off snapshot indices; otherwise it is the flat resource list.
+        // actions keep working off snapshot indices; otherwise it is the flat resource list. Each
+        // expanded Kustomization's inventory objects are interleaved as child rows right after it.
         let recs: Vec<EventRecord> = {
             let s = self.flux_state.lock().expect("flux poisoned");
             if self.flux_tree {
                 let flat = build_flux_tree(&s.resources, &self.flux_collapsed);
-                let recs = flat
-                    .iter()
-                    .map(|n| synthetic_flux_record(&s.resources[n.idx]))
-                    .collect();
-                self.flux_tree_nodes = flat;
+                let mut view: Vec<TreeRow> = Vec::with_capacity(flat.len());
+                let mut recs: Vec<EventRecord> = Vec::with_capacity(flat.len());
+                for n in flat {
+                    let r = &s.resources[n.idx];
+                    recs.push(synthetic_flux_record(r));
+                    let uid = flux_tree_uid(r);
+                    let depth = n.depth;
+                    let expanded = r.kind == "Kustomization" && self.flux_inv_expanded.contains_key(&uid);
+                    view.push(TreeRow::Res(n));
+                    if expanded {
+                        if let Some(inv) = self.flux_inv.get(&uid) {
+                            let items = inv.lock().expect("inventory poisoned").items.clone();
+                            for it in items {
+                                recs.push(synthetic_inventory_record(&uid, &it));
+                                view.push(TreeRow::Inv { ks_uid: uid.clone(), depth: depth + 1, item: it });
+                            }
+                        }
+                    }
+                }
+                self.flux_tree_view = view;
                 recs
             } else {
-                self.flux_tree_nodes.clear();
+                self.flux_tree_view.clear();
                 s.resources.iter().map(synthetic_flux_record).collect()
             }
         };
@@ -1313,9 +1342,28 @@ impl App {
             self.last_flux_sel_uid = None;
             return;
         }
-        let idx = prev_uid
-            .as_deref()
-            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+        // Jumping from elsewhere (e.g. RBAC origin) selects a specific resource once it appears.
+        let pending = self.flux_pending_select.as_ref().and_then(|uid| {
+            let target = format!("flux|{}", uid);
+            self.snapshot.iter().position(|r| r.uid == target)
+        });
+        if pending.is_some() {
+            self.flux_pending_select = None;
+        }
+        // On first load of the Flux view, land on the first Kustomization rather than row 0.
+        let first_ks = if self.flux_select_first_ks {
+            self.flux_select_first_ks = false;
+            self.snapshot.iter().position(|r| r.kind == "Kustomization")
+        } else {
+            None
+        };
+        let idx = pending
+            .or(first_ks)
+            .or_else(|| {
+                prev_uid
+                    .as_deref()
+                    .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            })
             .unwrap_or(0)
             .min(self.snapshot.len() - 1);
         self.table_state.select(Some(idx));
@@ -1326,7 +1374,6 @@ impl App {
             self.maybe_fetch_logs();
             self.maybe_fetch_status();
             self.maybe_fetch_related();
-            if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
         }
     }
 
@@ -1346,19 +1393,102 @@ impl App {
         self.refresh_flux_snapshot();
     }
 
-    // Collapses/expands the selected tree node (no-op if it has no children).
+    // Collapses/expands the selected tree node's dependency children (no-op if it has none, or if the
+    // selected row is an inventory child).
     fn toggle_flux_node(&mut self) {
         let Some(sel) = self.table_state.selected() else { return; };
-        let Some(node) = self.flux_tree_nodes.get(sel) else { return; };
-        if !node.has_children { return; }
-        let s = self.flux_state.lock().expect("flux poisoned");
-        let Some(r) = s.resources.get(node.idx) else { return; };
-        let uid = flux_tree_uid(r);
-        drop(s);
+        let idx = match self.flux_tree_view.get(sel) {
+            Some(TreeRow::Res(node)) if node.has_children => node.idx,
+            _ => return,
+        };
+        let uid = {
+            let s = self.flux_state.lock().expect("flux poisoned");
+            let Some(r) = s.resources.get(idx) else { return; };
+            flux_tree_uid(r)
+        };
         if !self.flux_collapsed.remove(&uid) {
             self.flux_collapsed.insert(uid);
         }
         self.refresh_flux_snapshot();
+    }
+
+    // The Kustomization that the selected row belongs to: the row itself if it is a Kustomization, or
+    // the parent of an inventory child row. Returns (uid, api_version, kind, ns, name).
+    fn selected_kustomization(&self) -> Option<(String, String, String, String, String)> {
+        let sel = self.table_state.selected()?;
+        match self.flux_tree_view.get(sel)? {
+            TreeRow::Res(node) => {
+                let s = self.flux_state.lock().expect("flux poisoned");
+                let r = s.resources.get(node.idx)?;
+                if r.kind != "Kustomization" { return None; }
+                Some((flux_tree_uid(r), r.api_version.clone(), r.kind.clone(), r.namespace.clone(), r.name.clone()))
+            }
+            TreeRow::Inv { ks_uid, .. } => {
+                let s = self.flux_state.lock().expect("flux poisoned");
+                let r = s.resources.iter().find(|r| &flux_tree_uid(r) == ks_uid)?;
+                Some((ks_uid.clone(), r.api_version.clone(), r.kind.clone(), r.namespace.clone(), r.name.clone()))
+            }
+        }
+    }
+
+    // `+` on a Kustomization: expand its inventory as child rows and fetch the applied objects' status.
+    fn expand_flux_inventory(&mut self) {
+        if !self.flux_tree {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "inventaire : disponible en vue arbre (t)".to_string(),
+            ));
+            return;
+        }
+        let Some((uid, api_version, kind, ns, name)) = self.selected_kustomization() else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "inventaire : sélectionnez un Kustomization".to_string(),
+            ));
+            return;
+        };
+        self.flux_inv_expanded.insert(uid.clone(), (api_version.clone(), kind.clone(), ns.clone(), name.clone()));
+        self.fetch_inventory_for(&uid, &api_version, &kind, &ns, &name, false);
+        self.refresh_flux_snapshot();
+    }
+
+    // `-`: collapse the inventory of the Kustomization the selected row belongs to.
+    fn collapse_flux_inventory(&mut self) {
+        if let Some((uid, ..)) = self.selected_kustomization() {
+            if self.flux_inv_expanded.remove(&uid).is_some() {
+                self.refresh_flux_snapshot();
+            }
+        }
+    }
+
+    // Spawn an inventory fetch for one Kustomization into its dedicated shared store (keyed by uid).
+    fn fetch_inventory_for(&mut self, uid: &str, api_version: &str, kind: &str, ns: &str, name: &str, force: bool) {
+        let state = self.flux_inv.entry(uid.to_string()).or_insert_with(new_inventory_state).clone();
+        {
+            let mut s = state.lock().expect("inventory poisoned");
+            s.current_key = Some(uid.to_string());
+            if !force { s.items.clear(); }
+            s.error = None;
+            s.loading = true;
+        }
+        let client = self.client.clone();
+        let (api_version, kind, ns, name, key) =
+            (api_version.to_string(), kind.to_string(), ns.to_string(), name.to_string(), uid.to_string());
+        tokio::spawn(async move {
+            fetch_inventory(client, api_version, kind, ns, name, key, state).await;
+        });
+    }
+
+    // Re-fetch every expanded Kustomization's inventory (used by the periodic tick during rollouts).
+    fn refresh_expanded_inventories(&mut self) {
+        let targets: Vec<(String, String, String, String, String)> = self
+            .flux_inv_expanded
+            .iter()
+            .map(|(uid, (av, kind, ns, name))| (uid.clone(), av.clone(), kind.clone(), ns.clone(), name.clone()))
+            .collect();
+        for (uid, av, kind, ns, name) in targets {
+            self.fetch_inventory_for(&uid, &av, &kind, &ns, &name, true);
+        }
     }
 
     fn refresh_flux(&self) {
@@ -1409,6 +1539,16 @@ impl App {
         ));
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
+        // Reconciling a Kustomization: expand its inventory in the tree so its objects can be watched
+        // live (switch to tree view if needed).
+        if kind == "Kustomization" {
+            let uid = format!("{}|{}/{}", kind, ns, name);
+            self.flux_tree = true;
+            self.flux_inv_expanded
+                .insert(uid.clone(), (api_version.clone(), kind.clone(), ns.clone(), name.clone()));
+            self.fetch_inventory_for(&uid, &api_version, &kind, &ns, &name, false);
+            self.refresh_flux_snapshot();
+        }
         tokio::spawn(async move {
             reconcile(client, scope, api_version, kind, ns, name, status).await;
         });
@@ -1543,7 +1683,6 @@ impl App {
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
         self.maybe_fetch_related();
-        if self.detail_tab == DetailTab::Inventory { self.maybe_fetch_inventory(false); }
     }
 
     fn refresh_nodes(&self) {
@@ -1597,6 +1736,125 @@ impl App {
     fn enter_pods_full(&mut self) {
         if self.snapshot.is_empty() { return; }
         self.mode = Mode::PodsFull;
+    }
+
+    // --- RBAC security view -------------------------------------------------------------------
+
+    fn enter_rbac_mode(&mut self) {
+        self.mode = Mode::Rbac;
+        self.rbac_cursor = 0;
+        self.rbac_detail_scroll = 0;
+        self.refresh_rbac();
+        self.start_rbac_auto_refresh();
+    }
+
+    fn exit_rbac_mode(&mut self) {
+        self.stop_rbac_auto_refresh();
+        self.mode = Mode::Selection;
+        self.reset_to_follow();
+    }
+
+    fn enter_rbac_full(&mut self) {
+        if self.rbac_selected().is_none() { return; }
+        self.rbac_detail_scroll = 0;
+        self.mode = Mode::RbacFull;
+    }
+
+    fn exit_rbac_full(&mut self) {
+        self.mode = Mode::Rbac;
+    }
+
+    fn refresh_rbac(&self) {
+        {
+            let mut s = self.rbac_state.lock().expect("rbac poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.rbac_state.clone();
+        let crit = self.critical_ns.clone();
+        tokio::spawn(async move { fetch_rbac(client, crit, state).await; });
+    }
+
+    // RBAC changes slowly; a 30s ticker keeps the view fresh without hammering the API.
+    fn start_rbac_auto_refresh(&mut self) {
+        self.stop_rbac_auto_refresh();
+        let client = self.client.clone();
+        let state = self.rbac_state.clone();
+        let crit = self.critical_ns.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_rbac(client.clone(), crit.clone(), state.clone()).await;
+            }
+        });
+        self.rbac_refresh_handle = Some(handle);
+    }
+
+    fn stop_rbac_auto_refresh(&mut self) {
+        if let Some(h) = self.rbac_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Indices of bindings passing the active severity floor, highest severity first (already sorted).
+    fn rbac_visible(&self) -> Vec<RbacBinding> {
+        let s = self.rbac_state.lock().expect("rbac poisoned");
+        s.bindings
+            .iter()
+            .filter(|b| b.severity >= self.rbac_min_sev)
+            .cloned()
+            .collect()
+    }
+
+    fn rbac_selected(&self) -> Option<RbacBinding> {
+        self.rbac_visible().into_iter().nth(self.rbac_cursor)
+    }
+
+    fn move_rbac_selection(&mut self, delta: i32) {
+        let len = self.rbac_visible().len();
+        if len == 0 { return; }
+        let cur = self.rbac_cursor as i32;
+        self.rbac_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.rbac_detail_scroll = 0;
+    }
+
+    // `o` on an RBAC binding: jump to the Flux object that manages it (Kustomization/HelmRelease),
+    // landing on it in the Flux tree. No-op for non-Flux provenance.
+    fn rbac_open_origin(&mut self) {
+        use crate::rbac::Provenance;
+        let Some(b) = self.rbac_selected() else { return; };
+        let (kind, ns, name) = match &b.provenance {
+            Provenance::FluxKustomization { namespace, name } => ("Kustomization", namespace.clone(), name.clone()),
+            Provenance::FluxHelmRelease { namespace, name } => ("HelmRelease", namespace.clone(), name.clone()),
+            other => {
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    format!("origine {} : non navigable", other.label()),
+                ));
+                return;
+            }
+        };
+        self.stop_rbac_auto_refresh();
+        self.flux_tree = true;
+        self.enter_flux_mode();
+        // Override the default first-Kustomization landing with the exact managing object.
+        self.flux_select_first_ks = false;
+        self.flux_pending_select = Some(format!("{}|{}/{}", kind, ns, name));
+    }
+
+    // Cycle the severity floor: all → HIGH+ → CRITICAL → all.
+    fn cycle_rbac_filter(&mut self) {
+        self.rbac_min_sev = match self.rbac_min_sev {
+            RbacSeverity::Info => RbacSeverity::High,
+            RbacSeverity::High => RbacSeverity::Critical,
+            _ => RbacSeverity::Info,
+        };
+        self.rbac_cursor = 0;
+        self.rbac_detail_scroll = 0;
     }
 
     fn exit_pods_full(&mut self) {
@@ -2101,6 +2359,59 @@ impl App {
         tokio::spawn(async move { fetch_node_usage(client, name, state).await; });
     }
 
+    // Build an event-shaped record describing the selected binding so the AI panel can explain why
+    // it is risky (findings + resolved rules), reusing the existing prompt plumbing.
+    fn synthetic_rbac_record(&self) -> Option<EventRecord> {
+        let b = self.rbac_selected()?;
+        let subjects = b.subjects.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ");
+        let findings = b
+            .findings
+            .iter()
+            .map(|f| format!("[{}] {}: {}", f.sev.label(), f.tag, f.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rules = b
+            .rules
+            .iter()
+            .map(|r| format!(
+                "  apiGroups={:?} resources={:?} verbs={:?}",
+                r.api_groups, r.resources, r.verbs
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = b.source.clone().unwrap_or_default();
+        let message = format!(
+            "{} {} → {}\nscope={}\nsubjects={}\nseverity={}\norigin={}\nsource={}\nfindings:\n{}\nrules:\n{}",
+            b.binding_kind,
+            b.binding_name,
+            b.role_ref.label(),
+            b.scope.label(),
+            subjects,
+            b.severity.label(),
+            b.provenance.label(),
+            source,
+            findings,
+            rules,
+        );
+        Some(EventRecord {
+            uid: format!("rbac|{}|{}", b.binding_kind, b.binding_name),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: Severity::Warning,
+            reason: format!("RBAC/{}", b.severity.label()),
+            api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            kind: b.binding_kind.clone(),
+            namespace: match &b.scope {
+                crate::rbac::Scope::Namespace(ns) => ns.clone(),
+                crate::rbac::Scope::ClusterWide => String::new(),
+            },
+            name: b.binding_name.clone(),
+            message,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        })
+    }
+
     fn synthetic_node_record(&self) -> Option<EventRecord> {
         let s = self.node_list_state.lock().expect("node list poisoned");
         let n = s.nodes.get(self.node_cursor)?;
@@ -2248,11 +2559,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Flux | Mode::FluxFull) {
             app.refresh_flux_snapshot();
             app.drain_reconcile_status();
-            if app.detail_tab == DetailTab::Inventory
+            if !app.flux_inv_expanded.is_empty()
                 && app.last_inventory_tick.elapsed() >= Duration::from_secs(5)
             {
                 app.last_inventory_tick = std::time::Instant::now();
-                app.maybe_fetch_inventory(true);
+                app.refresh_expanded_inventories();
             }
         }
         if matches!(app.mode, Mode::Pods | Mode::PodsFull) {
@@ -2303,7 +2614,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull) => {
             app.enter_command();
         }
 
@@ -2370,6 +2681,8 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Up, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Left, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
+        (KeyCode::Right, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Nodes) => app.move_node_selection(-1),
         (KeyCode::Down, _, Mode::Nodes) => app.move_node_selection(1),
         (KeyCode::PageUp, _, Mode::Nodes) => app.move_node_selection(-10),
@@ -2424,6 +2737,8 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Up, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Left, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
+        (KeyCode::Right, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Flux) => app.move_flux_selection(-1),
         (KeyCode::Down, _, Mode::Flux) => app.move_flux_selection(1),
         (KeyCode::PageUp, _, Mode::Flux) => app.move_flux_selection(-10),
@@ -2431,8 +2746,9 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Tab, _, Mode::Flux) => app.cycle_tab(),
         (KeyCode::BackTab, _, Mode::Flux) => app.cycle_tab_back(),
         (KeyCode::Char(' '), _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
-        (KeyCode::Enter, _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
         (KeyCode::Enter, _, Mode::Flux) => app.enter_flux_full(),
+        (KeyCode::Char('+'), _, Mode::Flux) => app.expand_flux_inventory(),
+        (KeyCode::Char('-'), _, Mode::Flux) => app.collapse_flux_inventory(),
         (KeyCode::Esc, _, Mode::Flux) => app.exit_flux_mode(),
         (KeyCode::F(5), _, Mode::Flux) => app.refresh_flux(),
         (KeyCode::Char('r'), _, Mode::Flux) => app.open_flux_action_menu(),
@@ -2481,6 +2797,8 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Up, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Left, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
+        (KeyCode::Right, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Pods) => app.move_pods_selection(-1),
         (KeyCode::Down, _, Mode::Pods) => app.move_pods_selection(1),
         (KeyCode::PageUp, _, Mode::Pods) => app.move_pods_selection(-10),
@@ -2524,6 +2842,32 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::PodsFull) => app.enter_ai_panel(),
         (KeyCode::Char('l'), _, Mode::PodsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::PodsFull) => {}
+
+        (KeyCode::Up, m, Mode::Rbac) if m.contains(KeyModifiers::SHIFT) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Rbac) if m.contains(KeyModifiers::SHIFT) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Rbac) => app.move_rbac_selection(-1),
+        (KeyCode::Down, _, Mode::Rbac) => app.move_rbac_selection(1),
+        (KeyCode::PageUp, _, Mode::Rbac) => app.move_rbac_selection(-10),
+        (KeyCode::PageDown, _, Mode::Rbac) => app.move_rbac_selection(10),
+        (KeyCode::Enter, _, Mode::Rbac) => app.enter_rbac_full(),
+        (KeyCode::Char('o'), _, Mode::Rbac) => app.rbac_open_origin(),
+        (KeyCode::Char('f'), _, Mode::Rbac) => app.cycle_rbac_filter(),
+        (KeyCode::F(5), _, Mode::Rbac) => app.refresh_rbac(),
+        (KeyCode::Esc, _, Mode::Rbac) => app.exit_rbac_mode(),
+        (KeyCode::Char('i'), _, Mode::Rbac) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Rbac) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Rbac) => {}
+
+        (KeyCode::Up, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::RbacFull) => app.rbac_detail_scroll = 0,
+        (KeyCode::Enter, _, Mode::RbacFull) => app.exit_rbac_full(),
+        (KeyCode::Esc, _, Mode::RbacFull) => app.exit_rbac_full(),
+        (KeyCode::Char('i'), _, Mode::RbacFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::RbacFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::RbacFull) => {}
 
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
@@ -2609,7 +2953,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -2638,11 +2982,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::Flux | Mode::Pods => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -2658,8 +3002,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -2678,6 +3022,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Flux | Mode::FluxFull => st.mode_flux,
         Mode::FluxLogs => st.mode_flux,
         Mode::Pods | Mode::PodsFull => st.mode_pods,
+        Mode::Rbac | Mode::RbacFull => st.mode_rbac,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -2719,10 +3064,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             } else {
                 draw_flux_table(f, app, ta);
             }
+        } else if draw_mode == Mode::Rbac {
+            draw_rbac_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -2805,12 +3152,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
-            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", if app.flux_tree { st.k_fold } else { st.k_zoom })),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
+            Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
+            Span::styled(" +/- ", kbg), Span::raw(format!(" {}   ", st.k_inventory)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             footer_sep(),
@@ -2859,6 +3208,27 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::Rbac => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
+            footer_sep(),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.rbac_min_sev.label())),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::RbacFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
@@ -3848,10 +4218,54 @@ fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
     }
 }
 
+// Snapshot record for one applied inventory object, so selecting it in the tree drives the shared
+// Logs/Status/Related detail panes against that real object.
+fn synthetic_inventory_record(ks_uid: &str, it: &InventoryItem) -> EventRecord {
+    let (severity, reason) = match (it.reconciling, it.ready) {
+        (true, _) => (Severity::Normal, "Reconciling".to_string()),
+        (_, Some(true)) => (Severity::Normal, "Ready".to_string()),
+        (_, Some(false)) => (Severity::Warning, "NotReady".to_string()),
+        (_, None) => (Severity::Normal, "Applied".to_string()),
+    };
+    let message = if it.msg.is_empty() {
+        format!("{} {}/{}", it.kind, it.namespace, it.name)
+    } else {
+        it.msg.clone()
+    };
+    EventRecord {
+        uid: format!("inv|{}|{}|{}/{}", ks_uid, it.kind, it.namespace, it.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: it.api_version.clone(),
+        kind: it.kind.clone(),
+        namespace: it.namespace.clone(),
+        name: it.name.clone(),
+        message,
+        component: "flux".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 // Colour for a pod STATUS string: green when settled, red for crash/error states, yellow otherwise.
+// Row style from the status colour: red rows get a dark-red background, finished (faded) rows are
+// dimmed whole-row, everything else is default.
+fn pod_row_style(status_color: Color) -> Style {
+    if status_color == Color::Red {
+        Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
+    } else if status_color == DIM {
+        Style::default().fg(DIM)
+    } else {
+        Style::default()
+    }
+}
+
 fn pod_status_color(status: &str) -> Color {
     match status {
-        "Running" | "Succeeded" | "Completed" => Color::Green,
+        "Running" => Color::Green,
+        // Finished successfully: faded, like k9s — healthy but no longer active.
+        "Succeeded" | "Completed" => DIM,
         "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => Color::Yellow,
         _ => Color::Red,
     }
@@ -3861,7 +4275,7 @@ fn pod_status_color(status: &str) -> Color {
 // kind="Pod"/apiVersion="v1" make the Logs/Status/Related tabs work for the selected pod.
 fn synthetic_pod_record(p: &PodResource) -> EventRecord {
     let severity = match pod_status_color(&p.status) {
-        Color::Green => Severity::Normal,
+        Color::Green | DIM => Severity::Normal,
         _ => Severity::Warning,
     };
     let owner = p
@@ -3908,6 +4322,34 @@ fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
     }
 }
 
+// A usage value (CPU millicores / memory bytes) formatted, or a dim "—" when metrics are unavailable.
+fn usage_cell(v: Option<i64>, fmt: fn(i64) -> String) -> Cell<'static> {
+    match v {
+        Some(v) => Cell::from(fmt(v)).style(Style::default().fg(Color::Cyan)),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
+    }
+}
+
+// Usage as a percentage of a request/limit, coloured by pressure (green→yellow→orange→red).
+fn pct_cell(usage: Option<i64>, base: Option<i64>) -> Cell<'static> {
+    match (usage, base) {
+        (Some(u), Some(b)) if b > 0 => {
+            let pct = (u * 100) / b;
+            let color = if pct >= 100 {
+                Color::Red
+            } else if pct >= 90 {
+                Color::Rgb(255, 140, 0)
+            } else if pct >= 70 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            Cell::from(format!("{pct}%")).style(Style::default().fg(color))
+        }
+        _ => Cell::from("—").style(Style::default().fg(DIM)),
+    }
+}
+
 fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (pods, loading, error) = {
         let s = app.pods_state.lock().expect("pods poisoned");
@@ -3924,41 +4366,44 @@ fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
-        Cell::from("STATUS"), Cell::from("RESTARTS"), Cell::from("AGE"),
-        Cell::from("NODE"), Cell::from("ORIGIN"),
+        Cell::from("STATUS"), Cell::from("RST"), Cell::from("CPU"), Cell::from("MEM"),
+        Cell::from("%CPU/R"), Cell::from("%CPU/L"), Cell::from("%MEM/R"), Cell::from("%MEM/L"),
+        Cell::from("IP"), Cell::from("NODE"), Cell::from("AGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = pods.iter().map(|p| {
         let status_color = pod_status_color(&p.status);
-        let row_style = if status_color == Color::Red {
-            Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
-        } else {
-            Style::default()
-        };
+        let row_style = pod_row_style(status_color);
         let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
-        let origin = p
-            .owner
-            .as_ref()
-            .map(|o| format!("{}/{}", o.kind, o.name))
-            .unwrap_or_default();
         Row::new(vec![
             Cell::from(p.namespace.clone()),
             Cell::from(p.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(p.ready.clone()),
             Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
-            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+            usage_cell(p.cpu_milli, format_cpu_milli),
+            usage_cell(p.mem_bytes, format_memory_bytes),
+            pct_cell(p.cpu_milli, p.cpu_req),
+            pct_cell(p.cpu_milli, p.cpu_lim),
+            pct_cell(p.mem_bytes, p.mem_req),
+            pct_cell(p.mem_bytes, p.mem_lim),
+            Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
             Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
-            Cell::from(origin).style(Style::default().fg(Color::Cyan)),
+            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
         ])
         .style(row_style)
     }).collect();
 
+    // Size NAMESPACE/NAME to their longest value (clamped) instead of grabbing all the slack, so the
+    // metric columns sit right next to the name like k9s.
+    let ns_w = col_width(pods.iter().map(|p| p.namespace.as_str()), "NAMESPACE", 9, 24);
+    let name_w = col_width(pods.iter().map(|p| p.name.as_str()), "NAME", 12, 50);
     let widths = [
-        Constraint::Length(20), Constraint::Min(28), Constraint::Length(7),
-        Constraint::Length(18), Constraint::Length(8), Constraint::Length(6),
-        Constraint::Length(22), Constraint::Min(24),
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(6),
+        Constraint::Length(12), Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
+        Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
+        Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -3968,6 +4413,12 @@ fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Column width fitted to the longest value (and the header), clamped to [min, max].
+fn col_width<'a>(values: impl Iterator<Item = &'a str>, header: &str, min: u16, max: u16) -> u16 {
+    let longest = values.map(|v| v.chars().count()).max().unwrap_or(0).max(header.len());
+    (longest as u16).clamp(min, max)
 }
 
 // Hierarchical view of a focused workload: the object on the first row (depth 0) followed by its
@@ -3991,7 +4442,8 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("STATUS"),
-        Cell::from("RESTARTS"), Cell::from("AGE"), Cell::from("NODE"),
+        Cell::from("RST"), Cell::from("CPU"), Cell::from("MEM"),
+        Cell::from("IP"), Cell::from("NODE"), Cell::from("AGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
@@ -4005,33 +4457,34 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(format!("▾ {} {}", w.kind, w.name)).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Cell::from(replicas).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from("Workload"),
+            Cell::from(String::new()), Cell::from(String::new()), Cell::from(String::new()),
+            Cell::from(String::new()),
             Cell::from(String::new()),
             Cell::from(w.age.clone()).style(Style::default().fg(DIM)),
-            Cell::from(String::new()),
         ]));
     }
     for p in &pods {
         let status_color = pod_status_color(&p.status);
-        let row_style = if status_color == Color::Red {
-            Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
-        } else {
-            Style::default()
-        };
+        let row_style = pod_row_style(status_color);
         let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
         rows.push(Row::new(vec![
             Cell::from(format!("    {}", p.name)),
             Cell::from(p.ready.clone()),
             Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
-            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+            usage_cell(p.cpu_milli, format_cpu_milli),
+            usage_cell(p.mem_bytes, format_memory_bytes),
+            Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
             Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
+            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
         ])
         .style(row_style));
     }
 
     let widths = [
-        Constraint::Min(40), Constraint::Length(10), Constraint::Length(18),
-        Constraint::Length(8), Constraint::Length(6), Constraint::Min(20),
+        Constraint::Min(36), Constraint::Length(8), Constraint::Length(14),
+        Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
+        Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -4041,6 +4494,226 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Colour for a severity tier, shared by the RBAC table rows and the detail findings.
+fn rbac_sev_color(s: RbacSeverity) -> Color {
+    match s {
+        RbacSeverity::Critical => Color::Red,
+        RbacSeverity::High => Color::Rgb(255, 140, 0),
+        RbacSeverity::Medium => Color::Yellow,
+        RbacSeverity::Low => Color::Cyan,
+        RbacSeverity::Info => DIM,
+    }
+}
+
+fn rbac_sev_icon(s: RbacSeverity) -> &'static str {
+    match s {
+        RbacSeverity::Critical => "●",
+        RbacSeverity::High => "●",
+        RbacSeverity::Medium => "●",
+        RbacSeverity::Low => "○",
+        RbacSeverity::Info => "·",
+    }
+}
+
+// Binding-centric security table: one row per binding, sorted by severity, dangerous grants on top.
+fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, total, counts) = {
+        let s = app.rbac_state.lock().expect("rbac poisoned");
+        let mut c = [0usize; 5];
+        for b in &s.bindings {
+            c[b.severity as usize] += 1;
+        }
+        (s.loading, s.error.clone(), s.bindings.len(), c)
+    };
+    let visible = app.rbac_visible();
+    if !visible.is_empty() {
+        app.rbac_cursor = app.rbac_cursor.min(visible.len() - 1);
+    }
+
+    let title = if let Some(e) = &error {
+        format!("rbac (erreur: {})", e)
+    } else if loading && total == 0 {
+        "rbac (chargement...)".to_string()
+    } else {
+        format!(
+            "rbac ({} bindings · crit{} high{} med{} low{}) · min={}",
+            total,
+            counts[RbacSeverity::Critical as usize],
+            counts[RbacSeverity::High as usize],
+            counts[RbacSeverity::Medium as usize],
+            counts[RbacSeverity::Low as usize],
+            app.rbac_min_sev.label(),
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("SEV"), Cell::from("SCOPE"), Cell::from("SUBJECT"),
+        Cell::from("ROLE"), Cell::from("SOURCE"), Cell::from("RISK"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = visible.iter().map(|b| {
+        let color = rbac_sev_color(b.severity);
+        let subject = match b.subjects.split_first() {
+            Some((first, rest)) if rest.is_empty() => first.label(),
+            Some((first, rest)) => format!("{} (+{})", first.label(), rest.len()),
+            None => "—".to_string(),
+        };
+        let row_style = if b.severity == RbacSeverity::Critical {
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            Cell::from(format!("{} {}", rbac_sev_icon(b.severity), b.severity.label()))
+                .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Cell::from(b.scope.label()).style(Style::default().fg(scope_color(b))),
+            Cell::from(subject),
+            Cell::from(b.role_ref.label()).style(Style::default().fg(Color::Cyan)),
+            Cell::from(b.provenance.label()).style(Style::default().fg(provenance_color(&b.provenance))),
+            Cell::from(b.risk_tags()).style(Style::default().fg(color)),
+            Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
+        ])
+        .style(row_style)
+    }).collect();
+
+    let widths = [
+        Constraint::Length(9), Constraint::Length(18), Constraint::Length(26),
+        Constraint::Length(24), Constraint::Length(22), Constraint::Min(20), Constraint::Length(6),
+    ];
+
+    let mut ts = TableState::default();
+    if !visible.is_empty() {
+        ts.select(Some(app.rbac_cursor));
+    }
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ts);
+}
+
+// A namespaced binding in a critical namespace is highlighted even though its scope is "just" a ns.
+fn scope_color(b: &RbacBinding) -> Color {
+    if matches!(b.scope, crate::rbac::Scope::ClusterWide) {
+        Color::Magenta
+    } else if b.findings.iter().any(|fd| fd.tag == "critical-ns") {
+        Color::Rgb(255, 140, 0)
+    } else {
+        DIM
+    }
+}
+
+// GitOps-managed origins read green (auditable); manual/unmanaged grants read red.
+fn provenance_color(p: &crate::rbac::Provenance) -> Color {
+    use crate::rbac::Provenance::*;
+    match p {
+        FluxKustomization { .. } | FluxHelmRelease { .. } => Color::Green,
+        Helm { .. } | Argo { .. } => Color::Cyan,
+        Owner { .. } => DIM,
+        Kubectl | Unmanaged => Color::Red,
+    }
+}
+
+// Detail panel (split top / full screen): selected binding's findings, then its resolved rules.
+fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(b) = app.rbac_selected() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un binding ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" rbac "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let title = Line::from(Span::styled(
+        format!(" {} {} ", b.binding_kind, b.binding_name),
+        Style::default().fg(Color::Black).bg(rbac_sev_color(b.severity)).add_modifier(Modifier::BOLD),
+    ));
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    lines.push(label("severity", b.severity.label().to_string()));
+    lines.push(label("scope", b.scope.label()));
+    lines.push(label("role", b.role_ref.label()));
+    if b.via_clusterrole {
+        lines.push(label("via", format!("ClusterRole rabattu sur {}", b.scope.label())));
+    }
+    if b.aggregated {
+        lines.push(label("aggregated", "règles composées par agrégation".to_string()));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<10}", "origin"), Style::default().fg(DIM)),
+        Span::styled(b.provenance.label(), Style::default().fg(provenance_color(&b.provenance))),
+    ]));
+    if let Some(src) = &b.source {
+        lines.push(label("source", src.clone()));
+    }
+    for (i, s) in b.subjects.iter().enumerate() {
+        lines.push(label(if i == 0 { "subjects" } else { "" }, s.label()));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("FINDINGS", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+    if b.findings.is_empty() {
+        lines.push(Line::from(Span::styled("  read-only / sans risque détecté", Style::default().fg(DIM))));
+    }
+    for fd in &b.findings {
+        lines.push(rbac_finding_line(fd));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("RULES", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+    if b.rules.is_empty() {
+        lines.push(Line::from(Span::styled("  (aucune règle résolue)", Style::default().fg(DIM))));
+    }
+    for r in &b.rules {
+        let mut spans = vec![
+            Span::styled("  verbs ", Style::default().fg(DIM)),
+            Span::styled(join_or_star(&r.verbs), Style::default().fg(Color::Yellow)),
+            Span::styled("  res ", Style::default().fg(DIM)),
+            Span::raw(join_or_star(&r.resources)),
+            Span::styled("  grp ", Style::default().fg(DIM)),
+            Span::styled(join_or_star(&r.api_groups), Style::default().fg(DIM)),
+        ];
+        if !r.resource_names.is_empty() {
+            spans.push(Span::styled("  names ", Style::default().fg(DIM)));
+            spans.push(Span::styled(r.resource_names.join(","), Style::default().fg(Color::Green)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.rbac_detail_scroll > max_scroll {
+        app.rbac_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.rbac_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn rbac_finding_line(fd: &RbacFinding) -> Line<'static> {
+    let color = rbac_sev_color(fd.sev);
+    Line::from(vec![
+        Span::styled(format!("  {} ", rbac_sev_icon(fd.sev)), Style::default().fg(color)),
+        Span::styled(format!("{:<8}", fd.sev.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<18}", fd.tag), Style::default().fg(color)),
+        Span::raw(fd.detail.clone()),
+    ])
+}
+
+fn join_or_star(v: &[String]) -> String {
+    if v.is_empty() { "—".to_string() } else { v.join(",") }
 }
 
 fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -4098,8 +4771,11 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .style(row_style)
     }).collect();
 
+    let kind_w = col_width(resources.iter().map(|r| r.kind.as_str()), "KIND", 8, 20);
+    let ns_w = col_width(resources.iter().map(|r| r.namespace.as_str()), "NAMESPACE", 9, 24);
+    let name_w = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 12, 50);
     let widths = [
-        Constraint::Length(16), Constraint::Length(22), Constraint::Length(28),
+        Constraint::Length(kind_w), Constraint::Length(ns_w), Constraint::Length(name_w),
         Constraint::Length(10), Constraint::Length(20), Constraint::Length(6), Constraint::Min(20),
     ];
 
@@ -4123,7 +4799,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = if let Some(e) = &error {
         format!("flux arbre (erreur: {})", e)
     } else {
-        format!("flux arbre ({} nœuds)", app.flux_tree_nodes.len())
+        format!("flux arbre ({} nœuds)", app.flux_tree_view.len())
     };
 
     let header_row = Row::new(vec![
@@ -4132,51 +4808,89 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    // Fit the RESSOURCE column to the widest (indented) label instead of a fixed minimum.
+    let mut name_w = "RESSOURCE".chars().count();
     let rows: Vec<Row> = app
-        .flux_tree_nodes
+        .flux_tree_view
         .iter()
-        .filter_map(|n| {
-            let r = resources.get(n.idx)?;
-            let marker = if n.has_children {
-                if n.collapsed { "▸" } else { "▾" }
-            } else {
-                " "
-            };
-            let label = format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind, r.name);
-
-            let (ready_txt, ready_color) = if r.suspended {
-                ("Suspended", Color::Yellow)
-            } else {
-                match r.ready {
-                    FluxReady::Ready => ("Ready", Color::Green),
-                    FluxReady::Reconciling => ("Reconciling", Color::Cyan),
-                    FluxReady::Failed => ("Failed", Color::Red),
-                    FluxReady::Unknown => ("Unknown", Color::Yellow),
+        .filter_map(|row| match row {
+            TreeRow::Res(n) => {
+                let r = resources.get(n.idx)?;
+                let marker = if n.has_children {
+                    if n.collapsed { "▸" } else { "▾" }
+                } else {
+                    " "
+                };
+                let mut label = format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind, r.name);
+                // Show that a Kustomization can reveal (or hide) its applied objects with +/-.
+                if r.kind == "Kustomization" {
+                    let expanded = app.flux_inv_expanded.contains_key(&flux_tree_uid(r));
+                    label.push_str(if expanded { "  ⊟" } else { "  ⊞" });
                 }
-            };
-            let row_style = match (r.suspended, r.ready) {
-                (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
-                (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
-                (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
-                (true, _) => Style::default().fg(DIM),
-                (false, FluxReady::Ready) => Style::default(),
-            };
-            let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
-            Some(
-                Row::new(vec![
-                    Cell::from(label),
-                    Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
-                    Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
-                    Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
-                    flux_message_cell(r, msg_color),
-                ])
-                .style(row_style),
-            )
+                name_w = name_w.max(label.chars().count());
+
+                let (ready_txt, ready_color) = if r.suspended {
+                    ("Suspended", Color::Yellow)
+                } else {
+                    match r.ready {
+                        FluxReady::Ready => ("Ready", Color::Green),
+                        FluxReady::Reconciling => ("Reconciling", Color::Cyan),
+                        FluxReady::Failed => ("Failed", Color::Red),
+                        FluxReady::Unknown => ("Unknown", Color::Yellow),
+                    }
+                };
+                let row_style = match (r.suspended, r.ready) {
+                    (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+                    (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+                    (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
+                    (true, _) => Style::default().fg(DIM),
+                    (false, FluxReady::Ready) => Style::default(),
+                };
+                let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
+                Some(
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+                        Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                        flux_message_cell(r, msg_color),
+                    ])
+                    .style(row_style),
+                )
+            }
+            TreeRow::Inv { depth, item, .. } => {
+                let (glyph, color) = inventory_glyph(item);
+                let nsname = if item.namespace.is_empty() {
+                    item.name.clone()
+                } else {
+                    format!("{}/{}", item.namespace, item.name)
+                };
+                let label = format!("{}{} {} {}", "  ".repeat(*depth), glyph, item.kind, nsname);
+                name_w = name_w.max(label.chars().count());
+                let ready_txt = if item.reconciling {
+                    "Reconciling"
+                } else {
+                    match item.ready {
+                        Some(true) => "Ready",
+                        Some(false) => "NotReady",
+                        None => "—",
+                    }
+                };
+                Some(
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(color)),
+                        Cell::from(ready_txt).style(Style::default().fg(color)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(item.msg.clone()).style(Style::default().fg(DIM)),
+                    ]),
+                )
+            }
         })
         .collect();
 
     let widths = [
-        Constraint::Min(40), Constraint::Length(10), Constraint::Length(18),
+        Constraint::Length((name_w as u16).clamp(24, 80)), Constraint::Length(10), Constraint::Length(18),
         Constraint::Length(6), Constraint::Min(20),
     ];
 
@@ -4310,6 +5024,13 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let is_rbac_mode = matches!(app.mode, Mode::Rbac | Mode::RbacFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Rbac | Mode::RbacFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Rbac | Mode::RbacFull));
+    if is_rbac_mode {
+        draw_rbac_detail(f, app, area);
+        return;
+    }
     let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)
         || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage))
         || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Nodes | Mode::NodesFull));
@@ -4323,40 +5044,22 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
     } else {
-        // Inventory only applies to Flux resources; outside the Flux views, treat it as Logs.
-        let show_inventory = app.flux_context();
-        let tab = if app.detail_tab == DetailTab::Inventory && !show_inventory {
-            DetailTab::Logs
-        } else {
-            app.detail_tab
-        };
-        let mut spans = vec![
-            tab_span("Logs", tab == DetailTab::Logs),
+        Line::from(vec![
+            tab_span("Logs", app.detail_tab == DetailTab::Logs),
             Span::raw(" │ "),
-            tab_span("Status", tab == DetailTab::Status),
+            tab_span("Status", app.detail_tab == DetailTab::Status),
             Span::raw(" │ "),
-            tab_span("Related", tab == DetailTab::Related),
-        ];
-        if show_inventory {
-            spans.push(Span::raw(" │ "));
-            spans.push(tab_span("Inventory", tab == DetailTab::Inventory));
-        }
-        Line::from(spans)
+            tab_span("Related", app.detail_tab == DetailTab::Related),
+        ])
     };
 
-    let effective_tab = if app.detail_tab == DetailTab::Inventory && !app.flux_context() {
-        DetailTab::Logs
-    } else {
-        app.detail_tab
-    };
     let lines: Vec<Line<'static>> = if is_node_mode {
         status_lines(app)
     } else {
-        match effective_tab {
+        match app.detail_tab {
             DetailTab::Logs => log_lines(app),
             DetailTab::Status => status_lines(app),
             DetailTab::Related => related_lines(app),
-            DetailTab::Inventory => inventory_lines(app),
         }
     };
 
@@ -4364,7 +5067,12 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let total = lines.len();
     let max_scroll = total.saturating_sub(visible);
 
-    let scroll_offset = {
+    // The Related tab is held at the top while pinned (re-evaluated each frame so it stays at the top
+    // as the content streams in), until the user scrolls.
+    let scroll_offset = if !is_node_mode && app.detail_tab == DetailTab::Related && app.related_pin_top {
+        app.related_scroll = max_scroll;
+        max_scroll
+    } else {
         let target = app.scroll_target();
         if *target > max_scroll { *target = max_scroll; }
         *target
@@ -4419,47 +5127,17 @@ fn log_lines(app: &App) -> Vec<Line<'static>> {
     s.lines.iter().map(|l| colorize_log_line(l)).collect()
 }
 
-// Renders the selected Kustomization's inventory: one line per applied object with a status glyph.
-fn inventory_lines(app: &App) -> Vec<Line<'static>> {
-    let s = app.inventory_state.lock().expect("inventory poisoned");
-    if let Some(e) = &s.error {
-        return vec![Line::from(Span::styled(e.clone(), Style::default().fg(DIM)))];
-    }
-    if s.loading && s.items.is_empty() {
-        return vec![Line::from("(loading...)")];
-    }
-    if s.items.is_empty() {
-        return vec![Line::from(Span::styled("(inventaire vide)".to_string(), Style::default().fg(DIM)))];
-    }
-    let header = format!("{} objets", s.items.len());
-    let mut out = vec![Line::from(Span::styled(header, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))];
-    if s.prune == Some(true) {
-        out.push(Line::from(Span::styled(
-            "⚠ prune activé : les objets retirés du git sont supprimés du cluster".to_string(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )));
-    }
-    for it in &s.items {
-        let (glyph, color) = match it.ready {
+// Status glyph + colour for an applied inventory object (shared by the tree rows).
+fn inventory_glyph(it: &InventoryItem) -> (&'static str, Color) {
+    if it.reconciling {
+        ("⟳", Color::Cyan)
+    } else {
+        match it.ready {
             Some(true) => ("✓", Color::Green),
             Some(false) => ("✗", Color::Red),
             None => ("·", DIM),
-        };
-        let kind_name = if it.namespace.is_empty() {
-            format!("{} {}", it.kind, it.name)
-        } else {
-            format!("{} {}/{}", it.kind, it.namespace, it.name)
-        };
-        let mut spans = vec![
-            Span::styled(format!(" {} ", glyph), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::raw(kind_name),
-        ];
-        if !it.msg.is_empty() {
-            spans.push(Span::styled(format!("  — {}", it.msg), Style::default().fg(DIM)));
         }
-        out.push(Line::from(spans));
     }
-    out
 }
 
 fn flux_logs_lines(app: &App) -> Vec<Line<'static>> {
@@ -4641,10 +5319,11 @@ fn related_lines(app: &App) -> Vec<Line<'static>> {
             for (title, body) in sections.iter() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    format!("◆ {}", title),
+                    format!("> {}", title),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )));
-                for body_line in body.lines() {
+                let display = pretty_json_for_display(body);
+                for body_line in display.lines() {
                     lines.push(colorize_json_line(body_line));
                 }
             }
@@ -4652,6 +5331,28 @@ fn related_lines(app: &App) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+// Re-expand a compact JSON section body to indented multi-line form for display. The stored body is
+// compact (token-minimal for the AI); a trailing truncation marker or a cut object falls back to raw.
+fn pretty_json_for_display(body: &str) -> String {
+    let (json, suffix) = match body.split_once("\n... ") {
+        Some((j, s)) => (j, Some(s)),
+        None => (body, None),
+    };
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(v) => match serde_json::to_string_pretty(&v) {
+            Ok(mut p) => {
+                if let Some(s) = suffix {
+                    p.push_str("\n... ");
+                    p.push_str(s);
+                }
+                p
+            }
+            Err(_) => body.to_string(),
+        },
+        Err(_) => body.to_string(),
+    }
 }
 
 fn colorize_json_line(line: &str) -> Line<'static> {
