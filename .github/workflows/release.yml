@@ -35,9 +35,18 @@ jobs:
 
       - run: tar czf $APP_NAME-macos-universal.tar.gz $APP_NAME
 
+      - name: Build Homebrew bottle (all tag)
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p bottle/$APP_NAME/$version/bin
+          cp $APP_NAME bottle/$APP_NAME/$version/bin/
+          tar czf "$APP_NAME-$version.all.bottle.tar.gz" -C bottle $APP_NAME
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.APP_NAME }}-macos-universal.tar.gz
+          files: |
+            ${{ env.APP_NAME }}-macos-universal.tar.gz
+            ${{ env.APP_NAME }}-*.all.bottle.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -98,27 +107,24 @@ jobs:
           base="https://github.com/agardenat/kdt/releases/download/${TAG}"
           gh release download "$TAG" --repo agardenat/kdt \
             --pattern 'kdt-macos-universal.tar.gz' \
-            --pattern 'kdt-linux-x86_64.tar.gz' \
+            --pattern "kdt-${version}.all.bottle.tar.gz" \
             --dir assets
-          macos_sha=$(sha256sum assets/kdt-macos-universal.tar.gz | cut -d' ' -f1)
-          linux_sha=$(sha256sum assets/kdt-linux-x86_64.tar.gz | cut -d' ' -f1)
+          src_sha=$(sha256sum assets/kdt-macos-universal.tar.gz | cut -d' ' -f1)
+          bottle_sha=$(sha256sum "assets/kdt-${version}.all.bottle.tar.gz" | cut -d' ' -f1)
           mkdir -p tap/Formula
           cat > tap/Formula/kdt.rb <<EOF
           class Kdt < Formula
             desc "Kubernetes diagnostics, events and logs in a terminal UI"
             homepage "https://github.com/agardenat/kdt"
             version "${version}"
+            url "${base}/kdt-macos-universal.tar.gz"
+            sha256 "${src_sha}"
 
-            on_macos do
-              url "${base}/kdt-macos-universal.tar.gz"
-              sha256 "${macos_sha}"
-            end
+            depends_on :macos
 
-            on_linux do
-              on_intel do
-                url "${base}/kdt-linux-x86_64.tar.gz"
-                sha256 "${linux_sha}"
-              end
+            bottle do
+              root_url "${base}"
+              sha256 cellar: :any_skip_relocation, all: "${bottle_sha}"
             end
 
             def install
