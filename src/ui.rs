@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 const DIM: Color = Color::Rgb(150, 150, 150);
 const SYS_DIM: Color = Color::Rgb(95, 95, 95);
 
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::DefaultTerminal;
 use tokio::task::JoinHandle;
@@ -936,7 +936,18 @@ impl App {
             }
             _ => String::new(),
         };
-        if text.is_empty() {
+        self.copy_text(text);
+    }
+
+    // Copy the text of the detail panel tab (Logs/Status/Related, or the node status) currently
+    // shown, mirroring exactly what draw_detail renders for the active mode.
+    fn copy_detail_view(&mut self) {
+        let text = detail_visible_text(self);
+        self.copy_text(text);
+    }
+
+    fn copy_text(&mut self, text: String) {
+        if text.trim().is_empty() {
             self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
             return;
         }
@@ -2659,6 +2670,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('c'), _, Mode::AiPanel) => app.copy_current_view(),
         (_, _, Mode::AiPanel) => {}
 
+        // Copy the active detail zone (Logs/Status/Related, or node status) wherever that panel is
+        // shown — same affordance as the AI/diagnostic views, just on the split detail panel.
+        (KeyCode::Char('c'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Pods | Mode::PodsFull | Mode::Flux | Mode::FluxFull) => app.copy_detail_view(),
+
         (KeyCode::Up, m, Mode::DetailFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::DetailFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
         (KeyCode::PageUp, _, Mode::DetailFull) => app.scroll_detail(10),
@@ -3117,6 +3132,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3127,6 +3143,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3137,6 +3154,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" u ", kbg), Span::raw(format!(" {}   ", st.k_node_usage)),
             Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3146,6 +3164,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3164,6 +3183,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3177,6 +3197,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -3199,6 +3220,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             }
             spans.extend(vec![
                 footer_sep(),
+                Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
                 Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
                 Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
             ]);
@@ -3210,6 +3232,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -4741,7 +4764,13 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = resources.iter().map(|r| {
+    let kind_w = col_width(resources.iter().map(|r| r.kind.as_str()), "KIND", 8, 20);
+    let ns_w = col_width(resources.iter().map(|r| r.namespace.as_str()), "NAMESPACE", 9, 24);
+    let name_w = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 12, 50);
+    let selected = app.table_state.selected();
+    let msg_w = flux_msg_width(area.width, kind_w + ns_w + name_w + 10 + 20 + 6, 7);
+
+    let rows: Vec<Row> = resources.iter().enumerate().map(|(i, r)| {
         let (ready_txt, ready_color) = if r.suspended {
             ("Suspended", Color::Yellow)
         } else {
@@ -4760,6 +4789,12 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             (false, FluxReady::Ready) => Style::default(),
         };
         let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
+        // The focused row expands its message over multiple lines so the full reason is readable.
+        let (msg_cell, height) = if selected == Some(i) && !r.message.is_empty() {
+            flux_message_cell_wrapped(r, msg_color, msg_w)
+        } else {
+            (flux_message_cell(r, msg_color), 1)
+        };
         Row::new(vec![
             Cell::from(r.kind.clone()).style(Style::default().fg(Color::Cyan)),
             Cell::from(r.namespace.clone()),
@@ -4767,14 +4802,12 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
             Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
             Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
-            flux_message_cell(r, msg_color),
+            msg_cell,
         ])
+        .height(height)
         .style(row_style)
     }).collect();
 
-    let kind_w = col_width(resources.iter().map(|r| r.kind.as_str()), "KIND", 8, 20);
-    let ns_w = col_width(resources.iter().map(|r| r.namespace.as_str()), "NAMESPACE", 9, 24);
-    let name_w = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 12, 50);
     let widths = [
         Constraint::Length(kind_w), Constraint::Length(ns_w), Constraint::Length(name_w),
         Constraint::Length(10), Constraint::Length(20), Constraint::Length(6), Constraint::Min(20),
@@ -4809,14 +4842,14 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // Fit the RESSOURCE column to the widest (indented) label instead of a fixed minimum.
-    let mut name_w = "RESSOURCE".chars().count();
-    let rows: Vec<Row> = app
+    // First pass: build every (indented) label so the RESSOURCE column can be sized before the rows
+    // are constructed — the MESSAGE width (needed to wrap the focused row) depends on that column.
+    let labels: Vec<String> = app
         .flux_tree_view
         .iter()
-        .filter_map(|row| match row {
+        .map(|row| match row {
             TreeRow::Res(n) => {
-                let r = resources.get(n.idx)?;
+                let Some(r) = resources.get(n.idx) else { return String::new(); };
                 let marker = if n.has_children {
                     if n.collapsed { "▸" } else { "▾" }
                 } else {
@@ -4828,70 +4861,100 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let expanded = app.flux_inv_expanded.contains_key(&flux_tree_uid(r));
                     label.push_str(if expanded { "  ⊟" } else { "  ⊞" });
                 }
-                name_w = name_w.max(label.chars().count());
-
-                let (ready_txt, ready_color) = if r.suspended {
-                    ("Suspended", Color::Yellow)
-                } else {
-                    match r.ready {
-                        FluxReady::Ready => ("Ready", Color::Green),
-                        FluxReady::Reconciling => ("Reconciling", Color::Cyan),
-                        FluxReady::Failed => ("Failed", Color::Red),
-                        FluxReady::Unknown => ("Unknown", Color::Yellow),
-                    }
-                };
-                let row_style = match (r.suspended, r.ready) {
-                    (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
-                    (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
-                    (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
-                    (true, _) => Style::default().fg(DIM),
-                    (false, FluxReady::Ready) => Style::default(),
-                };
-                let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
-                Some(
-                    Row::new(vec![
-                        Cell::from(label),
-                        Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
-                        Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
-                        Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
-                        flux_message_cell(r, msg_color),
-                    ])
-                    .style(row_style),
-                )
+                label
             }
             TreeRow::Inv { depth, item, .. } => {
-                let (glyph, color) = inventory_glyph(item);
                 let nsname = if item.namespace.is_empty() {
                     item.name.clone()
                 } else {
                     format!("{}/{}", item.namespace, item.name)
                 };
-                let label = format!("{}{} {} {}", "  ".repeat(*depth), glyph, item.kind, nsname);
-                name_w = name_w.max(label.chars().count());
-                let ready_txt = if item.reconciling {
-                    "Reconciling"
-                } else {
-                    match item.ready {
-                        Some(true) => "Ready",
-                        Some(false) => "NotReady",
-                        None => "—",
-                    }
-                };
-                Some(
+                format!("{}{} {} {}", "  ".repeat(*depth), inventory_glyph(item).0, item.kind, nsname)
+            }
+        })
+        .collect();
+    let name_w = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("RESSOURCE".chars().count());
+    let name_col = (name_w as u16).clamp(24, 80);
+    let selected = app.table_state.selected();
+    let msg_w = flux_msg_width(area.width, name_col + 10 + 18 + 6, 5);
+
+    let mut emit_idx = 0usize;
+    let rows: Vec<Row> = app
+        .flux_tree_view
+        .iter()
+        .enumerate()
+        .filter_map(|(vi, row)| {
+            let this_idx = emit_idx;
+            let label = labels[vi].clone();
+            let built = match row {
+                TreeRow::Res(n) => {
+                    let r = resources.get(n.idx)?;
+                    let (ready_txt, ready_color) = if r.suspended {
+                        ("Suspended", Color::Yellow)
+                    } else {
+                        match r.ready {
+                            FluxReady::Ready => ("Ready", Color::Green),
+                            FluxReady::Reconciling => ("Reconciling", Color::Cyan),
+                            FluxReady::Failed => ("Failed", Color::Red),
+                            FluxReady::Unknown => ("Unknown", Color::Yellow),
+                        }
+                    };
+                    let row_style = match (r.suspended, r.ready) {
+                        (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+                        (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
+                        (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
+                        (true, _) => Style::default().fg(DIM),
+                        (false, FluxReady::Ready) => Style::default(),
+                    };
+                    let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
+                    // The focused row expands its message so the full reason is readable inline.
+                    let (msg_cell, height) = if selected == Some(this_idx) && !r.message.is_empty() {
+                        flux_message_cell_wrapped(r, msg_color, msg_w)
+                    } else {
+                        (flux_message_cell(r, msg_color), 1)
+                    };
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+                        Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                        msg_cell,
+                    ])
+                    .height(height)
+                    .style(row_style)
+                }
+                TreeRow::Inv { item, .. } => {
+                    let (_, color) = inventory_glyph(item);
+                    let ready_txt = if item.reconciling {
+                        "Reconciling"
+                    } else {
+                        match item.ready {
+                            Some(true) => "Ready",
+                            Some(false) => "NotReady",
+                            None => "—",
+                        }
+                    };
                     Row::new(vec![
                         Cell::from(label).style(Style::default().fg(color)),
                         Cell::from(ready_txt).style(Style::default().fg(color)),
                         Cell::from(""),
                         Cell::from(""),
                         Cell::from(item.msg.clone()).style(Style::default().fg(DIM)),
-                    ]),
-                )
-            }
+                    ])
+                }
+            };
+            emit_idx += 1;
+            Some(built)
         })
         .collect();
 
     let widths = [
-        Constraint::Length((name_w as u16).clamp(24, 80)), Constraint::Length(10), Constraint::Length(18),
+        Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(18),
         Constraint::Length(6), Constraint::Min(20),
     ];
 
@@ -4915,6 +4978,66 @@ fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
     } else {
         Cell::from(r.message.clone()).style(Style::default().fg(msg_color))
     }
+}
+
+// Word-wrap to `width` columns, hard-breaking tokens longer than the width (Flux failure messages
+// carry long unbreakable tokens like fully-qualified CRD names).
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        // Hard-break a token that cannot fit on its own line.
+        while word.chars().count() > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let cut = word.char_indices().nth(width).map(|(i, _)| i).unwrap_or(word.len());
+            lines.push(word[..cut].to_string());
+            word = &word[cut..];
+        }
+        let extra = if cur.is_empty() { 0 } else { 1 };
+        if cur.chars().count() + extra + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+// Multi-line message cell for the focused row, so a failure reason is fully readable inline instead
+// of being truncated at the column edge. Returns the cell and the row height it needs.
+fn flux_message_cell_wrapped(r: &FluxResource, msg_color: Color, width: usize) -> (Cell<'static>, u16) {
+    let prune_prefix = r.prune == Some(true);
+    let prefix = if prune_prefix { "⚠ prune " } else { "" };
+    let body = format!("{}{}", prefix, r.message);
+    let wrapped = wrap_words(&body, width);
+    let height = wrapped.len().clamp(1, 8) as u16;
+    let lines: Vec<Line<'static>> = wrapped
+        .into_iter()
+        .take(8)
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(msg_color))))
+        .collect();
+    (Cell::from(Text::from(lines)), height)
+}
+
+// Width available for the flux MESSAGE column: inner width minus the fixed columns and the
+// inter-column spacing (ratatui's default column_spacing is 1).
+fn flux_msg_width(area_width: u16, fixed: u16, ncols: u16) -> usize {
+    let inner = area_width.saturating_sub(2);
+    inner.saturating_sub(fixed).saturating_sub(ncols.saturating_sub(1)).max(20) as usize
 }
 
 fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -5024,6 +5147,29 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
+// Flatten a styled line back to its plain text (used to copy what the detail panel shows).
+fn line_plain(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+// Plain text of the detail panel tab currently displayed, matching draw_detail's tab/node logic
+// (RBAC has its own panel and is not handled here — copy is not wired for those modes).
+fn detail_visible_text(app: &App) -> String {
+    let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Nodes | Mode::NodesFull));
+    let lines = if is_node_mode {
+        status_lines(app)
+    } else {
+        match app.detail_tab {
+            DetailTab::Logs => log_lines(app),
+            DetailTab::Status => status_lines(app),
+            DetailTab::Related => related_lines(app),
+        }
+    };
+    lines.iter().map(line_plain).collect::<Vec<_>>().join("\n")
+}
+
 fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
     let is_rbac_mode = matches!(app.mode, Mode::Rbac | Mode::RbacFull)
         || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Rbac | Mode::RbacFull))
@@ -5085,9 +5231,22 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         0
     };
 
-    let p = Paragraph::new(lines)
-        .scroll((scroll, app.detail_h_scroll as u16))
-        .block(Block::default().borders(Borders::ALL).title(title));
+    // Wrap the Status tab (and node status) so long condition messages — typically a Flux
+    // reconciliation error — are fully visible instead of being cut at the right edge. Logs and
+    // Related keep horizontal scrolling. Status content is short enough that the bottom-anchored
+    // scroll math stays accurate after wrapping.
+    let wrap_status = is_node_mode || app.detail_tab == DetailTab::Status;
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let p = if wrap_status {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(block)
+    } else {
+        Paragraph::new(lines)
+            .scroll((scroll, app.detail_h_scroll as u16))
+            .block(block)
+    };
     f.render_widget(p, area);
 }
 

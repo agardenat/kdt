@@ -510,7 +510,15 @@ fn format_dynamic_status(obj: &DynamicObject, kind: &str) -> Vec<(LineColor, Str
                 }
                 out.push((color, line));
                 if !message.is_empty() {
-                    out.push((LineColor::Dim, format!("    {}", message)));
+                    // Surface the message in the condition's colour so a failure (red) stands out
+                    // instead of being dimmed to gray, which is the least readable for the part
+                    // that actually explains the problem.
+                    let msg_color = match color {
+                        LineColor::Err => LineColor::Err,
+                        LineColor::Warn => LineColor::Warn,
+                        _ => LineColor::Dim,
+                    };
+                    out.push((msg_color, format!("    {}", message)));
                 }
             }
         }

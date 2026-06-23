@@ -76,6 +76,7 @@ pub struct Strings {
     pub k_scale: &'static str,
     pub k_scale_set: &'static str,
     pub k_ns_here: &'static str,
+    pub k_copy: &'static str,
 
     pub menu_pods_title: &'static str,
     pub menu_flux_title: &'static str,
@@ -229,6 +230,7 @@ pub const FR: Strings = Strings {
     k_scale: "scale",
     k_scale_set: "définir N…",
     k_ns_here: "filtrer ce ns",
+    k_copy: "copier",
 
     menu_pods_title: "Action sur le workload",
     menu_flux_title: "Réconciliation Flux",
@@ -382,6 +384,7 @@ pub const EN: Strings = Strings {
     k_scale: "scale",
     k_scale_set: "set N…",
     k_ns_here: "filter this ns",
+    k_copy: "copy",
 
     menu_pods_title: "Workload action",
     menu_flux_title: "Flux reconcile",
