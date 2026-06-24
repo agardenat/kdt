@@ -21,6 +21,8 @@ pub struct Strings {
     pub mode_pods: &'static str,
     pub mode_rbac: &'static str,
     pub mode_vuln: &'static str,
+    pub mode_secrets: &'static str,
+    pub mode_configmaps: &'static str,
 
     pub k_quit: &'static str,
     pub k_select: &'static str,
@@ -78,6 +80,8 @@ pub struct Strings {
     pub k_scale_set: &'static str,
     pub k_ns_here: &'static str,
     pub k_copy: &'static str,
+    pub k_reveal_b64: &'static str,
+    pub k_reveal_plain: &'static str,
 
     pub menu_pods_title: &'static str,
     pub menu_flux_title: &'static str,
@@ -176,6 +180,8 @@ pub const FR: Strings = Strings {
     mode_pods: "PODS",
     mode_rbac: "RBAC",
     mode_vuln: "VULN",
+    mode_secrets: "SECRETS",
+    mode_configmaps: "CONFIGMAPS",
 
     k_quit: "quitter",
     k_select: "sélection",
@@ -233,6 +239,8 @@ pub const FR: Strings = Strings {
     k_scale_set: "définir N…",
     k_ns_here: "filtrer ce ns",
     k_copy: "copier",
+    k_reveal_b64: "base64",
+    k_reveal_plain: "déchiffrer",
 
     menu_pods_title: "Action sur le workload",
     menu_flux_title: "Réconciliation Flux",
@@ -331,6 +339,8 @@ pub const EN: Strings = Strings {
     mode_pods: "PODS",
     mode_rbac: "RBAC",
     mode_vuln: "VULN",
+    mode_secrets: "SECRETS",
+    mode_configmaps: "CONFIGMAPS",
 
     k_quit: "quit",
     k_select: "select",
@@ -388,6 +398,8 @@ pub const EN: Strings = Strings {
     k_scale_set: "set N…",
     k_ns_here: "filter this ns",
     k_copy: "copy",
+    k_reveal_b64: "base64",
+    k_reveal_plain: "decode",
 
     menu_pods_title: "Workload action",
     menu_flux_title: "Flux reconcile",

@@ -67,7 +67,57 @@ enum VulnRow {
     K8s(K8sVersionRisk),
     Image(VulnComponent),
 }
+use crate::secrets::{
+    fetch_secrets, new_secrets_state, Expiry, SecretInfo, SharedSecrets,
+};
+use crate::configmaps::{
+    fetch_configmaps, human_size, new_configmaps_state, ConfigMapInfo, SharedConfigMaps,
+};
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
+
+// In-panel reveal of a secret's data values (`b`/`d`). Hidden by default and reset whenever the
+// selection changes, so values never linger on screen unintentionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretReveal { Hidden, Base64, Decoded }
+
+// First entry of every data-copy picker: copies the whole object manifest instead of a single key.
+const MANIFEST_ENTRY: &str = "manifest (YAML)";
+
+// Modal picker shown on `c` over a secret: pick which data key to copy (decoded) to the clipboard.
+struct SecretsCopyMenu {
+    title: String,
+    keys: Vec<String>,
+    cursor: usize,
+}
+
+// Same idea for ConfigMaps: pick a key to copy its (plain-text) value.
+struct ConfigmapsCopyMenu {
+    title: String,
+    keys: Vec<String>,
+    cursor: usize,
+}
+
+// How the secrets table is filtered (`f`): every secret, only TLS, or only TLS within 30 days of
+// expiry (or already expired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretFilter { All, Tls, Expiring }
+
+impl SecretFilter {
+    fn label(self) -> &'static str {
+        match self { SecretFilter::All => "ALL", SecretFilter::Tls => "TLS", SecretFilter::Expiring => "EXPIRING" }
+    }
+    fn matches(self, s: &SecretInfo) -> bool {
+        match self {
+            SecretFilter::All => true,
+            SecretFilter::Tls => s.is_tls(),
+            SecretFilter::Expiring => s
+                .tls
+                .as_ref()
+                .map(|c| c.expiry != Expiry::Ok)
+                .unwrap_or(false),
+        }
+    }
+}
 use crate::events::{
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
     fetch_nodes, fetch_status, format_cpu_milli, format_memory_bytes, new_cluster_info_state,
@@ -105,7 +155,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull }
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
 #[derive(Clone)]
@@ -148,6 +198,8 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("rbac", &["rb", "roles", "bindings", "security", "sec"]),
     ("vuln", &["vulnerabilities", "vulns", "cve", "cves"]),
+    ("secrets", &["secret", "se", "tls", "certs", "certificates"]),
+    ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("quit", &["q"]),
 ];
 
@@ -325,6 +377,19 @@ pub struct App {
     pub vuln_min_sev: VulnSev,
     pub vuln_detail_scroll: usize,
     pub vuln_refresh_handle: Option<JoinHandle<()>>,
+    pub secrets_state: SharedSecrets,
+    pub secrets_cursor: usize,
+    secrets_filter: SecretFilter,
+    secrets_reveal: SecretReveal,
+    secrets_copy_menu: Option<SecretsCopyMenu>,
+    pub secrets_detail_scroll: usize,
+    pub secrets_refresh_handle: Option<JoinHandle<()>>,
+    pub configmaps_state: SharedConfigMaps,
+    pub configmaps_cursor: usize,
+    configmaps_copy_menu: Option<ConfigmapsCopyMenu>,
+    pub configmaps_detail_scroll: usize,
+    pub configmaps_h_scroll: usize,
+    pub configmaps_refresh_handle: Option<JoinHandle<()>>,
     // Built-in critical namespaces merged with the user's config overrides.
     pub critical_ns: Vec<String>,
     // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
@@ -429,6 +494,19 @@ impl App {
             vuln_min_sev: VulnSev::Unknown,
             vuln_detail_scroll: 0,
             vuln_refresh_handle: None,
+            secrets_state: new_secrets_state(),
+            secrets_cursor: 0,
+            secrets_filter: SecretFilter::All,
+            secrets_reveal: SecretReveal::Hidden,
+            secrets_copy_menu: None,
+            secrets_detail_scroll: 0,
+            secrets_refresh_handle: None,
+            configmaps_state: new_configmaps_state(),
+            configmaps_cursor: 0,
+            configmaps_copy_menu: None,
+            configmaps_detail_scroll: 0,
+            configmaps_h_scroll: 0,
+            configmaps_refresh_handle: None,
             critical_ns: critical_namespaces(&file_config.critical_namespaces),
             action_menu: None,
         }
@@ -714,6 +792,14 @@ impl App {
                 None => return,
             },
             Mode::Vuln | Mode::VulnFull => match self.synthetic_vuln_record() {
+                Some(r) => r,
+                None => return,
+            },
+            Mode::Secrets | Mode::SecretsFull => match self.synthetic_secrets_record() {
+                Some(r) => r,
+                None => return,
+            },
+            Mode::Configmaps | Mode::ConfigmapsFull => match self.synthetic_configmaps_record() {
                 Some(r) => r,
                 None => return,
             },
@@ -1285,6 +1371,16 @@ impl App {
                 self.leave_special_modes();
                 self.enter_vuln_mode();
             }
+            "secrets" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_secrets_mode();
+            }
+            "configmaps" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_configmaps_mode();
+            }
             _ => self.exit_command(),
         }
     }
@@ -1308,6 +1404,12 @@ impl App {
             }
             Mode::Vuln | Mode::VulnFull => {
                 self.stop_vuln_auto_refresh();
+            }
+            Mode::Secrets | Mode::SecretsFull => {
+                self.stop_secrets_auto_refresh();
+            }
+            Mode::Configmaps | Mode::ConfigmapsFull => {
+                self.stop_configmaps_auto_refresh();
             }
             _ => {}
         }
@@ -2014,6 +2116,290 @@ impl App {
         self.vuln_detail_scroll = 0;
     }
 
+    // --- Secrets view -------------------------------------------------------------------------
+
+    fn enter_secrets_mode(&mut self) {
+        self.mode = Mode::Secrets;
+        self.secrets_cursor = 0;
+        self.secrets_detail_scroll = 0;
+        self.secrets_reveal = SecretReveal::Hidden;
+        self.secrets_copy_menu = None;
+        self.refresh_secrets();
+        self.start_secrets_auto_refresh();
+    }
+
+    fn exit_secrets_mode(&mut self) {
+        self.stop_secrets_auto_refresh();
+        self.mode = Mode::Selection;
+        self.reset_to_follow();
+    }
+
+    fn enter_secrets_full(&mut self) {
+        if self.secret_selected().is_none() { return; }
+        self.secrets_detail_scroll = 0;
+        self.mode = Mode::SecretsFull;
+    }
+
+    fn exit_secrets_full(&mut self) {
+        self.mode = Mode::Secrets;
+    }
+
+    fn refresh_secrets(&self) {
+        {
+            let mut s = self.secrets_state.lock().expect("secrets poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.secrets_state.clone();
+        tokio::spawn(async move { fetch_secrets(client, state).await; });
+    }
+
+    // Secrets change rarely; a 60s ticker keeps the expiry countdown fresh without polling pressure.
+    fn start_secrets_auto_refresh(&mut self) {
+        self.stop_secrets_auto_refresh();
+        let client = self.client.clone();
+        let state = self.secrets_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_secrets(client.clone(), state.clone()).await;
+            }
+        });
+        self.secrets_refresh_handle = Some(handle);
+    }
+
+    fn stop_secrets_auto_refresh(&mut self) {
+        if let Some(h) = self.secrets_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // The secrets passing the active filter (already sorted urgent-TLS-first by the fetcher).
+    fn secret_rows(&self) -> Vec<SecretInfo> {
+        let s = self.secrets_state.lock().expect("secrets poisoned");
+        s.secrets.iter().filter(|x| self.secrets_filter.matches(x)).cloned().collect()
+    }
+
+    fn secret_selected(&self) -> Option<SecretInfo> {
+        self.secret_rows().into_iter().nth(self.secrets_cursor)
+    }
+
+    fn move_secret_selection(&mut self, delta: i32) {
+        let len = self.secret_rows().len();
+        if len == 0 { return; }
+        let cur = self.secrets_cursor as i32;
+        self.secrets_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.secrets_detail_scroll = 0;
+        // Never carry a revealed value over to a different secret.
+        self.secrets_reveal = SecretReveal::Hidden;
+    }
+
+    // Cycle the filter: all → TLS only → expiring/expired → all.
+    fn cycle_secrets_filter(&mut self) {
+        self.secrets_filter = match self.secrets_filter {
+            SecretFilter::All => SecretFilter::Tls,
+            SecretFilter::Tls => SecretFilter::Expiring,
+            SecretFilter::Expiring => SecretFilter::All,
+        };
+        self.secrets_cursor = 0;
+        self.secrets_detail_scroll = 0;
+        self.secrets_reveal = SecretReveal::Hidden;
+    }
+
+    // Toggle the in-panel reveal of data values: pressing the same key again hides them.
+    fn toggle_secret_reveal(&mut self, target: SecretReveal) {
+        self.secrets_reveal = if self.secrets_reveal == target { SecretReveal::Hidden } else { target };
+        self.secrets_detail_scroll = 0;
+    }
+
+    // Open the copy picker on the selected secret (one entry per data key). No-op when empty.
+    fn open_secrets_copy_menu(&mut self) {
+        let Some(s) = self.secret_selected() else { return; };
+        if s.data.is_empty() {
+            self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
+            return;
+        }
+        self.secrets_copy_menu = Some(SecretsCopyMenu {
+            title: format!("copier — {}/{}", s.namespace, s.name),
+            keys: s.data_keys.clone(),
+            cursor: 0,
+        });
+    }
+
+    fn secrets_copy_menu_move(&mut self, delta: i32) {
+        if let Some(menu) = self.secrets_copy_menu.as_mut() {
+            // Row 0 is the manifest entry, rows 1.. are the data keys.
+            let max = menu.keys.len() as i32;
+            let cur = menu.cursor as i32;
+            menu.cursor = (cur + delta).clamp(0, max) as usize;
+        }
+    }
+
+    fn secrets_copy_menu_close(&mut self) {
+        self.secrets_copy_menu = None;
+    }
+
+    // Copy the manifest (row 0) or the decoded value of the picked data key, then close the menu.
+    fn secrets_copy_menu_activate(&mut self) {
+        let Some(menu) = self.secrets_copy_menu.as_ref() else { return; };
+        let cursor = menu.cursor;
+        let key = menu.keys.get(cursor.wrapping_sub(1)).cloned();
+        self.secrets_copy_menu = None;
+        if cursor == 0 {
+            let manifest = self.secret_selected().map(|s| s.manifest).unwrap_or_default();
+            self.copy_text(manifest);
+            return;
+        }
+        let Some(key) = key else { return; };
+        let value = self
+            .secret_selected()
+            .and_then(|s| s.data.into_iter().find(|(k, _)| *k == key).map(|(_, v)| v));
+        match value {
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                self.copy_text(text);
+            }
+            None => {
+                self.clipboard_status = Some((std::time::Instant::now(), "clé introuvable".to_string()));
+            }
+        }
+    }
+
+    // --- ConfigMaps view ----------------------------------------------------------------------
+
+    fn enter_configmaps_mode(&mut self) {
+        self.mode = Mode::Configmaps;
+        self.configmaps_cursor = 0;
+        self.configmaps_detail_scroll = 0;
+        self.configmaps_h_scroll = 0;
+        self.configmaps_copy_menu = None;
+        self.refresh_configmaps();
+        self.start_configmaps_auto_refresh();
+    }
+
+    fn exit_configmaps_mode(&mut self) {
+        self.stop_configmaps_auto_refresh();
+        self.mode = Mode::Selection;
+        self.reset_to_follow();
+    }
+
+    fn enter_configmaps_full(&mut self) {
+        if self.configmap_selected().is_none() { return; }
+        self.configmaps_detail_scroll = 0;
+        self.mode = Mode::ConfigmapsFull;
+    }
+
+    fn exit_configmaps_full(&mut self) {
+        self.mode = Mode::Configmaps;
+    }
+
+    fn refresh_configmaps(&self) {
+        {
+            let mut s = self.configmaps_state.lock().expect("configmaps poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.configmaps_state.clone();
+        tokio::spawn(async move { fetch_configmaps(client, state).await; });
+    }
+
+    fn start_configmaps_auto_refresh(&mut self) {
+        self.stop_configmaps_auto_refresh();
+        let client = self.client.clone();
+        let state = self.configmaps_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_configmaps(client.clone(), state.clone()).await;
+            }
+        });
+        self.configmaps_refresh_handle = Some(handle);
+    }
+
+    fn stop_configmaps_auto_refresh(&mut self) {
+        if let Some(h) = self.configmaps_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    fn configmap_rows(&self) -> Vec<ConfigMapInfo> {
+        self.configmaps_state.lock().expect("configmaps poisoned").items.clone()
+    }
+
+    fn configmap_selected(&self) -> Option<ConfigMapInfo> {
+        self.configmap_rows().into_iter().nth(self.configmaps_cursor)
+    }
+
+    fn move_configmap_selection(&mut self, delta: i32) {
+        let len = self.configmap_rows().len();
+        if len == 0 { return; }
+        let cur = self.configmaps_cursor as i32;
+        self.configmaps_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.configmaps_detail_scroll = 0;
+        self.configmaps_h_scroll = 0;
+    }
+
+    fn open_configmaps_copy_menu(&mut self) {
+        let Some(cm) = self.configmap_selected() else { return; };
+        let keys = cm.keys();
+        if keys.is_empty() {
+            self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
+            return;
+        }
+        self.configmaps_copy_menu = Some(ConfigmapsCopyMenu {
+            title: format!("copier — {}/{}", cm.namespace, cm.name),
+            keys,
+            cursor: 0,
+        });
+    }
+
+    fn configmaps_copy_menu_move(&mut self, delta: i32) {
+        if let Some(menu) = self.configmaps_copy_menu.as_mut() {
+            // Row 0 is the manifest entry, rows 1.. are the data keys.
+            let max = menu.keys.len() as i32;
+            let cur = menu.cursor as i32;
+            menu.cursor = (cur + delta).clamp(0, max) as usize;
+        }
+    }
+
+    fn configmaps_copy_menu_close(&mut self) {
+        self.configmaps_copy_menu = None;
+    }
+
+    // Copy the manifest (row 0) or the picked key's text value. Binary keys report no text value.
+    fn configmaps_copy_menu_activate(&mut self) {
+        let Some(menu) = self.configmaps_copy_menu.as_ref() else { return; };
+        let cursor = menu.cursor;
+        let key = menu.keys.get(cursor.wrapping_sub(1)).cloned();
+        self.configmaps_copy_menu = None;
+        if cursor == 0 {
+            let manifest = self.configmap_selected().map(|cm| cm.manifest).unwrap_or_default();
+            self.copy_text(manifest);
+            return;
+        }
+        let Some(key) = key else { return; };
+        let value = self
+            .configmap_selected()
+            .and_then(|cm| cm.data.into_iter().find(|(k, _)| *k == key).map(|(_, v)| v));
+        match value {
+            Some(text) => self.copy_text(text),
+            None => {
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    format!("{key} : binaire, non copiable en texte"),
+                ));
+            }
+        }
+    }
+
     fn exit_pods_full(&mut self) {
         self.mode = Mode::Pods;
     }
@@ -2638,6 +3024,109 @@ impl App {
         }
     }
 
+    // Event-shaped record for the AI panel: the selected secret's type/consumers and, for a TLS
+    // secret, the decoded certificate (subject/issuer/SAN/expiry) so the model can flag expiry risk
+    // and chain/issuer problems.
+    fn synthetic_secrets_record(&self) -> Option<EventRecord> {
+        let s = self.secret_selected()?;
+        let mut msg = format!(
+            "secret={}/{}\ntype={}\nclés={}\norigine={}",
+            s.namespace,
+            s.name,
+            s.type_,
+            if s.data_keys.is_empty() { "—".to_string() } else { s.data_keys.join(", ") },
+            s.provenance.label(),
+        );
+        if !s.ingress_refs.is_empty() {
+            msg.push_str(&format!("\ningress consommateurs={}", s.ingress_refs.join(", ")));
+        }
+        if let Some(cm) = &s.cert_manager {
+            msg.push_str(&format!("\ncert-manager Certificate={cm}"));
+        }
+        if let Some(c) = &s.tls {
+            msg.push_str(&format!(
+                "\n--- certificat TLS ---\nsubject CN={}\nissuer CN={}\nauto-signé={}\nCA={}\nSAN={}\nvalidité={} → {} ({} jours restants)\nclé={}\nserial={}",
+                c.subject_cn,
+                c.issuer_cn,
+                c.self_signed,
+                c.is_ca,
+                if c.sans.is_empty() { "—".to_string() } else { c.sans.join(", ") },
+                c.not_before,
+                c.not_after,
+                c.days_remaining,
+                c.key_algo,
+                c.serial,
+            ));
+            if let Some(ca) = &c.ca_bundle {
+                msg.push_str(&format!(
+                    "\nCA bundle: CN={} expire {} ({} jours)",
+                    ca.subject_cn, ca.not_after, ca.days_remaining,
+                ));
+            }
+        } else if let Some(e) = &s.tls_error {
+            msg.push_str(&format!("\ncertificat TLS illisible: {e}"));
+        }
+        let reason = match s.tls.as_ref().map(|c| c.expiry) {
+            Some(Expiry::Expired) => "SECRET/TLS-EXPIRED",
+            Some(Expiry::Critical) | Some(Expiry::Warn) => "SECRET/TLS-EXPIRING",
+            Some(Expiry::Ok) => "SECRET/TLS",
+            None => "SECRET",
+        };
+        Some(EventRecord {
+            uid: format!("secret|{}|{}", s.namespace, s.name),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: if matches!(s.tls.as_ref().map(|c| c.expiry), Some(Expiry::Expired) | Some(Expiry::Critical)) {
+                Severity::Warning
+            } else {
+                Severity::Normal
+            },
+            reason: reason.to_string(),
+            api_version: "v1".to_string(),
+            kind: "Secret".to_string(),
+            namespace: s.namespace.clone(),
+            name: s.name.clone(),
+            message: msg,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        })
+    }
+
+    // Event-shaped record for the AI panel: the selected ConfigMap's keys and (truncated) values so
+    // the model can explain what the configuration does or spot misconfigurations.
+    fn synthetic_configmaps_record(&self) -> Option<EventRecord> {
+        let cm = self.configmap_selected()?;
+        let mut msg = format!(
+            "configmap={}/{}\norigine={}\nclés texte={} · clés binaires={}",
+            cm.namespace,
+            cm.name,
+            cm.provenance.label(),
+            cm.data.len(),
+            cm.binary_keys.len(),
+        );
+        for (k, v) in &cm.data {
+            let val: String = v.chars().take(2000).collect();
+            msg.push_str(&format!("\n--- {k} ---\n{val}"));
+        }
+        if !cm.binary_keys.is_empty() {
+            msg.push_str(&format!("\nbinaires: {}", cm.binary_keys.join(", ")));
+        }
+        Some(EventRecord {
+            uid: format!("configmap|{}|{}", cm.namespace, cm.name),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: Severity::Normal,
+            reason: "ConfigMap".to_string(),
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: cm.namespace.clone(),
+            name: cm.name.clone(),
+            message: msg,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        })
+    }
+
     fn synthetic_node_record(&self) -> Option<EventRecord> {
         let s = self.node_list_state.lock().expect("node list poisoned");
         let n = s.nodes.get(self.node_cursor)?;
@@ -2830,6 +3319,30 @@ fn handle_event(app: &mut App, ev: Event) {
         }
         return;
     }
+    // The secrets copy picker grabs all input while open (Ctrl-C still quits).
+    if app.secrets_copy_menu.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.secrets_copy_menu_activate(),
+            (KeyCode::Esc, _) => app.secrets_copy_menu_close(),
+            (KeyCode::Up | KeyCode::Char('k'), _) => app.secrets_copy_menu_move(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => app.secrets_copy_menu_move(1),
+            _ => {}
+        }
+        return;
+    }
+    // The configmaps copy picker grabs all input while open (Ctrl-C still quits).
+    if app.configmaps_copy_menu.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.configmaps_copy_menu_activate(),
+            (KeyCode::Esc, _) => app.configmaps_copy_menu_close(),
+            (KeyCode::Up | KeyCode::Char('k'), _) => app.configmaps_copy_menu_move(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => app.configmaps_copy_menu_move(1),
+            _ => {}
+        }
+        return;
+    }
     match (k.code, k.modifiers, app.mode) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
 
@@ -2840,7 +3353,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull) => {
             app.enter_command();
         }
 
@@ -3124,6 +3637,67 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::VulnFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::VulnFull) => {}
 
+        (KeyCode::Up, m, Mode::Secrets) if m.contains(KeyModifiers::SHIFT) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Secrets) if m.contains(KeyModifiers::SHIFT) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Secrets) => app.move_secret_selection(-1),
+        (KeyCode::Down, _, Mode::Secrets) => app.move_secret_selection(1),
+        (KeyCode::PageUp, _, Mode::Secrets) => app.move_secret_selection(-10),
+        (KeyCode::PageDown, _, Mode::Secrets) => app.move_secret_selection(10),
+        (KeyCode::Enter, _, Mode::Secrets) => app.enter_secrets_full(),
+        (KeyCode::Char('f'), _, Mode::Secrets) => app.cycle_secrets_filter(),
+        (KeyCode::Char('b'), _, Mode::Secrets) => app.toggle_secret_reveal(SecretReveal::Base64),
+        (KeyCode::Char('d'), _, Mode::Secrets) => app.toggle_secret_reveal(SecretReveal::Decoded),
+        (KeyCode::Char('c'), _, Mode::Secrets) => app.open_secrets_copy_menu(),
+        (KeyCode::F(5), _, Mode::Secrets) => app.refresh_secrets(),
+        (KeyCode::Esc, _, Mode::Secrets) => app.exit_secrets_mode(),
+        (KeyCode::Char('i'), _, Mode::Secrets) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Secrets) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Secrets) => {}
+
+        (KeyCode::Up, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::SecretsFull) => app.secrets_detail_scroll = 0,
+        (KeyCode::Char('b'), _, Mode::SecretsFull) => app.toggle_secret_reveal(SecretReveal::Base64),
+        (KeyCode::Char('d'), _, Mode::SecretsFull) => app.toggle_secret_reveal(SecretReveal::Decoded),
+        (KeyCode::Char('c'), _, Mode::SecretsFull) => app.open_secrets_copy_menu(),
+        (KeyCode::Enter, _, Mode::SecretsFull) => app.exit_secrets_full(),
+        (KeyCode::Esc, _, Mode::SecretsFull) => app.exit_secrets_full(),
+        (KeyCode::Char('i'), _, Mode::SecretsFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::SecretsFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::SecretsFull) => {}
+
+        (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Configmaps) => app.move_configmap_selection(-1),
+        (KeyCode::Down, _, Mode::Configmaps) => app.move_configmap_selection(1),
+        (KeyCode::PageUp, _, Mode::Configmaps) => app.move_configmap_selection(-10),
+        (KeyCode::PageDown, _, Mode::Configmaps) => app.move_configmap_selection(10),
+        (KeyCode::Left, _, Mode::Configmaps) => app.configmaps_h_scroll = app.configmaps_h_scroll.saturating_sub(5),
+        (KeyCode::Right, _, Mode::Configmaps) => app.configmaps_h_scroll = app.configmaps_h_scroll.saturating_add(5),
+        (KeyCode::Enter, _, Mode::Configmaps) => app.enter_configmaps_full(),
+        (KeyCode::Char('c'), _, Mode::Configmaps) => app.open_configmaps_copy_menu(),
+        (KeyCode::F(5), _, Mode::Configmaps) => app.refresh_configmaps(),
+        (KeyCode::Esc, _, Mode::Configmaps) => app.exit_configmaps_mode(),
+        (KeyCode::Char('i'), _, Mode::Configmaps) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Configmaps) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Configmaps) => {}
+
+        (KeyCode::Up, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = 0,
+        (KeyCode::Left, _, Mode::ConfigmapsFull) => app.configmaps_h_scroll = app.configmaps_h_scroll.saturating_sub(5),
+        (KeyCode::Right, _, Mode::ConfigmapsFull) => app.configmaps_h_scroll = app.configmaps_h_scroll.saturating_add(5),
+        (KeyCode::Char('c'), _, Mode::ConfigmapsFull) => app.open_configmaps_copy_menu(),
+        (KeyCode::Enter, _, Mode::ConfigmapsFull) => app.exit_configmaps_full(),
+        (KeyCode::Esc, _, Mode::ConfigmapsFull) => app.exit_configmaps_full(),
+        (KeyCode::Char('i'), _, Mode::ConfigmapsFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::ConfigmapsFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::ConfigmapsFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -3208,7 +3782,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -3237,11 +3811,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -3257,8 +3831,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -3279,6 +3853,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Pods | Mode::PodsFull => st.mode_pods,
         Mode::Rbac | Mode::RbacFull => st.mode_rbac,
         Mode::Vuln | Mode::VulnFull => st.mode_vuln,
+        Mode::Secrets | Mode::SecretsFull => st.mode_secrets,
+        Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -3324,10 +3900,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_rbac_table(f, app, ta);
         } else if draw_mode == Mode::Vuln {
             draw_vuln_table(f, app, ta);
+        } else if draw_mode == Mode::Secrets {
+            draw_secrets_table(f, app, ta);
+        } else if draw_mode == Mode::Configmaps {
+            draw_configmaps_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -3519,6 +4099,57 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
+        Mode::Secrets => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.secrets_filter.label())),
+            Span::styled(" b ", kbg), Span::raw(format!(" {}   ", st.k_reveal_b64)),
+            Span::styled(" d ", kbg), Span::raw(format!(" {}   ", st.k_reveal_plain)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::SecretsFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" b ", kbg), Span::raw(format!(" {}   ", st.k_reveal_b64)),
+            Span::styled(" d ", kbg), Span::raw(format!(" {}   ", st.k_reveal_plain)),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::Configmaps => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::ConfigmapsFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
     footer_spans.push(Span::raw("   "));
@@ -3558,8 +4189,100 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.action_menu.is_some() {
         draw_action_menu_popup(f, app, area);
     }
+    if app.secrets_copy_menu.is_some() {
+        draw_secrets_copy_menu_popup(f, app, area);
+    }
+    if app.configmaps_copy_menu.is_some() {
+        draw_configmaps_copy_menu_popup(f, app, area);
+    }
 
     visible_rows
+}
+
+// Copy picker over a ConfigMap: a highlighted list of its keys; Enter copies the (text) value.
+fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(menu) = app.configmaps_copy_menu.as_ref() else { return; };
+
+    let popup_w = (area.width * 50 / 100).max(40).min(area.width);
+    let popup_h = (menu.keys.len() as u16 + 6).min(area.height.saturating_sub(2)).max(7);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", menu.title))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = copy_menu_items(&menu.keys);
+    let mut list_state = ListState::default();
+    list_state.select(Some(menu.cursor));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ choisir · Enter copier · Esc annuler",
+            Style::default().fg(DIM),
+        ))),
+        chunks[1],
+    );
+}
+
+// Copy picker over a secret: a highlighted list of its data keys; Enter copies the decoded value.
+fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(menu) = app.secrets_copy_menu.as_ref() else { return; };
+
+    let popup_w = (area.width * 50 / 100).max(40).min(area.width);
+    let popup_h = (menu.keys.len() as u16 + 6).min(area.height.saturating_sub(2)).max(7);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", menu.title))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = copy_menu_items(&menu.keys);
+    let mut list_state = ListState::default();
+    list_state.select(Some(menu.cursor));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ choisir · Enter copier (déchiffré) · Esc annuler",
+            Style::default().fg(DIM),
+        ))),
+        chunks[1],
+    );
+}
+
+// Picker item list shared by the secrets/configmaps copy popups: the manifest entry then the keys.
+fn copy_menu_items(keys: &[String]) -> Vec<ListItem<'static>> {
+    let mut items = vec![ListItem::new(Line::from(Span::styled(
+        format!(" {MANIFEST_ENTRY}"),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )))];
+    items.extend(keys.iter().map(|k| ListItem::new(format!(" {k}"))));
+    items
 }
 
 // Renders the action menu overlay: a highlighted list of choices with the selected entry's
@@ -5267,6 +5990,391 @@ fn vuln_cve_line(v: &crate::vulnerabilities::Cve, image: bool) -> Line<'static> 
     Line::from(spans)
 }
 
+// --- Secrets view rendering -------------------------------------------------------------------
+
+// Expiry colour for the table/detail: expired & <15d are red, <30d orange, otherwise green.
+fn expiry_color(e: Expiry) -> Color {
+    match e {
+        Expiry::Expired | Expiry::Critical => Color::Red,
+        Expiry::Warn => Color::Rgb(255, 140, 0),
+        Expiry::Ok => Color::Green,
+    }
+}
+
+// Human-readable "EXPIRY" cell: the date plus the signed days remaining (or "expiré").
+fn expiry_text(c: &crate::secrets::TlsCert) -> String {
+    if c.days_remaining < 0 {
+        format!("{} (expiré)", c.not_after)
+    } else {
+        format!("{} ({}j)", c.not_after, c.days_remaining)
+    }
+}
+
+// Drop the well-known `kubernetes.io/`/`bootstrap.kubernetes.io/` prefixes so the TYPE column reads
+// "tls", "service-account-token", "dockerconfigjson"… instead of the full noisy type string.
+fn secret_type_short(t: &str) -> String {
+    t.strip_prefix("kubernetes.io/")
+        .or_else(|| t.strip_prefix("bootstrap.kubernetes.io/"))
+        .unwrap_or(t)
+        .to_string()
+}
+
+// Secrets table: every secret in scope (filtered by `f`), TLS certs about to expire pinned on top with
+// a coloured EXPIRY cell. Non-TLS rows leave EXPIRY blank.
+fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, cm_present, summary) = {
+        let s = app.secrets_state.lock().expect("secrets poisoned");
+        (s.loading, s.error.clone(), s.cert_manager_present, s.summary())
+    };
+    let rows_data = app.secret_rows();
+    if !rows_data.is_empty() {
+        app.secrets_cursor = app.secrets_cursor.min(rows_data.len() - 1);
+    }
+
+    let (total, tls, expired, expiring) = summary;
+    let title = if let Some(e) = &error {
+        format!("secrets (erreur: {})", e)
+    } else if loading && total == 0 {
+        "secrets (chargement...)".to_string()
+    } else {
+        let cm = if cm_present { " · cert-manager ✓" } else { "" };
+        format!(
+            "secrets ({} · tls{} expirés{} <30j{}){} · filtre={}",
+            total, tls, expired, expiring, cm, app.secrets_filter.label(),
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("TYPE"),
+        Cell::from("DATA"), Cell::from("ISSUER"), Cell::from("EXPIRY"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = rows_data.iter().map(|s| {
+        let expiry_cell = match (&s.tls, &s.tls_error) {
+            (Some(c), _) => Cell::from(expiry_text(c))
+                .style(Style::default().fg(expiry_color(c.expiry)).add_modifier(Modifier::BOLD)),
+            (None, Some(_)) => Cell::from("cert illisible").style(Style::default().fg(Color::Red)),
+            (None, None) => Cell::from("—").style(Style::default().fg(DIM)),
+        };
+        // Issuer CN for TLS rows; self-signed certs are flagged since their issuer == subject.
+        let issuer_cell = match &s.tls {
+            Some(c) if c.self_signed => Cell::from(format!("{} (self)", c.issuer_cn))
+                .style(Style::default().fg(Color::Yellow)),
+            Some(c) => Cell::from(c.issuer_cn.clone()).style(Style::default().fg(DIM)),
+            None => Cell::from("—").style(Style::default().fg(DIM)),
+        };
+        Row::new(vec![
+            Cell::from(s.namespace.clone()).style(Style::default().fg(DIM)),
+            Cell::from(s.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(secret_type_short(&s.type_)).style(Style::default().fg(if s.is_tls() { Color::Cyan } else { DIM })),
+            Cell::from(s.data_keys.len().to_string()).style(Style::default().fg(DIM)),
+            issuer_cell,
+            expiry_cell,
+            Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
+        ])
+    }).collect();
+
+    let name_w = col_width(rows_data.iter().map(|s| s.name.as_str()), "NAME", 12, 60);
+    let widths = [
+        Constraint::Length(22), Constraint::Length(name_w), Constraint::Length(20),
+        Constraint::Length(5), Constraint::Length(28), Constraint::Length(22), Constraint::Length(6),
+    ];
+
+    let mut ts = TableState::default();
+    if !rows_data.is_empty() {
+        ts.select(Some(app.secrets_cursor));
+    }
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ts);
+}
+
+// Detail panel (split top / full screen): the selected secret's decoded certificate plus its
+// consumers (Ingress / cert-manager), or the plain key list for a non-TLS secret.
+fn draw_secrets_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(s) = app.secret_selected() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un secret ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" secrets "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, lines) = secret_detail_lines(&s, app.secrets_reveal);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.secrets_detail_scroll > max_scroll {
+        app.secrets_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.secrets_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, Vec<Line<'static>>) {
+    let (title_bg, title_txt) = match (&s.tls, s.is_tls()) {
+        (Some(c), _) => (expiry_color(c.expiry), format!(" {}/{} : TLS ", s.namespace, s.name)),
+        (None, true) => (Color::Red, format!(" {}/{} : TLS illisible ", s.namespace, s.name)),
+        (None, false) => (Color::Cyan, format!(" {}/{} ", s.namespace, s.name)),
+    };
+    let title = Line::from(Span::styled(
+        title_txt,
+        Style::default().fg(Color::Black).bg(title_bg).add_modifier(Modifier::BOLD),
+    ));
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<14}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(label("type", s.type_.clone()));
+    lines.push(label("origine", s.provenance.label()));
+    lines.push(label(
+        "clés",
+        if s.data_keys.is_empty() { "—".to_string() } else { s.data_keys.join(", ") },
+    ));
+    lines.push(label("âge", s.age.clone()));
+
+    if let Some(c) = &s.tls {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Certificat", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(label("subject CN", c.subject_cn.clone()));
+        let issuer = if c.self_signed {
+            format!("{} (auto-signé)", c.issuer_cn)
+        } else {
+            c.issuer_cn.clone()
+        };
+        lines.push(label("issuer (CA)", issuer));
+        if c.is_ca {
+            lines.push(label("contrainte", "certificat de CA (CA:TRUE)".to_string()));
+        }
+        lines.push(label("clé", c.key_algo.clone()));
+        lines.push(label("serial", c.serial.clone()));
+        lines.push(label("émis le", c.not_before.clone()));
+        let exp = if c.days_remaining < 0 {
+            format!("{} — EXPIRÉ depuis {} j", c.not_after, -c.days_remaining)
+        } else {
+            format!("{} — {} jours restants", c.not_after, c.days_remaining)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "expire le"), Style::default().fg(DIM)),
+            Span::styled(exp, Style::default().fg(expiry_color(c.expiry)).add_modifier(Modifier::BOLD)),
+        ]));
+        if let Some(ca) = &c.ca_bundle {
+            lines.push(label(
+                "ca.crt",
+                format!("{} · expire {} ({} j)", ca.subject_cn, ca.not_after, ca.days_remaining),
+            ));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "SAN (Subject Alternative Names)",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        if c.sans.is_empty() {
+            lines.push(Line::from(Span::styled("  (aucun)", Style::default().fg(DIM))));
+        }
+        for san in &c.sans {
+            lines.push(Line::from(Span::raw(format!("  {san}"))));
+        }
+    } else if let Some(e) = &s.tls_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("certificat illisible : {e}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // Consumers / issuer — the "Related" section folded into the detail panel.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Consommateurs / émetteur",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(cm) = &s.cert_manager {
+        lines.push(label("cert-manager", format!("Certificate {cm}")));
+    }
+    if s.ingress_refs.is_empty() {
+        lines.push(Line::from(Span::styled("  aucun Ingress référençant ce secret", Style::default().fg(DIM))));
+    } else {
+        for ing in &s.ingress_refs {
+            lines.push(Line::from(vec![
+                Span::styled("  ingress ", Style::default().fg(DIM)),
+                Span::raw(ing.clone()),
+            ]));
+        }
+    }
+
+    // Revealed data values (`b` base64 / `d` decoded). Hidden by default; never shown unless toggled.
+    if reveal != SecretReveal::Hidden {
+        lines.push(Line::from(""));
+        let (heading, color) = match reveal {
+            SecretReveal::Base64 => ("Contenu (base64)", Color::Magenta),
+            SecretReveal::Decoded => ("Contenu (déchiffré)", Color::Red),
+            SecretReveal::Hidden => unreachable!(),
+        };
+        lines.push(Line::from(Span::styled(
+            heading, Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in &s.data {
+            lines.push(Line::from(Span::styled(
+                format!("{k}:"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            match reveal {
+                SecretReveal::Base64 => {
+                    use base64::Engine;
+                    let enc = base64::engine::general_purpose::STANDARD.encode(v);
+                    lines.push(Line::from(Span::raw(enc)));
+                }
+                SecretReveal::Decoded => {
+                    for line in String::from_utf8_lossy(v).split('\n') {
+                        lines.push(Line::from(Span::raw(format!("  {line}"))));
+                    }
+                }
+                SecretReveal::Hidden => unreachable!(),
+            }
+        }
+    }
+
+    (title, lines)
+}
+
+// --- ConfigMaps view rendering ----------------------------------------------------------------
+
+fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, total) = {
+        let s = app.configmaps_state.lock().expect("configmaps poisoned");
+        (s.loading, s.error.clone(), s.items.len())
+    };
+    let rows_data = app.configmap_rows();
+    if !rows_data.is_empty() {
+        app.configmaps_cursor = app.configmaps_cursor.min(rows_data.len() - 1);
+    }
+
+    let title = if let Some(e) = &error {
+        format!("configmaps (erreur: {})", e)
+    } else if loading && total == 0 {
+        "configmaps (chargement...)".to_string()
+    } else {
+        format!("configmaps ({})", total)
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KEYS"),
+        Cell::from("SIZE"), Cell::from("ORIGIN"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = rows_data.iter().map(|cm| {
+        let n_keys = cm.data.len() + cm.binary_keys.len();
+        Row::new(vec![
+            Cell::from(cm.namespace.clone()).style(Style::default().fg(DIM)),
+            Cell::from(cm.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(n_keys.to_string()).style(Style::default().fg(DIM)),
+            Cell::from(human_size(cm.total_bytes)).style(Style::default().fg(DIM)),
+            Cell::from(cm.provenance.label()).style(Style::default().fg(DIM)),
+            Cell::from(cm.age.clone()).style(Style::default().fg(DIM)),
+        ])
+    }).collect();
+
+    let name_w = col_width(rows_data.iter().map(|cm| cm.name.as_str()), "NAME", 12, 60);
+    let origin_w = col_width(rows_data.iter().map(|cm| cm.provenance.label()).collect::<Vec<_>>().iter().map(|s| s.as_str()), "ORIGIN", 8, 36);
+    let widths = [
+        Constraint::Length(22), Constraint::Length(name_w), Constraint::Length(5),
+        Constraint::Length(8), Constraint::Length(origin_w), Constraint::Length(6),
+    ];
+
+    let mut ts = TableState::default();
+    if !rows_data.is_empty() {
+        ts.select(Some(app.configmaps_cursor));
+    }
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ts);
+}
+
+// Detail panel (split top / full screen): the selected ConfigMap's metadata then every key's value
+// inline (ConfigMap data is plain text, shown directly), binary keys listed by name only.
+fn draw_configmaps_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(cm) = app.configmap_selected() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez une configmap ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" configmaps "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, lines) = configmap_detail_lines(&cm);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.configmaps_detail_scroll > max_scroll {
+        app.configmaps_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.configmaps_detail_scroll as u16, app.configmaps_h_scroll as u16))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn configmap_detail_lines(cm: &ConfigMapInfo) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" {}/{} ", cm.namespace, cm.name),
+        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(label("origine", cm.provenance.label()));
+    lines.push(label("clés", format!("{} texte · {} binaire", cm.data.len(), cm.binary_keys.len())));
+    lines.push(label("taille", human_size(cm.total_bytes)));
+    lines.push(label("âge", cm.age.clone()));
+
+    for (k, v) in &cm.data {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{k}:"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for line in v.split('\n') {
+            lines.push(Line::from(Span::raw(format!("  {line}"))));
+        }
+    }
+
+    if !cm.binary_keys.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Clés binaires (binaryData)",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for k in &cm.binary_keys {
+            lines.push(Line::from(Span::raw(format!("  {k}"))));
+        }
+    }
+
+    (title, lines)
+}
+
 fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (resources, loading, error, counts) = {
         let s = app.flux_state.lock().expect("flux poisoned");
@@ -5714,6 +6822,20 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Vuln | Mode::VulnFull));
     if is_vuln_mode {
         draw_vuln_detail(f, app, area);
+        return;
+    }
+    let is_secrets_mode = matches!(app.mode, Mode::Secrets | Mode::SecretsFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Secrets | Mode::SecretsFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Secrets | Mode::SecretsFull));
+    if is_secrets_mode {
+        draw_secrets_detail(f, app, area);
+        return;
+    }
+    let is_configmaps_mode = matches!(app.mode, Mode::Configmaps | Mode::ConfigmapsFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Configmaps | Mode::ConfigmapsFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Configmaps | Mode::ConfigmapsFull));
+    if is_configmaps_mode {
+        draw_configmaps_detail(f, app, area);
         return;
     }
     let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)

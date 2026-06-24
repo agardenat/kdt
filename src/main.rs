@@ -7,6 +7,7 @@ mod ai;
 mod cli;
 mod clip;
 mod config;
+mod configmaps;
 mod diagnostic;
 mod enrich;
 mod events;
@@ -16,6 +17,7 @@ mod lang;
 mod pdf;
 mod pods;
 mod rbac;
+mod secrets;
 mod ui;
 mod vulnerabilities;
 
