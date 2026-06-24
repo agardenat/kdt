@@ -11,6 +11,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
 - **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais.
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
+- **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
 ## Installation
@@ -123,6 +124,8 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `nodes` | `no`, `node` | Vue Nodes |
 | `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
+| `rbac` | `rb`, `roles`, `bindings`, `sec` | Vue sécurité RBAC (bindings scorés par sévérité) |
+| `vuln` | `cve`, `cves`, `vulns` | Vue vulnérabilités (images + version k8s) |
 | `quit` | `q` | Quitter |
 
 ### FluxCD (`:flux`)
@@ -195,6 +198,37 @@ Le menu `r` (sur l'objet d'origine) propose, avec explication et confirmation :
 **rescale** (rétablit le nombre de répliques initial mémorisé), **recyclage** (scale 0 puis remonte,
 recrée tous les pods) et **restart** (`rollout restart` progressif). Le menu `s` permet le scaling
 incrémental ou la saisie directe d'un nombre de répliques.
+
+### Vulnérabilités (`:vuln`)
+
+Vue de la surface d'attaque connue du cluster. Le **scan d'images** repose sur **Trivy Operator** ;
+s'il n'est pas installé, la vue bascule en **repli léger** n'affichant que le risque sur la version
+de Kubernetes (qui ne dépend que de la version serveur et du feed officiel).
+
+- **Images** (Trivy requis) : une ligne par image scannée (`VulnerabilityReport` / `ClusterVulnerabilityReport`),
+  avec le namespace, le workload, le tag, le décompte CVE par sévérité (`crit/high/med/low`) et le
+  nombre de CVE **corrigibles** par une mise à jour. Tri par sévérité maximale décroissante.
+- **Version Kubernetes** : première ligne (magenta) — version serveur, cible de patch
+  (`→ dernier patch de la mineure` si en retard, `✓` si à jour), badge `EOL` si la mineure est hors
+  fenêtre de support, et les CVE récentes du **feed officiel Kubernetes**. Cette partie demande un
+  accès réseau sortant et se dégrade proprement (les images restent affichées) s'il est coupé.
+
+Le détail (`Enter`) liste chaque CVE : `SÉV  score  ID  paquet  installé → corrigé` (image) ou
+`SÉV  score  ID  résumé  lien` (k8s).
+
+> Les CVE et scores viennent de Trivy / du feed k8s ; le feed officiel n'étant pas filtré par
+> version, la liste k8s montre les CVE récentes et s'appuie sur le retard de patch comme signal
+> actionnable.
+
+| Touche | Action |
+|---|---|
+| `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
+| `Enter` | Détail plein écran (CVE du composant) |
+| `Shift-↑/↓`, `g` | Scroll du détail |
+| `f` | Filtrer le seuil de sévérité (tous → HIGH+ → CRIT) |
+| `F5` | Rafraîchir (auto toutes les 60 s) |
+| `i` | Panneau IA (synthèse des CVE et chemin de mise à jour) |
+| `Esc` | Retour |
 
 ### Nodes / Node usage
 | Touche | Action |

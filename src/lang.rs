@@ -20,6 +20,7 @@ pub struct Strings {
     pub mode_flux: &'static str,
     pub mode_pods: &'static str,
     pub mode_rbac: &'static str,
+    pub mode_vuln: &'static str,
 
     pub k_quit: &'static str,
     pub k_select: &'static str,
@@ -174,6 +175,7 @@ pub const FR: Strings = Strings {
     mode_flux: "FLUX",
     mode_pods: "PODS",
     mode_rbac: "RBAC",
+    mode_vuln: "VULN",
 
     k_quit: "quitter",
     k_select: "sélection",
@@ -328,6 +330,7 @@ pub const EN: Strings = Strings {
     mode_flux: "FLUX",
     mode_pods: "PODS",
     mode_rbac: "RBAC",
+    mode_vuln: "VULN",
 
     k_quit: "quit",
     k_select: "select",

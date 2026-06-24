@@ -17,6 +17,7 @@ mod pdf;
 mod pods;
 mod rbac;
 mod ui;
+mod vulnerabilities;
 
 use std::path::PathBuf;
 

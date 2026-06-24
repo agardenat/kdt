@@ -56,6 +56,17 @@ use crate::rbac::{
     critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, RbacBinding,
     Severity as RbacSeverity, SharedRbac,
 };
+use crate::vulnerabilities::{
+    fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
+};
+
+// A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
+// or one scanned image.
+#[derive(Clone)]
+enum VulnRow {
+    K8s(K8sVersionRisk),
+    Image(VulnComponent),
+}
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 use crate::events::{
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
@@ -94,7 +105,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull }
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
 #[derive(Clone)]
@@ -136,6 +147,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("rbac", &["rb", "roles", "bindings", "security", "sec"]),
+    ("vuln", &["vulnerabilities", "vulns", "cve", "cves"]),
     ("quit", &["q"]),
 ];
 
@@ -308,6 +320,11 @@ pub struct App {
     pub rbac_min_sev: RbacSeverity,
     pub rbac_detail_scroll: usize,
     pub rbac_refresh_handle: Option<JoinHandle<()>>,
+    pub vuln_state: SharedVuln,
+    pub vuln_cursor: usize,
+    pub vuln_min_sev: VulnSev,
+    pub vuln_detail_scroll: usize,
+    pub vuln_refresh_handle: Option<JoinHandle<()>>,
     // Built-in critical namespaces merged with the user's config overrides.
     pub critical_ns: Vec<String>,
     // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
@@ -407,6 +424,11 @@ impl App {
             rbac_min_sev: RbacSeverity::Info,
             rbac_detail_scroll: 0,
             rbac_refresh_handle: None,
+            vuln_state: new_vuln_state(),
+            vuln_cursor: 0,
+            vuln_min_sev: VulnSev::Unknown,
+            vuln_detail_scroll: 0,
+            vuln_refresh_handle: None,
             critical_ns: critical_namespaces(&file_config.critical_namespaces),
             action_menu: None,
         }
@@ -424,6 +446,7 @@ impl App {
             }
         });
     }
+
 
 
     fn reset_to_follow(&mut self) {
@@ -687,6 +710,10 @@ impl App {
             },
             Mode::Diagnostic => self.synthetic_diagnostic_record(),
             Mode::Rbac | Mode::RbacFull => match self.synthetic_rbac_record() {
+                Some(r) => r,
+                None => return,
+            },
+            Mode::Vuln | Mode::VulnFull => match self.synthetic_vuln_record() {
                 Some(r) => r,
                 None => return,
             },
@@ -1251,6 +1278,13 @@ impl App {
                 self.leave_special_modes();
                 self.enter_rbac_mode();
             }
+            "vuln" => {
+                // Always opens: with Trivy Operator it lists scanned images; without it, the view
+                // falls back to the Kubernetes version risk alone (server version + official feed).
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_vuln_mode();
+            }
             _ => self.exit_command(),
         }
     }
@@ -1271,6 +1305,9 @@ impl App {
             }
             Mode::Rbac | Mode::RbacFull => {
                 self.stop_rbac_auto_refresh();
+            }
+            Mode::Vuln | Mode::VulnFull => {
+                self.stop_vuln_auto_refresh();
             }
             _ => {}
         }
@@ -1869,6 +1906,114 @@ impl App {
         self.rbac_detail_scroll = 0;
     }
 
+    // --- Vulnerability view -------------------------------------------------------------------
+
+    fn enter_vuln_mode(&mut self) {
+        self.mode = Mode::Vuln;
+        self.vuln_cursor = 0;
+        self.vuln_detail_scroll = 0;
+        self.refresh_vulnerabilities();
+        self.start_vuln_auto_refresh();
+    }
+
+    fn exit_vuln_mode(&mut self) {
+        self.stop_vuln_auto_refresh();
+        self.mode = Mode::Selection;
+        self.reset_to_follow();
+    }
+
+    fn enter_vuln_full(&mut self) {
+        if self.vuln_selected().is_none() { return; }
+        self.vuln_detail_scroll = 0;
+        self.mode = Mode::VulnFull;
+    }
+
+    fn exit_vuln_full(&mut self) {
+        self.mode = Mode::Vuln;
+    }
+
+    // Current server version (read from the cluster banner state) to scope the k8s CVE lookup.
+    fn server_version(&self) -> Option<String> {
+        self.cluster_info.lock().expect("cluster info poisoned").server_version.clone()
+    }
+
+    fn refresh_vulnerabilities(&self) {
+        {
+            let mut s = self.vuln_state.lock().expect("vuln poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.vuln_state.clone();
+        let version = self.server_version();
+        tokio::spawn(async move { fetch_vulnerabilities(client, version, state).await; });
+    }
+
+    // VulnerabilityReports change slowly (operator rescans on a schedule); a 60s ticker is plenty.
+    fn start_vuln_auto_refresh(&mut self) {
+        self.stop_vuln_auto_refresh();
+        let client = self.client.clone();
+        let state = self.vuln_state.clone();
+        let version = self.server_version();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_vulnerabilities(client.clone(), version.clone(), state.clone()).await;
+            }
+        });
+        self.vuln_refresh_handle = Some(handle);
+    }
+
+    fn stop_vuln_auto_refresh(&mut self) {
+        if let Some(h) = self.vuln_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Selectable rows: the k8s control-plane risk first (when known, always shown), then the scanned
+    // images passing the active severity floor (already sorted highest-severity first).
+    fn vuln_rows(&self) -> Vec<VulnRow> {
+        let s = self.vuln_state.lock().expect("vuln poisoned");
+        let mut rows: Vec<VulnRow> = Vec::new();
+        if let Some(k8s) = &s.k8s {
+            rows.push(VulnRow::K8s(k8s.clone()));
+        }
+        rows.extend(
+            s.components
+                .iter()
+                .filter(|c| c.max_sev >= self.vuln_min_sev)
+                .cloned()
+                .map(VulnRow::Image),
+        );
+        rows
+    }
+
+    fn vuln_selected(&self) -> Option<VulnRow> {
+        self.vuln_rows().into_iter().nth(self.vuln_cursor)
+    }
+
+    fn move_vuln_selection(&mut self, delta: i32) {
+        let len = self.vuln_rows().len();
+        if len == 0 { return; }
+        let cur = self.vuln_cursor as i32;
+        self.vuln_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.vuln_detail_scroll = 0;
+    }
+
+    // Cycle the severity floor: all → HIGH+ → CRITICAL → all.
+    fn cycle_vuln_filter(&mut self) {
+        self.vuln_min_sev = match self.vuln_min_sev {
+            VulnSev::Critical => VulnSev::Unknown,
+            VulnSev::High => VulnSev::Critical,
+            _ => VulnSev::High,
+        };
+        self.vuln_cursor = 0;
+        self.vuln_detail_scroll = 0;
+    }
+
     fn exit_pods_full(&mut self) {
         self.mode = Mode::Pods;
     }
@@ -2424,6 +2569,75 @@ impl App {
         })
     }
 
+    // Event-shaped record for the AI panel: the selected image's CVEs (or the k8s version risk), so
+    // the model can summarise impact and the upgrade path.
+    fn synthetic_vuln_record(&self) -> Option<EventRecord> {
+        match self.vuln_selected()? {
+            VulnRow::Image(c) => {
+                let cve_lines = c
+                    .cves
+                    .iter()
+                    .take(40)
+                    .map(|v| {
+                        let fix = if v.fixed.is_empty() {
+                            "pas de fix".to_string()
+                        } else {
+                            format!("{} → {}", v.installed, v.fixed)
+                        };
+                        format!("[{} {:.1}] {} {} ({})", v.severity.label(), v.score, v.id, v.package, fix)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let message = format!(
+                    "image={}:{}\nworkload={}\ncrit={} high={} med={} low={} fixables={}\nCVEs:\n{}",
+                    c.image, c.version, c.workload, c.critical, c.high, c.medium, c.low, c.fixable, cve_lines,
+                );
+                Some(EventRecord {
+                    uid: format!("vuln|{}|{}", c.namespace, c.image),
+                    time: k8s_openapi::jiff::Timestamp::now(),
+                    severity: Severity::Warning,
+                    reason: format!("VULN/{}", c.max_sev.label()),
+                    api_version: "aquasecurity.github.io/v1alpha1".to_string(),
+                    kind: "VulnerabilityReport".to_string(),
+                    namespace: c.namespace.clone(),
+                    name: c.image.clone(),
+                    message,
+                    component: String::new(),
+                    host: String::new(),
+                    count: 1,
+                })
+            }
+            VulnRow::K8s(k) => {
+                let cve_lines = k
+                    .cves
+                    .iter()
+                    .take(40)
+                    .map(|v| format!("[{} {:.1}] {} {}", v.severity.label(), v.score, v.id, v.title))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let target = k.latest_patch.clone().unwrap_or_else(|| "?".to_string());
+                let message = format!(
+                    "Kubernetes control-plane\nversion serveur={}\ncible (dernier patch mineure)={}\nretard de patch={}\nEOL={}\nCVEs récentes (feed officiel, non filtrées par version):\n{}",
+                    k.server_version, target, k.behind, k.eol, cve_lines,
+                );
+                Some(EventRecord {
+                    uid: format!("vuln|k8s|{}", k.server_version),
+                    time: k8s_openapi::jiff::Timestamp::now(),
+                    severity: Severity::Warning,
+                    reason: "VULN/k8s".to_string(),
+                    api_version: String::new(),
+                    kind: "KubernetesVersion".to_string(),
+                    namespace: String::new(),
+                    name: k.server_version.clone(),
+                    message,
+                    component: String::new(),
+                    host: String::new(),
+                    count: 1,
+                })
+            }
+        }
+    }
+
     fn synthetic_node_record(&self) -> Option<EventRecord> {
         let s = self.node_list_state.lock().expect("node list poisoned");
         let n = s.nodes.get(self.node_cursor)?;
@@ -2626,7 +2840,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull) => {
             app.enter_command();
         }
 
@@ -2885,6 +3099,31 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::RbacFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::RbacFull) => {}
 
+        (KeyCode::Up, m, Mode::Vuln) if m.contains(KeyModifiers::SHIFT) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Vuln) if m.contains(KeyModifiers::SHIFT) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Vuln) => app.move_vuln_selection(-1),
+        (KeyCode::Down, _, Mode::Vuln) => app.move_vuln_selection(1),
+        (KeyCode::PageUp, _, Mode::Vuln) => app.move_vuln_selection(-10),
+        (KeyCode::PageDown, _, Mode::Vuln) => app.move_vuln_selection(10),
+        (KeyCode::Enter, _, Mode::Vuln) => app.enter_vuln_full(),
+        (KeyCode::Char('f'), _, Mode::Vuln) => app.cycle_vuln_filter(),
+        (KeyCode::F(5), _, Mode::Vuln) => app.refresh_vulnerabilities(),
+        (KeyCode::Esc, _, Mode::Vuln) => app.exit_vuln_mode(),
+        (KeyCode::Char('i'), _, Mode::Vuln) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Vuln) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Vuln) => {}
+
+        (KeyCode::Up, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::VulnFull) => app.vuln_detail_scroll = 0,
+        (KeyCode::Enter, _, Mode::VulnFull) => app.exit_vuln_full(),
+        (KeyCode::Esc, _, Mode::VulnFull) => app.exit_vuln_full(),
+        (KeyCode::Char('i'), _, Mode::VulnFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::VulnFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::VulnFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -2969,7 +3208,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -2998,11 +3237,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -3018,8 +3257,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -3039,6 +3278,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::FluxLogs => st.mode_flux,
         Mode::Pods | Mode::PodsFull => st.mode_pods,
         Mode::Rbac | Mode::RbacFull => st.mode_rbac,
+        Mode::Vuln | Mode::VulnFull => st.mode_vuln,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -3082,10 +3322,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             }
         } else if draw_mode == Mode::Rbac {
             draw_rbac_table(f, app, ta);
+        } else if draw_mode == Mode::Vuln {
+            draw_vuln_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -3250,6 +3492,26 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
         Mode::RbacFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::Vuln => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.vuln_min_sev.label())),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::VulnFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
@@ -4220,6 +4482,7 @@ fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
         (false, FluxReady::Reconciling) => (Severity::Normal, "Reconciling".to_string()),
         (false, FluxReady::Failed) => (Severity::Warning, "ReconciliationFailed".to_string()),
         (false, FluxReady::Unknown) => (Severity::Warning, "Unknown".to_string()),
+        (false, FluxReady::NotApplicable) => (Severity::Normal, "N/A".to_string()),
     };
     let message = if r.message.is_empty() {
         format!("{} {}/{}", r.kind, r.namespace, r.name)
@@ -4740,6 +5003,270 @@ fn join_or_star(v: &[String]) -> String {
     if v.is_empty() { "—".to_string() } else { v.join(",") }
 }
 
+fn vuln_sev_color(s: VulnSev) -> Color {
+    match s {
+        VulnSev::Critical => Color::Red,
+        VulnSev::High => Color::Rgb(255, 140, 0),
+        VulnSev::Medium => Color::Yellow,
+        VulnSev::Low => Color::Cyan,
+        VulnSev::Unknown => DIM,
+    }
+}
+
+// Image vulnerability table: the k8s control-plane risk first (when known), then one row per scanned
+// image, sorted by max severity. Severity floor filters the image rows (`f`).
+fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, available, total, counts) = {
+        let s = app.vuln_state.lock().expect("vuln poisoned");
+        (s.loading, s.error.clone(), s.available, s.components.len(), s.counts())
+    };
+    let rows_data = app.vuln_rows();
+    if !rows_data.is_empty() {
+        app.vuln_cursor = app.vuln_cursor.min(rows_data.len() - 1);
+    }
+
+    let title = if !available {
+        // Trivy Operator absent: light fallback showing only the Kubernetes version risk.
+        "vuln · k8s seul (Trivy Operator absent → pas de scan d'images)".to_string()
+    } else if let Some(e) = &error {
+        format!("vuln (erreur: {})", e)
+    } else if loading && total == 0 {
+        "vuln (chargement...)".to_string()
+    } else {
+        let (c, h, m, l) = counts;
+        format!(
+            "vuln ({} images · crit{} high{} med{} low{}) · min={}",
+            total, c, h, m, l, app.vuln_min_sev.label(),
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("SEV"), Cell::from("NAMESPACE"), Cell::from("COMPONENT"),
+        Cell::from("VERSION"), Cell::from("CRIT"), Cell::from("HIGH"), Cell::from("MED"),
+        Cell::from("LOW"), Cell::from("→ TARGET"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let count_cell = |n: usize, color: Color| {
+        if n == 0 {
+            Cell::from("·").style(Style::default().fg(DIM))
+        } else {
+            Cell::from(n.to_string()).style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        }
+    };
+
+    let rows: Vec<Row> = rows_data.iter().map(|row| match row {
+        VulnRow::K8s(k) => {
+            let crit = k.cves.iter().filter(|c| c.severity == VulnSev::Critical).count();
+            let high = k.cves.iter().filter(|c| c.severity == VulnSev::High).count();
+            let med = k.cves.iter().filter(|c| c.severity == VulnSev::Medium).count();
+            let low = k.cves.iter().filter(|c| c.severity == VulnSev::Low).count();
+            let target = match (&k.latest_patch, k.behind) {
+                (Some(v), true) => format!("→ {}", v),
+                (Some(v), false) => format!("✓ {}", v),
+                (None, _) => "?".to_string(),
+            };
+            let comp = if k.eol {
+                "kubernetes (EOL)".to_string()
+            } else {
+                "kubernetes".to_string()
+            };
+            let target_color = if k.eol || k.behind { Color::Red } else { Color::Green };
+            Row::new(vec![
+                Cell::from("k8s").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Cell::from("control-plane").style(Style::default().fg(DIM)),
+                Cell::from(comp).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Cell::from(k.server_version.clone()),
+                count_cell(crit, Color::Red),
+                count_cell(high, Color::Rgb(255, 140, 0)),
+                count_cell(med, Color::Yellow),
+                count_cell(low, Color::Cyan),
+                Cell::from(target).style(Style::default().fg(target_color).add_modifier(Modifier::BOLD)),
+                Cell::from("—").style(Style::default().fg(DIM)),
+            ])
+            .style(Style::default().bg(Color::Rgb(20, 20, 40)))
+        }
+        VulnRow::Image(c) => {
+            let color = vuln_sev_color(c.max_sev);
+            let target = if c.fixable > 0 {
+                format!("{} fixables", c.fixable)
+            } else {
+                "—".to_string()
+            };
+            Row::new(vec![
+                Cell::from(c.max_sev.label()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Cell::from(c.namespace.clone()).style(Style::default().fg(DIM)),
+                Cell::from(short_image(&c.image)).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(c.version.clone()).style(Style::default().fg(DIM)),
+                count_cell(c.critical, Color::Red),
+                count_cell(c.high, Color::Rgb(255, 140, 0)),
+                count_cell(c.medium, Color::Yellow),
+                count_cell(c.low, Color::Cyan),
+                Cell::from(target).style(Style::default().fg(if c.fixable > 0 { Color::Green } else { DIM })),
+                Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+            ])
+        }
+    }).collect();
+
+    let widths = [
+        Constraint::Length(8), Constraint::Length(16), Constraint::Min(24),
+        Constraint::Length(16), Constraint::Length(5), Constraint::Length(5),
+        Constraint::Length(5), Constraint::Length(5), Constraint::Length(14), Constraint::Length(6),
+    ];
+
+    let mut ts = TableState::default();
+    if !rows_data.is_empty() {
+        ts.select(Some(app.vuln_cursor));
+    }
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ts);
+}
+
+// Keep the trailing image path + tag-relevant part readable when the registry prefix is long.
+fn short_image(image: &str) -> String {
+    let trimmed = image
+        .strip_prefix("index.docker.io/library/")
+        .or_else(|| image.strip_prefix("index.docker.io/"))
+        .or_else(|| image.strip_prefix("docker.io/library/"))
+        .or_else(|| image.strip_prefix("docker.io/"))
+        .unwrap_or(image);
+    trimmed.to_string()
+}
+
+// Detail panel (split top / full screen): the selected component's CVEs, or the k8s version risk.
+fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(row) = app.vuln_selected() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un composant ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" vuln "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, lines) = match &row {
+        VulnRow::K8s(k) => vuln_k8s_lines(k),
+        VulnRow::Image(c) => vuln_image_lines(c),
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.vuln_detail_scroll > max_scroll {
+        app.vuln_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.vuln_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" {} : {} ", short_image(&c.image), c.version),
+        Style::default().fg(Color::Black).bg(vuln_sev_color(c.max_sev)).add_modifier(Modifier::BOLD),
+    ));
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(label("workload", c.workload.clone()));
+    lines.push(label("image", c.image.clone()));
+    lines.push(label(
+        "counts",
+        format!("crit {} · high {} · med {} · low {} · total {}", c.critical, c.high, c.medium, c.low, c.total()),
+    ));
+    lines.push(label("fixables", format!("{} CVE corrigibles par mise à jour", c.fixable)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "CVEs", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if c.cves.is_empty() {
+        lines.push(Line::from(Span::styled("  (aucune)", Style::default().fg(DIM))));
+    }
+    for v in &c.cves {
+        lines.push(vuln_cve_line(v, true));
+    }
+    (title, lines)
+}
+
+fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" Kubernetes {} ", k.server_version),
+        Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD),
+    ));
+    let label = |key: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{key:<14}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(label("version", k.server_version.clone()));
+    match (&k.latest_patch, k.behind) {
+        (Some(v), true) => lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "cible patch"), Style::default().fg(DIM)),
+            Span::styled(format!("→ monter vers {}", v), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ])),
+        (Some(v), false) => lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "cible patch"), Style::default().fg(DIM)),
+            Span::styled(format!("✓ à jour ({})", v), Style::default().fg(Color::Green)),
+        ])),
+        (None, _) => lines.push(label("cible patch", "non résolue".to_string())),
+    }
+    if k.eol {
+        lines.push(Line::from(Span::styled(
+            "  ⚠ version hors fenêtre de support (EOL)",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(note) = &k.note {
+        lines.push(label("note", note.clone()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "CVEs récentes (feed officiel k8s, non filtrées par version)",
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if k.cves.is_empty() {
+        lines.push(Line::from(Span::styled("  (aucune / indisponible)", Style::default().fg(DIM))));
+    }
+    for v in &k.cves {
+        lines.push(vuln_cve_line(v, false));
+    }
+    (title, lines)
+}
+
+fn vuln_cve_line(v: &crate::vulnerabilities::Cve, image: bool) -> Line<'static> {
+    let color = vuln_sev_color(v.severity);
+    let mut spans = vec![
+        Span::styled(format!("  {:<5}", v.severity.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:>5.1}  ", v.score), Style::default().fg(color)),
+        Span::styled(format!("{:<18}", v.id), Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if image {
+        let fix = if v.fixed.is_empty() {
+            Span::styled("pas de fix".to_string(), Style::default().fg(DIM))
+        } else {
+            Span::styled(format!("{} → {}", v.installed, v.fixed), Style::default().fg(Color::Green))
+        };
+        spans.push(Span::styled(format!("{:<22}", v.package), Style::default().fg(Color::Cyan)));
+        spans.push(fix);
+    } else if !v.title.is_empty() {
+        spans.push(Span::raw(v.title.clone()));
+    }
+    if !v.url.is_empty() {
+        spans.push(Span::styled(format!("  {}", v.url), Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
 fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (resources, loading, error, counts) = {
         let s = app.flux_state.lock().expect("flux poisoned");
@@ -4779,6 +5306,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 FluxReady::Reconciling => ("Reconciling", Color::Cyan),
                 FluxReady::Failed => ("Failed", Color::Red),
                 FluxReady::Unknown => ("Unknown", Color::Yellow),
+                FluxReady::NotApplicable => ("N/A", DIM),
             }
         };
         let row_style = match (r.suspended, r.ready) {
@@ -4787,6 +5315,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
             (true, _) => Style::default().fg(DIM),
             (false, FluxReady::Ready) => Style::default(),
+            (false, FluxReady::NotApplicable) => Style::default(),
         };
         let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
         // The focused row expands its message over multiple lines so the full reason is readable.
@@ -4902,6 +5431,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             FluxReady::Reconciling => ("Reconciling", Color::Cyan),
                             FluxReady::Failed => ("Failed", Color::Red),
                             FluxReady::Unknown => ("Unknown", Color::Yellow),
+                            FluxReady::NotApplicable => ("N/A", DIM),
                         }
                     };
                     let row_style = match (r.suspended, r.ready) {
@@ -4910,6 +5440,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
                         (true, _) => Style::default().fg(DIM),
                         (false, FluxReady::Ready) => Style::default(),
+                        (false, FluxReady::NotApplicable) => Style::default(),
                     };
                     let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
                     // The focused row expands its message so the full reason is readable inline.
@@ -5176,6 +5707,13 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Rbac | Mode::RbacFull));
     if is_rbac_mode {
         draw_rbac_detail(f, app, area);
+        return;
+    }
+    let is_vuln_mode = matches!(app.mode, Mode::Vuln | Mode::VulnFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Vuln | Mode::VulnFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Vuln | Mode::VulnFull));
+    if is_vuln_mode {
+        draw_vuln_detail(f, app, area);
         return;
     }
     let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)

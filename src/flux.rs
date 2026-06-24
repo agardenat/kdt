@@ -22,6 +22,9 @@ pub enum FluxReady {
     Reconciling,
     Failed,
     Unknown,
+    // Static reference with no reconciliation, hence no Ready condition (e.g. an OCI HelmRepository):
+    // neutral, neither healthy-green nor a problem.
+    NotApplicable,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,7 @@ impl FluxResource {
             (false, FluxReady::Reconciling) => 2,
             (true, _) => 3,
             (false, FluxReady::Ready) => 4,
+            (false, FluxReady::NotApplicable) => 5,
         };
         (bucket, self.kind.as_str(), self.namespace.as_str(), self.name.as_str())
     }
@@ -82,6 +86,8 @@ impl FluxState {
                 FluxReady::Reconciling => reconciling += 1,
                 FluxReady::Failed => failed += 1,
                 FluxReady::Unknown => unknown += 1,
+                // Counted as ready: a static OCI reference is neutral, not a pending/unknown problem.
+                FluxReady::NotApplicable => ready += 1,
             }
         }
         (ready, failed, unknown, suspended, reconciling)
@@ -328,6 +334,14 @@ fn parse_flux(obj: &DynamicObject, kind: &str, api_version: &str) -> FluxResourc
         None => (FluxReady::Unknown, "(pas de condition Ready)".to_string()),
     };
 
+    // An OCI HelmRepository is a static reference (no reconciliation, no Ready condition): surface it
+    // as N/A instead of a misleading "Unknown".
+    let (ready, message) = if ready == FluxReady::Unknown && is_oci_helm_repository(obj, kind) {
+        (FluxReady::NotApplicable, "OCI (référence statique, pas de réconciliation)".to_string())
+    } else {
+        (ready, message)
+    };
+
     let revision = flux_revision(status);
     let age = obj
         .metadata
@@ -533,6 +547,18 @@ fn is_suspended(obj: &DynamicObject) -> bool {
         .and_then(|s| s.get("suspend"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+// A HelmRepository with spec.type: oci is a static OCI reference: source-controller never reconciles
+// it, so it exposes no Ready condition.
+fn is_oci_helm_repository(obj: &DynamicObject, kind: &str) -> bool {
+    kind == "HelmRepository"
+        && obj
+            .data
+            .get("spec")
+            .and_then(|s| s.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("oci")
 }
 
 // Extracts the source of a Kustomization (spec.sourceRef) or a HelmRelease (spec.chartRef or
