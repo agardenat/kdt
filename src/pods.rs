@@ -94,7 +94,7 @@ impl WorkloadResource {
 #[derive(Default, Debug, Clone)]
 pub struct PodsState {
     pub pods: Vec<PodResource>,
-    pub owner: Option<WorkloadResource>,
+    pub workloads: Vec<WorkloadResource>,
     pub error: Option<String>,
     pub loading: bool,
 }
@@ -105,8 +105,20 @@ pub fn new_pods_state() -> SharedPods {
     Arc::new(Mutex::new(PodsState::default()))
 }
 
-// List pods in `namespace` (None = all namespaces), resolving each pod's top-level owner.
-pub async fn fetch_pods(client: Client, namespace: Option<String>, state: SharedPods) {
+// (group, version, kind) of the top-level workloads listed as parent rows. ReplicaSets are left out
+// on purpose: a pod owned by a Deployment's ReplicaSet is resolved up to the Deployment, and naked
+// ReplicaSets/bare pods surface as their own orphan group in the UI.
+const WORKLOAD_KINDS: &[(&str, &str, &str)] = &[
+    ("apps", "v1", "Deployment"),
+    ("apps", "v1", "StatefulSet"),
+    ("apps", "v1", "DaemonSet"),
+    ("batch", "v1", "Job"),
+];
+
+// List every pod plus every top-level workload in `namespace` (None = all namespaces). Pods carry
+// their resolved owner so the UI can group each pod under its workload row. Workloads are listed
+// directly (not derived from pods) so a scaled-to-zero Deployment still shows up for scale/restart.
+pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: SharedPods) {
     {
         let mut s = state.lock().expect("pods poisoned");
         s.loading = true;
@@ -135,57 +147,40 @@ pub async fn fetch_pods(client: Client, namespace: Option<String>, state: Shared
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
+    let mut workloads = list_workloads(&client, &namespace).await;
+    workloads.sort_by(|a, b| {
+        (a.namespace.as_str(), a.kind.as_str(), a.name.as_str())
+            .cmp(&(b.namespace.as_str(), b.kind.as_str(), b.name.as_str()))
+    });
+
     let mut s = state.lock().expect("pods poisoned");
     s.loading = false;
-    s.owner = None;
+    s.workloads = workloads;
     s.pods = pods;
     s.error = None;
 }
 
-// Load a workload (for its replica counts) and every pod that ultimately belongs to it.
-pub async fn fetch_workload_pods(client: Client, owner: OwnerRef, state: SharedPods) {
-    {
-        let mut s = state.lock().expect("pods poisoned");
-        s.loading = true;
-        s.error = None;
-    }
-
-    let workload = fetch_workload(&client, &owner).await;
-
-    let api: Api<Pod> = Api::namespaced(client.clone(), &owner.namespace);
-    let list = match api.list(&ListParams::default()).await {
-        Ok(l) => l,
-        Err(e) => {
-            let mut s = state.lock().expect("pods poisoned");
-            s.loading = false;
-            s.error = Some(e.to_string());
-            return;
-        }
-    };
-
-    let usage = fetch_pod_usage(&client).await;
-    let mut rs_cache: HashMap<String, Option<OwnerRef>> = HashMap::new();
-    let mut pods: Vec<PodResource> = Vec::new();
-    for p in &list.items {
-        let resolved = resolve_owner(&client, p, &mut rs_cache).await;
-        if resolved.as_ref().map(|o| o.kind == owner.kind && o.name == owner.name) == Some(true) {
-            pods.push(pod_resource(p, resolved, &usage));
+async fn list_workloads(client: &Client, namespace: &Option<String>) -> Vec<WorkloadResource> {
+    let mut out = Vec::new();
+    for (group, version, kind) in WORKLOAD_KINDS {
+        let gvk = GroupVersionKind::gvk(group, version, kind);
+        let Ok((ar, _caps)) = discovery::pinned_kind(client, &gvk).await else { continue };
+        let api: Api<DynamicObject> = match namespace {
+            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+            None => Api::all_with(client.clone(), &ar),
+        };
+        let Ok(list) = api.list(&ListParams::default()).await else { continue };
+        let api_version = format!("{}/{}", group, version);
+        for obj in &list.items {
+            out.push(workload_from_obj(obj, kind, &api_version));
         }
     }
-    pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-
-    let mut s = state.lock().expect("pods poisoned");
-    s.loading = false;
-    s.owner = workload;
-    s.pods = pods;
-    s.error = None;
+    out
 }
 
-async fn fetch_workload(client: &Client, owner: &OwnerRef) -> Option<WorkloadResource> {
-    let (group, version) = split_api_version(&owner.api_version).ok()?;
-    let ar = resolve_ar(client, group, &[version], &owner.kind).await.ok()?;
-    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), &owner.namespace, &ar);
-    let obj = api.get(&owner.name).await.ok()?;
+fn workload_from_obj(obj: &DynamicObject, kind: &str, api_version: &str) -> WorkloadResource {
+    let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+    let name = obj.metadata.name.clone().unwrap_or_default();
     let replicas = obj
         .data
         .get("spec")
@@ -195,7 +190,11 @@ async fn fetch_workload(client: &Client, owner: &OwnerRef) -> Option<WorkloadRes
     let ready_replicas = obj
         .data
         .get("status")
-        .and_then(|s| s.get("readyReplicas").or_else(|| s.get("numberReady")))
+        .and_then(|s| {
+            s.get("readyReplicas")
+                .or_else(|| s.get("numberReady"))
+                .or_else(|| s.get("ready"))
+        })
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
     let age = obj
@@ -204,16 +203,16 @@ async fn fetch_workload(client: &Client, owner: &OwnerRef) -> Option<WorkloadRes
         .as_ref()
         .map(|t| format_age(&t.0))
         .unwrap_or_default();
-    Some(WorkloadResource {
-        kind: owner.kind.clone(),
-        api_version: owner.api_version.clone(),
-        namespace: owner.namespace.clone(),
-        name: owner.name.clone(),
+    WorkloadResource {
+        kind: kind.to_string(),
+        api_version: api_version.to_string(),
+        namespace: namespace.clone(),
+        name: name.clone(),
         replicas,
         ready_replicas,
         age,
-        uid: WorkloadResource::uid(&owner.kind, &owner.namespace, &owner.name),
-    })
+        uid: WorkloadResource::uid(kind, &namespace, &name),
+    }
 }
 
 // Walk a pod's ownerReferences to the top-level workload. A ReplicaSet is resolved one step further
@@ -378,12 +377,6 @@ fn workload_group(kind: &str) -> Option<(&'static str, &'static [&'static str])>
         "Job" => Some(("batch", &["v1"])),
         _ => None,
     }
-}
-
-fn split_api_version(api_version: &str) -> Result<(&str, &str), String> {
-    api_version
-        .split_once('/')
-        .ok_or_else(|| format!("apiVersion invalide : {}", api_version))
 }
 
 async fn resolve_ar(

@@ -49,8 +49,8 @@ pub enum TreeRow {
 use crate::lang;
 use crate::pdf;
 use crate::pods::{
-    fetch_pods, fetch_workload_pods, new_pods_state, run_force_recycle, run_restart, run_scale,
-    OwnerRef, PodResource, SharedPods, WorkloadResource,
+    fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, PodResource,
+    SharedPods, WorkloadResource,
 };
 use crate::rbac::{
     critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, RbacBinding,
@@ -120,7 +120,8 @@ impl SecretFilter {
 }
 use crate::events::{
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
-    fetch_nodes, fetch_status, format_cpu_milli, format_memory_bytes, new_cluster_info_state,
+    fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
+    new_cluster_info_state,
     new_log_state, new_node_list_state, new_node_usage_state, new_ns_list_state, spawn_watcher,
     EventRecord, LineColor, Severity, SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList,
     SharedNodeUsage, SharedNsList, SharedStatus,
@@ -156,6 +157,15 @@ fn is_critical_reason(reason: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull }
+
+// One visual line in the merged workloads view: either a workload (parent/group row) or one of its
+// pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
+// `App::snapshot` (and thus `table_state`), so a selected index maps to the same row in both.
+#[derive(Clone)]
+pub enum PodRow {
+    Workload(WorkloadResource),
+    Pod(PodResource),
+}
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
 #[derive(Clone)]
@@ -193,7 +203,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("events", &["ev", "event"]),
     ("namespace", &["ns", "namespaces"]),
     ("nodes", &["no", "node"]),
-    ("pods", &["po", "pod"]),
+    ("workloads", &["wl", "workload", "deploy", "deployments", "pods", "po", "pod"]),
     ("flux", &["fl", "ks", "kustomizations", "hr", "helmreleases"]),
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("rbac", &["rb", "roles", "bindings", "security", "sec"]),
@@ -233,7 +243,7 @@ fn command_name_suggestions(input: &str) -> Vec<&'static str> {
 
 // Commands that take an optional namespace argument (`:ns/pods/events <name>`).
 fn command_takes_ns(cmd: &str) -> bool {
-    matches!(cmd, "events" | "namespace" | "pods")
+    matches!(cmd, "events" | "namespace" | "workloads")
 }
 
 // Map a namespace argument to a watcher scope: `all`/`*`/`0`/empty mean "all namespaces".
@@ -361,7 +371,8 @@ pub struct App {
     pub flux_pending_select: Option<String>,
     pub cluster_info: SharedClusterInfo,
     pub pods_state: SharedPods,
-    pub pods_focus: Option<OwnerRef>,
+    // Flattened display rows (workload then its pods), kept in lockstep with `snapshot`.
+    pub pods_rows: Vec<PodRow>,
     pub pods_saved_replicas: std::collections::HashMap<String, i32>,
     pub pods_refresh_handle: Option<JoinHandle<()>>,
     pub last_pods_sel_uid: Option<String>,
@@ -479,7 +490,7 @@ impl App {
             flux_pending_select: None,
             cluster_info: new_cluster_info_state(),
             pods_state: new_pods_state(),
-            pods_focus: None,
+            pods_rows: Vec::new(),
             pods_saved_replicas: std::collections::HashMap::new(),
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
@@ -672,6 +683,28 @@ impl App {
                 fetch_flux_logs(client, controllers, filter, key, log_state, 500).await;
             });
             return;
+        }
+        // A workload row in the workloads view: a workload has no logs of its own, so aggregate the
+        // logs of all its pods (one `▼ pod <name>` section each).
+        if matches!(self.mode, Mode::Pods | Mode::PodsFull) {
+            if let Some((namespace, pods)) = self.selected_workload_pods() {
+                let key = format!("wl-logs:{}|{}/{}", rec.kind, rec.namespace, rec.name);
+                if self.last_pod_key.as_deref() == Some(&key) { return; }
+                self.last_pod_key = Some(key.clone());
+                {
+                    let mut s = self.log_state.lock().expect("log state poisoned");
+                    s.current_key = Some(key.clone());
+                    s.lines.clear();
+                    s.error = None;
+                    s.loading = true;
+                }
+                let client = self.client.clone();
+                let log_state = self.log_state.clone();
+                tokio::spawn(async move {
+                    fetch_workload_logs(client, namespace, pods, key, log_state, 500).await;
+                });
+                return;
+            }
         }
         if rec.kind != "Pod" {
             let mut s = self.log_state.lock().expect("log state poisoned");
@@ -1340,7 +1373,7 @@ impl App {
                 self.leave_special_modes();
                 self.enter_nodes_mode();
             }
-            "pods" => {
+            "workloads" => {
                 self.mode = origin;
                 self.leave_special_modes();
                 if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
@@ -1854,7 +1887,7 @@ impl App {
 
     fn enter_pods_mode(&mut self) {
         self.mode = Mode::Pods;
-        self.pods_focus = None;
+        self.pods_rows.clear();
         self.detail_tab = DetailTab::Logs;
         self.snapshot.clear();
         self.table_state.select(None);
@@ -1872,7 +1905,7 @@ impl App {
     fn exit_pods_mode(&mut self) {
         self.mode = Mode::Selection;
         self.stop_pods_auto_refresh();
-        self.pods_focus = None;
+        self.pods_rows.clear();
         self.snapshot.clear();
         self.table_state.select(None);
         self.selected_uid = None;
@@ -2404,7 +2437,7 @@ impl App {
         self.mode = Mode::Pods;
     }
 
-    // Kick off a one-shot pod fetch for the current scope (flat list or focused workload).
+    // Kick off a one-shot fetch of workloads + pods for the current namespace scope.
     fn refresh_pods(&self) {
         {
             let mut s = self.pods_state.lock().expect("pods poisoned");
@@ -2413,24 +2446,16 @@ impl App {
         }
         let client = self.client.clone();
         let state = self.pods_state.clone();
-        match self.pods_focus.clone() {
-            Some(owner) => {
-                tokio::spawn(async move { fetch_workload_pods(client, owner, state).await; });
-            }
-            None => {
-                let ns = self.current_ns_opt();
-                tokio::spawn(async move { fetch_pods(client, ns, state).await; });
-            }
-        }
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move { fetch_workloads(client, ns, state).await; });
     }
 
-    // Restarts the 5 s auto-refresh, capturing the current scope (flat vs. focused). Must be called
-    // again whenever the focus changes so the ticker fetches the right set.
+    // Restarts the 5 s auto-refresh, capturing the current namespace scope. Must be called again
+    // whenever the namespace filter changes so the ticker fetches the right set.
     fn start_pods_auto_refresh(&mut self) {
         self.stop_pods_auto_refresh();
         let client = self.client.clone();
         let state = self.pods_state.clone();
-        let focus = self.pods_focus.clone();
         let ns = self.current_ns_opt();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -2438,10 +2463,7 @@ impl App {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                match &focus {
-                    Some(owner) => fetch_workload_pods(client.clone(), owner.clone(), state.clone()).await,
-                    None => fetch_pods(client.clone(), ns.clone(), state.clone()).await,
-                }
+                fetch_workloads(client.clone(), ns.clone(), state.clone()).await;
             }
         });
         self.pods_refresh_handle = Some(handle);
@@ -2458,39 +2480,45 @@ impl App {
     fn schedule_pods_refresh(&self, after_ms: u64) {
         let client = self.client.clone();
         let state = self.pods_state.clone();
-        let focus = self.pods_focus.clone();
         let ns = self.current_ns_opt();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(after_ms)).await;
-            match focus {
-                Some(owner) => fetch_workload_pods(client, owner, state).await,
-                None => fetch_pods(client, ns, state).await,
-            }
+            fetch_workloads(client, ns, state).await;
         });
     }
 
-    // Rebuild the visible snapshot from the shared pod state. In the flat list every row is a pod; in
-    // the focused (hierarchical) view row 0 is the workload object and the rest are its pods. The
-    // snapshot carries real api_version/kind/ns/name so the shared detail tabs (Logs/Status/Related)
-    // work per pod and per workload without extra plumbing.
+    // Rebuild the flattened display rows (and the matching snapshot) from the shared state: each
+    // workload row is followed by the pods that resolve to it, then any orphan pods (bare pods or
+    // pods of a naked ReplicaSet) close the list. The snapshot carries real api_version/kind/ns/name
+    // so the shared detail tabs (Logs/Status/Related) work per pod and per workload, and stays index-
+    // aligned with `pods_rows` so a selected table row maps to the same workload/pod in both.
     fn refresh_pods_snapshot(&mut self) {
-        let recs: Vec<EventRecord> = {
+        let rows: Vec<PodRow> = {
             let s = self.pods_state.lock().expect("pods poisoned");
-            if self.pods_focus.is_some() {
-                let mut recs: Vec<EventRecord> = Vec::with_capacity(s.pods.len() + 1);
-                if let Some(w) = &s.owner {
-                    recs.push(synthetic_workload_record(w));
-                    // Remember the initial replica count once, so rescale/recycle can restore it.
-                    if let Some(r) = w.replicas {
-                        self.pods_saved_replicas.entry(w.uid.clone()).or_insert(r);
-                    }
+            let mut rows: Vec<PodRow> = Vec::with_capacity(s.pods.len() + s.workloads.len());
+            for w in &s.workloads {
+                rows.push(PodRow::Workload(w.clone()));
+                // Remember the initial replica count once, so rescale/recycle can restore it.
+                if let Some(r) = w.replicas {
+                    self.pods_saved_replicas.entry(w.uid.clone()).or_insert(r);
                 }
-                recs.extend(s.pods.iter().map(synthetic_pod_record));
-                recs
-            } else {
-                s.pods.iter().map(synthetic_pod_record).collect()
+                for p in s.pods.iter().filter(|p| pod_belongs_to(p, w)) {
+                    rows.push(PodRow::Pod(p.clone()));
+                }
             }
+            for p in s.pods.iter().filter(|p| !s.workloads.iter().any(|w| pod_belongs_to(p, w))) {
+                rows.push(PodRow::Pod(p.clone()));
+            }
+            rows
         };
+        let recs: Vec<EventRecord> = rows
+            .iter()
+            .map(|r| match r {
+                PodRow::Workload(w) => synthetic_workload_record(w),
+                PodRow::Pod(p) => synthetic_pod_record(p),
+            })
+            .collect();
+        self.pods_rows = rows;
         let prev_uid = self
             .table_state
             .selected()
@@ -2533,54 +2561,44 @@ impl App {
         self.maybe_fetch_related();
     }
 
-    // Switch from the selected pod to its originating workload, showing the workload + all its pods.
-    fn focus_owner(&mut self) {
-        let owner = self
-            .table_state
-            .selected()
-            .and_then(|i| self.pods_state.lock().expect("pods poisoned").pods.get(i).and_then(|p| p.owner.clone()));
-        let Some(owner) = owner else {
-            self.clipboard_status = Some((
-                std::time::Instant::now(),
-                "pas d'objet d'origine pour ce pod".to_string(),
-            ));
-            return;
-        };
-        self.pods_focus = Some(owner);
-        self.enter_pods_scope();
-    }
-
-    // Return from the hierarchical view to the flat pod list.
-    fn unfocus_owner(&mut self) {
-        self.pods_focus = None;
-        self.enter_pods_scope();
-    }
-
-    // Shared reset when the pod scope changes (focus on / off): clear selection, refetch, restart
-    // the auto-refresh so it targets the new scope.
-    fn enter_pods_scope(&mut self) {
-        self.last_pods_sel_uid = None;
-        self.table_state.select(None);
-        self.selected_uid = None;
-        self.reset_scroll();
-        {
-            let mut s = self.pods_state.lock().expect("pods poisoned");
-            s.pods.clear();
-            s.owner = None;
+    // The workload that scale/restart actions target: the selected row when it is a workload, or the
+    // owning workload of the selected pod row (so actions work whether a parent or child is selected).
+    fn selected_workload(&self) -> Option<WorkloadResource> {
+        let i = self.table_state.selected()?;
+        match self.pods_rows.get(i)? {
+            PodRow::Workload(w) => Some(w.clone()),
+            PodRow::Pod(p) => {
+                let o = p.owner.as_ref()?;
+                self.pods_rows.iter().find_map(|r| match r {
+                    PodRow::Workload(w)
+                        if w.kind == o.kind && w.name == o.name && w.namespace == o.namespace =>
+                    {
+                        Some(w.clone())
+                    }
+                    _ => None,
+                })
+            }
         }
-        self.snapshot.clear();
-        self.refresh_pods();
-        self.start_pods_auto_refresh();
-        self.refresh_pods_snapshot();
     }
 
-    fn focus_workload(&self) -> Option<WorkloadResource> {
-        self.pods_state.lock().expect("pods poisoned").owner.clone()
+    // (namespace, pod names) of the selected workload row, for aggregated log fetching. None when the
+    // selected row is a pod (its own logs are fetched directly) or no workload is selected.
+    fn selected_workload_pods(&self) -> Option<(String, Vec<String>)> {
+        let i = self.table_state.selected()?;
+        let PodRow::Workload(w) = self.pods_rows.get(i)? else { return None };
+        let s = self.pods_state.lock().expect("pods poisoned");
+        let pods: Vec<String> = s
+            .pods
+            .iter()
+            .filter(|p| pod_belongs_to(p, w))
+            .map(|p| p.name.clone())
+            .collect();
+        Some((w.namespace.clone(), pods))
     }
 
-    // Scale the focused workload by a relative delta (clamped at 0).
+    // Scale the selected workload by a relative delta (clamped at 0).
     fn pods_scale(&mut self, delta: i32) {
-        let Some(w) = self.focus_workload() else {
+        let Some(w) = self.selected_workload() else {
             self.pods_scale_hint();
             return;
         };
@@ -2597,7 +2615,7 @@ impl App {
 
     // Scale the focused workload to zero (its initial count is already memorised for restore).
     fn pods_scale_zero(&mut self) {
-        let Some(w) = self.focus_workload() else {
+        let Some(w) = self.selected_workload() else {
             self.pods_scale_hint();
             return;
         };
@@ -2613,7 +2631,7 @@ impl App {
 
     // Scale the focused workload to an exact replica count (clamped at 0).
     fn pods_scale_set(&mut self, target: i32) {
-        let Some(w) = self.focus_workload() else {
+        let Some(w) = self.selected_workload() else {
             self.pods_scale_hint();
             return;
         };
@@ -2630,7 +2648,7 @@ impl App {
     // Rescale to the memorised initial count. `force` first scales to 0 then back up, bypassing the
     // rolling update for a hard recycle of all pods.
     fn pods_rescale(&mut self, force: bool) {
-        let Some(w) = self.focus_workload() else {
+        let Some(w) = self.selected_workload() else {
             self.pods_scale_hint();
             return;
         };
@@ -2671,7 +2689,7 @@ impl App {
 
     // Rollout restart of the focused workload (Deployment/StatefulSet/DaemonSet).
     fn pods_restart(&mut self) {
-        let Some(w) = self.focus_workload() else {
+        let Some(w) = self.selected_workload() else {
             self.pods_scale_hint();
             return;
         };
@@ -2701,14 +2719,14 @@ impl App {
     fn pods_scale_hint(&mut self) {
         self.clipboard_status = Some((
             std::time::Instant::now(),
-            "scale/restart : basculez sur l'objet (o) d'abord".to_string(),
+            "scale/restart : sélectionnez un workload (ou un de ses pods)".to_string(),
         ));
     }
 
     // Opens the workload action menu (rescale / recycle / restart). Requires a focused workload,
     // otherwise it falls back to the focus hint.
     fn open_pods_action_menu(&mut self) {
-        if self.focus_workload().is_none() {
+        if self.selected_workload().is_none() {
             self.pods_scale_hint();
             return;
         }
@@ -2729,7 +2747,7 @@ impl App {
 
     // Opens the workload scale menu (+1 / -1 / scale 0 / set an exact replica count).
     fn open_pods_scale_menu(&mut self) {
-        if self.focus_workload().is_none() {
+        if self.selected_workload().is_none() {
             self.pods_scale_hint();
             return;
         }
@@ -3549,12 +3567,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Tab, _, Mode::Pods) => app.cycle_tab(),
         (KeyCode::BackTab, _, Mode::Pods) => app.cycle_tab_back(),
         (KeyCode::Enter, _, Mode::Pods) => app.enter_pods_full(),
-        (KeyCode::Esc, _, Mode::Pods) => {
-            if app.pods_focus.is_some() { app.unfocus_owner(); } else { app.exit_pods_mode(); }
-        }
-        (KeyCode::Char('o'), _, Mode::Pods) => {
-            if app.pods_focus.is_some() { app.unfocus_owner(); } else { app.focus_owner(); }
-        }
+        (KeyCode::Esc, _, Mode::Pods) => app.exit_pods_mode(),
         (KeyCode::Char('n'), _, Mode::Pods) => app.filter_ns_to_selected(),
         (KeyCode::Char('0'), _, Mode::Pods) => app.clear_namespace_filter(),
         (KeyCode::Char('s'), _, Mode::Pods) => app.open_pods_scale_menu(),
@@ -3885,11 +3898,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         if draw_mode == Mode::Nodes {
             draw_nodes_table(f, app, ta);
         } else if draw_mode == Mode::Pods {
-            if app.pods_focus.is_some() {
-                draw_pods_tree(f, app, ta);
-            } else {
-                draw_pods_table(f, app, ta);
-            }
+            draw_pods_tree(f, app, ta);
         } else if draw_mode == Mode::Flux {
             if app.flux_tree {
                 draw_flux_tree(f, app, ta);
@@ -4023,31 +4032,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
-        Mode::Pods => {
-            let mut spans = vec![
-                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
-                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
-                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
-                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
-                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
-                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
-            ];
-            if app.pods_focus.is_some() {
-                spans.extend(vec![
-                    footer_sep(),
-                    Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
-                    Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
-                ]);
-            }
-            spans.extend(vec![
-                footer_sep(),
-                Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
-                Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
-                Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
-            ]);
-            spans
-        }
+        Mode::Pods => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+            footer_sep(),
+            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
+            footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
         Mode::PodsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
@@ -5360,19 +5359,72 @@ fn pct_cell(usage: Option<i64>, base: Option<i64>) -> Cell<'static> {
     }
 }
 
-fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (pods, loading, error) = {
+// Column width fitted to the longest value (and the header), clamped to [min, max].
+fn col_width<'a>(values: impl Iterator<Item = &'a str>, header: &str, min: u16, max: u16) -> u16 {
+    let longest = values.map(|v| v.chars().count()).max().unwrap_or(0).max(header.len());
+    (longest as u16).clamp(min, max)
+}
+
+// Does pod `p` resolve up to workload `w` (so it nests under it in the merged view)?
+fn pod_belongs_to(p: &PodResource, w: &WorkloadResource) -> bool {
+    p.owner
+        .as_ref()
+        .map(|o| o.kind == w.kind && o.name == w.name && o.namespace == w.namespace)
+        .unwrap_or(false)
+}
+
+// Merged workloads/pods view: each workload is a parent row, its pods nest under it (depth 1), and
+// orphan pods (bare pods or pods of a naked ReplicaSet) trail at the end keeping their namespace.
+// Rendered straight from `app.pods_rows`, which is index-aligned with the snapshot/`table_state`, so
+// the highlighted row matches the detail panel and the scale/restart target.
+fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_pods, n_workloads) = {
         let s = app.pods_state.lock().expect("pods poisoned");
-        (s.pods.clone(), s.loading, s.error.clone())
+        (s.loading, s.error.clone(), s.pods.len(), s.workloads.len())
     };
+    let src = &app.pods_rows;
 
     let title = if let Some(e) = &error {
-        format!("pods (erreur: {})", e)
-    } else if loading && pods.is_empty() {
-        "pods (chargement...)".to_string()
+        format!("workloads (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "workloads (chargement...)".to_string()
     } else {
-        format!("pods ({}) · ns={}", pods.len(), app.namespace_label)
+        format!(
+            "workloads ({} workloads · {} pods) · ns={}",
+            n_workloads, n_pods, app.namespace_label
+        )
     };
+
+    // A pod row nests under the workload row it immediately follows when its owner matches; otherwise
+    // it is an orphan. `parent[i]` is the index of the owning workload row (None for orphans), used
+    // both to aggregate child CPU/MEM onto the workload row and to decide indentation/namespace.
+    let mut parent: Vec<Option<usize>> = vec![None; src.len()];
+    let mut cur: Option<(&str, &str, &str, usize)> = None;
+    for (i, row) in src.iter().enumerate() {
+        match row {
+            PodRow::Workload(w) => cur = Some((&w.kind, &w.name, &w.namespace, i)),
+            PodRow::Pod(p) => {
+                if let (Some(o), Some((k, n, ns, idx))) = (p.owner.as_ref(), cur) {
+                    if o.kind == k && o.name == n && o.namespace == ns {
+                        parent[i] = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+    let mut agg: Vec<(i64, i64, bool, bool)> = vec![(0, 0, false, false); src.len()];
+    for (i, row) in src.iter().enumerate() {
+        if let (PodRow::Pod(p), Some(idx)) = (row, parent[i]) {
+            if let Some(c) = p.cpu_milli {
+                agg[idx].0 += c;
+                agg[idx].2 = true;
+            }
+            if let Some(m) = p.mem_bytes {
+                agg[idx].1 += m;
+                agg[idx].3 = true;
+            }
+        }
+    }
 
     let header_row = Row::new(vec![
         Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
@@ -5382,118 +5434,84 @@ fn draw_pods_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = pods.iter().map(|p| {
-        let status_color = pod_status_color(&p.status);
-        let row_style = pod_row_style(status_color);
-        let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
-        Row::new(vec![
-            Cell::from(p.namespace.clone()),
-            Cell::from(p.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from(p.ready.clone()),
-            Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-            Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
-            usage_cell(p.cpu_milli, format_cpu_milli),
-            usage_cell(p.mem_bytes, format_memory_bytes),
-            pct_cell(p.cpu_milli, p.cpu_req),
-            pct_cell(p.cpu_milli, p.cpu_lim),
-            pct_cell(p.mem_bytes, p.mem_req),
-            pct_cell(p.mem_bytes, p.mem_lim),
-            Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
-            Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
-            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
-        ])
-        .style(row_style)
-    }).collect();
+    let blank = || Cell::from("");
+    let rows: Vec<Row> = src
+        .iter()
+        .enumerate()
+        .map(|(i, row)| match row {
+            PodRow::Workload(w) => {
+                let ready = w
+                    .replicas
+                    .map(|r| format!("{}/{}", w.ready_replicas, r))
+                    .unwrap_or_else(|| w.ready_replicas.to_string());
+                let (status, status_color) = match w.replicas {
+                    Some(r) if w.ready_replicas >= r => ("Ready", Color::Green),
+                    Some(_) => ("Scaling", Color::Yellow),
+                    None => (w.kind.as_str(), Color::Cyan),
+                };
+                let (cpu, mem, has_cpu, has_mem) = agg[i];
+                Row::new(vec![
+                    Cell::from(w.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(format!("▾ {} {}", w.kind, w.name))
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Cell::from(ready).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(status).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                    blank(),
+                    usage_cell(has_cpu.then_some(cpu), format_cpu_milli),
+                    usage_cell(has_mem.then_some(mem), format_memory_bytes),
+                    blank(), blank(), blank(), blank(),
+                    blank(),
+                    blank(),
+                    Cell::from(w.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
+            PodRow::Pod(p) => {
+                let status_color = pod_status_color(&p.status);
+                let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
+                let orphan = parent[i].is_none();
+                let ns_cell = if orphan {
+                    Cell::from(p.namespace.clone()).style(Style::default().fg(DIM))
+                } else {
+                    blank()
+                };
+                Row::new(vec![
+                    ns_cell,
+                    Cell::from(format!("    {}", p.name)),
+                    Cell::from(p.ready.clone()),
+                    Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                    Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
+                    usage_cell(p.cpu_milli, format_cpu_milli),
+                    usage_cell(p.mem_bytes, format_memory_bytes),
+                    pct_cell(p.cpu_milli, p.cpu_req),
+                    pct_cell(p.cpu_milli, p.cpu_lim),
+                    pct_cell(p.mem_bytes, p.mem_req),
+                    pct_cell(p.mem_bytes, p.mem_lim),
+                    Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+                ])
+                .style(pod_row_style(status_color))
+            }
+        })
+        .collect();
 
-    // Size NAMESPACE/NAME to their longest value (clamped) instead of grabbing all the slack, so the
-    // metric columns sit right next to the name like k9s.
-    let ns_w = col_width(pods.iter().map(|p| p.namespace.as_str()), "NAMESPACE", 9, 24);
-    let name_w = col_width(pods.iter().map(|p| p.name.as_str()), "NAME", 12, 50);
+    let ns_values = src.iter().map(|r| match r {
+        PodRow::Workload(w) => w.namespace.as_str(),
+        PodRow::Pod(p) => p.namespace.as_str(),
+    });
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            PodRow::Workload(w) => format!("▾ {} {}", w.kind, w.name),
+            PodRow::Pod(p) => format!("    {}", p.name),
+        })
+        .collect();
+    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 56);
     let widths = [
-        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(6),
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(7),
         Constraint::Length(12), Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
         Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
-        Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-// Column width fitted to the longest value (and the header), clamped to [min, max].
-fn col_width<'a>(values: impl Iterator<Item = &'a str>, header: &str, min: u16, max: u16) -> u16 {
-    let longest = values.map(|v| v.chars().count()).max().unwrap_or(0).max(header.len());
-    (longest as u16).clamp(min, max)
-}
-
-// Hierarchical view of a focused workload: the object on the first row (depth 0) followed by its
-// pods (depth 1), mirroring the Flux tree look. Selection (app.table_state) stays aligned with the
-// snapshot, where index 0 is the workload and the rest are the pods, in the same order.
-fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (owner, pods, loading, error) = {
-        let s = app.pods_state.lock().expect("pods poisoned");
-        (s.owner.clone(), s.pods.clone(), s.loading, s.error.clone())
-    };
-
-    let title = if let Some(e) = &error {
-        format!("pods arbre (erreur: {})", e)
-    } else if loading && owner.is_none() {
-        "pods arbre (chargement...)".to_string()
-    } else if let Some(w) = &owner {
-        format!("{} {}/{} ({} pods)", w.kind, w.namespace, w.name, pods.len())
-    } else {
-        "pods arbre".to_string()
-    };
-
-    let header_row = Row::new(vec![
-        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("STATUS"),
-        Cell::from("RST"), Cell::from("CPU"), Cell::from("MEM"),
-        Cell::from("IP"), Cell::from("NODE"), Cell::from("AGE"),
-    ])
-    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-
-    let mut rows: Vec<Row> = Vec::with_capacity(pods.len() + 1);
-    if let Some(w) = &owner {
-        let replicas = w
-            .replicas
-            .map(|r| format!("{}/{}", w.ready_replicas, r))
-            .unwrap_or_else(|| format!("{}", w.ready_replicas));
-        rows.push(Row::new(vec![
-            Cell::from(format!("▾ {} {}", w.kind, w.name)).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from(replicas).style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from("Workload"),
-            Cell::from(String::new()), Cell::from(String::new()), Cell::from(String::new()),
-            Cell::from(String::new()),
-            Cell::from(String::new()),
-            Cell::from(w.age.clone()).style(Style::default().fg(DIM)),
-        ]));
-    }
-    for p in &pods {
-        let status_color = pod_status_color(&p.status);
-        let row_style = pod_row_style(status_color);
-        let restart_color = if p.restarts > 0 { Color::Yellow } else { DIM };
-        rows.push(Row::new(vec![
-            Cell::from(format!("    {}", p.name)),
-            Cell::from(p.ready.clone()),
-            Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-            Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
-            usage_cell(p.cpu_milli, format_cpu_milli),
-            usage_cell(p.mem_bytes, format_memory_bytes),
-            Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
-            Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
-            Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
-        ])
-        .style(row_style));
-    }
-
-    let widths = [
-        Constraint::Min(36), Constraint::Length(8), Constraint::Length(14),
-        Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
         Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
     ];
 

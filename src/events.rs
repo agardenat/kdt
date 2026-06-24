@@ -162,19 +162,11 @@ pub fn new_log_state() -> SharedLog {
     Arc::new(Mutex::new(LogState::default()))
 }
 
-// Fetch recent logs for every container (init + regular) of a pod. The `tail` budget is split
-// across containers when there is more than one. `key` guards against a stale write (see AiState).
-pub async fn fetch_logs(
-    client: Client,
-    namespace: String,
-    pod: String,
-    key: String,
-    state: SharedLog,
-    tail: i64,
-) {
-    let api: Api<Pod> = Api::namespaced(client, &namespace);
-
-    let containers: Vec<(String, bool)> = match api.get(&pod).await {
+// Recent logs for every container (init + regular) of one pod, as display lines. Container headers
+// are added only when the pod has more than one container. Failures (get/logs) are embedded as
+// lines rather than aborting, so aggregating across several pods never drops the others.
+async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64) -> Vec<String> {
+    let containers: Vec<(String, bool)> = match api.get(pod).await {
         Ok(p) => {
             let mut names = Vec::new();
             if let Some(spec) = p.spec.as_ref() {
@@ -189,57 +181,96 @@ pub async fn fetch_logs(
             }
             names
         }
-        Err(e) => {
-            let mut s = state.lock().expect("log state poisoned");
-            if s.current_key.as_deref() != Some(&key) { return; }
-            s.loading = false;
-            s.lines.clear();
-            s.error = Some(format!("get pod: {}", e));
-            return;
-        }
+        Err(e) => return vec![format!("(échec récupération du pod {}: {})", pod, e)],
     };
 
     if containers.is_empty() {
-        let mut s = state.lock().expect("log state poisoned");
-        if s.current_key.as_deref() != Some(&key) { return; }
-        s.loading = false;
-        s.lines.clear();
-        s.error = Some("aucun container trouvé sur ce pod".to_string());
-        return;
+        return vec!["aucun container trouvé sur ce pod".to_string()];
     }
 
     let multi = containers.len() > 1;
     let per_container_tail = if multi { tail.max(1) / containers.len() as i64 } else { tail };
     let per_container_tail = per_container_tail.max(50);
-    let mut all_lines: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
 
     for (cname, is_init) in &containers {
         if multi {
             let kind = if *is_init { "init container" } else { "container" };
-            all_lines.push(format!("══ {}: {} ══", kind, cname));
+            out.push(format!("══ {}: {} ══", kind, cname));
         }
         let lp = LogParams {
             tail_lines: Some(per_container_tail),
             container: Some(cname.clone()),
             ..Default::default()
         };
-        match api.logs(&pod, &lp).await {
+        match api.logs(pod, &lp).await {
             Ok(text) => {
-                let lines = text.lines();
                 let mut count = 0;
-                for line in lines {
-                    all_lines.push(line.to_string());
+                for line in text.lines() {
+                    out.push(line.to_string());
                     count += 1;
                 }
                 if multi && count == 0 {
-                    all_lines.push("(aucun log)".to_string());
+                    out.push("(aucun log)".to_string());
                 }
             }
             Err(e) => {
-                all_lines.push(format!("(échec récupération logs de {}: {})", cname, e));
+                out.push(format!("(échec récupération logs de {}: {})", cname, e));
             }
         }
-        if multi { all_lines.push(String::new()); }
+        if multi { out.push(String::new()); }
+    }
+
+    out
+}
+
+// Fetch recent logs for every container (init + regular) of a pod. The `tail` budget is split
+// across containers when there is more than one. `key` guards against a stale write (see AiState).
+pub async fn fetch_logs(
+    client: Client,
+    namespace: String,
+    pod: String,
+    key: String,
+    state: SharedLog,
+    tail: i64,
+) {
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
+    let lines = pod_log_lines(&api, &pod, tail).await;
+
+    let mut s = state.lock().expect("log state poisoned");
+    if s.current_key.as_deref() != Some(&key) { return; }
+    s.loading = false;
+    s.lines = lines;
+    s.error = None;
+}
+
+// Aggregate logs for a whole workload: the tail budget is split across its pods, each section
+// prefixed with a `▼ pod <name>` header. Pods are fetched in the order given (already sorted by the
+// pods view, so problem pods surface first). `key` guards against a stale write.
+pub async fn fetch_workload_logs(
+    client: Client,
+    namespace: String,
+    pods: Vec<String>,
+    key: String,
+    state: SharedLog,
+    tail: i64,
+) {
+    if pods.is_empty() {
+        let mut s = state.lock().expect("log state poisoned");
+        if s.current_key.as_deref() != Some(&key) { return; }
+        s.loading = false;
+        s.lines.clear();
+        s.error = Some("aucun pod en cours pour ce workload".to_string());
+        return;
+    }
+
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
+    let per_pod_tail = (tail / pods.len() as i64).max(80);
+    let mut all_lines: Vec<String> = Vec::new();
+    for (i, pod) in pods.iter().enumerate() {
+        if i > 0 { all_lines.push(String::new()); }
+        all_lines.push(format!("▼ pod {}", pod));
+        all_lines.extend(pod_log_lines(&api, pod, per_pod_tail).await);
     }
 
     let mut s = state.lock().expect("log state poisoned");
