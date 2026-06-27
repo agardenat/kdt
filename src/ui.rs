@@ -73,6 +73,27 @@ use crate::secrets::{
 use crate::configmaps::{
     fetch_configmaps, human_size, new_configmaps_state, ConfigMapInfo, SharedConfigMaps,
 };
+use crate::svc::{
+    endpoint_belongs_to, fetch_network, new_network_state, EndpointRow, IngressClassResource,
+    IngressResource, ServiceResource, SharedNetwork,
+};
+
+// The two object worlds the Services/Ingress view toggles between (palette `svc` vs `ingress`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetWorld {
+    Services,
+    Ingress,
+}
+
+// One visual row of the network view: a parent (Service / IngressClass) or its children, plus the
+// flat Ingress row. Kept index-aligned with the snapshot so the detail panel tracks the selection.
+#[derive(Debug, Clone)]
+enum NetRow {
+    Service(ServiceResource),
+    Endpoint(EndpointRow),
+    Ingress(IngressResource),
+    IngressClass(IngressClassResource),
+}
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 
 // In-panel reveal of a secret's data values (`b`/`d`). Hidden by default and reset whenever the
@@ -156,7 +177,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -210,6 +231,8 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("vuln", &["vulnerabilities", "vulns", "cve", "cves"]),
     ("secrets", &["secret", "se", "tls", "certs", "certificates"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
+    ("services", &["svc", "service", "svcs"]),
+    ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
     ("quit", &["q"]),
 ];
 
@@ -373,9 +396,20 @@ pub struct App {
     pub pods_state: SharedPods,
     // Flattened display rows (workload then its pods), kept in lockstep with `snapshot`.
     pub pods_rows: Vec<PodRow>,
+    // When true, the workloads view shows parent workload rows with their pods nested under them;
+    // when false (default) only pods are listed flat. Toggled with `t`.
+    pub pods_show_workloads: bool,
     pub pods_saved_replicas: std::collections::HashMap<String, i32>,
     pub pods_refresh_handle: Option<JoinHandle<()>>,
     pub last_pods_sel_uid: Option<String>,
+    // Services/Ingress view: shared inventory, the flattened display rows (index-aligned with the
+    // snapshot), which world is shown, and whether children are nested (`t` toggle).
+    pub network_state: SharedNetwork,
+    net_rows: Vec<NetRow>,
+    net_world: NetWorld,
+    net_group: bool,
+    pub net_refresh_handle: Option<JoinHandle<()>>,
+    last_net_sel_uid: Option<String>,
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
     pub rbac_state: SharedRbac,
@@ -491,6 +525,13 @@ impl App {
             cluster_info: new_cluster_info_state(),
             pods_state: new_pods_state(),
             pods_rows: Vec::new(),
+            pods_show_workloads: false,
+            network_state: new_network_state(),
+            net_rows: Vec::new(),
+            net_world: NetWorld::Services,
+            net_group: false,
+            net_refresh_handle: None,
+            last_net_sel_uid: None,
             pods_saved_replicas: std::collections::HashMap::new(),
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
@@ -1414,6 +1455,16 @@ impl App {
                 self.leave_special_modes();
                 self.enter_configmaps_mode();
             }
+            "services" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_network_mode(NetWorld::Services);
+            }
+            "ingress" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_network_mode(NetWorld::Ingress);
+            }
             _ => self.exit_command(),
         }
     }
@@ -1443,6 +1494,10 @@ impl App {
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
                 self.stop_configmaps_auto_refresh();
+            }
+            Mode::Services | Mode::ServicesFull => {
+                self.stop_network_auto_refresh();
+                self.clear_status_state();
             }
             _ => {}
         }
@@ -1920,6 +1975,202 @@ impl App {
     fn enter_pods_full(&mut self) {
         if self.snapshot.is_empty() { return; }
         self.mode = Mode::PodsFull;
+    }
+
+    // --- Services / Ingress view --------------------------------------------------------------
+
+    // Open the network view in the given world (Services or Ingress). Both worlds share one fetch and
+    // one shared state, so switching world only re-renders; the namespace scope drives the fetch.
+    fn enter_network_mode(&mut self, world: NetWorld) {
+        self.mode = Mode::Services;
+        self.net_world = world;
+        self.net_rows.clear();
+        // Status is the most useful default tab for Services/Ingress (they have no logs of their own).
+        self.detail_tab = DetailTab::Status;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_net_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_network();
+        self.start_network_auto_refresh();
+        self.refresh_net_snapshot();
+    }
+
+    fn exit_network_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_network_auto_refresh();
+        self.net_rows.clear();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_net_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_network_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.mode = Mode::ServicesFull;
+    }
+
+    fn exit_network_full(&mut self) {
+        self.mode = Mode::Services;
+    }
+
+    // `t`: toggle nesting of children under their parent (endpoints under a Service, ingresses under
+    // their IngressClass). Same meaning as `t` in the workloads view: "show the grouping".
+    fn toggle_network_group(&mut self) {
+        self.net_group = !self.net_group;
+        self.refresh_net_snapshot();
+    }
+
+    // `g`: switch between the Services and Ingress worlds (same shared inventory, no reload needed).
+    fn cycle_network_world(&mut self) {
+        self.net_world = match self.net_world {
+            NetWorld::Services => NetWorld::Ingress,
+            NetWorld::Ingress => NetWorld::Services,
+        };
+        self.last_net_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_net_snapshot();
+    }
+
+    // One-shot fetch of the network inventory for the current namespace scope.
+    fn refresh_network(&self) {
+        {
+            let mut s = self.network_state.lock().expect("network poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.network_state.clone();
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move { fetch_network(client, ns, state).await; });
+    }
+
+    fn start_network_auto_refresh(&mut self) {
+        self.stop_network_auto_refresh();
+        let client = self.client.clone();
+        let state = self.network_state.clone();
+        let ns = self.current_ns_opt();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_network(client.clone(), ns.clone(), state.clone()).await;
+            }
+        });
+        self.net_refresh_handle = Some(handle);
+    }
+
+    fn stop_network_auto_refresh(&mut self) {
+        if let Some(h) = self.net_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuild the flattened display rows and the index-aligned snapshot from the shared state, honoring
+    // the active world and the `t` grouping. Selection is preserved by uid across refreshes/toggles so
+    // the highlighted row and detail panel stay put. Mirrors `refresh_pods_snapshot`.
+    fn refresh_net_snapshot(&mut self) {
+        let rows: Vec<NetRow> = {
+            let s = self.network_state.lock().expect("network poisoned");
+            match (self.net_world, self.net_group) {
+                // Services, grouped: each Service followed by its backing endpoints.
+                (NetWorld::Services, true) => {
+                    let mut rows: Vec<NetRow> =
+                        Vec::with_capacity(s.services.len() + s.endpoints.len());
+                    for svc in &s.services {
+                        rows.push(NetRow::Service(svc.clone()));
+                        for ep in s.endpoints.iter().filter(|e| endpoint_belongs_to(e, svc)) {
+                            rows.push(NetRow::Endpoint(ep.clone()));
+                        }
+                    }
+                    rows
+                }
+                // Services, flat: just the Service rows.
+                (NetWorld::Services, false) => {
+                    s.services.iter().cloned().map(NetRow::Service).collect()
+                }
+                // Ingress, grouped by class: each IngressClass followed by the ingresses that name it,
+                // then ingresses with no class (or an unknown one) trailing as their own group.
+                (NetWorld::Ingress, true) => {
+                    let mut rows: Vec<NetRow> =
+                        Vec::with_capacity(s.ingresses.len() + s.ingress_classes.len());
+                    for cls in &s.ingress_classes {
+                        rows.push(NetRow::IngressClass(cls.clone()));
+                        for ing in s.ingresses.iter().filter(|i| i.class.as_deref() == Some(cls.name.as_str())) {
+                            rows.push(NetRow::Ingress(ing.clone()));
+                        }
+                    }
+                    let known: Vec<&str> = s.ingress_classes.iter().map(|c| c.name.as_str()).collect();
+                    for ing in s
+                        .ingresses
+                        .iter()
+                        .filter(|i| i.class.as_deref().map(|c| !known.contains(&c)).unwrap_or(true))
+                    {
+                        rows.push(NetRow::Ingress(ing.clone()));
+                    }
+                    rows
+                }
+                // Ingress, flat: just the Ingress rows.
+                (NetWorld::Ingress, false) => {
+                    s.ingresses.iter().cloned().map(NetRow::Ingress).collect()
+                }
+            }
+        };
+        let recs: Vec<EventRecord> = rows.iter().map(synthetic_net_record).collect();
+        self.net_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_net_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_net_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_net_sel_uid = Some(cur_uid);
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_net_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_net_sel_uid = self.selected_uid.clone();
+        self.reset_scroll();
+        self.maybe_fetch_logs();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
     }
 
     // --- RBAC security view -------------------------------------------------------------------
@@ -2495,21 +2746,28 @@ impl App {
     fn refresh_pods_snapshot(&mut self) {
         let rows: Vec<PodRow> = {
             let s = self.pods_state.lock().expect("pods poisoned");
-            let mut rows: Vec<PodRow> = Vec::with_capacity(s.pods.len() + s.workloads.len());
+            // Remember the initial replica count once, so rescale/recycle can restore it.
             for w in &s.workloads {
-                rows.push(PodRow::Workload(w.clone()));
-                // Remember the initial replica count once, so rescale/recycle can restore it.
                 if let Some(r) = w.replicas {
                     self.pods_saved_replicas.entry(w.uid.clone()).or_insert(r);
                 }
-                for p in s.pods.iter().filter(|p| pod_belongs_to(p, w)) {
+            }
+            if self.pods_show_workloads {
+                let mut rows: Vec<PodRow> = Vec::with_capacity(s.pods.len() + s.workloads.len());
+                for w in &s.workloads {
+                    rows.push(PodRow::Workload(w.clone()));
+                    for p in s.pods.iter().filter(|p| pod_belongs_to(p, w)) {
+                        rows.push(PodRow::Pod(p.clone()));
+                    }
+                }
+                for p in s.pods.iter().filter(|p| !s.workloads.iter().any(|w| pod_belongs_to(p, w))) {
                     rows.push(PodRow::Pod(p.clone()));
                 }
+                rows
+            } else {
+                // Pods-only view: flat list of every pod, no parent workload rows.
+                s.pods.iter().map(|p| PodRow::Pod(p.clone())).collect()
             }
-            for p in s.pods.iter().filter(|p| !s.workloads.iter().any(|w| pod_belongs_to(p, w))) {
-                rows.push(PodRow::Pod(p.clone()));
-            }
-            rows
         };
         let recs: Vec<EventRecord> = rows
             .iter()
@@ -2545,6 +2803,13 @@ impl App {
             self.maybe_fetch_status();
             self.maybe_fetch_related();
         }
+    }
+
+    // Toggle between the flat pods-only view (default) and the tabular view that nests pods under
+    // their originating workload rows.
+    fn toggle_pods_workloads(&mut self) {
+        self.pods_show_workloads = !self.pods_show_workloads;
+        self.refresh_pods_snapshot();
     }
 
     fn move_pods_selection(&mut self, delta: i32) {
@@ -3224,9 +3489,13 @@ impl App {
             return;
         }
         let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
+        let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
+        let net_world = self.net_world;
         self.apply_namespace(Some(ns));
         if was_pods {
             self.enter_pods_mode();
+        } else if was_net {
+            self.enter_network_mode(net_world);
         } else {
             self.mode = Mode::Selection;
         }
@@ -3242,9 +3511,13 @@ impl App {
             return;
         }
         let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
+        let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
+        let net_world = self.net_world;
         self.apply_namespace(None);
         if was_pods {
             self.enter_pods_mode();
+        } else if was_net {
+            self.enter_network_mode(net_world);
         } else {
             self.mode = Mode::Selection;
         }
@@ -3302,6 +3575,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Pods | Mode::PodsFull) {
             app.refresh_pods_snapshot();
             app.drain_reconcile_status();
+        }
+        if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
+            app.refresh_net_snapshot();
         }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
@@ -3371,7 +3647,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.enter_command();
         }
 
@@ -3576,6 +3852,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
         (KeyCode::Char('l'), _, Mode::Pods) => app.ai_language = app.ai_language.toggle(),
+        (KeyCode::Char('t'), _, Mode::Pods) => app.toggle_pods_workloads(),
         (_, _, Mode::Pods) => {}
 
         (KeyCode::Up, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -3711,6 +3988,48 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::ConfigmapsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ConfigmapsFull) => {}
 
+        (KeyCode::Up, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Left, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
+        (KeyCode::Right, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
+        (KeyCode::Up, _, Mode::Services) => app.move_net_selection(-1),
+        (KeyCode::Down, _, Mode::Services) => app.move_net_selection(1),
+        (KeyCode::PageUp, _, Mode::Services) => app.move_net_selection(-10),
+        (KeyCode::PageDown, _, Mode::Services) => app.move_net_selection(10),
+        (KeyCode::Tab, _, Mode::Services) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::Services) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::Services) => app.enter_network_full(),
+        (KeyCode::Esc, _, Mode::Services) => app.exit_network_mode(),
+        (KeyCode::Char('n'), _, Mode::Services) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Services) => app.clear_namespace_filter(),
+        (KeyCode::Char('t'), _, Mode::Services) => app.toggle_network_group(),
+        (KeyCode::Char('g'), _, Mode::Services) => app.cycle_network_world(),
+        (KeyCode::F(5), _, Mode::Services) => app.refresh_network(),
+        (KeyCode::Char('i'), _, Mode::Services) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Services) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Services) => {}
+
+        (KeyCode::Up, m, Mode::ServicesFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::ServicesFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::ServicesFull) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::ServicesFull) => app.scroll_detail(-10),
+        (KeyCode::Left, m, Mode::ServicesFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5);
+        }
+        (KeyCode::Right, m, Mode::ServicesFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_add(5);
+        }
+        (KeyCode::Home, _, Mode::ServicesFull) => app.detail_h_scroll = 0,
+        (KeyCode::Tab, _, Mode::ServicesFull) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::ServicesFull) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::ServicesFull) => app.exit_network_full(),
+        (KeyCode::Esc, _, Mode::ServicesFull) => app.exit_network_full(),
+        (KeyCode::Char('g'), _, Mode::ServicesFull) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::ServicesFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('i'), _, Mode::ServicesFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::ServicesFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::ServicesFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -3795,7 +4114,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -3824,11 +4143,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(1),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps | Mode::Services => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -3844,8 +4163,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -3868,6 +4187,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Vuln | Mode::VulnFull => st.mode_vuln,
         Mode::Secrets | Mode::SecretsFull => st.mode_secrets,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
+        Mode::Services | Mode::ServicesFull => st.mode_services,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -3913,10 +4233,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_secrets_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
+        } else if draw_mode == Mode::Services {
+            draw_net_tree(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -4039,6 +4361,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+            Span::styled(" t ", kbg), Span::raw(format!(" {}   ", if app.pods_show_workloads { "pods" } else { st.k_toggle_wl })),
             footer_sep(),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
@@ -4146,6 +4469,42 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             footer_sep(),
+            Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        ],
+        Mode::Services => {
+            // `t` shows the opposite of the current grouping; `g` names the other world to switch to.
+            let toggle_label = if app.net_group {
+                st.k_net_flat
+            } else if app.net_world == NetWorld::Services {
+                "endpoints"
+            } else {
+                st.k_net_byclass
+            };
+            let world_label = if app.net_world == NetWorld::Services { "ingress" } else { "services" };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+                footer_sep(),
+                Span::styled(" t ", kbg), Span::raw(format!(" {}   ", toggle_label)),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", world_label)),
+                footer_sep(),
+                Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
+                Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
+                Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+            ]
+        }
+        Mode::ServicesFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" c ", kbg), Span::raw(format!(" {}   ", st.k_copy)),
             Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_ai)),
             Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
         ],
@@ -5331,6 +5690,80 @@ fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
     }
 }
 
+// Adapt a network row into an EventRecord so the shared Status/Related tabs work via the real
+// apiVersion/kind/namespace/name. Endpoint rows expose themselves as their backing Pod, so selecting
+// one yields that pod's status/related/logs just like in the pods view.
+fn synthetic_net_record(row: &NetRow) -> EventRecord {
+    let now = k8s_openapi::jiff::Timestamp::now();
+    match row {
+        NetRow::Service(s) => EventRecord {
+            uid: format!("net|{}", s.uid),
+            time: now,
+            severity: Severity::Normal,
+            reason: "Service".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            namespace: s.namespace.clone(),
+            name: s.name.clone(),
+            message: format!(
+                "{} clusterIP={} extIP={} ports={} endpoints={}/{}",
+                s.type_, s.cluster_ip, s.external_ip, s.ports, s.endpoints_ready, s.endpoints_total
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+        NetRow::Endpoint(e) => EventRecord {
+            uid: format!("net|{}", e.uid),
+            time: now,
+            severity: if e.ready { Severity::Normal } else { Severity::Warning },
+            reason: if e.ready { "Ready".to_string() } else { "NotReady".to_string() },
+            api_version: "v1".to_string(),
+            kind: if e.target_kind == "Pod" { "Pod".to_string() } else { e.target_kind.clone() },
+            namespace: e.service_namespace.clone(),
+            name: e.target_name.clone(),
+            message: format!("address={} node={} ready={}", e.address, e.node, e.ready),
+            component: String::new(),
+            host: e.node.clone(),
+            count: 1,
+        },
+        NetRow::Ingress(i) => EventRecord {
+            uid: format!("net|{}", i.uid),
+            time: now,
+            severity: Severity::Normal,
+            reason: "Ingress".to_string(),
+            api_version: "networking.k8s.io/v1".to_string(),
+            kind: "Ingress".to_string(),
+            namespace: i.namespace.clone(),
+            name: i.name.clone(),
+            message: format!(
+                "class={} hosts={} tls={} {}",
+                i.class.clone().unwrap_or_else(|| "—".to_string()),
+                i.hosts,
+                i.tls,
+                i.rules
+            ),
+            component: String::new(),
+            host: i.address.clone(),
+            count: 1,
+        },
+        NetRow::IngressClass(c) => EventRecord {
+            uid: format!("net|{}", c.uid),
+            time: now,
+            severity: Severity::Normal,
+            reason: "IngressClass".to_string(),
+            api_version: "networking.k8s.io/v1".to_string(),
+            kind: "IngressClass".to_string(),
+            namespace: String::new(),
+            name: c.name.clone(),
+            message: format!("controller={}{}", c.controller, if c.is_default { " (default)" } else { "" }),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+    }
+}
+
 // A usage value (CPU millicores / memory bytes) formatted, or a dim "—" when metrics are unavailable.
 fn usage_cell(v: Option<i64>, fmt: fn(i64) -> String) -> Cell<'static> {
     match v {
@@ -5384,14 +5817,20 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
     let src = &app.pods_rows;
 
+    let view_label = if app.pods_show_workloads { "workloads" } else { "pods" };
     let title = if let Some(e) = &error {
-        format!("workloads (erreur: {})", e)
+        format!("{} (erreur: {})", view_label, e)
     } else if loading && src.is_empty() {
-        "workloads (chargement...)".to_string()
+        format!("{} (chargement...)", view_label)
+    } else if app.pods_show_workloads {
+        format!(
+            "workloads ({} workloads · {} pods) · ns={} · [t] pods",
+            n_workloads, n_pods, app.namespace_label
+        )
     } else {
         format!(
-            "workloads ({} workloads · {} pods) · ns={}",
-            n_workloads, n_pods, app.namespace_label
+            "pods ({} pods) · ns={} · [t] workloads",
+            n_pods, app.namespace_label
         )
     };
 
@@ -5434,6 +5873,8 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    // In the flat pods-only view there are no parent workload rows, so pod names are not indented.
+    let pod_indent = if app.pods_show_workloads { "    " } else { "" };
     let blank = || Cell::from("");
     let rows: Vec<Row> = src
         .iter()
@@ -5476,7 +5917,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 };
                 Row::new(vec![
                     ns_cell,
-                    Cell::from(format!("    {}", p.name)),
+                    Cell::from(format!("{}{}", pod_indent, p.name)),
                     Cell::from(p.ready.clone()),
                     Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
                     Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
@@ -5503,7 +5944,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|r| match r {
             PodRow::Workload(w) => format!("▾ {} {}", w.kind, w.name),
-            PodRow::Pod(p) => format!("    {}", p.name),
+            PodRow::Pod(p) => format!("{}{}", pod_indent, p.name),
         })
         .collect();
     let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
@@ -5513,6 +5954,224 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(12), Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
         Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
         Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Services/Ingress view: dispatches to the per-world table. Rendered straight from `app.net_rows`,
+// which is index-aligned with the snapshot/`table_state`, so the highlighted row drives the detail.
+fn draw_net_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    match app.net_world {
+        NetWorld::Services => draw_services_table(f, app, area),
+        NetWorld::Ingress => draw_ingress_table(f, app, area),
+    }
+}
+
+// Services table: each Service row, with its backing endpoints nested under it when `t` grouping is on.
+fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_svc, n_ep) = {
+        let s = app.network_state.lock().expect("network poisoned");
+        (s.loading, s.error.clone(), s.services.len(), s.endpoints.len())
+    };
+    let src = &app.net_rows;
+
+    let title = if let Some(e) = &error {
+        format!("services (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "services (chargement...)".to_string()
+    } else if app.net_group {
+        format!(
+            "services ({} svc · {} endpoints) · ns={} · [t] plat · [g] ingress",
+            n_svc, n_ep, app.namespace_label
+        )
+    } else {
+        format!(
+            "services ({} svc) · ns={} · [t] endpoints · [g] ingress",
+            n_svc, app.namespace_label
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("TYPE"), Cell::from("CLUSTER-IP"),
+        Cell::from("EXTERNAL-IP"), Cell::from("PORTS"), Cell::from("ENDPOINTS"), Cell::from("NODE"),
+        Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let ep_indent = if app.net_group { "    " } else { "" };
+    let blank = || Cell::from("");
+    let rows: Vec<Row> = src
+        .iter()
+        .map(|row| match row {
+            NetRow::Service(s) => {
+                let endpoints = format!("{}/{}", s.endpoints_ready, s.endpoints_total);
+                let ep_color = if s.endpoints_total == 0 {
+                    Color::Red
+                } else if s.endpoints_ready < s.endpoints_total {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                let prefix = if app.net_group { "▾ " } else { "" };
+                Row::new(vec![
+                    Cell::from(s.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(format!("{}{}", prefix, s.name))
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Cell::from(s.type_.clone()),
+                    Cell::from(s.cluster_ip.clone()),
+                    Cell::from(s.external_ip.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(s.ports.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(endpoints).style(Style::default().fg(ep_color).add_modifier(Modifier::BOLD)),
+                    blank(),
+                    Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
+            NetRow::Endpoint(e) => {
+                let (ready_txt, ready_color) = if e.ready {
+                    ("✓ ready", Color::Green)
+                } else {
+                    ("✗ notready", Color::Red)
+                };
+                Row::new(vec![
+                    blank(),
+                    Cell::from(format!("{}{}", ep_indent, e.target_name)),
+                    Cell::from(e.target_kind.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(e.address.clone()),
+                    blank(),
+                    blank(),
+                    Cell::from(ready_txt).style(Style::default().fg(ready_color)),
+                    Cell::from(e.node.clone()).style(Style::default().fg(DIM)),
+                    blank(),
+                ])
+            }
+            _ => Row::new(vec![blank()]),
+        })
+        .collect();
+
+    let ns_values = src.iter().map(|r| match r {
+        NetRow::Service(s) => s.namespace.as_str(),
+        NetRow::Endpoint(e) => e.service_namespace.as_str(),
+        _ => "",
+    });
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            NetRow::Service(s) => s.name.clone(),
+            NetRow::Endpoint(e) => format!("{}{}", ep_indent, e.target_name),
+            _ => String::new(),
+        })
+        .collect();
+    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 48);
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(12),
+        Constraint::Length(16), Constraint::Length(18), Constraint::Length(20),
+        Constraint::Length(11), Constraint::Length(20), Constraint::Length(5),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Ingress table: each Ingress row, grouped under its IngressClass (with the serving controller) when
+// `t` grouping is on.
+fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_ing, n_cls) = {
+        let s = app.network_state.lock().expect("network poisoned");
+        (s.loading, s.error.clone(), s.ingresses.len(), s.ingress_classes.len())
+    };
+    let src = &app.net_rows;
+
+    let title = if let Some(e) = &error {
+        format!("ingress (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "ingress (chargement...)".to_string()
+    } else if app.net_group {
+        format!(
+            "ingress ({} ingress · {} classes) · ns={} · [t] plat · [g] services",
+            n_ing, n_cls, app.namespace_label
+        )
+    } else {
+        format!(
+            "ingress ({} ingress) · ns={} · [t] par class · [g] services",
+            n_ing, app.namespace_label
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("CLASS/CTRL"), Cell::from("HOSTS"),
+        Cell::from("ROUTES"), Cell::from("TLS"), Cell::from("ADDRESS"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let ing_indent = if app.net_group { "    " } else { "" };
+    let blank = || Cell::from("");
+    let rows: Vec<Row> = src
+        .iter()
+        .map(|row| match row {
+            NetRow::IngressClass(c) => {
+                let name = if c.is_default {
+                    format!("▾ {} (default)", c.name)
+                } else {
+                    format!("▾ {}", c.name)
+                };
+                Row::new(vec![
+                    blank(),
+                    Cell::from(name).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Cell::from(c.controller.clone()).style(Style::default().fg(DIM)),
+                    blank(), blank(), blank(), blank(),
+                    Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
+            NetRow::Ingress(i) => {
+                let (tls_txt, tls_color) = if i.tls { ("TLS", Color::Green) } else { ("—", DIM) };
+                // When grouped under their class, ingresses don't repeat the class column.
+                let class_cell = if app.net_group {
+                    blank()
+                } else {
+                    Cell::from(i.class.clone().unwrap_or_else(|| "—".to_string()))
+                        .style(Style::default().fg(DIM))
+                };
+                Row::new(vec![
+                    Cell::from(i.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(format!("{}{}", ing_indent, i.name)),
+                    class_cell,
+                    Cell::from(i.hosts.clone()),
+                    Cell::from(i.rules.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(tls_txt).style(Style::default().fg(tls_color)),
+                    Cell::from(i.address.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(i.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
+            _ => Row::new(vec![blank()]),
+        })
+        .collect();
+
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            NetRow::IngressClass(c) => format!("▾ {}", c.name),
+            NetRow::Ingress(i) => format!("{}{}", ing_indent, i.name),
+            _ => String::new(),
+        })
+        .collect();
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40);
+    let widths = [
+        Constraint::Length(14), Constraint::Length(name_w), Constraint::Length(20),
+        Constraint::Length(24), Constraint::Min(20), Constraint::Length(4),
+        Constraint::Length(18), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)

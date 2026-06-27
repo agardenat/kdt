@@ -18,6 +18,7 @@ mod pdf;
 mod pods;
 mod rbac;
 mod secrets;
+mod svc;
 mod ui;
 mod vulnerabilities;
 
