@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 // Shared progress/result state for the AI panel. `current_key` identifies the in-flight request
@@ -165,6 +166,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -173,19 +175,22 @@ struct ChatMessage<'a> {
     content: &'a str,
 }
 
+// Streaming (SSE) chunk shape: {"choices":[{"delta":{"content":"..."}}]}
 #[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
+struct ChatStreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
 }
 
 #[derive(Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
+struct StreamChoice {
+    delta: StreamDelta,
 }
 
 #[derive(Deserialize)]
-struct ChoiceMessage {
-    content: String,
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 // Some models emit literal escape sequences (e.g. "\n") inside the JSON string content.
@@ -215,63 +220,106 @@ pub fn normalize_ai_content(s: &str) -> String {
 
 // Fire a chat completion and stream progress/result into the shared state. Every state write is
 // guarded by `current_key` so a superseded request silently drops its result instead of clobbering.
-pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: String, state: SharedAi) {
+// Fire a streaming (SSE) chat completion, feeding the running accumulated raw content to `on_delta`
+// after each chunk. `on_delta` returns false to abort early (e.g. the request was superseded).
+// Returns the full raw (un-normalized) content on success.
+async fn stream_completion(
+    config: &AiConfig,
+    lang: AiLanguage,
+    prompt: &str,
+    connect_timeout: Duration,
+    mut on_delta: impl FnMut(&str) -> bool,
+) -> Result<String, String> {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = ChatRequest {
         model: &config.model,
         messages: vec![
             ChatMessage { role: "system", content: lang.system_prompt() },
-            ChatMessage { role: "user", content: &prompt },
+            ChatMessage { role: "user", content: prompt },
         ],
         temperature: 0.2,
+        stream: true,
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+    // No global `.timeout()`: it would cut a legitimately long stream. Bound connect + per-read only.
+    let client = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(Duration::from_secs(120))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            store_error(&state, &key, format!("client: {}", e));
-            return;
-        }
-    };
+        .map_err(|e| format!("client: {}", e))?;
 
-    update_stage(&state, &key, format!("Envoi de la requête à {}...", config.model));
-
-    let result = client.post(&url)
+    let resp = client
+        .post(&url)
         .bearer_auth(&config.api_key)
         .json(&body)
         .send()
-        .await;
+        .await
+        .map_err(|e| format!("requête: {}", e))?;
 
-    update_stage(&state, &key, "Réception et analyse de la réponse...");
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let snippet: String = text.chars().take(800).collect();
+        return Err(format!("HTTP {}: {}", status, snippet));
+    }
 
-    match result {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                let snippet: String = text.chars().take(800).collect();
-                store_error(&state, &key, format!("HTTP {}: {}", status, snippet));
-                return;
-            }
-            match resp.json::<ChatResponse>().await {
-                Ok(r) => {
-                    let content = r.choices.into_iter().next()
-                        .map(|c| normalize_ai_content(&c.message.content))
-                        .unwrap_or_default();
-                    let mut s = state.lock().expect("ai state poisoned");
-                    if s.current_key.as_deref() != Some(&key) { return; }
-                    s.loading = false;
-                    s.content = content;
-                    s.error = None;
-                    s.stage.clear();
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new(); // holds an incomplete trailing SSE line between chunks
+    let mut raw = String::new(); // accumulated assistant content
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("flux: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        // Process complete lines; keep the last (possibly partial) line in `buf`.
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data.is_empty() { continue; }
+            if data == "[DONE]" { break 'outer; }
+
+            if let Ok(parsed) = serde_json::from_str::<ChatStreamChunk>(data) {
+                if let Some(delta) = parsed.choices.into_iter().next().and_then(|c| c.delta.content) {
+                    if !delta.is_empty() {
+                        raw.push_str(&delta);
+                        if !on_delta(&raw) { break 'outer; }
+                    }
                 }
-                Err(e) => store_error(&state, &key, format!("parse: {}", e)),
             }
         }
-        Err(e) => store_error(&state, &key, format!("requête: {}", e)),
+    }
+
+    Ok(raw)
+}
+
+// Stream a chat completion into the shared UI state. Every state write is guarded by `current_key`
+// so a superseded request silently drops its result instead of clobbering a newer one.
+pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: String, state: SharedAi) {
+    update_stage(&state, &key, format!("Envoi de la requête à {}...", config.model));
+
+    // Append each delta to the panel content; the render loop (polled every 250ms) shows it live.
+    let on_delta = |raw: &str| {
+        let mut s = state.lock().expect("ai state poisoned");
+        if s.current_key.as_deref() != Some(&key) { return false; }
+        if !s.stage.is_empty() { s.stage.clear(); }
+        s.content = normalize_ai_content(raw);
+        s.error = None;
+        true
+    };
+
+    match stream_completion(&config, lang, &prompt, Duration::from_secs(30), on_delta).await {
+        Ok(raw) => {
+            let mut s = state.lock().expect("ai state poisoned");
+            if s.current_key.as_deref() != Some(&key) { return; }
+            s.loading = false;
+            s.content = normalize_ai_content(&raw);
+            s.error = None;
+            s.stage.clear();
+        }
+        Err(e) => store_error(&state, &key, e),
     }
 }
 
@@ -283,43 +331,12 @@ fn store_error(state: &SharedAi, key: &str, msg: String) {
 }
 
 // Blocking-style variant used by the batch PDF extraction: returns the content directly
-// instead of mutating shared UI state.
+// instead of mutating shared UI state. Streams under the hood for timeout resilience.
 pub async fn query_ai_direct(
     config: &AiConfig,
     lang: AiLanguage,
     prompt: &str,
 ) -> Result<String, String> {
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let body = ChatRequest {
-        model: &config.model,
-        messages: vec![
-            ChatMessage { role: "system", content: lang.system_prompt() },
-            ChatMessage { role: "user", content: prompt },
-        ],
-        temperature: 0.2,
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()
-        .map_err(|e| format!("client: {}", e))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("requête: {}", e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        let snippet: String = text.chars().take(800).collect();
-        return Err(format!("HTTP {}: {}", status, snippet));
-    }
-    let r: ChatResponse = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    Ok(r
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| normalize_ai_content(&c.message.content))
-        .unwrap_or_default())
+    let raw = stream_completion(config, lang, prompt, Duration::from_secs(30), |_| true).await?;
+    Ok(normalize_ai_content(&raw))
 }

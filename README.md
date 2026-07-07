@@ -9,7 +9,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Vue Nodes** : liste des nœuds, détail plein écran, et vue d'usage (CPU/mémoire requests, tri configurable).
 - **Diagnostic cluster** : batterie de vérifications (version, namespaces système, kube-system, CoreDNS, CNI, webhooks, Rancher, pods en erreur, PV, évènements warning récents…).
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
-- **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais.
+- **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais. La réponse est **streamée** (SSE) et s'affiche au fil de l'eau.
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
@@ -258,6 +258,8 @@ Le détail (`Enter`) liste chaque CVE : `SÉV  score  ID  paquet  installé → 
 | `↑/↓`, `PgUp/PgDn`, `g`/`G` | Scroll |
 | `c` | Copier le contenu |
 | `l` | Bascule langue |
+
+La réponse du modèle est reçue en streaming (SSE, format OpenAI `chat/completions`) : le texte apparaît progressivement à mesure qu'il est généré, sans attendre la fin de la réponse. Relancer une analyse (`i`) pendant qu'une autre streame interrompt proprement la précédente.
 
 ## Configuration
 
