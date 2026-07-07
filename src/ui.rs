@@ -371,6 +371,7 @@ pub struct App {
     pub scroll_frozen: bool,
     pub selected_uid: Option<String>,
     pub command_input: String,
+    pub command_cursor: usize,
     pub command_return_mode: Mode,
     pub flux_state: SharedFlux,
     pub reconcile_status: SharedReconcile,
@@ -507,6 +508,7 @@ impl App {
             scroll_frozen: false,
             selected_uid: None,
             command_input: String::new(),
+            command_cursor: 0,
             command_return_mode: Mode::Selection,
             flux_state: new_flux_state(),
             reconcile_status: new_reconcile_status(),
@@ -1313,6 +1315,7 @@ impl App {
         if self.mode == Mode::Command { return; }
         self.command_return_mode = self.mode;
         self.command_input.clear();
+        self.command_cursor = 0;
         self.mode = Mode::Command;
         // Prefetch namespaces so `:ns/pods/events <name>` can autocomplete.
         let client = self.client.clone();
@@ -1334,10 +1337,24 @@ impl App {
         } else if c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == '.' {
             self.command_input.push(c.to_ascii_lowercase());
         }
+        // Typing narrows the list, so any prior selection is stale.
+        self.command_cursor = 0;
     }
 
     fn command_backspace(&mut self) {
         self.command_input.pop();
+        self.command_cursor = 0;
+    }
+
+    // Move the palette selection with the up/down arrows, clamped to the suggestion list.
+    fn move_command_selection(&mut self, delta: i32) {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_cursor = 0;
+            return;
+        }
+        let max = len as i32 - 1;
+        self.command_cursor = (self.command_cursor as i32 + delta).clamp(0, max) as usize;
     }
 
     // Suggestions for the palette: command names before the space, matching namespaces after it.
@@ -1364,12 +1381,18 @@ impl App {
 
     fn command_autocomplete(&mut self) {
         let suggestions = self.command_suggestions();
-        if let Some(first) = suggestions.first() {
-            self.command_input = first.clone();
+        if let Some(sel) = suggestions.get(self.command_cursor).or_else(|| suggestions.first()) {
+            self.command_input = sel.clone();
+            self.command_cursor = 0;
         }
     }
 
     fn command_run(&mut self) {
+        // Enter runs the highlighted suggestion (or the raw input if nothing matches).
+        let suggestions = self.command_suggestions();
+        if let Some(sel) = suggestions.get(self.command_cursor) {
+            self.command_input = sel.clone();
+        }
         let input = self.command_input.trim().to_string();
         let (cmd_part, arg) = match input.split_once(' ') {
             Some((c, rest)) => (c.to_string(), Some(rest.trim().to_string())),
@@ -3642,6 +3665,8 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Esc, _, Mode::Command) => app.exit_command(),
         (KeyCode::Enter, _, Mode::Command) => app.command_run(),
+        (KeyCode::Up, _, Mode::Command) => app.move_command_selection(-1),
+        (KeyCode::Down, _, Mode::Command) => app.move_command_selection(1),
         (KeyCode::Tab, _, Mode::Command) => app.command_autocomplete(),
         (KeyCode::Backspace, _, Mode::Command) => app.command_backspace(),
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
@@ -7377,8 +7402,12 @@ fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     } else {
-        for (i, name) in suggestions.iter().take(6).enumerate() {
-            let style = if i == 0 {
+        // Scroll the 6-row window so the highlighted suggestion stays visible.
+        const WINDOW: usize = 6;
+        let cursor = app.command_cursor.min(suggestions.len().saturating_sub(1));
+        let offset = cursor.saturating_sub(WINDOW - 1);
+        for (i, name) in suggestions.iter().enumerate().skip(offset).take(WINDOW) {
+            let style = if i == cursor {
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
