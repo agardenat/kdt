@@ -591,13 +591,16 @@ impl App {
     // Rebuild the visible event list from the buffer applying the active filter. When following
     // (no anchored uid) the cursor stays on the newest row; otherwise it tracks the anchored uid.
     fn refresh_live_snapshot(&mut self) {
-        let snap: Vec<EventRecord> = {
+        let mut snap: Vec<EventRecord> = {
             let buf = self.buffer.lock().expect("buffer poisoned");
             buf.iter()
                 .filter(|r| self.filter.matches(r))
                 .cloned()
                 .collect()
         };
+        // The watcher emits (and re-emits on reconnect) in arbitrary order, so sort by timestamp
+        // to present events chronologically with the newest at the bottom (where following anchors).
+        snap.sort_by_key(|r| r.time);
         if snap.is_empty() { return; }
         let last = snap.len() - 1;
         let idx = match self.selected_uid.as_ref() {
