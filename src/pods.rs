@@ -52,14 +52,9 @@ pub struct PodResource {
 }
 
 impl PodResource {
-    // Surface problems first (not-ready/failed), then by namespace/name.
-    fn sort_key(&self) -> (u8, &str, &str) {
-        let bucket = match self.status.as_str() {
-            "Running" | "Succeeded" | "Completed" => 2,
-            "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => 1,
-            _ => 0,
-        };
-        (bucket, self.namespace.as_str(), self.name.as_str())
+    // Stable order by namespace/name so pods keep their natural place (problems are not hoisted up).
+    fn sort_key(&self) -> (&str, &str) {
+        (self.namespace.as_str(), self.name.as_str())
     }
 }
 
