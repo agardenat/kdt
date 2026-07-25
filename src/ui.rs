@@ -4293,9 +4293,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
 
     let kbg = Style::default().fg(Color::Black).bg(Color::White);
     let footer_spans = match draw_mode {
+        // Each mode lists its shortcuts as groups of related keys, separated by footer_sep():
+        // entry/exit · navigation · view-specific filters · view-specific actions.
         Mode::Selection => vec![
             Span::styled(" q ", kbg), Span::raw(format!(" {}   ", st.k_quit)),
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" a ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_all, app.filter == Filter::All),
             Span::raw("   "),
@@ -4305,33 +4309,39 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" e ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_err, app.filter == Filter::Errors),
             Span::raw("   "),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", if app.scroll_frozen { st.k_unfreeze } else { st.k_freeze })),
-            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            footer_sep(),
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
         ],
         Mode::DetailFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
-            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::Nodes => vec![
             Span::styled(" Esc/N ", kbg), Span::raw(format!(" {}   ", st.k_back)),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
-            Span::styled(" u ", kbg), Span::raw(format!(" {}   ", st.k_node_usage)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            footer_sep(),
+            Span::styled(" u ", kbg), Span::raw(format!(" {}   ", st.k_node_usage)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::NodesFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
@@ -4340,22 +4350,25 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Flux => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             footer_sep(),
-            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
-            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
             Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
             Span::styled(" +/- ", kbg), Span::raw(format!(" {}   ", st.k_inventory)),
+            footer_sep(),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
+            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::FluxFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
@@ -4365,9 +4378,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Pods => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
             Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", if app.pods_show_workloads { "pods" } else { st.k_toggle_wl })),
             footer_sep(),
@@ -4376,28 +4391,32 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         ],
         Mode::PodsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::Rbac => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
-            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
             footer_sep(),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
             Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.rbac_min_sev.label())),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::RbacFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::Vuln => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
@@ -4406,22 +4425,26 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         ],
         Mode::VulnFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::Secrets => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
-            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.secrets_filter.label())),
             Span::styled(" b ", kbg), Span::raw(format!(" {}   ", st.k_reveal_b64)),
             Span::styled(" d ", kbg), Span::raw(format!(" {}   ", st.k_reveal_plain)),
+            footer_sep(),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.secrets_filter.label())),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::SecretsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
@@ -4431,6 +4454,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Configmaps => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
@@ -4439,6 +4463,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         ],
         Mode::ConfigmapsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
@@ -4456,19 +4481,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             vec![
                 Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
                 Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
                 Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
                 Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
                 footer_sep(),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
                 Span::styled(" t ", kbg), Span::raw(format!(" {}   ", toggle_label)),
                 Span::styled(" g ", kbg), Span::raw(format!(" {}   ", world_label)),
             ]
         }
         Mode::ServicesFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
@@ -4490,31 +4517,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     global_spans.push(Span::styled(" m ", kbg));
     global_spans.push(Span::raw(format!(" {}:{}", st.k_provider, app.ai_provider_name())));
 
-    // Spread every shortcut evenly over two rows: merge context + tool cells, sort by width and
-    // deal them alternately. Both rows end up with the same count, the longest cells land last
-    // (rightmost), and each column stacks two cells of similar width so it stays homogeneous.
-    let mut cells = footer_cells(footer_spans);
-    cells.extend(footer_cells(global_spans));
-    cells.sort_by_key(|c| cell_width(c));
-    let mut top: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut bottom: Vec<Vec<Span<'static>>> = Vec::new();
-    for (idx, cell) in cells.into_iter().enumerate() {
-        if idx % 2 == 0 {
-            top.push(cell);
-        } else {
-            bottom.push(cell);
-        }
-    }
-    let cols = top.len().max(bottom.len());
-    let mut widths = vec![0usize; cols];
-    for (j, c) in top.iter().enumerate() {
-        widths[j] = widths[j].max(cell_width(c));
-    }
-    for (j, c) in bottom.iter().enumerate() {
-        widths[j] = widths[j].max(cell_width(c));
-    }
-    let top_line = render_footer_row(&top, &widths);
-    let mut bottom_line = render_footer_row(&bottom, &widths);
+    // Lay the shortcuts out group by group: related keys stay together on the same row, the two
+    // rows are balanced by width, and the tool bar always closes the last row.
+    let groups = footer_groups(footer_spans);
+    let tools = footer_groups(global_spans)
+        .into_iter()
+        .flatten()
+        .collect::<FooterGroup>();
+    let (top, bottom) = balance_footer_rows(groups, tools, footer_a.width as usize);
+    let top_line = render_footer_row(&top);
+    let mut bottom_line = render_footer_row(&bottom);
     if let Some(msg) = app.clipboard_status_active() {
         bottom_line.push(Span::styled(
             msg.to_string(),
@@ -7616,26 +7628,37 @@ fn footer_sep() -> Span<'static> {
     Span::styled("│  ", Style::default().fg(DIM))
 }
 
-// Blank columns between grid cells so neighbouring key boxes never touch.
+// Blank columns between shortcuts so neighbouring key boxes never touch.
 const FOOTER_COL_GAP: usize = 2;
+// Width of footer_sep() once rendered ("│" plus its trailing gap).
+const FOOTER_SEP_WIDTH: usize = 3;
 
-// Split a flat run of footer spans into one cell per shortcut. A new cell starts at every key box
-// (white background); labels attach to the current cell; group separators are dropped since the
-// column grid provides the visual spacing instead.
-fn footer_cells(spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
-    let mut cells: Vec<Vec<Span<'static>>> = Vec::new();
+// One shortcut: its key box plus the label spans that follow it.
+type FooterCell = Vec<Span<'static>>;
+// A run of related shortcuts, delimited by footer_sep() in the per-mode tables. A group is the
+// unit of layout: it is never split across the two footer rows, so keys that belong together
+// (a/w/e on the events view, r/z on Flux…) always stay side by side.
+type FooterGroup = Vec<FooterCell>;
+
+// Split a flat run of footer spans into groups of cells. A new cell starts at every key box (white
+// background); labels attach to the current cell; every separator opens a new group.
+fn footer_groups(spans: Vec<Span<'static>>) -> Vec<FooterGroup> {
+    let mut groups: Vec<FooterGroup> = vec![Vec::new()];
     for span in spans {
         if span.content.starts_with('│') {
+            groups.push(Vec::new());
             continue;
         }
         let is_key = span.style.bg == Some(Color::White);
-        if is_key || cells.is_empty() {
-            cells.push(vec![span]);
+        let group = groups.last_mut().expect("group present");
+        if is_key || group.is_empty() {
+            group.push(vec![span]);
         } else {
-            cells.last_mut().expect("cell present").push(span);
+            group.last_mut().expect("cell present").push(span);
         }
     }
-    cells
+    groups.retain(|g| !g.is_empty());
+    groups
 }
 
 // Visible width of a cell, ignoring the trailing padding baked into labels.
@@ -7644,28 +7667,86 @@ fn cell_width(cell: &[Span<'static>]) -> usize {
     text.trim_end().chars().count()
 }
 
-// Emit a row's cells, each padded to its column width plus a fixed gap. Trailing whitespace baked
-// into labels is stripped first so the padding lands exactly on the column boundary.
-fn render_footer_row(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Vec<Span<'static>> {
+// Rendered width of a group: every cell plus the gap that follows it.
+fn group_width(group: &FooterGroup) -> usize {
+    group.iter().map(|c| cell_width(c) + FOOTER_COL_GAP).sum()
+}
+
+// Total width of a row of groups, separators included.
+fn row_width(groups: &[FooterGroup]) -> usize {
+    let seps = groups.len().saturating_sub(1) * FOOTER_SEP_WIDTH;
+    groups.iter().map(group_width).sum::<usize>() + seps
+}
+
+// Deal the groups over two rows of roughly equal length. The entry group (palette, back, quit)
+// opens the top row and the tool bar closes the bottom one, so both anchors keep their usual spot;
+// the groups in between go widest-first to whichever row is currently shorter, then are put back in
+// authoring order inside their row. Everything stays on a single row when it fits.
+fn balance_footer_rows(
+    groups: Vec<FooterGroup>,
+    tools: FooterGroup,
+    avail: usize,
+) -> (Vec<FooterGroup>, Vec<FooterGroup>) {
+    let mut all = groups;
+    all.push(tools);
+    if row_width(&all) <= avail {
+        return (all, Vec::new());
+    }
+    let tools = all.pop().expect("tool bar present");
+    if all.is_empty() {
+        return (Vec::new(), vec![tools]);
+    }
+
+    let mut order: Vec<usize> = (1..all.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(group_width(&all[i])));
+    let mut top_idx: Vec<usize> = vec![0];
+    let mut bottom_idx: Vec<usize> = Vec::new();
+    let mut top_w = group_width(&all[0]);
+    let mut bottom_w = group_width(&tools);
+    for i in order {
+        let w = group_width(&all[i]) + FOOTER_SEP_WIDTH;
+        if top_w <= bottom_w {
+            top_idx.push(i);
+            top_w += w;
+        } else {
+            bottom_idx.push(i);
+            bottom_w += w;
+        }
+    }
+    top_idx.sort_unstable();
+    bottom_idx.sort_unstable();
+
+    let mut slots: Vec<Option<FooterGroup>> = all.into_iter().map(Some).collect();
+    let mut take = |idx: &[usize]| -> Vec<FooterGroup> {
+        idx.iter()
+            .map(|&i| slots[i].take().expect("group taken once"))
+            .collect()
+    };
+    let top = take(&top_idx);
+    let mut bottom = take(&bottom_idx);
+    bottom.push(tools);
+    (top, bottom)
+}
+
+// Emit a row: cells separated by a fixed gap, groups by a dim divider. Trailing whitespace baked
+// into labels is stripped first so the gap lands exactly where expected.
+fn render_footer_row(groups: &[FooterGroup]) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
-    for (j, cell) in cells.iter().enumerate() {
-        let last = cell
-            .iter()
-            .rposition(|s| !s.content.trim_end().is_empty());
-        if let Some(last) = last {
-            for (idx, span) in cell.iter().enumerate() {
-                if idx > last {
-                    break;
-                }
-                if idx == last {
-                    out.push(Span::styled(span.content.trim_end().to_string(), span.style));
-                } else {
+    for (gi, group) in groups.iter().enumerate() {
+        if gi > 0 {
+            out.push(footer_sep());
+        }
+        for cell in group {
+            let last = cell.iter().rposition(|s| !s.content.trim_end().is_empty());
+            if let Some(last) = last {
+                for span in cell.iter().take(last) {
                     out.push(span.clone());
                 }
+                let span = &cell[last];
+                out.push(Span::styled(span.content.trim_end().to_string(), span.style));
             }
+            out.push(Span::raw(" ".repeat(FOOTER_COL_GAP)));
         }
-        let pad = widths[j].saturating_sub(cell_width(cell)) + FOOTER_COL_GAP;
-        out.push(Span::raw(" ".repeat(pad)));
     }
     out
 }
@@ -8646,5 +8727,91 @@ fn line_color_to_pdf(c: LineColor) -> &'static str {
         LineColor::Err => "err",
         LineColor::Info => "info",
         LineColor::Dim => "dim",
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+
+    fn key(k: &str) -> Span<'static> {
+        Span::styled(format!(" {} ", k), Style::default().fg(Color::Black).bg(Color::White))
+    }
+    fn lbl(l: &str) -> Span<'static> {
+        Span::raw(format!(" {}   ", l))
+    }
+    fn row_text(groups: &[FooterGroup]) -> String {
+        render_footer_row(groups).iter().map(|s| s.content.to_string()).collect()
+    }
+
+    // The events footer, as built by draw(): entry keys, a/w/e filters, navigation, view, tools.
+    fn selection_footer() -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        let spans = vec![
+            key("q"), lbl("quitter"),
+            key(":"), lbl("commandes"),
+            key("Esc"), lbl("retour"),
+            footer_sep(),
+            key("a"), lbl("tous"),
+            key("w"), lbl("warnings"),
+            key("e"), lbl("erreurs"),
+            footer_sep(),
+            key("↑↓"), lbl("navigation"),
+            key("Shift+↑↓"), lbl("défilement détail"),
+            key("s"), lbl("figer"),
+            footer_sep(),
+            key("Enter"), lbl("zoom"),
+            key("Tab"), lbl("vue"),
+            footer_sep(),
+            key("D"), lbl("diagnostic"),
+            key("X"), lbl("extraire"),
+        ];
+        let tools = vec![
+            key("c"), lbl("copier"),
+            key("i"), lbl("IA"),
+            key("l"), lbl("langue:fr"),
+            key("m"), lbl("modèle:local"),
+        ];
+        (spans, tools)
+    }
+
+    fn layout(width: usize) -> (String, String) {
+        let (spans, tools) = selection_footer();
+        let groups = footer_groups(spans);
+        let tools = footer_groups(tools).into_iter().flatten().collect::<FooterGroup>();
+        let (top, bottom) = balance_footer_rows(groups, tools, width);
+        (row_text(&top), row_text(&bottom))
+    }
+
+    #[test]
+    fn groups_are_never_split_across_rows() {
+        let (top, bottom) = layout(140);
+        // The three event filters belong to the same group: same row, and side by side.
+        let row = if top.contains(" a ") { &top } else { &bottom };
+        let a = row.find(" a ").expect("filter a on that row");
+        let w = row.find(" w ").expect("filter w on the same row");
+        let e = row.find(" e ").expect("filter e on the same row");
+        assert!(a < w && w < e, "a/w/e out of order: {row}");
+        assert!(!row[a..e].contains('│'), "a/w/e split by a divider: {row}");
+    }
+
+    #[test]
+    fn entry_keys_open_the_top_row_and_tools_close_the_bottom_one() {
+        let (top, bottom) = layout(140);
+        assert!(top.starts_with(" q "), "top row should start with the entry group: {top}");
+        assert!(bottom.trim_end().ends_with("modèle:local"), "tool bar should close the footer: {bottom}");
+    }
+
+    #[test]
+    fn rows_stay_balanced() {
+        let (top, bottom) = layout(140);
+        let (t, b) = (top.chars().count(), bottom.chars().count());
+        assert!(t.abs_diff(b) < 20, "unbalanced rows: {t} vs {b}");
+    }
+
+    #[test]
+    fn everything_fits_on_one_row_when_wide_enough() {
+        let (top, bottom) = layout(400);
+        assert!(bottom.is_empty(), "second row should stay empty: {bottom}");
+        assert!(top.contains("modèle:local"), "tool bar should join the single row: {top}");
     }
 }
