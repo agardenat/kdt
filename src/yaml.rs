@@ -61,6 +61,29 @@ pub async fn fetch_yaml(
     }
 }
 
+// Resolve any GVK through discovery and hand back the API, scoped the way the kind requires. Shared
+// with the delete flow, which needs the very same "reach any object by GVK" plumbing.
+pub async fn dynamic_api(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+) -> Result<Api<DynamicObject>, String> {
+    let gvk = if let Some((g, v)) = api_version.split_once('/') {
+        GroupVersionKind::gvk(g, v, kind)
+    } else {
+        GroupVersionKind::gvk("", api_version, kind)
+    };
+    let (ar, caps) = discovery::pinned_kind(client, &gvk)
+        .await
+        .map_err(|e| format!("discovery {}/{} : {}", api_version, kind, e))?;
+    Ok(if caps.scope == Scope::Cluster {
+        Api::all_with(client.clone(), &ar)
+    } else {
+        Api::namespaced_with(client.clone(), namespace, &ar)
+    })
+}
+
 async fn load_object(
     client: &Client,
     api_version: &str,
@@ -71,19 +94,7 @@ async fn load_object(
     if kind.is_empty() || name.is_empty() {
         return Err("objet sans kind/name".to_string());
     }
-    let gvk = if let Some((g, v)) = api_version.split_once('/') {
-        GroupVersionKind::gvk(g, v, kind)
-    } else {
-        GroupVersionKind::gvk("", api_version, kind)
-    };
-    let (ar, caps) = discovery::pinned_kind(client, &gvk)
-        .await
-        .map_err(|e| format!("discovery {}/{} : {}", api_version, kind, e))?;
-    let api: Api<DynamicObject> = if caps.scope == Scope::Cluster {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
-    };
+    let api = dynamic_api(client, api_version, kind, namespace).await?;
     let obj = api.get(name).await.map_err(|e| e.to_string())?;
     let mut value = serde_json::to_value(&obj).map_err(|e| e.to_string())?;
     // A GET normally echoes apiVersion/kind; re-add them if the server omitted them so the YAML

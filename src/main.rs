@@ -8,6 +8,7 @@ mod cli;
 mod clip;
 mod config;
 mod configmaps;
+mod delete;
 mod diagnostic;
 mod enrich;
 mod events;

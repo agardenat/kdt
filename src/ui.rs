@@ -27,6 +27,10 @@ use crate::ai::{
     AiConfig, AiLanguage, AiProviderResolved, SharedAi,
 };
 use crate::config::{self, FileConfig};
+use crate::delete::{
+    new_delete_state, preflight, run_delete, GitOpsTool, Level as DelLevel, Reason as DelReason,
+    SharedDelete,
+};
 use crate::diagnostic::{
     format_diagnostic_for_ai, new_diagnostic_state, run_diagnostic, DiagStatus, DiagnosticStep,
     SharedDiagnostic,
@@ -68,6 +72,23 @@ struct YamlView {
     title: String,
     scroll: usize,
     h_scroll: usize,
+}
+
+// The Ctrl-D overlay: which object is about to be deleted and how far the confirmation has got.
+// The preflight findings and the outcome live in `App::delete_state`, written by the background
+// task. Two confirmation paths: `armed` (a plain yes/no) for an object nothing warns about, and
+// `typed` (retype the name) as soon as a danger — a GitOps owner, a cascade — is on the table.
+struct DeleteView {
+    title: String,
+    api_version: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    key: String,
+    armed: bool,
+    typed: Option<String>,
+    // Set once the successful deletion has triggered a refresh of the underlying view.
+    refreshed: bool,
 }
 
 // A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
@@ -455,6 +476,9 @@ pub struct App {
     yaml_state: SharedYaml,
     // Whether the YAML panel shows the neat (runtime attributes stripped) or the raw document.
     yaml_neat: bool,
+    // Delete overlay (Ctrl-D): `None` when closed. Guard-rails and outcome sit in `delete_state`.
+    delete_view: Option<DeleteView>,
+    delete_state: SharedDelete,
 }
 
 impl App {
@@ -581,6 +605,8 @@ impl App {
             yaml_view: None,
             yaml_state: new_yaml_state(),
             yaml_neat: true,
+            delete_view: None,
+            delete_state: new_delete_state(),
         }
     }
 
@@ -1302,6 +1328,153 @@ impl App {
     fn copy_yaml_view(&mut self) {
         let text = self.yaml_visible_text();
         self.copy_text(text);
+    }
+
+    // Ctrl-D: open the delete panel on the selected object and run the guard-rail checks. Nothing
+    // is deleted here — the panel only shows what the checks found and waits for a confirmation.
+    fn open_delete_view(&mut self) {
+        let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
+            let st = lang::t(self.ai_language);
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.delete_no_object.to_string()));
+            return;
+        };
+        let key = format!("{}|{}|{}/{}", api_version, kind, namespace, name);
+        let title = if namespace.is_empty() {
+            format!("{} {}", kind, name)
+        } else {
+            format!("{} {}/{}", kind, namespace, name)
+        };
+        self.delete_view = Some(DeleteView {
+            title,
+            api_version: api_version.clone(),
+            kind: kind.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            key: key.clone(),
+            armed: false,
+            typed: None,
+            refreshed: false,
+        });
+        {
+            let mut s = self.delete_state.lock().expect("delete state poisoned");
+            *s = crate::delete::DeleteState { key: key.clone(), loading: true, ..Default::default() };
+        }
+        let client = self.client.clone();
+        let state = self.delete_state.clone();
+        tokio::spawn(async move {
+            preflight(client, api_version, kind, namespace, name, key, state).await;
+        });
+    }
+
+    fn close_delete_view(&mut self) {
+        self.delete_view = None;
+    }
+
+    // Enter: walk one step down the confirmation path — arm, open the type-the-name prompt, or,
+    // when the gesture is complete, fire the deletion. A no-op while the checks are still running.
+    fn delete_confirm(&mut self) {
+        let (loading, strict, busy) = {
+            let s = self.delete_state.lock().expect("delete state poisoned");
+            (s.loading, s.needs_strict_confirm(), s.deleting || s.done.is_some())
+        };
+        if loading || busy {
+            return;
+        }
+        let Some(v) = self.delete_view.as_mut() else { return };
+        if strict {
+            match v.typed.as_ref() {
+                // First Enter acknowledges the warning and opens the name prompt.
+                None => {
+                    v.typed = Some(String::new());
+                    return;
+                }
+                // The deletion goes through only on an exact match; a mismatch just keeps waiting.
+                Some(buf) if buf.trim() != v.name => return,
+                Some(_) => {}
+            }
+        } else if !v.armed {
+            v.armed = true;
+            return;
+        }
+        self.spawn_delete();
+    }
+
+    fn spawn_delete(&mut self) {
+        let Some(v) = self.delete_view.as_ref() else { return };
+        let (api_version, kind, namespace, name, key) = (
+            v.api_version.clone(),
+            v.kind.clone(),
+            v.namespace.clone(),
+            v.name.clone(),
+            v.key.clone(),
+        );
+        {
+            let mut s = self.delete_state.lock().expect("delete state poisoned");
+            s.deleting = true;
+            s.done = None;
+        }
+        let client = self.client.clone();
+        let state = self.delete_state.clone();
+        tokio::spawn(async move {
+            run_delete(client, api_version, kind, namespace, name, key, state).await;
+        });
+    }
+
+    // Esc: undo one confirmation step, or close the panel when there is none left.
+    fn delete_back(&mut self) {
+        match self.delete_view.as_mut() {
+            Some(v) if v.typed.is_some() => v.typed = None,
+            Some(v) if v.armed => v.armed = false,
+            _ => self.delete_view = None,
+        }
+    }
+
+    // Type-the-name buffer, capped at the length of a DNS subdomain.
+    fn delete_input(&mut self, c: char) {
+        if let Some(buf) = self.delete_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            if buf.len() < 253 {
+                buf.push(c);
+            }
+        }
+    }
+
+    fn delete_backspace(&mut self) {
+        if let Some(buf) = self.delete_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            buf.pop();
+        }
+    }
+
+    // Polled every tick: once the API has accepted a deletion, refresh the view behind the panel so
+    // the row is gone when it closes. Views that rebuild their snapshot each tick need nothing.
+    fn poll_delete(&mut self) {
+        let deleted = {
+            let s = self.delete_state.lock().expect("delete state poisoned");
+            matches!(s.done, Some(Ok(())))
+        };
+        if !deleted {
+            return;
+        }
+        let Some(v) = self.delete_view.as_mut() else { return };
+        if v.refreshed {
+            return;
+        }
+        v.refreshed = true;
+        self.refresh_current_view();
+    }
+
+    // Re-run the fetch backing whichever view is on screen.
+    fn refresh_current_view(&self) {
+        match self.mode {
+            Mode::Nodes | Mode::NodesFull => self.refresh_nodes(),
+            Mode::Flux | Mode::FluxFull => self.refresh_flux(),
+            Mode::Pods | Mode::PodsFull => self.schedule_pods_refresh(800),
+            Mode::Services | Mode::ServicesFull => self.refresh_network(),
+            Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
+            Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
+            Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
+            _ => {}
+        }
     }
 
     fn enter_extract(&mut self) {
@@ -3751,6 +3924,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
             app.refresh_net_snapshot();
         }
+        if app.delete_view.is_some() {
+            app.poll_delete();
+        }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
         tokio::select! {
@@ -3788,6 +3964,24 @@ fn handle_event(app: &mut App, ev: Event) {
             (KeyCode::Left, _) => app.scroll_yaml_h(-5),
             (KeyCode::Right, _) => app.scroll_yaml_h(5),
             (KeyCode::Home, _) => app.scroll_yaml_h(i32::MIN + 1),
+            _ => {}
+        }
+        return;
+    }
+    // The delete panel grabs all input while open (Ctrl-C still quits): with a confirmation this
+    // deliberate, no stray keystroke may reach the view underneath.
+    if app.delete_view.is_some() {
+        let typing = app.delete_view.as_ref().is_some_and(|v| v.typed.is_some());
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.delete_confirm(),
+            (KeyCode::Esc, _) => app.delete_back(),
+            (KeyCode::Backspace, _) => app.delete_backspace(),
+            // Once the name prompt is open every printable key feeds it, `q` included.
+            (KeyCode::Char(c), m) if typing && !m.contains(KeyModifiers::CONTROL) => {
+                app.delete_input(c)
+            }
+            (KeyCode::Char('q'), _) => app.close_delete_view(),
             _ => {}
         }
         return;
@@ -3849,6 +4043,11 @@ fn handle_event(app: &mut App, ev: Event) {
         // `y` shows the YAML of the selected object, from every view that has one.
         (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_yaml_view();
+        }
+
+        // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+            app.open_delete_view();
         }
 
         (KeyCode::Char('m'), _, Mode::AiPanel) => {
@@ -4287,8 +4486,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::PageDown, _, Mode::Selection) => app.move_selection(10),
         (KeyCode::Tab, _, Mode::Selection) => app.cycle_tab(),
         (KeyCode::BackTab, _, Mode::Selection) => app.cycle_tab_back(),
+        // Half-page scroll of the detail pane: Ctrl-U up, Ctrl-F down — the downward half-page moved
+        // off Ctrl-D when that one became "delete the selected object" in every view.
         (KeyCode::Char('u'), KeyModifiers::CONTROL, Mode::Selection) => app.scroll_detail(10),
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection) => app.scroll_detail(-10),
+        (KeyCode::Char('f'), KeyModifiers::CONTROL, Mode::Selection) => app.scroll_detail(-10),
         (KeyCode::Char('g'), _, Mode::Selection) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Selection) => app.scroll_detail_bottom(),
         _ => {}
@@ -4686,6 +4887,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if !matches!(draw_mode, Mode::Vuln | Mode::VulnFull) {
         global_spans.push(Span::styled(" y ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_yaml)));
+        global_spans.push(Span::styled(" ^D ", kbg));
+        global_spans.push(Span::raw(format!(" {}   ", st.k_delete)));
     }
     global_spans.push(Span::styled(" i ", kbg));
     global_spans.push(Span::raw(format!(" {}   ", st.k_ai)));
@@ -4753,8 +4956,140 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.yaml_view.is_some() {
         draw_yaml_popup(f, app, area);
     }
+    if app.delete_view.is_some() {
+        draw_delete_popup(f, app, area);
+    }
 
     visible_rows
+}
+
+// The localised sentence for one guard-rail finding.
+fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
+    match reason {
+        DelReason::GitOps { tool, detail } => {
+            let template = match tool {
+                GitOpsTool::FluxKustomize => st.del_flux_ks,
+                GitOpsTool::FluxHelm => st.del_flux_hr,
+                GitOpsTool::Argo => st.del_argo,
+                GitOpsTool::Helm => st.del_helm,
+            };
+            template.replace("{d}", detail)
+        }
+        DelReason::GitOpsRoot { kind } => st.del_gitops_root.replace("{d}", kind),
+        DelReason::NamespaceCascade => st.del_namespace.to_string(),
+        DelReason::CrdCascade => st.del_crd.to_string(),
+        DelReason::OwnedBy { kind, name } => {
+            st.del_owned.replace("{d}", &format!("{}/{}", kind, name))
+        }
+        DelReason::SystemNamespace { namespace } => st.del_system_ns.replace("{d}", namespace),
+        DelReason::NodeDrain => st.del_node.to_string(),
+        DelReason::PersistentData => st.del_persistent.to_string(),
+        DelReason::Finalizers => st.del_finalizers.to_string(),
+    }
+}
+
+// Ctrl-D panel: the target, what the guard-rails found, and the confirmation prompt matching the
+// severity — a yes/no for a standalone object, retyping the name once anything dangerous shows up.
+fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(v) = app.delete_view.as_ref() else { return };
+    let s = app.delete_state.lock().expect("delete state poisoned").clone();
+    let st = lang::t(app.ai_language);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", st.delete_target), Style::default().fg(DIM)),
+            Span::styled(
+                v.title.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if s.loading {
+        lines.push(Line::from(Span::styled(
+            st.delete_checking,
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(e) = &s.error {
+        lines.push(Line::from(Span::styled(
+            st.delete_check_failed.replace("{e}", e),
+            Style::default().fg(Color::Red),
+        )));
+    } else if s.reasons.is_empty() {
+        lines.push(Line::from(Span::styled(
+            st.delete_no_finding,
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        for r in &s.reasons {
+            let (marker, color) = match r.level() {
+                DelLevel::Danger => ("⛔ ", Color::Red),
+                DelLevel::Warn => ("⚠ ", Color::Yellow),
+                DelLevel::Info => ("· ", DIM),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(color)),
+                Span::styled(delete_reason_text(st, r), Style::default().fg(color)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Last line: where the confirmation stands, or the outcome once the API has answered.
+    let (prompt, prompt_color) = match (&s.done, s.deleting) {
+        (Some(Ok(())), _) => (st.delete_ok.to_string(), Color::Green),
+        (Some(Err(e)), _) => (st.delete_failed.replace("{e}", e), Color::Red),
+        (None, true) => (st.delete_running.to_string(), Color::Yellow),
+        (None, false) if s.loading => (String::new(), DIM),
+        (None, false) => match v.typed.as_ref() {
+            Some(buf) => {
+                let mut p = st.delete_strict_prompt.replace("{n}", buf);
+                if buf.trim() != v.name {
+                    p.push_str(&format!("  ({})", st.delete_strict_mismatch.replace("{name}", &v.name)));
+                }
+                (p, Color::Red)
+            }
+            None if s.needs_strict_confirm() => (st.delete_strict_hint.to_string(), Color::Red),
+            None if v.armed => (st.delete_confirm_prompt.to_string(), Color::Yellow),
+            None => (st.delete_arm_prompt.to_string(), Color::Yellow),
+        },
+    };
+    if !prompt.is_empty() {
+        lines.push(Line::from(Span::styled(
+            prompt,
+            Style::default().fg(prompt_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    let popup_w = (area.width * 70 / 100).max(56).min(area.width);
+    // The findings wrap, so size the popup on the longest one rather than on the line count alone.
+    let inner_w = popup_w.saturating_sub(4).max(1) as usize;
+    let height: usize = lines
+        .iter()
+        .map(|l| (l.width().max(1)).div_ceil(inner_w))
+        .sum();
+    let popup_h = (height as u16 + 2).clamp(7, area.height);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let border = if s.done.as_ref().is_some_and(|r| r.is_ok()) {
+        Color::Green
+    } else if s.needs_strict_confirm() || v.armed {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let title = format!(" {}  ·  Esc {} ", st.delete_title, st.k_cancel);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(border)),
+        );
+    f.render_widget(p, popup_area);
 }
 
 // Full-screen YAML of the selected object, in its neat or raw form. Only the visible window is

@@ -13,6 +13,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
+- **Suppression avec garde-fous (`Ctrl-D`)** : relit l'objet avant tout, avertit s'il est déployé par un moteur GitOps (Flux, Argo CD, Helm) ou si la suppression cascade (namespace, CRD, point d'entrée GitOps) ; l'avertissement se passe outre, mais en retapant le nom de l'objet.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
 ## Installation
@@ -93,7 +94,7 @@ défilement live est actif.
 | `Esc` | Revenir au suivi du plus récent (et dégeler) |
 | `Enter` | Détail plein écran |
 | `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
-| `Shift-↑/↓`, `Ctrl-U/D` | Scroll du détail |
+| `Shift-↑/↓`, `Ctrl-U/F` | Scroll du détail |
 | `g` / `G` | Haut / bas du détail |
 | `a` / `w` / `e` | Filtre All / Warnings / Errors |
 | `:` | Palette de commandes (style k9s) |
@@ -101,6 +102,7 @@ défilement live est actif.
 | `0` | Retirer le filtre namespace (tous namespaces confondus) |
 | `N` | Nodes du pod sélectionné |
 | `y` | YAML de l'objet sélectionné |
+| `Ctrl-D` | Supprimer l'objet sélectionné (avec garde-fous) |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
 | `i` | Panneau IA |
@@ -135,6 +137,38 @@ Deux affichages, bascule par `t` :
 | `Esc` / `q` | Fermer |
 
 > Sur un `Secret`, le manifeste contient les valeurs `data` en base64, comme `kubectl get -o yaml`.
+
+### Suppression d'un objet (`Ctrl-D`)
+
+Disponible depuis les mêmes vues que `y`. Rien n'est supprimé avant que l'objet n'ait été relu et
+passé au crible : le panneau affiche d'abord ce que les garde-fous ont trouvé, puis demande une
+confirmation dont l'exigence dépend de la gravité.
+
+Ce qui est vérifié :
+
+| Constat | Niveau |
+|---|---|
+| Déployé par un moteur GitOps — Kustomization ou HelmRelease Flux, Application Argo CD, release Helm | ⛔ |
+| L'objet **est** un point d'entrée GitOps (`Kustomization`, `HelmRelease`, `Application`) : sa suppression emporte tout ce qu'il déploie | ⛔ |
+| `Namespace` (suppression en cascade) et `CustomResourceDefinition` (toutes les instances du cluster) | ⛔ |
+| Objet piloté par un contrôleur (`ownerReferences`) : recréé aussitôt | ⚠ |
+| Namespace système (`kube-system`, `flux-system`, `argocd`…), `Node` à drainer, `PersistentVolume(Claim)` | ⚠ |
+| `finalizers` présents : la suppression peut rester bloquée en `Terminating` | · |
+
+L'appartenance GitOps se lit sur les labels/annotations posés par les contrôleurs
+(`kustomize.toolkit.fluxcd.io/*`, `helm.toolkit.fluxcd.io/*`, `argocd.argoproj.io/tracking-id` ou
+`/instance`, `meta.helm.sh/release-*`) : peu importe l'outil, tant qu'il signe ce qu'il applique.
+
+**Aucun avertissement ne bloque** — mais plus le constat est grave, plus le geste est engageant :
+
+| Situation | Confirmation |
+|---|---|
+| Aucun constat, ou constats ⚠ / · uniquement | `Entrée` pour armer, `Entrée` pour confirmer |
+| Au moins un constat ⛔, ou vérifications impossibles (objet disparu, RBAC) | `Entrée` pour passer outre, puis **saisie du nom exact de l'objet** avant que `Entrée` ne supprime |
+
+`Esc` revient d'un cran (annule la saisie, désarme, puis ferme). La suppression utilise la
+propagation *background*, comme `kubectl delete`, et la vue sous-jacente est rafraîchie dès que
+l'API a accepté la demande.
 
 ### Palette de commandes (`:`)
 
