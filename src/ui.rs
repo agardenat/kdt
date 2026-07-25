@@ -59,6 +59,16 @@ use crate::rbac::{
 use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
+use crate::yaml::{fetch_yaml, new_yaml_state, SharedYaml};
+
+// The `y` overlay: the YAML of the object selected in whichever view was on screen. Only the
+// display position lives here; the fetched document sits in `App::yaml_state`, and the raw/neat
+// preference in `App::yaml_neat` so it survives closing the panel.
+struct YamlView {
+    title: String,
+    scroll: usize,
+    h_scroll: usize,
+}
 
 // A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
 // or one scanned image.
@@ -440,6 +450,11 @@ pub struct App {
     pub critical_ns: Vec<String>,
     // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
     action_menu: Option<ActionMenu>,
+    // YAML overlay (`y`): `None` when closed. The document itself is fetched into `yaml_state`.
+    yaml_view: Option<YamlView>,
+    yaml_state: SharedYaml,
+    // Whether the YAML panel shows the neat (runtime attributes stripped) or the raw document.
+    yaml_neat: bool,
 }
 
 impl App {
@@ -563,6 +578,9 @@ impl App {
             configmaps_refresh_handle: None,
             critical_ns: critical_namespaces(&file_config.critical_namespaces),
             action_menu: None,
+            yaml_view: None,
+            yaml_state: new_yaml_state(),
+            yaml_neat: true,
         }
     }
 
@@ -1156,6 +1174,134 @@ impl App {
                 self.clipboard_status = Some((std::time::Instant::now(), format!("copie KO: {}", e)));
             }
         }
+    }
+
+    // The Kubernetes object the current view points at, as (apiVersion, kind, namespace, name).
+    // Every list view answers here so `y` shows the YAML of "whatever is selected" everywhere: the
+    // table-backed views read it off the shared snapshot, the others off their own cursor.
+    fn current_object_ref(&self) -> Option<(String, String, String, String)> {
+        match self.mode {
+            Mode::Nodes | Mode::NodesFull => {
+                let s = self.node_list_state.lock().expect("node list poisoned");
+                let n = s.nodes.get(self.node_cursor)?;
+                Some(("v1".to_string(), "Node".to_string(), String::new(), n.name.clone()))
+            }
+            Mode::Rbac | Mode::RbacFull => {
+                let b = self.rbac_selected()?;
+                let ns = match &b.scope {
+                    crate::rbac::Scope::Namespace(ns) => ns.clone(),
+                    crate::rbac::Scope::ClusterWide => String::new(),
+                };
+                Some((
+                    "rbac.authorization.k8s.io/v1".to_string(),
+                    b.binding_kind.clone(),
+                    ns,
+                    b.binding_name.clone(),
+                ))
+            }
+            Mode::Secrets | Mode::SecretsFull => {
+                let s = self.secret_selected()?;
+                Some(("v1".to_string(), "Secret".to_string(), s.namespace, s.name))
+            }
+            Mode::Configmaps | Mode::ConfigmapsFull => {
+                let cm = self.configmap_selected()?;
+                Some(("v1".to_string(), "ConfigMap".to_string(), cm.namespace, cm.name))
+            }
+            Mode::Selection
+            | Mode::DetailFull
+            | Mode::Flux
+            | Mode::FluxFull
+            | Mode::Pods
+            | Mode::PodsFull
+            | Mode::Services
+            | Mode::ServicesFull => {
+                let rec = self.snapshot.get(self.table_state.selected()?)?;
+                if rec.kind.is_empty() || rec.name.is_empty() { return None; }
+                // Events carry the involved object's apiVersion, which older sources leave empty.
+                let api_version = if rec.api_version.is_empty() { "v1" } else { &rec.api_version };
+                Some((api_version.to_string(), rec.kind.clone(), rec.namespace.clone(), rec.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    // `y`: open the YAML panel on the selected object and fetch it live.
+    fn open_yaml_view(&mut self) {
+        let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "yaml : aucun objet sélectionné".to_string(),
+            ));
+            return;
+        };
+        let key = format!("{}|{}|{}/{}", api_version, kind, namespace, name);
+        let title = if namespace.is_empty() {
+            format!("{} {}", kind, name)
+        } else {
+            format!("{} {}/{}", kind, namespace, name)
+        };
+        self.yaml_view = Some(YamlView { title, scroll: 0, h_scroll: 0 });
+        {
+            let mut s = self.yaml_state.lock().expect("yaml state poisoned");
+            s.key = key.clone();
+            s.loading = true;
+            s.error = None;
+            s.raw.clear();
+            s.neat.clear();
+        }
+        let client = self.client.clone();
+        let state = self.yaml_state.clone();
+        tokio::spawn(async move {
+            fetch_yaml(client, api_version, kind, namespace, name, key, state).await;
+        });
+    }
+
+    fn close_yaml_view(&mut self) {
+        self.yaml_view = None;
+    }
+
+    // Re-fetch the object currently displayed, keeping the raw/neat choice and the scroll position.
+    fn refresh_yaml_view(&mut self) {
+        let Some(v) = self.yaml_view.as_ref() else { return; };
+        let (scroll, h_scroll) = (v.scroll, v.h_scroll);
+        self.open_yaml_view();
+        if let Some(v) = self.yaml_view.as_mut() {
+            v.scroll = scroll;
+            v.h_scroll = h_scroll;
+        }
+    }
+
+    fn toggle_yaml_neat(&mut self) {
+        self.yaml_neat = !self.yaml_neat;
+    }
+
+    fn scroll_yaml(&mut self, delta: i32) {
+        let Some(v) = self.yaml_view.as_mut() else { return; };
+        v.scroll = if delta < 0 {
+            v.scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            v.scroll.saturating_add(delta as usize)
+        };
+    }
+
+    fn scroll_yaml_h(&mut self, delta: i32) {
+        let Some(v) = self.yaml_view.as_mut() else { return; };
+        v.h_scroll = if delta < 0 {
+            v.h_scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            v.h_scroll.saturating_add(delta as usize)
+        };
+    }
+
+    // The document as displayed: the neat or the raw form, whichever the panel is showing.
+    fn yaml_visible_text(&self) -> String {
+        let s = self.yaml_state.lock().expect("yaml state poisoned");
+        if self.yaml_neat { s.neat.clone() } else { s.raw.clone() }
+    }
+
+    fn copy_yaml_view(&mut self) {
+        let text = self.yaml_visible_text();
+        self.copy_text(text);
     }
 
     fn enter_extract(&mut self) {
@@ -3625,6 +3771,27 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
+    // The YAML panel grabs all input while open (Ctrl-C still quits).
+    if app.yaml_view.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Esc | KeyCode::Char('q' | 'y'), _) => app.close_yaml_view(),
+            (KeyCode::Char('t'), _) => app.toggle_yaml_neat(),
+            (KeyCode::Char('c'), _) => app.copy_yaml_view(),
+            (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => app.refresh_yaml_view(),
+            (KeyCode::Up, _) => app.scroll_yaml(-1),
+            (KeyCode::Down, _) => app.scroll_yaml(1),
+            (KeyCode::PageUp, _) => app.scroll_yaml(-10),
+            (KeyCode::PageDown, _) => app.scroll_yaml(10),
+            (KeyCode::Char('g'), _) => app.scroll_yaml(i32::MIN + 1),
+            (KeyCode::Char('G'), _) => app.scroll_yaml(i32::MAX),
+            (KeyCode::Left, _) => app.scroll_yaml_h(-5),
+            (KeyCode::Right, _) => app.scroll_yaml_h(5),
+            (KeyCode::Home, _) => app.scroll_yaml_h(i32::MIN + 1),
+            _ => {}
+        }
+        return;
+    }
     // The action menu overlay grabs all input while open (Ctrl-C still quits).
     if app.action_menu.is_some() {
         match (k.code, k.modifiers) {
@@ -3677,6 +3844,11 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.enter_command();
+        }
+
+        // `y` shows the YAML of the selected object, from every view that has one.
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+            app.open_yaml_view();
         }
 
         (KeyCode::Char('m'), _, Mode::AiPanel) => {
@@ -4510,6 +4682,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         global_spans.push(Span::styled(" c ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_copy)));
     }
+    // Vulnerabilities are scan results, not API objects: nothing to show the YAML of.
+    if !matches!(draw_mode, Mode::Vuln | Mode::VulnFull) {
+        global_spans.push(Span::styled(" y ", kbg));
+        global_spans.push(Span::raw(format!(" {}   ", st.k_yaml)));
+    }
     global_spans.push(Span::styled(" i ", kbg));
     global_spans.push(Span::raw(format!(" {}   ", st.k_ai)));
     global_spans.push(Span::styled(" l ", kbg));
@@ -4573,8 +4750,139 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.configmaps_copy_menu.is_some() {
         draw_configmaps_copy_menu_popup(f, app, area);
     }
+    if app.yaml_view.is_some() {
+        draw_yaml_popup(f, app, area);
+    }
 
     visible_rows
+}
+
+// Full-screen YAML of the selected object, in its neat or raw form. Only the visible window is
+// built and colourised, so a large manifest costs the same to draw as a small one.
+fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, content) = {
+        let s = app.yaml_state.lock().expect("yaml state poisoned");
+        let content = if app.yaml_neat { s.neat.clone() } else { s.raw.clone() };
+        (s.loading, s.error.clone(), content)
+    };
+    let Some((obj_title, mut scroll, h_scroll)) = app
+        .yaml_view
+        .as_ref()
+        .map(|v| (v.title.clone(), v.scroll, v.h_scroll))
+    else {
+        return;
+    };
+
+    let popup_w = (area.width * 90 / 100).max(60).min(area.width);
+    let popup_h = (area.height * 90 / 100).max(10).min(area.height);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let st = lang::t(app.ai_language);
+    let inner_h = popup_h.saturating_sub(2) as usize;
+
+    let (lines, border_color): (Vec<Line<'static>>, Color) = if let Some(e) = &error {
+        scroll = 0;
+        (
+            e.lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red))))
+                .collect(),
+            Color::Red,
+        )
+    } else if loading {
+        scroll = 0;
+        (vec![Line::from(Span::styled(st.lbl_loading, Style::default().fg(Color::Yellow)))], Color::Yellow)
+    } else {
+        let total = content.lines().count();
+        scroll = scroll.min(total.saturating_sub(inner_h));
+        (
+            content
+                .lines()
+                .skip(scroll)
+                .take(inner_h)
+                .map(|l| colorize_yaml_line(&slice_from(l, h_scroll)))
+                .collect(),
+            Color::Cyan,
+        )
+    };
+    if let Some(v) = app.yaml_view.as_mut() {
+        v.scroll = scroll;
+    }
+
+    let mode_label = if app.yaml_neat { st.lbl_yaml_neat } else { st.lbl_yaml_raw };
+    let clip_suffix = app
+        .clipboard_status_active()
+        .map(|m| format!("  · ✂ {}", m))
+        .unwrap_or_default();
+    let title = format!(
+        " YAML {} [{}]  t {}  ↑↓ {}  ←→ {}  g/G {}  c {}  Esc {}{} ",
+        obj_title,
+        mode_label,
+        st.k_yaml_toggle,
+        st.k_scroll,
+        st.k_h_scroll,
+        st.k_top_bot,
+        st.k_copy,
+        st.k_close,
+        clip_suffix,
+    );
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(border_color)),
+    );
+    f.render_widget(p, popup_area);
+}
+
+// Minimal YAML highlighting: keys in cyan, list dashes dimmed, scalars coloured by type.
+fn colorize_yaml_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return Line::from(line.to_string());
+    }
+    let indent_len = line.len() - trimmed.len();
+    let mut spans = vec![Span::raw(line[..indent_len].to_string())];
+
+    let rest = match trimmed.strip_prefix("- ") {
+        Some(r) => {
+            spans.push(Span::styled("- ".to_string(), Style::default().fg(DIM)));
+            r
+        }
+        None => trimmed,
+    };
+
+    match split_yaml_key(rest) {
+        Some((key, value)) => {
+            spans.push(Span::styled(key.to_string(), Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(":".to_string(), Style::default().fg(DIM)));
+            if !value.is_empty() {
+                spans.push(Span::styled(value.to_string(), yaml_value_style(value.trim_start())));
+            }
+        }
+        None => spans.push(Span::styled(rest.to_string(), yaml_value_style(rest))),
+    }
+    Line::from(spans)
+}
+
+// Split `key: value` at the mapping colon (a trailing `:` means the value is the nested block that
+// follows). Returns the key and everything after the colon, padding included.
+fn split_yaml_key(rest: &str) -> Option<(&str, &str)> {
+    let idx = if rest.ends_with(':') { rest.len() - 1 } else { rest.find(": ")? };
+    Some((&rest[..idx], &rest[idx + 1..]))
+}
+
+fn yaml_value_style(value: &str) -> Style {
+    if value.starts_with('"') || value.starts_with('\'') {
+        Style::default().fg(Color::Green)
+    } else if value == "null" || value == "~" || value == "{}" || value == "[]" {
+        Style::default().fg(DIM)
+    } else if value == "true" || value == "false" || value.starts_with(|c: char| c.is_ascii_digit()) {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
 // Copy picker over a ConfigMap: a highlighted list of its keys; Enter copies the (text) value.

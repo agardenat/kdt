@@ -21,6 +21,7 @@ mod secrets;
 mod svc;
 mod ui;
 mod vulnerabilities;
+mod yaml;
 
 use std::path::PathBuf;
 

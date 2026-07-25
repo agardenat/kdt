@@ -12,6 +12,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais. La réponse est **streamée** (SSE) et s'affiche au fil de l'eau.
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
+- **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
 ## Installation
@@ -99,6 +100,7 @@ défilement live est actif.
 | `n` | Filtrer sur le namespace de l'évènement sélectionné |
 | `0` | Retirer le filtre namespace (tous namespaces confondus) |
 | `N` | Nodes du pod sélectionné |
+| `y` | YAML de l'objet sélectionné |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
 | `i` | Panneau IA |
@@ -106,6 +108,33 @@ défilement live est actif.
 | `m` | Fournisseur IA suivant |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
+
+### YAML de l'objet (`y`)
+
+Disponible depuis **toutes les vues** (évènements, nodes, workloads, flux, services/ingress,
+RBAC, secrets, configmaps) : `y` ouvre le manifeste de l'objet sous le curseur, récupéré en
+direct via l'API (découverte de GVK, donc les CRD marchent comme les kinds natifs).
+
+Deux affichages, bascule par `t` :
+
+- **neat** (par défaut) : sans les attributs de run — `managedFields`, `resourceVersion`, `uid`,
+  `generation`, `creationTimestamp`, `status`, l'annotation `last-applied-configuration`, ainsi que
+  les valeurs par défaut injectées dans les pod specs (`dnsPolicy`, `schedulerName`,
+  `terminationMessagePath`, tolérations et volumes `kube-api-access-*`…). Ce qui reste est
+  ré-appliquable.
+- **brut** : exactement ce que renvoie l'API, comme `kubectl get -o yaml`.
+
+| Touche | Action |
+|---|---|
+| `y` | Ouvrir (depuis une vue) / fermer |
+| `t` | Basculer **neat** ↔ **brut** |
+| `c` | Copier le YAML affiché |
+| `↑/↓`, `PgUp/PgDn`, `g`/`G` | Scroll |
+| `←` / `→` / `Home` | Scroll horizontal |
+| `r` / `F5` | Recharger l'objet |
+| `Esc` / `q` | Fermer |
+
+> Sur un `Secret`, le manifeste contient les valeurs `data` en base64, comme `kubectl get -o yaml`.
 
 ### Palette de commandes (`:`)
 
@@ -367,6 +396,13 @@ Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downl
 | `cli.rs` | Parsing des arguments (clap) |
 | `events.rs` | Watcher d'évènements, logs (pods + controllers Flux), status, nœuds, usage |
 | `flux.rs` | FluxCD : inventaire, réconciliation, suspend, inventaire d'objets, arbre de dépendances |
+| `pods.rs` | Workloads et pods : inventaire, scale, restart, recyclage |
+| `svc.rs` | Services / Endpoints / Ingress / IngressClass |
+| `rbac.rs` | Bindings RBAC scorés par sévérité |
+| `vulnerabilities.rs` | CVE images (Trivy Operator) + risque version Kubernetes |
+| `secrets.rs` | Secrets et certificats TLS (expiration, consommateurs) |
+| `configmaps.rs` | ConfigMaps et leur contenu |
+| `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
 | `diagnostic.rs` | Étapes de diagnostic cluster |
 | `extract.rs` | Extraction complète → rapport |

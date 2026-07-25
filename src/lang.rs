@@ -86,6 +86,10 @@ pub struct Strings {
     pub k_copy: &'static str,
     pub k_reveal_b64: &'static str,
     pub k_reveal_plain: &'static str,
+    pub k_yaml: &'static str,
+    pub k_yaml_toggle: &'static str,
+    pub lbl_yaml_neat: &'static str,
+    pub lbl_yaml_raw: &'static str,
 
     pub menu_pods_title: &'static str,
     pub menu_flux_title: &'static str,
@@ -249,6 +253,10 @@ pub const FR: Strings = Strings {
     k_copy: "copier",
     k_reveal_b64: "base64",
     k_reveal_plain: "déchiffrer",
+    k_yaml: "yaml",
+    k_yaml_toggle: "brut/neat",
+    lbl_yaml_neat: "neat",
+    lbl_yaml_raw: "brut",
 
     menu_pods_title: "Action sur le workload",
     menu_flux_title: "Réconciliation Flux",
@@ -412,6 +420,10 @@ pub const EN: Strings = Strings {
     k_copy: "copy",
     k_reveal_b64: "base64",
     k_reveal_plain: "decode",
+    k_yaml: "yaml",
+    k_yaml_toggle: "raw/neat",
+    lbl_yaml_neat: "neat",
+    lbl_yaml_raw: "raw",
 
     menu_pods_title: "Workload action",
     menu_flux_title: "Flux reconcile",
