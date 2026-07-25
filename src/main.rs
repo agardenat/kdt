@@ -15,6 +15,7 @@ mod enrich;
 mod events;
 mod extract;
 mod flux;
+mod glyphs;
 mod lang;
 mod pdf;
 mod pods;
@@ -93,6 +94,13 @@ async fn main() -> Result<()> {
     init_logging();
 
     let args = cli::Args::parse();
+
+    // Caractérisation du terminal : ne demande aucun cluster.
+    if args.probe_glyphs {
+        glyphs::print_report()?;
+        return Ok(());
+    }
+
     let client = build_client(args.context.as_deref()).await?;
 
     let ns = if args.all_namespaces { None } else { args.namespace.clone() };

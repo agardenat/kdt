@@ -921,8 +921,8 @@ pub async fn set_suspend(
     status: SharedReconcile,
 ) {
     let msg = match run_set_suspend(&client, &api_version, &kind, &ns, &name, suspend).await {
-        Ok(()) if suspend => format!("⏸ suspendu : {}/{}", kind, name),
-        Ok(()) => format!("▶ repris : {}/{}", kind, name),
+        Ok(()) if suspend => format!("■ suspendu : {}/{}", kind, name),
+        Ok(()) => format!("► repris : {}/{}", kind, name),
         Err(e) => format!("✗ suspend : {}", e),
     };
     if let Ok(mut s) = status.lock() {

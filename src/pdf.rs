@@ -147,7 +147,7 @@ const TEMPLATE: &str = r###"
 #let marker-fg(m) = {
   if m == "▲" or m == "↑" { rgb("#ffe082") }
   else if m == "▼" or m == "↓" or m == "↡" { rgb("#fff59d") }
-  else if m == "≫" { rgb("#ffccbc") }
+  else if m == "»" { rgb("#ffccbc") }
   else { white }
 }
 
@@ -336,7 +336,7 @@ const TEMPLATE: &str = r###"
             #text(fill: rgb(brand.red), weight: "bold")[▲] use ≥ limit (cpuMax / OOMrisk) \
             #text(fill: rgb(brand.red), weight: "bold")[▼] sous-utilisé (use < 30 % de request) \
             #text(fill: rgb(brand.red), weight: "bold")[↡] sous-utilisé extrême (use < 5 %) \
-            #text(fill: rgb(brand.red), weight: "bold")[≫] limit ≫ request (limit > 4× req) \
+            #text(fill: rgb(brand.red), weight: "bold")[»] limit » request (limit > 4× req) \
             #text(fill: rgb(brand.red), weight: "bold")[—] valeur manquante (request ou limit non définie) \
             #text(fill: rgb("#999"))[·] préfixe = conteneur système
           ]
@@ -928,7 +928,7 @@ mod tests {
                     pod: "web-7cd5".to_string(),
                     container: "app".to_string(),
                     cpu_req: cell("500m", 2),
-                    cpu_lim: cell("2", 4).with_marker("≫"),
+                    cpu_lim: cell("2", 4).with_marker("»"),
                     cpu_use: cell("2.1", 5).with_marker("▲"),
                     mem_req: cell("512Mi", 1),
                     mem_lim: cell("1Gi", 3),

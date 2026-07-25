@@ -2197,7 +2197,7 @@ impl App {
         };
         self.clipboard_status = Some((
             std::time::Instant::now(),
-            format!("⟳ reconcile demandé : {}/{}…", kind, name),
+            format!("↻ reconcile demandé : {}/{}…", kind, name),
         ));
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
@@ -2251,7 +2251,7 @@ impl App {
             std::time::Instant::now(),
             format!(
                 "{} {}/{}…",
-                if suspend { "⏸ suspend" } else { "▶ resume" },
+                if suspend { "■ suspend" } else { "► resume" },
                 rec.kind,
                 rec.name
             ),
@@ -3773,7 +3773,7 @@ impl App {
         if force {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("♻ recyclage {}/{} (0 → {})…", w.kind, w.name, target),
+                format!("↻ recyclage {}/{} (0 → {})…", w.kind, w.name, target),
             ));
             tokio::spawn(async move { run_force_recycle(client, owner, target, status).await; });
             // Force-recycle scales to 0 then back up (~2 s); refresh around each step.
@@ -5587,8 +5587,8 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         for r in &s.reasons {
             let (marker, color) = match r.level() {
-                DelLevel::Danger => ("⛔ ", Color::Red),
-                DelLevel::Warn => ("⚠ ", Color::Yellow),
+                DelLevel::Danger => ("✗ ", Color::Red),
+                DelLevel::Warn => ("▲ ", Color::Yellow),
                 DelLevel::Info => ("· ", DIM),
             };
             lines.push(Line::from(vec![
@@ -5710,7 +5710,7 @@ fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let mode_label = if app.yaml_neat { st.lbl_yaml_neat } else { st.lbl_yaml_raw };
     let clip_suffix = app
         .clipboard_status_active()
-        .map(|m| format!("  · ✂ {}", m))
+        .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
     let title = format!(
         " YAML {} [{}]  t {}  ↑↓ {}  ←→ {}  g/G {}  c {}  Esc {}{} ",
@@ -5998,7 +5998,7 @@ fn draw_extract_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(format!("  {}", st.lbl_press_esc_close), Style::default().fg(DIM))));
         if let Some(m) = app.clipboard_status_active() {
-            lines.push(Line::from(Span::styled(format!("  ✂ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(format!("  ⊡ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
         }
     } else {
         lines.push(Line::from(Span::styled(st.lbl_preparation, Style::default().fg(Color::Yellow))));
@@ -6195,8 +6195,8 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             else if cpu_req_under_used { issues.push("cpuOver"); }
             if mem_extreme { issues.push("memOver!!"); }
             else if mem_req_under_used { issues.push("memOver"); }
-            if cpu_lim_excessive { issues.push("cpuLim≫"); }
-            if mem_lim_excessive { issues.push("memLim≫"); }
+            if cpu_lim_excessive { issues.push("cpuLim»"); }
+            if mem_lim_excessive { issues.push("memLim»"); }
             if cpu_at_limit { issues.push("cpuMax"); }
             if mem_at_limit { issues.push("OOMrisk"); }
             let issues_text = issues.join(",");
@@ -6292,7 +6292,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ];
     if let Some(m) = app.clipboard_status_active() {
         spans.push(Span::raw("   "));
-        spans.push(Span::styled(format!("✂ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!("⊡ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
     }
     let footer = Paragraph::new(Line::from(spans));
     f.render_widget(footer, footer_a);
@@ -6590,7 +6590,7 @@ fn draw_diagnostic_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ];
     if let Some(m) = app.clipboard_status_active() {
         spans.push(Span::raw("   "));
-        spans.push(Span::styled(format!("✂ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!("⊡ {}", m), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
     }
     let footer = Paragraph::new(Line::from(spans));
     f.render_widget(footer, footer_a);
@@ -6617,7 +6617,7 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .unwrap_or_default();
     let clip_suffix = app
         .clipboard_status_active()
-        .map(|m| format!("  · ✂ {}", m))
+        .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
     let title = format!(
         " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}  m {}{}  c copier  Esc {}{}{} ",
@@ -7897,7 +7897,7 @@ fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
     }
     if k.eol {
         lines.push(Line::from(Span::styled(
-            "  ⚠ version hors fenêtre de support (EOL)",
+            "  ▲ version hors fenêtre de support (EOL)",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
@@ -8218,7 +8218,7 @@ fn cert_ready_cell(r: CmReady) -> (&'static str, Color) {
 fn cert_glyph(r: CmReady) -> &'static str {
     match r {
         CmReady::Ready => "✓",
-        CmReady::InProgress => "⟳",
+        CmReady::InProgress => "↻",
         CmReady::Failed => "✗",
         CmReady::Unknown => "·",
     }
@@ -8280,7 +8280,7 @@ fn certs_panel_title(app: &App, tree: bool, rows: &[CmResource]) -> String {
     .counts();
     let acme = if acme_installed { "" } else { " · sans ACME" };
     format!(
-        "{} ({} certificats · ✓{} ✗{} ⟳{} · {} expirent <30j{}) · filtre={}",
+        "{} ({} certificats · ✓{} ✗{} ↻{} · {} expirent <30j{}) · filtre={}",
         kind, total, ready, failed, flight, expiring, acme, app.certs_filter.label()
     )
 }
@@ -8570,7 +8570,7 @@ fn cert_chain_lines(
         let r = &resources[i];
         let (_, color) = cert_ready_cell(r.ready);
         let branch = if pos == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth)) };
-        let here = if i == idx { "▶ " } else { "" };
+        let here = if i == idx { "► " } else { "" };
         let mut spans = vec![
             Span::styled(branch, Style::default().fg(DIM)),
             Span::styled(here, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
@@ -8672,8 +8672,8 @@ fn cert_chain_lines(
         )));
         for h in hints {
             let (glyph, color) = match h.level {
-                HintLevel::Danger => ("⛔", Color::Red),
-                HintLevel::Warn => ("⚠", Color::Rgb(255, 140, 0)),
+                HintLevel::Danger => ("✗", Color::Red),
+                HintLevel::Warn => ("▲", Color::Rgb(255, 140, 0)),
                 HintLevel::Info => ("·", DIM),
             };
             let mut first = true;
@@ -8830,7 +8830,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         "flux (chargement...)".to_string()
     } else {
         format!(
-            "flux ({} · ✓{} ✗{} ⟳{} ?{} ⏸{})",
+            "flux ({} · ✓{} ✗{} ↻{} ?{} ■{})",
             resources.len(), ready, failed, reconciling, unknown, suspended
         )
     };
@@ -9053,7 +9053,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
     if r.prune == Some(true) {
         Cell::from(Line::from(vec![
-            Span::styled("⚠ prune ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("▲ prune ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(r.message.clone(), Style::default().fg(msg_color)),
         ]))
     } else {
@@ -9102,7 +9102,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 // of being truncated at the column edge. Returns the cell and the row height it needs.
 fn flux_message_cell_wrapped(r: &FluxResource, msg_color: Color, width: usize) -> (Cell<'static>, u16) {
     let prune_prefix = r.prune == Some(true);
-    let prefix = if prune_prefix { "⚠ prune " } else { "" };
+    let prefix = if prune_prefix { "▲ prune " } else { "" };
     let body = format!("{}{}", prefix, r.message);
     let wrapped = wrap_words(&body, width);
     let height = wrapped.len().clamp(1, 8) as u16;
@@ -9174,7 +9174,7 @@ fn loading_lines(
     model: &str,
     lang: AiLanguage,
 ) -> Vec<Line<'static>> {
-    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner_chars = ['◐', '◓', '◑', '◒'];
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -9190,8 +9190,8 @@ fn loading_lines(
     let st = lang::t(lang);
     let stage_text = if stage.is_empty() { st.lbl_preparation.to_string() } else { stage.to_string() };
     let (elapsed_label, resources_label, model_label, lang_label, hint) = match lang {
-        AiLanguage::Fr => ("⏱ écoulé : ", "◆ ressources collectées : ", "⌨ modèle : ", "    langue : ", "    (les requêtes longues peuvent prendre 30-60s sur de gros prompts)"),
-        AiLanguage::En => ("⏱ elapsed: ",  "◆ resources collected: ",   "⌨ model: ",   "    language: ", "    (long requests may take 30-60s for large prompts)"),
+        AiLanguage::Fr => ("◔ écoulé : ", "● ressources collectées : ", "» modèle : ", "    langue : ", "    (les requêtes longues peuvent prendre 30-60s sur de gros prompts)"),
+        AiLanguage::En => ("◔ elapsed: ",  "● resources collected: ",   "» model: ",   "    language: ", "    (long requests may take 30-60s for large prompts)"),
     };
     let _ = st;
 
@@ -9529,7 +9529,7 @@ fn log_lines(app: &App) -> Vec<Line<'static>> {
 // Status glyph + colour for an applied inventory object (shared by the tree rows).
 fn inventory_glyph(it: &InventoryItem) -> (&'static str, Color) {
     if it.reconciling {
-        ("⟳", Color::Cyan)
+        ("↻", Color::Cyan)
     } else {
         match it.ready {
             Some(true) => ("✓", Color::Green),
@@ -10482,6 +10482,52 @@ fn line_color_to_pdf(c: LineColor) -> &'static str {
         LineColor::Err => "err",
         LineColor::Info => "info",
         LineColor::Dim => "dim",
+    }
+}
+
+// Un glyphe mal choisi décale toute la fin de sa ligne, et la bordure droite des panneaux part en
+// escalier. Deux causes, mesurables toutes les deux, d'où les deux critères de la liste ci-dessous :
+//   1. le glyphe doit exister dans la mono du terminal avec l'avance d'une cellule, sinon il est
+//      dessiné depuis une police de repli proportionnelle (cosmic-term shape la ligne entière avec
+//      cosmic-text, donc la dérive se propage jusqu'à la bordure) ;
+//   2. il ne doit pas être couvert par la police emoji, sinon le moteur peut le détourner vers un
+//      glyphe couleur double largeur — c'est ce qui arrivait au triangle U+25B6, remplacé par ►.
+// Contrôles avant d'ajouter un glyphe (DejaVu Sans Mono = mono par défaut de la plupart des Linux) :
+//     fc-list "DejaVu Sans Mono:charset=25CF" family   # vide = absent, à écarter
+//     fc-list "Noto Color Emoji:charset=25CF" family   # non vide = risque emoji, à écarter
+#[cfg(test)]
+mod glyph_guard {
+    // Vérifiés dans DejaVu Sans Mono (présents, avance 1233 = une cellule) et absents de Noto
+    // Color Emoji.
+    const APPROVED: &str = "·»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
+
+    #[test]
+    fn sources_use_only_font_safe_glyphs() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/ illisible") {
+            let path = entry.expect("entrée de src/ illisible").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("source illisible");
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            for ch in src.chars() {
+                // Les lettres accentuées viennent du texte FR/EN, pas de l'iconographie.
+                if ch.is_ascii() || ch.is_alphabetic() || APPROVED.contains(ch) {
+                    continue;
+                }
+                let found = format!("{name}: {ch} (U+{:04X})", ch as u32);
+                if !offenders.contains(&found) {
+                    offenders.push(found);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "glyphes hors liste, potentiellement absents de la police mono du terminal : {}",
+            offenders.join(", ")
+        );
     }
 }
 

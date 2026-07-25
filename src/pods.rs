@@ -423,7 +423,7 @@ pub async fn run_force_recycle(client: Client, owner: OwnerRef, replicas: i32, s
         Ok(()) => {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             match patch_replicas(&client, &owner, replicas).await {
-                Ok(()) => format!("♻ recycle {}/{} (0 → {})", owner.kind, owner.name, replicas),
+                Ok(()) => format!("↻ recycle {}/{} (0 → {})", owner.kind, owner.name, replicas),
                 Err(e) => format!("✗ recycle (remontée) : {}", e),
             }
         }

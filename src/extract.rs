@@ -434,7 +434,7 @@ fn row_has_issue(r: &PodUsageRow) -> bool {
 }
 
 // Convert a node's raw usage rows into the PDF model: sort containers (user first, by memory
-// request), and attach per-cell incidence levels and markers (▲ at-limit, ▼ under-used, ≫ over-limit).
+// request), and attach per-cell incidence levels and markers (▲ at-limit, ▼ under-used, » over-limit).
 pub fn node_section_from(
     name: &str,
     s: &NodeUsageState,
@@ -475,8 +475,8 @@ pub fn node_section_from(
 
             let cpu_req_marker = if cpu_extreme { "↡" } else if cpu_req_under_used { "▼" } else { "" };
             let mem_req_marker = if mem_extreme { "↡" } else if mem_req_under_used { "▼" } else { "" };
-            let cpu_lim_marker = if cpu_lim_excessive { "≫" } else { "" };
-            let mem_lim_marker = if mem_lim_excessive { "≫" } else { "" };
+            let cpu_lim_marker = if cpu_lim_excessive { "»" } else { "" };
+            let mem_lim_marker = if mem_lim_excessive { "»" } else { "" };
             let cpu_use_marker = if cpu_at_limit { "▲" } else { "" };
             let mem_use_marker = if mem_at_limit { "▲" } else { "" };
 

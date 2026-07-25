@@ -723,7 +723,7 @@ fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
                             "    state: Terminated ({}, exit={}){}",
                             t.reason.as_deref().unwrap_or(""),
                             t.exit_code,
-                            if oom { "  ⚠ OOMKILLED" } else { "" },
+                            if oom { "  ▲ OOMKILLED" } else { "" },
                         )));
                     }
                 }
@@ -735,7 +735,7 @@ fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
                             "    last: Terminated ({}, exit={}){}",
                             t.reason.as_deref().unwrap_or(""),
                             t.exit_code,
-                            if oom { "  ⚠ OOMKILLED précédemment" } else { "" },
+                            if oom { "  ▲ OOMKILLED précédemment" } else { "" },
                         )));
                     }
                 }
@@ -759,7 +759,7 @@ fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
         let oom_count = count_oom(s);
         if oom_count > 0 {
             out.push((LineColor::Plain, String::new()));
-            out.push((LineColor::Err, format!("⚠ OOMKilled détecté sur {} container(s)", oom_count)));
+            out.push((LineColor::Err, format!("▲ OOMKilled détecté sur {} container(s)", oom_count)));
         }
     } else {
         out.push((LineColor::Warn, "No status available".into()));
@@ -828,7 +828,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
 
     if let Some(spec) = node.spec.as_ref() {
         if spec.unschedulable.unwrap_or(false) {
-            out.push((LineColor::Err, "⚠ Unschedulable (cordoned)".into()));
+            out.push((LineColor::Err, "▲ Unschedulable (cordoned)".into()));
         }
         if let Some(taints) = &spec.taints {
             if !taints.is_empty() {
@@ -1074,7 +1074,7 @@ pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
     out.push((LineColor::Plain, String::new()));
     out.push((
         LineColor::Err,
-        format!("⚠ Récents OOMKilled sur ce noeud ({}) :", entries.len()),
+        format!("▲ Récents OOMKilled sur ce noeud ({}) :", entries.len()),
     ));
     for (_, line) in entries.iter().take(10) {
         out.push((LineColor::Err, line.clone()));

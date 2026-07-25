@@ -2124,6 +2124,7 @@ dependencies = [
  "typst",
  "typst-as-lib",
  "typst-pdf",
+ "unicode-width",
  "x509-parser",
 ]
 
