@@ -220,10 +220,12 @@ L'appartenance GitOps se lit sur les labels/annotations posés par les contrôle
 
 | Situation | Confirmation |
 |---|---|
-| Aucun constat, ou constats ⚠ / · uniquement | `Entrée` pour armer, `Entrée` pour confirmer |
-| Au moins un constat ⛔, ou vérifications impossibles (objet disparu, RBAC) | `Entrée` pour passer outre, puis **saisie du nom exact de l'objet** avant que `Entrée` ne supprime |
+| Aucun constat, ou constats ⚠ / · uniquement | `Ctrl-D` pour armer, `Ctrl-D` pour confirmer |
+| Au moins un constat ⛔, ou vérifications impossibles (objet disparu, RBAC) | `Ctrl-D` pour passer outre, puis **saisie du nom exact de l'objet** avant que `Ctrl-D` ne supprime |
 
-`Esc` revient d'un cran (annule la saisie, désarme, puis ferme). La suppression utilise la
+**La réponse par défaut est « non »** : seul `Ctrl-D` — la touche qui a ouvert le panneau — avance
+vers la suppression. `Entrée` et `Esc` annulent toutes les deux et referment le panneau, quel que
+soit l'avancement du geste : la touche réflexe ne détruit jamais. La suppression utilise la
 propagation *background*, comme `kubectl delete`, et la vue sous-jacente est rafraîchie dès que
 l'API a accepté la demande.
 

@@ -1483,12 +1483,9 @@ impl App {
         });
     }
 
-    fn close_delete_view(&mut self) {
-        self.delete_view = None;
-    }
-
-    // Enter: walk one step down the confirmation path — arm, open the type-the-name prompt, or,
+    // Ctrl-D: walk one step down the confirmation path — arm, open the type-the-name prompt, or,
     // when the gesture is complete, fire the deletion. A no-op while the checks are still running.
+    // Only this chord ever advances: the panel refuses by default, so Enter cancels like Esc.
     fn delete_confirm(&mut self) {
         let (loading, strict, busy) = {
             let s = self.delete_state.lock().expect("delete state poisoned");
@@ -1500,7 +1497,7 @@ impl App {
         let Some(v) = self.delete_view.as_mut() else { return };
         if strict {
             match v.typed.as_ref() {
-                // First Enter acknowledges the warning and opens the name prompt.
+                // The first chord acknowledges the warning and opens the name prompt.
                 None => {
                     v.typed = Some(String::new());
                     return;
@@ -1537,13 +1534,10 @@ impl App {
         });
     }
 
-    // Esc: undo one confirmation step, or close the panel when there is none left.
-    fn delete_back(&mut self) {
-        match self.delete_view.as_mut() {
-            Some(v) if v.typed.is_some() => v.typed = None,
-            Some(v) if v.armed => v.armed = false,
-            _ => self.delete_view = None,
-        }
+    // Esc and Enter: cancel outright. Both close the panel whatever step the gesture has reached —
+    // refusing is the default answer, so the reflex key must never be the one that destroys.
+    fn delete_cancel(&mut self) {
+        self.delete_view = None;
     }
 
     // Type-the-name buffer, capped at the length of a DNS subdomain.
@@ -4767,14 +4761,16 @@ fn handle_event(app: &mut App, ev: Event) {
         let typing = app.delete_view.as_ref().is_some_and(|v| v.typed.is_some());
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
-            (KeyCode::Enter, _) => app.delete_confirm(),
-            (KeyCode::Esc, _) => app.delete_back(),
+            // Ctrl-D — the chord that opened the panel — is the only key that moves towards the
+            // deletion; Enter answers no, like Esc.
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.delete_confirm(),
+            (KeyCode::Enter | KeyCode::Esc, _) => app.delete_cancel(),
             (KeyCode::Backspace, _) => app.delete_backspace(),
             // Once the name prompt is open every printable key feeds it, `q` included.
             (KeyCode::Char(c), m) if typing && !m.contains(KeyModifiers::CONTROL) => {
                 app.delete_input(c)
             }
-            (KeyCode::Char('q'), _) => app.close_delete_view(),
+            (KeyCode::Char('q'), _) => app.delete_cancel(),
             _ => {}
         }
         return;
@@ -6167,7 +6163,7 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         Color::Yellow
     };
-    let title = format!(" {}  ·  Esc {} ", st.delete_title, st.k_cancel);
+    let title = format!(" {}  ·  {} {} ", st.delete_title, st.delete_cancel_keys, st.k_cancel);
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .block(
