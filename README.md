@@ -15,6 +15,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
 - **Édition avec garde-fous (`e`)** : l'objet part dans `$EDITOR` (vim &co.) puis revient par un `PUT` verrouillé sur son `resourceVersion`. Avant, kdt dit ce qui rendra l'édition vaine — objet GitOps réécrit au prochain reconcile, spec tenue par un contrôleur, `can-i update` refusé ; après, il classe chaque champ modifié entre *appliqué*, *ignoré* et *rejeté par l'API*.
 - **Suppression avec garde-fous (`Ctrl-D`)** : relit l'objet avant tout, avertit s'il est déployé par un moteur GitOps (Flux, Argo CD, Helm) ou si la suppression cascade (namespace, CRD, point d'entrée GitOps) ; l'avertissement se passe outre, mais en retapant le nom de l'objet.
+- **Touch (`h`)** : pose `kdt.io/touched-at` (horodatage à la milliseconde) et `kdt.io/touched-by` sur l'objet sélectionné, pour lui faire retraverser la chaîne d'admission — réévaluer une règle Kyverno, réveiller un contrôleur. Sans confirmation : c'est un merge patch de deux annotations, et le bandeau nomme l'objet touché.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
 ## Installation
@@ -104,6 +105,7 @@ défilement live est actif.
 | `N` | Nodes du pod sélectionné |
 | `y` | YAML de l'objet sélectionné |
 | `e` | Éditer l'objet sélectionné dans `$EDITOR` (avec garde-fous) |
+| `h` | Toucher l'objet sélectionné (annotation horodatée, sans confirmation) |
 | `Ctrl-D` | Supprimer l'objet sélectionné (avec garde-fous) |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
@@ -194,6 +196,40 @@ verrou optimiste, donc une modification concurrente fait échouer la requête au
 travail d'un autre. Un YAML invalide ou un refus de l'API n'est jamais une perte : `Entrée` renvoie
 dans l'éditeur avec le tampon tel qu'il était. La vue sous-jacente est rafraîchie dès que l'API a
 accepté.
+
+### Touch d'un objet (`h`)
+
+Disponible depuis les mêmes vues que `y`. `h` pose deux annotations sur l'objet sélectionné :
+
+```yaml
+metadata:
+  annotations:
+    kdt.io/touched-at: "2026-07-25T18:32:28.070Z"
+    kdt.io/touched-by: agardenat
+```
+
+Ce qui compte n'est pas l'annotation mais **l'écriture** qu'elle provoque. Les webhooks d'admission
+— Kyverno et consorts — ne tournent qu'à la création et à la mise à jour : pour faire réévaluer une
+politique sur un objet que personne n'a modifié, il faut lui changer quelque chose d'inoffensif.
+C'est aussi ce qui fait repasser un contrôleur qui *watch* l'objet.
+
+L'horodatage est à la **milliseconde**, et c'est nécessaire : un merge patch qui ne change rien est
+absorbé par l'API sans incrémenter le `resourceVersion`, donc sans appeler le moindre webhook. Deux
+touches dans la même seconde porteraient la même valeur et la seconde ne ferait rien du tout.
+`kdt.io/touched-by` reprend `$USER` (à défaut `$LOGNAME`, sinon `kdt`).
+
+Le patch est un **merge patch** sur la seule map `annotations` : les autres annotations, les labels
+et le reste de l'objet ne sont ni relus ni réécrits, il n'y a donc rien à perdre face à une
+modification concurrente.
+
+> ⚠ **Aucune confirmation, aucun garde-fou** : contrairement à `e` et `Ctrl-D`, `h` part
+> immédiatement. Dans la vue évènements, où le curseur **suit** le flux, l'objet touché est celui qui
+> était sélectionné au moment de la frappe — geler le défilement (`s`) ou ancrer le curseur avant de
+> toucher. Le bandeau du footer nomme toujours l'objet effectivement touché (`✓ touché
+> ConfigMap default/exemple`), ou affiche le refus de l'API (`✗ touch … is forbidden…`).
+
+Un objet piloté par GitOps se touche sans problème — l'annotation n'est pas dans le dépôt, donc rien
+ne la revendique, et Flux ou Argo la laissent en place jusqu'à ce qu'ils réécrivent l'objet.
 
 ### Suppression d'un objet (`Ctrl-D`)
 
@@ -458,7 +494,7 @@ La valeur n'est jamais transmise à l'API : elle ne sert qu'au rognage local. Re
 - **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives. Le payload est compacté avant envoi (JSON sans espaces, lignes répétées des logs/status fusionnées, événements liés dédupliqués) et borné par section, ainsi que globalement quand `context_window` est défini.
 - **Endpoint** : un `base_url` en `http://` envoie la clé `Authorization: Bearer` et le payload en clair. Préfère `https://` (ou un endpoint local pour de l'inférence offline).
 - **Clé API** : stockée en clair dans `config.json` ; restreins les permissions du fichier (`chmod 600`). La clé n'est jamais journalisée.
-- **Accès cluster** : toutes les requêtes Kubernetes sont en lecture seule (`get`/`list`/`watch`/`logs`) ; aucune mutation, aucun shell-out.
+- **Accès cluster** : toute la navigation est en lecture seule (`get`/`list`/`watch`/`logs`). Les seules écritures sont celles qu'une touche déclenche explicitement — scale / restart / recyclage, reconcile et suspend Flux, renew cert-manager, édition (`e`, un `PUT`), suppression (`Ctrl-D`), touch (`h`, un patch de deux annotations) — et elles sont refusées par l'API si le kubeconfig n'en a pas le droit. Un seul shell-out : `$EDITOR`, lancé par `e`.
 - **Rendu PDF** : le contenu IA est échappé avant d'être évalué comme markup Typst (`convert_inline_md`), ce qui neutralise l'injection de code Typst ; les blocs de code passent par `raw()` (jamais évalué).
 
 ## Logs
@@ -559,6 +595,7 @@ bandeau.
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
 | `edit.rs` | Édition d'un objet via `$EDITOR` : garde-fous, diff, écriture |
 | `delete.rs` | Suppression d'un objet : garde-fous et exécution |
+| `touch.rs` | Touch d'un objet : annotation horodatée pour relancer l'admission |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
 | `diagnostic.rs` | Étapes de diagnostic cluster |
 | `extract.rs` | Extraction complète → rapport |

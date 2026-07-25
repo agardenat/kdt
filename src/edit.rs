@@ -384,8 +384,9 @@ async fn replace(
 
 // kube renders an API failure by dumping the whole response — the message, an escaped second copy
 // of it, and the diff the server computed — which is unreadable in a panel. The server's own
-// `message` is the part that tells the user what to fix.
-fn api_error_text(e: kube::Error) -> String {
+// `message` is the part that tells the user what to fix. Shared with [`crate::touch`], which writes
+// through the same API and would otherwise show the same wall of text in a single footer line.
+pub fn api_error_text(e: kube::Error) -> String {
     match e {
         kube::Error::Api(resp) if !resp.message.is_empty() => resp.message,
         other => other.to_string(),

@@ -163,6 +163,12 @@ pub struct Strings {
     pub ed_running_pod: &'static str,
     pub ed_partial_spec: &'static str,
 
+    pub k_touch: &'static str,
+    pub touch_no_object: &'static str,
+    pub touch_running: &'static str,
+    pub touch_ok: &'static str,
+    pub touch_failed: &'static str,
+
     pub menu_pods_title: &'static str,
     pub menu_flux_title: &'static str,
     pub menu_certs_title: &'static str,
@@ -404,6 +410,12 @@ pub const FR: Strings = Strings {
     ed_running_pod: "Pod en cours d'exécution : seule l'image des conteneurs est modifiable à chaud",
     ed_partial_spec: "{d} : spec en grande partie figée après création, la plupart des champs seront rejetés",
 
+    k_touch: "toucher",
+    touch_no_object: "touch : aucun objet sélectionné",
+    touch_running: "↻ touch {d}…",
+    touch_ok: "✓ touché {d}",
+    touch_failed: "✗ touch {d} : {e}",
+
     menu_pods_title: "Action sur le workload",
     menu_flux_title: "Réconciliation Flux",
     menu_certs_title: "Actions cert-manager",
@@ -644,6 +656,12 @@ pub const EN: Strings = Strings {
     ed_immutable_obj: "Marked immutable: true — its data can no longer be changed",
     ed_running_pod: "Running pod: only container images can be changed in place",
     ed_partial_spec: "{d}: the spec is mostly frozen after creation, most fields will be rejected",
+
+    k_touch: "touch",
+    touch_no_object: "touch: no object selected",
+    touch_running: "↻ touching {d}…",
+    touch_ok: "✓ touched {d}",
+    touch_failed: "✗ touch {d}: {e}",
 
     menu_pods_title: "Workload action",
     menu_flux_title: "Flux reconcile",

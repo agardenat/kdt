@@ -104,6 +104,7 @@ use crate::rbac::{
 use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
+use crate::touch;
 use crate::yaml::{fetch_yaml, new_yaml_state, SharedYaml};
 
 // The `y` overlay: the YAML of the object selected in whichever view was on screen. Only the
@@ -486,6 +487,10 @@ pub struct App {
     pub command_return_mode: Mode,
     pub flux_state: SharedFlux,
     pub reconcile_status: SharedReconcile,
+    // Outcome of the last `h` touch. Its own channel rather than `reconcile_status`, which is only
+    // drained in the Flux/Pods/Certs views: `h` fires from every view and must report back in all
+    // of them.
+    pub touch_status: SharedReconcile,
     pub flux_logs_state: SharedLog,
     pub flux_logs_handle: Option<JoinHandle<()>>,
     pub last_inventory_tick: std::time::Instant,
@@ -652,6 +657,7 @@ impl App {
             command_return_mode: Mode::Selection,
             flux_state: new_flux_state(),
             reconcile_status: new_reconcile_status(),
+            touch_status: new_reconcile_status(),
             flux_logs_state: new_log_state(),
             flux_logs_handle: None,
             last_inventory_tick: std::time::Instant::now(),
@@ -1773,6 +1779,36 @@ impl App {
         }
         v.refreshed = true;
         self.refresh_current_view();
+    }
+
+    // `h`: stamp the selected object with a fresh timestamp annotation, to make the API server
+    // replay its admission chain over an object nobody else has changed. Deliberately unguarded —
+    // it adds two `kdt.io/` metadata keys and removes nothing, and being one keystroke is the whole
+    // point — so the only feedback is the toast, seeded here and completed by the patch.
+    fn touch_selected(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.touch_no_object.to_string()));
+            return;
+        };
+        let target = touch::label(&kind, &namespace, &name);
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            st.touch_running.replace("{d}", &target),
+        ));
+        let client = self.client.clone();
+        let status = self.touch_status.clone();
+        tokio::spawn(async move {
+            touch::run_touch(client, api_version, kind, namespace, name, st, status).await;
+        });
+    }
+
+    // Folds the outcome of the last touch into the shared toast, replacing the "in flight" message.
+    fn drain_touch_status(&mut self) {
+        if let Some(msg) = self.touch_status.lock().ok().and_then(|mut s| s.take()) {
+            self.clipboard_status = Some(msg);
+        }
     }
 
     // Re-run the fetch backing whichever view is on screen.
@@ -4645,6 +4681,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut visible_rows: usize = 20;
 
     loop {
+        // `h` fires from every view, so its outcome is collected before anything mode-specific.
+        app.drain_touch_status();
         if app.mode == Mode::Selection && !app.scroll_frozen {
             app.refresh_live_snapshot();
         }
@@ -4849,6 +4887,13 @@ fn handle_event(app: &mut App, ev: Event) {
         // `e` edits the selected object in `$EDITOR`, from the same views.
         (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_edit_view();
+        }
+
+        // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
+        // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
+        // reflex would be to move left, not to write to the cluster.
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+            app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
@@ -5762,6 +5807,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         global_spans.push(Span::raw(format!(" {}   ", st.k_yaml)));
         global_spans.push(Span::styled(" e ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_edit)));
+        global_spans.push(Span::styled(" h ", kbg));
+        global_spans.push(Span::raw(format!(" {}   ", st.k_touch)));
         global_spans.push(Span::styled(" ^D ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_delete)));
     }
@@ -5782,16 +5829,26 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let (top, bottom) = balance_footer_rows(groups, tools, footer_a.width as usize);
     let top_line = render_footer_row(&top);
     let mut bottom_line = render_footer_row(&bottom);
+    // The toast trails the tool bar when there is room for it. When there is not — a narrow terminal
+    // and a long tool bar — it moves to the blank row between the two instead of being clipped: it
+    // is the only thing a fire-and-forget action (`h`, a copy, a reconcile) ever says back.
+    let mut spacer_line: Vec<Span> = Vec::new();
     if let Some(msg) = app.clipboard_status_active() {
-        bottom_line.push(Span::styled(
+        let toast = Span::styled(
             msg.to_string(),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ));
+        );
+        let used: usize = bottom_line.iter().map(Span::width).sum();
+        if used + toast.width() <= footer_a.width as usize {
+            bottom_line.push(toast);
+        } else {
+            spacer_line.push(toast);
+        }
     }
     f.render_widget(
         Paragraph::new(vec![
             Line::from(top_line),
-            Line::default(),
+            Line::from(spacer_line),
             Line::from(bottom_line),
         ]),
         footer_a,

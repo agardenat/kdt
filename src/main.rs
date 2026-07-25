@@ -23,6 +23,7 @@ mod pods;
 mod rbac;
 mod secrets;
 mod svc;
+mod touch;
 mod ui;
 mod vulnerabilities;
 mod yaml;
