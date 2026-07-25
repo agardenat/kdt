@@ -79,7 +79,7 @@ fn init_logging() {
     } else {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
-            .with_writer(|| std::io::sink())
+            .with_writer(std::io::sink)
             .try_init();
     }
 }

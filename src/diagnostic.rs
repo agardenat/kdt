@@ -229,10 +229,10 @@ async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                                 ready = c.status == "True";
                             }
                             "MemoryPressure" | "DiskPressure" | "PIDPressure"
-                            | "NetworkUnavailable" => {
-                                if c.status == "True" {
-                                    pressure_here.push(c.type_.as_str());
-                                }
+                            | "NetworkUnavailable"
+                                if c.status == "True" =>
+                            {
+                                pressure_here.push(c.type_.as_str());
                             }
                             _ => {}
                         }
@@ -402,7 +402,7 @@ async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_i
                     }
                 }
             }
-            high_restarts.sort_by(|a, b| b.1.cmp(&a.1));
+            high_restarts.sort_by_key(|(_, r)| std::cmp::Reverse(*r));
             high_restarts.truncate(5);
             for (n, r) in &high_restarts {
                 lines.push((LineColor::Warn, format!("{} : restarts={}", n, r)));
@@ -1216,7 +1216,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
                 format!("{} évènements Warning visibles dans la fenêtre serveur", total),
             ));
             let mut sorted: Vec<(String, usize)> = by_reason.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             for (reason, n) in sorted.into_iter().take(8) {
                 lines.push((LineColor::Plain, format!("{:>4} × {}", n, reason)));
             }

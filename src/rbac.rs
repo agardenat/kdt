@@ -781,7 +781,7 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
         }
     }
 
-    bindings.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    bindings.sort_by_key(|a| a.sort_key());
 
     let mut s = state.lock().expect("rbac poisoned");
     s.loading = false;

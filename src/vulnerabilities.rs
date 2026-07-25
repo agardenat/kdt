@@ -244,7 +244,7 @@ async fn fetch_trivy_reports(client: &Client) -> Result<Vec<VulnComponent>, Triv
         }
     }
 
-    components.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    components.sort_by_key(|a| a.sort_key());
     Ok(components)
 }
 
@@ -297,7 +297,7 @@ fn parse_report(obj: &DynamicObject) -> Option<VulnComponent> {
             cves.push(parse_image_cve(v));
         }
     }
-    cves.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    cves.sort_by_key(|a| a.sort_key());
 
     let mut comp = VulnComponent {
         namespace: obj.metadata.namespace.clone().unwrap_or_default(),

@@ -200,7 +200,7 @@ pub async fn fetch_secrets(client: Client, state: SharedSecrets) {
     for sec in &secrets.items {
         out.push(build_secret_info(sec, &ingress_map, &cm_map));
     }
-    out.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    out.sort_by_key(|a| a.sort_key());
 
     let mut s = state.lock().expect("secrets poisoned");
     s.loading = false;
@@ -459,13 +459,13 @@ mod tests {
 
     #[test]
     fn sort_puts_urgent_tls_first_then_others() {
-        let mut v = vec![
+        let mut v = [
             info("a", "opaque", None, false),
             info("a", "broken-tls", None, true),
             info("a", "fresh", Some(300), true),
             info("a", "urgent", Some(2), true),
         ];
-        v.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        v.sort_by_key(|a| a.sort_key());
         let order: Vec<&str> = v.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(order, ["urgent", "fresh", "broken-tls", "opaque"]);
     }

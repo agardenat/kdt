@@ -253,9 +253,11 @@ pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, Node
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
 // `App::snapshot` (and thus `table_state`), so a selected index maps to the same row in both.
 #[derive(Clone)]
+// `Pod` is boxed: a PodResource is ~2.5× the size of a WorkloadResource, and this vector holds one
+// entry per visible line, so the unboxed enum would pad every workload row up to the pod size.
 pub enum PodRow {
     Workload(WorkloadResource),
-    Pod(PodResource),
+    Pod(Box<PodResource>),
 }
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
@@ -538,6 +540,9 @@ pub struct App {
 }
 
 impl App {
+    // Wiring from `main`: every argument is a distinct collaborator with no natural grouping, so the
+    // flat parameter list stays clearer here than a dedicated builder or deps struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: SharedBuffer,
         namespace_label: String,
@@ -3594,16 +3599,16 @@ impl App {
                 for w in &s.workloads {
                     rows.push(PodRow::Workload(w.clone()));
                     for p in s.pods.iter().filter(|p| pod_belongs_to(p, w)) {
-                        rows.push(PodRow::Pod(p.clone()));
+                        rows.push(PodRow::Pod(Box::new(p.clone())));
                     }
                 }
                 for p in s.pods.iter().filter(|p| !s.workloads.iter().any(|w| pod_belongs_to(p, w))) {
-                    rows.push(PodRow::Pod(p.clone()));
+                    rows.push(PodRow::Pod(Box::new(p.clone())));
                 }
                 rows
             } else {
                 // Pods-only view: flat list of every pod, no parent workload rows.
-                s.pods.iter().map(|p| PodRow::Pod(p.clone())).collect()
+                s.pods.iter().map(|p| PodRow::Pod(Box::new(p.clone()))).collect()
             }
         };
         let recs: Vec<EventRecord> = rows
@@ -5941,7 +5946,7 @@ fn draw_extract_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let pct = if s.total > 0 { (s.current * 100) / s.total.max(1) } else { 0 };
     let bar_w = popup_area.width.saturating_sub(6) as usize;
     let filled = (bar_w * pct.min(100)) / 100;
-    let bar: String = std::iter::repeat('█').take(filled).chain(std::iter::repeat('░').take(bar_w.saturating_sub(filled))).collect();
+    let bar: String = std::iter::repeat_n('█', filled).chain(std::iter::repeat_n('░', bar_w.saturating_sub(filled))).collect();
 
     let elapsed_ms = s
         .elapsed_ms
@@ -6328,15 +6333,20 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
     let dim   = |s: String| Span::styled(s, Style::default().fg(DIM));
     let plain = |s: &'static str| Span::raw(s);
 
+    // `cpu`/`mem` are (request, limit, usage) triples; `alloc` is the (cpu, mem) cluster allocatable
+    // the percentages are computed against.
     fn line_for(
         label_text: &'static str,
         label_color: Color,
         n: usize,
-        cr: i64, cl: i64, cu: i64,
-        mr: i64, ml: i64, mu: i64,
-        alloc_cpu: i64, alloc_mem: i64,
+        cpu: (i64, i64, i64),
+        mem: (i64, i64, i64),
+        alloc: (i64, i64),
     ) -> Line<'static> {
         use crate::events::{format_cpu_milli, format_memory_bytes};
+        let (cr, cl, cu) = cpu;
+        let (mr, ml, mu) = mem;
+        let (alloc_cpu, alloc_mem) = alloc;
         let pct_cr = if alloc_cpu > 0 { cr * 100 / alloc_cpu } else { 0 };
         let pct_cl = if alloc_cpu > 0 { cl * 100 / alloc_cpu } else { 0 };
         let pct_cu = if alloc_cpu > 0 { cu * 100 / alloc_cpu } else { 0 };
@@ -6363,9 +6373,9 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
 
     let _ = (label, val, dim, plain);
     vec![
-        line_for("USER",  Color::Cyan, un, u_cr, u_cl, u_cu, u_mr, u_ml, u_mu, alloc_cpu, alloc_mem),
-        line_for("SYS",   SYS_DIM,    sn, s_cr, s_cl, s_cu, s_mr, s_ml, s_mu, alloc_cpu, alloc_mem),
-        line_for("TOTAL", Color::White, un + sn, t_cr, t_cl, t_cu, t_mr, t_ml, t_mu, alloc_cpu, alloc_mem),
+        line_for("USER",  Color::Cyan, un, (u_cr, u_cl, u_cu), (u_mr, u_ml, u_mu), (alloc_cpu, alloc_mem)),
+        line_for("SYS",   SYS_DIM,    sn, (s_cr, s_cl, s_cu), (s_mr, s_ml, s_mu), (alloc_cpu, alloc_mem)),
+        line_for("TOTAL", Color::White, un + sn, (t_cr, t_cl, t_cu), (t_mr, t_ml, t_mu), (alloc_cpu, alloc_mem)),
         Line::from(vec![
             Span::styled(format!("{:<6}", "WASTE"), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("(req-use) ", Style::default().fg(DIM)),
@@ -7519,7 +7529,7 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = visible.iter().map(|b| {
         let color = rbac_sev_color(b.severity);
         let subject = match b.subjects.split_first() {
-            Some((first, rest)) if rest.is_empty() => first.label(),
+            Some((first, [])) => first.label(),
             Some((first, rest)) => format!("{} (+{})", first.label(), rest.len()),
             None => "—".to_string(),
         };
@@ -9767,17 +9777,18 @@ fn colorize_json_line(line: &str) -> Line<'static> {
         return Line::from(Span::styled(line.to_string(), Style::default().fg(DIM)));
     }
 
-    if trimmed.starts_with('"') {
-        if let Some(end_q) = trimmed[1..].find('"') {
+    if let Some(after_quote) = trimmed.strip_prefix('"') {
+        if let Some(end_q) = after_quote.find('"') {
             let key_full = &trimmed[..end_q + 2];
             let after_key = &trimmed[end_q + 2..];
-            if after_key.starts_with(':') {
-                let value_part = after_key[1..].trim_start();
+            if let Some(after_colon) = after_key.strip_prefix(':') {
+                let value_part = after_colon.trim_start();
                 let value_style = if value_part.starts_with('"') {
                     Style::default().fg(Color::Green)
-                } else if value_part.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
-                    Style::default().fg(Color::Magenta)
-                } else if value_part.starts_with("true") || value_part.starts_with("false") {
+                } else if value_part.starts_with(|c: char| c.is_ascii_digit() || c == '-')
+                    || value_part.starts_with("true")
+                    || value_part.starts_with("false")
+                {
                     Style::default().fg(Color::Magenta)
                 } else if value_part.starts_with("null") {
                     Style::default().fg(DIM)
@@ -9878,7 +9889,7 @@ fn split_table_row(line: &str) -> Vec<String> {
     let s = s.strip_prefix('|').unwrap_or(s);
     let s = s.strip_suffix('|').unwrap_or(s);
     s.split('|')
-        .map(|c| c.trim().split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect()
 }
 
@@ -10350,6 +10361,9 @@ fn build_extra_block(extra: &[(String, String)], budget: Option<usize>) -> Strin
     out
 }
 
+// Mirrors `build_ai_prompt_inner`'s parameters plus the budget; grouping them would only move the
+// same list into a struct used at a single call site.
+#[allow(clippy::too_many_arguments)]
 fn build_ai_prompt(
     rec: &EventRecord,
     ctx_label: &str,

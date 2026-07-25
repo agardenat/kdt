@@ -398,8 +398,7 @@ mod tests {
                 Reason::SystemNamespace { namespace: "kube-system".to_string() },
             ]
         );
-        let mut s = DeleteState::default();
-        s.reasons = reasons;
+        let s = DeleteState { reasons, ..Default::default() };
         assert!(!s.needs_strict_confirm());
     }
 
@@ -422,8 +421,7 @@ mod tests {
                 Reason::Finalizers,
             ]
         );
-        let mut s = DeleteState::default();
-        s.reasons = reasons;
+        let s = DeleteState { reasons, ..Default::default() };
         assert!(s.needs_strict_confirm());
     }
 
@@ -451,8 +449,7 @@ mod tests {
 
     #[test]
     fn a_failed_preflight_forces_the_strict_confirmation() {
-        let mut s = DeleteState::default();
-        s.error = Some("forbidden".to_string());
+        let s = DeleteState { error: Some("forbidden".to_string()), ..Default::default() };
         assert!(s.needs_strict_confirm());
     }
 }

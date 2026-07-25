@@ -73,7 +73,7 @@ pub async fn fetch_configmaps(client: Client, state: SharedConfigMaps) {
     for cm in &list.items {
         out.push(build_info(cm));
     }
-    out.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    out.sort_by_key(|a| a.sort_key());
 
     let mut s = state.lock().expect("configmaps poisoned");
     s.loading = false;
