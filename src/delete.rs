@@ -207,8 +207,8 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
     let annotations = sub_map(meta, "annotations");
 
     let mut out = Vec::new();
-    if let Some(r) = gitops_reason(labels, annotations) {
-        out.push(r);
+    if let Some((tool, detail)) = gitops_owner(labels, annotations) {
+        out.push(Reason::GitOps { tool, detail });
     }
     if is_gitops_root(api_version, kind) {
         out.push(Reason::GitOpsRoot { kind: kind.to_string() });
@@ -240,42 +240,53 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
     out
 }
 
+// Object-level entry points for the two ownership checks, shared with the edit guard-rails
+// ([`crate::edit`]), which ask the same questions of an object for the opposite reason: what is
+// deployed by a controller cannot be deleted *or* edited durably.
+pub fn gitops_owner_of(obj: &Value) -> Option<(GitOpsTool, String)> {
+    let meta = obj.get("metadata");
+    gitops_owner(sub_map(meta, "labels"), sub_map(meta, "annotations"))
+}
+
+pub fn controller_owner_of(obj: &Value) -> Option<(String, String)> {
+    controller_owner(obj.get("metadata"))
+}
+
 // Flux/Argo/Helm ownership, read off the labels and annotations their controllers write. Flux keys
 // are looked up in both maps: some setups propagate them as annotations.
-fn gitops_reason(
+fn gitops_owner(
     labels: Option<&Map<String, Value>>,
     annotations: Option<&Map<String, Value>>,
-) -> Option<Reason> {
+) -> Option<(GitOpsTool, String)> {
     let stamped = |key: &str| -> Option<&str> {
         lookup(labels, key).or_else(|| lookup(annotations, key))
     };
 
-    for (tool, (name_key, ns_key)) in [
-        (GitOpsTool::FluxKustomize, FLUX_KS),
-        (GitOpsTool::FluxHelm, FLUX_HR),
-    ] {
+    for (tool, (name_key, ns_key)) in
+        [(GitOpsTool::FluxKustomize, FLUX_KS), (GitOpsTool::FluxHelm, FLUX_HR)]
+    {
         if let Some(name) = stamped(name_key) {
             let detail = match stamped(ns_key) {
                 Some(ns) => format!("{}/{}", ns, name),
                 None => name.to_string(),
             };
-            return Some(Reason::GitOps { tool, detail });
+            return Some((tool, detail));
         }
     }
     // `<app>:<group>/<Kind>:<ns>/<name>` — only the application name is interesting here.
     if let Some(id) = lookup(annotations, ARGO_TRACKING) {
         let app = id.split(':').next().unwrap_or(id);
-        return Some(Reason::GitOps { tool: GitOpsTool::Argo, detail: app.to_string() });
+        return Some((GitOpsTool::Argo, app.to_string()));
     }
     if let Some(app) = lookup(labels, ARGO_INSTANCE) {
-        return Some(Reason::GitOps { tool: GitOpsTool::Argo, detail: app.to_string() });
+        return Some((GitOpsTool::Argo, app.to_string()));
     }
     if let Some(release) = lookup(annotations, HELM_RELEASE.0) {
         let detail = match lookup(annotations, HELM_RELEASE.1) {
             Some(ns) => format!("{}/{}", ns, release),
             None => release.to_string(),
         };
-        return Some(Reason::GitOps { tool: GitOpsTool::Helm, detail });
+        return Some((GitOpsTool::Helm, detail));
     }
     None
 }

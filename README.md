@@ -13,6 +13,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
+- **Édition avec garde-fous (`e`)** : l'objet part dans `$EDITOR` (vim &co.) puis revient par un `PUT` verrouillé sur son `resourceVersion`. Avant, kdt dit ce qui rendra l'édition vaine — objet GitOps réécrit au prochain reconcile, spec tenue par un contrôleur, `can-i update` refusé ; après, il classe chaque champ modifié entre *appliqué*, *ignoré* et *rejeté par l'API*.
 - **Suppression avec garde-fous (`Ctrl-D`)** : relit l'objet avant tout, avertit s'il est déployé par un moteur GitOps (Flux, Argo CD, Helm) ou si la suppression cascade (namespace, CRD, point d'entrée GitOps) ; l'avertissement se passe outre, mais en retapant le nom de l'objet.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
@@ -96,12 +97,13 @@ défilement live est actif.
 | `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related) |
 | `Shift-↑/↓`, `Ctrl-U/F` | Scroll du détail |
 | `g` / `G` | Haut / bas du détail |
-| `a` / `w` / `e` | Filtre All / Warnings / Errors |
+| `a` / `w` / `x` | Filtre All / Warnings / Errors |
 | `:` | Palette de commandes (style k9s) |
 | `n` | Filtrer sur le namespace de l'évènement sélectionné |
 | `0` | Retirer le filtre namespace (tous namespaces confondus) |
 | `N` | Nodes du pod sélectionné |
 | `y` | YAML de l'objet sélectionné |
+| `e` | Éditer l'objet sélectionné dans `$EDITOR` (avec garde-fous) |
 | `Ctrl-D` | Supprimer l'objet sélectionné (avec garde-fous) |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
@@ -137,6 +139,61 @@ Deux affichages, bascule par `t` :
 | `Esc` / `q` | Fermer |
 
 > Sur un `Secret`, le manifeste contient les valeurs `data` en base64, comme `kubectl get -o yaml`.
+
+### Édition d'un objet (`e`)
+
+Disponible depuis les mêmes vues que `y`, et depuis le panneau YAML lui-même. Le manifeste part
+dans **votre** éditeur — kdt rend la main au terminal le temps de l'édition, puis la reprend :
+
+```
+e  →  vérifications  →  $EDITOR  →  diff + verdict  →  Entrée  →  PUT
+```
+
+L'éditeur est choisi dans cet ordre : `$KDT_EDITOR`, `$KUBE_EDITOR`, `$VISUAL`, `$EDITOR`, sinon
+`vi`. La valeur peut porter des arguments (`KDT_EDITOR="nvim -u NONE"`). Le fichier temporaire est
+créé en `0600` (un `Secret` y transite) et effacé à la fermeture du panneau.
+
+**Avant** d'ouvrir l'éditeur, l'objet est relu et passé au crible. Si rien n'est à signaler
+l'éditeur s'ouvre directement ; sinon le panneau affiche d'abord ses constats :
+
+| Constat | Niveau |
+|---|---|
+| Déployé par un moteur GitOps (Flux, Argo CD, Helm) : la modification sera écrasée au prochain reconcile — c'est le dépôt Git qu'il faut éditer | ⛔ |
+| Objet en cours de suppression (`deletionTimestamp`), ou pod terminé (`Succeeded`/`Failed`) | ⛔ |
+| L'API répond « non » à un `can-i update` sur cet objet | ⛔ |
+| Spec tenue par un contrôleur (`ownerReferences`) : perdue à la prochaine recréation | ⚠ |
+| Pod en cours d'exécution : seule l'image des conteneurs est modifiable à chaud | ⚠ |
+| `Job`, `PersistentVolumeClaim`, `StatefulSet` : spec en grande partie figée après création | ⚠ |
+| `ConfigMap`/`Secret` marqué `immutable: true` | ⚠ |
+
+**Au retour** de l'éditeur, le document est comparé à celui qui est parti et chaque champ modifié
+est classé — c'est là que se voit une édition qui ne servira à rien :
+
+| Verdict | Ce qui se passe |
+|---|---|
+| Document inchangé | Le panneau se ferme, rien n'est envoyé (c'est aussi comme ça qu'on annule) |
+| Seuls des champs gérés par l'API changent (`status`, `resourceVersion`, `managedFields`…) | ⛔ appliquer ne modifierait rien |
+| Champs figés après création (`spec.nodeName` d'un pod, `spec.serviceName` d'un StatefulSet, `spec.clusterIP` d'un Service, `data` d'un objet immutable…) | ⛔ l'API rejettera |
+| `apiVersion`, `kind`, `metadata.name`/`namespace`/`uid` modifiés | ⛔ ce n'est plus le même objet |
+
+Les champs sont listés par chemin (`spec.containers[0].image`), colorés selon leur sort : cyan pour
+ce qui sera appliqué, rouge pour ce qui sera rejeté, gris pour ce qui sera ignoré. Les constats de
+la pré-vérification restent affichés — on revient d'un autre programme, et « Flux va l'écraser »
+mérite d'être relu au moment d'appliquer.
+
+**Aucun avertissement ne bloque** : `Entrée` applique, `e` ré-ouvre l'éditeur, `Esc` abandonne.
+
+| Touche | Action |
+|---|---|
+| `e` | Ouvrir (depuis une vue ou depuis le panneau YAML) / ré-éditer |
+| `Entrée` | Éditer quand même (constats) · appliquer (revue) · ré-éditer (refus de l'API) |
+| `Esc` / `q` | Fermer sans rien appliquer |
+
+L'écriture est un `PUT` complet, comme `kubectl edit` : le `resourceVersion` du document sert de
+verrou optimiste, donc une modification concurrente fait échouer la requête au lieu d'écraser le
+travail d'un autre. Un YAML invalide ou un refus de l'API n'est jamais une perte : `Entrée` renvoie
+dans l'éditeur avec le tampon tel qu'il était. La vue sous-jacente est rafraîchie dès que l'API a
+accepté.
 
 ### Suppression d'un objet (`Ctrl-D`)
 
@@ -498,6 +555,8 @@ bandeau.
 | `certmanager.rs` | cert-manager : chaîne Issuer → Certificate → Order → Challenge, diagnostics ACME |
 | `configmaps.rs` | ConfigMaps et leur contenu |
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
+| `edit.rs` | Édition d'un objet via `$EDITOR` : garde-fous, diff, écriture |
+| `delete.rs` | Suppression d'un objet : garde-fous et exécution |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
 | `diagnostic.rs` | Étapes de diagnostic cluster |
 | `extract.rs` | Extraction complète → rapport |

@@ -11,6 +11,7 @@ mod config;
 mod configmaps;
 mod delete;
 mod diagnostic;
+mod edit;
 mod enrich;
 mod events;
 mod extract;

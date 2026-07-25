@@ -6,6 +6,7 @@
 //! state; each fetch carries a key/id that is re-checked before committing, so results from a
 //! superseded selection are dropped instead of overwriting the current view.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -35,6 +36,7 @@ use crate::diagnostic::{
     format_diagnostic_for_ai, new_diagnostic_state, run_diagnostic, DiagStatus, DiagnosticStep,
     SharedDiagnostic,
 };
+use crate::edit::{self, new_edit_state, Diff as EditDiff, Reason as EdReason, SharedEdit};
 use crate::clip;
 use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
 use crate::flux::{
@@ -128,6 +130,38 @@ struct DeleteView {
     typed: Option<String>,
     // Set once the successful deletion has triggered a refresh of the underlying view.
     refreshed: bool,
+}
+
+// The `e` overlay: an object on a round-trip through `$EDITOR`. The fetched document, the
+// guard-rails and the outcome live in `App::edit_state`, written by the background tasks; the temp
+// file is kept until the panel closes so a rejected apply can be re-edited from where it left off.
+struct EditView {
+    title: String,
+    api_version: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    key: String,
+    path: PathBuf,
+    phase: EditPhase,
+    // What came back from the editor, and how it differs from what was fetched.
+    edited: Option<serde_json::Value>,
+    diff: EditDiff,
+    // The editor failed, or wrote back something that is not a YAML object: re-editing resumes from
+    // the faulty buffer rather than throwing the user's work away.
+    error: Option<String>,
+    // Set once the accepted change has triggered a refresh of the underlying view.
+    refreshed: bool,
+}
+
+// Where the edit round-trip stands. `Warned` is only ever reached when the preflight has something
+// to say — on an object nothing warns about, the editor opens straight away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditPhase {
+    Loading,
+    Warned,
+    Editing,
+    Review,
 }
 
 // A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
@@ -537,6 +571,12 @@ pub struct App {
     // Delete overlay (Ctrl-D): `None` when closed. Guard-rails and outcome sit in `delete_state`.
     delete_view: Option<DeleteView>,
     delete_state: SharedDelete,
+    // Edit overlay (`e`): `None` when closed. Document, guard-rails and outcome sit in `edit_state`.
+    edit_view: Option<EditView>,
+    edit_state: SharedEdit,
+    // Set when the panel wants `$EDITOR`: only the run loop can honour it, since handing the
+    // terminal over means tearing down the very event stream the key was read from.
+    pending_editor: Option<PathBuf>,
 }
 
 impl App {
@@ -678,6 +718,9 @@ impl App {
             yaml_neat: true,
             delete_view: None,
             delete_state: new_delete_state(),
+            edit_view: None,
+            edit_state: new_edit_state(),
+            pending_editor: None,
         }
     }
 
@@ -1529,6 +1572,208 @@ impl App {
             return;
         }
         let Some(v) = self.delete_view.as_mut() else { return };
+        if v.refreshed {
+            return;
+        }
+        v.refreshed = true;
+        self.refresh_current_view();
+    }
+
+    // `e`: open the edit panel on the selected object and run the guard-rail checks. Nothing is
+    // written here — the panel decides whether it has something to warn about before handing the
+    // document to the editor.
+    fn open_edit_view(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.edit_no_object.to_string()));
+            return;
+        };
+        let key = format!("{}|{}|{}/{}", api_version, kind, namespace, name);
+        let title = if namespace.is_empty() {
+            format!("{} {}", kind, name)
+        } else {
+            format!("{} {}/{}", kind, namespace, name)
+        };
+        self.edit_view = Some(EditView {
+            title,
+            api_version: api_version.clone(),
+            kind: kind.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            key: key.clone(),
+            path: edit::temp_path(&kind, &namespace, &name),
+            phase: EditPhase::Loading,
+            edited: None,
+            diff: EditDiff::default(),
+            error: None,
+            refreshed: false,
+        });
+        {
+            let mut s = self.edit_state.lock().expect("edit state poisoned");
+            *s = crate::edit::EditState { key: key.clone(), loading: true, ..Default::default() };
+        }
+        let client = self.client.clone();
+        let state = self.edit_state.clone();
+        tokio::spawn(async move {
+            edit::preflight(client, api_version, kind, namespace, name, key, state).await;
+        });
+    }
+
+    // The temp file goes with the panel: a Secret's data spent time in it.
+    fn close_edit_view(&mut self) {
+        if let Some(v) = self.edit_view.take() {
+            edit::remove_temp(&v.path);
+        }
+    }
+
+    // Hand the document to `$EDITOR`. The run loop picks the request up and suspends the terminal;
+    // the file is only seeded on the first pass, so a re-edit reopens the user's own buffer.
+    fn request_editor(&mut self) {
+        let st = lang::t(self.ai_language);
+        let (blocked, text) = {
+            let s = self.edit_state.lock().expect("edit state poisoned");
+            // Nothing to edit without a document; and once a change has gone through, the document
+            // in hand is stale — re-editing it would only earn a resourceVersion conflict. A write
+            // in flight waits its turn too. A *refused* write, on the other hand, is exactly what
+            // one wants to reopen.
+            let stale = s.applying || matches!(s.done, Some(Ok(())));
+            (s.error.is_some() || stale, s.text.clone())
+        };
+        if blocked || text.is_empty() {
+            return;
+        }
+        let path = {
+            let Some(v) = self.edit_view.as_mut() else { return };
+            if !v.path.exists() {
+                let header = format!(
+                    "# {}\n# {}\n#\n",
+                    st.edit_header_object.replace("{d}", &v.title),
+                    st.edit_header_hint,
+                );
+                if let Err(e) = edit::write_temp(&v.path, &format!("{}{}", header, text)) {
+                    v.error = Some(e);
+                    v.phase = EditPhase::Review;
+                    return;
+                }
+            }
+            v.phase = EditPhase::Editing;
+            v.path.clone()
+        };
+        self.pending_editor = Some(path);
+    }
+
+    // Back from the editor: read the buffer, parse it, and work out what actually changed.
+    fn editor_returned(&mut self, outcome: Result<(), String>) {
+        let st = lang::t(self.ai_language);
+        let Some((doc, kind, path)) = self.edit_view.as_ref().map(|v| {
+            let doc = self.edit_state.lock().expect("edit state poisoned").doc.clone();
+            (doc, v.kind.clone(), v.path.clone())
+        }) else {
+            return;
+        };
+        let result = outcome
+            .map_err(|e| st.edit_editor_failed.replace("{e}", &e))
+            .and_then(|()| edit::read_temp(&path))
+            .and_then(|text| edit::parse(&text).map_err(|e| st.edit_parse_error.replace("{e}", &e)));
+
+        let unchanged = {
+            let Some(v) = self.edit_view.as_mut() else { return };
+            v.phase = EditPhase::Review;
+            match result {
+                Ok(edited) => {
+                    v.diff = edit::diff(&doc, &edited, &kind);
+                    v.edited = Some(edited);
+                    v.error = None;
+                    v.diff.is_empty()
+                }
+                Err(e) => {
+                    v.error = Some(e);
+                    v.edited = None;
+                    v.diff = EditDiff::default();
+                    false
+                }
+            }
+        };
+        // Quitting the editor without touching anything is how one cancels: say so and get out of
+        // the way rather than opening a review panel on an empty diff.
+        if unchanged {
+            self.close_edit_view();
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.edit_no_change.to_string()));
+        }
+    }
+
+    // Enter: open the editor, apply what came back, or re-edit a rejected document — whichever the
+    // panel is waiting for. A no-op while a check or a write is in flight.
+    fn edit_confirm(&mut self) {
+        let (loading, applying, done) = {
+            let s = self.edit_state.lock().expect("edit state poisoned");
+            (s.loading, s.applying, s.done.clone())
+        };
+        if loading || applying {
+            return;
+        }
+        match done {
+            // The change went through: Enter is now just an acknowledgement.
+            Some(Ok(())) => return self.close_edit_view(),
+            // The API refused it: back to the editor with the document that was refused.
+            Some(Err(_)) => return self.request_editor(),
+            None => {}
+        }
+        let Some(v) = self.edit_view.as_ref() else { return };
+        match v.phase {
+            EditPhase::Loading | EditPhase::Editing => {}
+            EditPhase::Warned => self.request_editor(),
+            EditPhase::Review if v.error.is_some() => self.request_editor(),
+            EditPhase::Review => self.spawn_apply(),
+        }
+    }
+
+    fn spawn_apply(&mut self) {
+        let Some(v) = self.edit_view.as_ref() else { return };
+        let Some(doc) = v.edited.clone() else { return };
+        let (api_version, kind, namespace, name, key) = (
+            v.api_version.clone(),
+            v.kind.clone(),
+            v.namespace.clone(),
+            v.name.clone(),
+            v.key.clone(),
+        );
+        {
+            let mut s = self.edit_state.lock().expect("edit state poisoned");
+            s.applying = true;
+            s.done = None;
+        }
+        let client = self.client.clone();
+        let state = self.edit_state.clone();
+        tokio::spawn(async move {
+            edit::apply(client, api_version, kind, namespace, name, key, doc, state).await;
+        });
+    }
+
+    // Polled every tick: drives the one transition the panel cannot make by itself (the preflight
+    // landing), and refreshes the view behind it once a change has been accepted.
+    fn poll_edit(&mut self) {
+        let (loading, failed, quiet, applied) = {
+            let s = self.edit_state.lock().expect("edit state poisoned");
+            (s.loading, s.error.is_some(), s.reasons.is_empty(), matches!(s.done, Some(Ok(()))))
+        };
+        if self.edit_view.as_ref().map(|v| v.phase) == Some(EditPhase::Loading) && !loading {
+            match (failed, quiet) {
+                // Nothing to warn about: the object goes straight to the editor.
+                (false, true) => self.request_editor(),
+                _ => {
+                    if let Some(v) = self.edit_view.as_mut() {
+                        v.phase = EditPhase::Warned;
+                    }
+                }
+            }
+        }
+        if !applied {
+            return;
+        }
+        let Some(v) = self.edit_view.as_mut() else { return };
         if v.refreshed {
             return;
         }
@@ -4392,6 +4637,9 @@ pub async fn run(mut app: App) -> Result<()> {
     app.spawn_cluster_info_refresh();
     let result = run_loop(&mut terminal, &mut app).await;
     ratatui::restore();
+    // Quitting with the edit panel open (`q`, Ctrl-C) must not leave the document behind: it is a
+    // faithful copy of the object, Secret payload included.
+    app.close_edit_view();
     result
 }
 
@@ -4430,6 +4678,19 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.delete_view.is_some() {
             app.poll_delete();
         }
+        if app.edit_view.is_some() {
+            app.poll_edit();
+        }
+        // Handing the terminal to `$EDITOR` means giving up the input stream too: a live
+        // `EventStream` would eat the keystrokes meant for the editor. It is dropped here and built
+        // again on return, which is why this can only happen in the loop and not in a key handler.
+        if let Some(path) = app.pending_editor.take() {
+            drop(events);
+            let outcome = edit_externally(terminal, &path).await;
+            events = EventStream::new();
+            app.editor_returned(outcome);
+            continue;
+        }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
         tokio::select! {
@@ -4445,6 +4706,30 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+// Give the terminal back to the shell for the duration of the editor: leave the alternate screen so
+// the editor draws on a clean, scrollable screen, then take everything back — raw mode, alternate
+// screen, hidden cursor — and repaint from scratch, since whatever the editor left behind is not
+// something ratatui's diffing knows about.
+async fn edit_externally(terminal: &mut DefaultTerminal, path: &std::path::Path) -> Result<(), String> {
+    use crossterm::cursor::{Hide, Show};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+
+    let suspend = disable_raw_mode()
+        .and_then(|()| crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, Show));
+    if let Err(e) = suspend {
+        return Err(e.to_string());
+    }
+    let result = edit::run_editor(path).await;
+    // The terminal has to come back whatever the editor did, or kdt is left drawing into a screen
+    // it no longer owns — so the restore errors are folded in rather than short-circuiting.
+    let restore = enable_raw_mode()
+        .and_then(|()| crossterm::execute!(std::io::stdout(), EnterAlternateScreen, Hide))
+        .and_then(|()| terminal.clear());
+    result.and_then(|()| restore.map_err(|e| e.to_string()))
+}
+
 // Central key dispatcher: matches on (key, modifiers, current mode). Mode-specific arms come first;
 // the trailing arms handle keys shared across modes (horizontal scroll, quit…).
 fn handle_event(app: &mut App, ev: Event) {
@@ -4455,6 +4740,11 @@ fn handle_event(app: &mut App, ev: Event) {
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
             (KeyCode::Esc | KeyCode::Char('q' | 'y'), _) => app.close_yaml_view(),
+            // Straight from reading the object to editing it, on the same selection.
+            (KeyCode::Char('e'), _) => {
+                app.close_yaml_view();
+                app.open_edit_view();
+            }
             (KeyCode::Char('t'), _) => app.toggle_yaml_neat(),
             (KeyCode::Char('c'), _) => app.copy_yaml_view(),
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => app.refresh_yaml_view(),
@@ -4485,6 +4775,18 @@ fn handle_event(app: &mut App, ev: Event) {
                 app.delete_input(c)
             }
             (KeyCode::Char('q'), _) => app.close_delete_view(),
+            _ => {}
+        }
+        return;
+    }
+    // The edit panel grabs all input while open (Ctrl-C still quits). While `$EDITOR` has the
+    // terminal, this dispatcher is not running at all: the run loop owns that stretch.
+    if app.edit_view.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.edit_confirm(),
+            (KeyCode::Char('e'), _) => app.request_editor(),
+            (KeyCode::Esc | KeyCode::Char('q'), _) => app.close_edit_view(),
             _ => {}
         }
         return;
@@ -4546,6 +4848,11 @@ fn handle_event(app: &mut App, ev: Event) {
         // `y` shows the YAML of the selected object, from every view that has one.
         (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_yaml_view();
+        }
+
+        // `e` edits the selected object in `$EDITOR`, from the same views.
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+            app.open_edit_view();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
@@ -5008,7 +5315,9 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('0'), _, Mode::Selection) => app.clear_namespace_filter(),
         (KeyCode::Char('a' | 'A'), _, Mode::Selection) => app.filter = Filter::All,
         (KeyCode::Char('w' | 'W'), _, Mode::Selection) => app.filter = Filter::Warnings,
-        (KeyCode::Char('e' | 'E'), _, Mode::Selection) => app.filter = Filter::Errors,
+        // `e` is the global edit key, so the errors filter sits on `x` next to its two siblings.
+        // Lowercase only: `X` is the PDF extraction.
+        (KeyCode::Char('x'), _, Mode::Selection) => app.filter = Filter::Errors,
         (KeyCode::Char('N'), _, Mode::Selection) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('N'), _, Mode::DetailFull) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('i'), _, Mode::Selection) => app.enter_ai_panel(),
@@ -5222,7 +5531,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" w ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_warn, app.filter == Filter::Warnings),
             Span::raw("   "),
-            Span::styled(" e ", kbg), Span::raw(" "),
+            Span::styled(" x ", kbg), Span::raw(" "),
             filter_label(st.lbl_filter_label_err, app.filter == Filter::Errors),
             Span::raw("   "),
             footer_sep(),
@@ -5455,6 +5764,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if !matches!(draw_mode, Mode::Vuln | Mode::VulnFull) {
         global_spans.push(Span::styled(" y ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_yaml)));
+        global_spans.push(Span::styled(" e ", kbg));
+        global_spans.push(Span::raw(format!(" {}   ", st.k_edit)));
         global_spans.push(Span::styled(" ^D ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_delete)));
     }
@@ -5527,8 +5838,216 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.delete_view.is_some() {
         draw_delete_popup(f, app, area);
     }
+    if app.edit_view.is_some() {
+        draw_edit_popup(f, app, area);
+    }
 
     visible_rows
+}
+
+// The localised sentence for one edit guard-rail.
+fn edit_reason_text(st: &lang::Strings, reason: &EdReason) -> String {
+    match reason {
+        EdReason::GitOps { tool, detail } => {
+            let template = match tool {
+                GitOpsTool::FluxKustomize => st.ed_flux_ks,
+                GitOpsTool::FluxHelm => st.ed_flux_hr,
+                GitOpsTool::Argo => st.ed_argo,
+                GitOpsTool::Helm => st.ed_helm,
+            };
+            template.replace("{d}", detail)
+        }
+        EdReason::OwnedBy { kind, name } => {
+            st.ed_owned.replace("{d}", &format!("{}/{}", kind, name))
+        }
+        EdReason::Terminating => st.ed_terminating.to_string(),
+        EdReason::Completed { phase } => st.ed_completed.replace("{d}", phase),
+        EdReason::Forbidden => st.ed_forbidden.to_string(),
+        EdReason::Immutable => st.ed_immutable_obj.to_string(),
+        EdReason::RunningPod => st.ed_running_pod.to_string(),
+        EdReason::PartialSpec { kind } => st.ed_partial_spec.replace("{d}", kind),
+    }
+}
+
+// Beyond this many changed paths the panel stops listing them one by one and just counts the rest:
+// the point is to show what is being touched, not to be a diff viewer.
+const EDIT_PATHS_SHOWN: usize = 8;
+
+// A validation refusal from the API server can run to several hundred characters. Past this the
+// panel would grow taller than the screen and push its own prompt off the bottom, leaving the user
+// with no visible way out — so the message is cut and the rest stays for the API to repeat.
+const EDIT_ERROR_MAX: usize = 240;
+
+fn clip_error(text: &str) -> String {
+    match text.char_indices().nth(EDIT_ERROR_MAX) {
+        Some((idx, _)) => format!("{}…", &text[..idx]),
+        None => text.to_string(),
+    }
+}
+
+// The edit panel, in whichever of its three states it is: waiting on the preflight, warning about
+// what the checks found, or reviewing what came back from the editor before it is written.
+fn draw_edit_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(v) = app.edit_view.as_ref() else { return };
+    let s = app.edit_state.lock().expect("edit state poisoned").clone();
+    let st = lang::t(app.ai_language);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", st.edit_target), Style::default().fg(DIM)),
+            Span::styled(
+                v.title.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if s.loading {
+        lines.push(Line::from(Span::styled(st.edit_checking, Style::default().fg(Color::Yellow))));
+    } else if let Some(e) = &s.error {
+        lines.push(Line::from(Span::styled(
+            st.edit_load_failed.replace("{e}", e),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        // The preflight findings stay on screen through the review too: the user has been away in
+        // another program since they were first shown, and "Flux will overwrite this" is exactly
+        // what one needs reminding of at the moment of applying.
+        for r in &s.reasons {
+            let (marker, color) = match r.level() {
+                DelLevel::Danger => ("✗ ", Color::Red),
+                DelLevel::Warn => ("▲ ", Color::Yellow),
+                DelLevel::Info => ("· ", DIM),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(color)),
+                Span::styled(edit_reason_text(st, r), Style::default().fg(color)),
+            ]));
+        }
+        if v.phase == EditPhase::Review {
+            if !s.reasons.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(edit_diff_lines(st, v));
+        }
+        // The refusal goes in the body, not in the prompt: it is long enough to wrap several times,
+        // and the prompt has to stay the last line so it survives on a short screen.
+        if let Some(Err(e)) = &s.done {
+            lines.push(Line::from(Span::styled(
+                st.edit_failed.replace("{e}", &clip_error(e)),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+
+    let (prompt, prompt_color) = edit_prompt(st, v, &s);
+    if !prompt.is_empty() {
+        lines.push(Line::from(Span::styled(
+            prompt,
+            Style::default().fg(prompt_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    let popup_w = (area.width * 70 / 100).max(56).min(area.width);
+    // The findings wrap, so size the popup on the longest one rather than on the line count alone.
+    let inner_w = popup_w.saturating_sub(4).max(1) as usize;
+    let height: usize = lines.iter().map(|l| (l.width().max(1)).div_ceil(inner_w)).sum();
+    let popup_h = (height as u16 + 2).clamp(7, area.height);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let border = match () {
+        _ if s.done.as_ref().is_some_and(|r| r.is_ok()) => Color::Green,
+        _ if s.error.is_some() || v.error.is_some() || s.done.is_some() => Color::Red,
+        _ if v.phase == EditPhase::Review && (v.diff.rejected() || v.diff.is_noop()) => Color::Red,
+        _ if s.reasons.iter().any(|r| r.level() == DelLevel::Danger) => Color::Red,
+        _ if !s.reasons.is_empty() => Color::Yellow,
+        _ => Color::Cyan,
+    };
+    let title = format!(" {}  ·  Esc {} ", st.edit_title, st.k_cancel);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(border)),
+    );
+    f.render_widget(p, popup_area);
+}
+
+// What came back from the editor: the fields that changed, then what will happen to them.
+fn edit_diff_lines(st: &lang::Strings, v: &EditView) -> Vec<Line<'static>> {
+    if let Some(e) = &v.error {
+        return vec![Line::from(Span::styled(e.clone(), Style::default().fg(Color::Red)))];
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        st.edit_changes.replace("{n}", &v.diff.paths.len().to_string()),
+        Style::default().fg(Color::White),
+    ))];
+    for p in v.diff.paths.iter().take(EDIT_PATHS_SHOWN) {
+        let color = if v.diff.identity.contains(p) || v.diff.immutable.contains(p) {
+            Color::Red
+        } else if v.diff.server_owned.contains(p) {
+            DIM
+        } else {
+            Color::Cyan
+        };
+        // A visible marker, not indentation: the panel wraps with `trim`, which eats leading spaces.
+        lines.push(Line::from(vec![
+            Span::styled("· ", Style::default().fg(DIM)),
+            Span::styled(p.clone(), Style::default().fg(color)),
+        ]));
+    }
+    if v.diff.paths.len() > EDIT_PATHS_SHOWN {
+        let rest = v.diff.paths.len() - EDIT_PATHS_SHOWN;
+        lines.push(Line::from(Span::styled(
+            st.edit_more_changes.replace("{n}", &rest.to_string()),
+            Style::default().fg(DIM),
+        )));
+    }
+
+    let mut verdict = |text: String, color: Color| {
+        lines.push(Line::from(Span::styled(text, Style::default().fg(color))));
+    };
+    if !v.diff.identity.is_empty() {
+        verdict(st.edit_identity.replace("{d}", &v.diff.identity.join(", ")), Color::Red);
+    }
+    if !v.diff.immutable.is_empty() {
+        verdict(st.edit_immutable.replace("{d}", &v.diff.immutable.join(", ")), Color::Red);
+    }
+    if v.diff.is_noop() {
+        verdict(st.edit_noop.to_string(), Color::Red);
+    } else if !v.diff.server_owned.is_empty() {
+        verdict(st.edit_server_owned.replace("{d}", &v.diff.server_owned.join(", ")), DIM);
+    }
+    lines
+}
+
+// The last line: what the panel is waiting for, or the outcome once the API has answered.
+fn edit_prompt(
+    st: &lang::Strings,
+    v: &EditView,
+    s: &crate::edit::EditState,
+) -> (String, Color) {
+    match (&s.done, s.applying) {
+        (Some(Ok(())), _) => (st.edit_ok.to_string(), Color::Green),
+        // The refusal itself is already on a line of its own above.
+        (Some(Err(_)), _) => (st.edit_reedit_prompt.to_string(), Color::Red),
+        (None, true) => (st.edit_applying.to_string(), Color::Yellow),
+        (None, false) if s.loading => (String::new(), DIM),
+        (None, false) if s.error.is_some() => (String::new(), DIM),
+        (None, false) => match v.phase {
+            EditPhase::Loading => (String::new(), DIM),
+            EditPhase::Editing => (st.edit_editor_running.to_string(), Color::Yellow),
+            EditPhase::Warned => (st.edit_open_prompt.to_string(), Color::Yellow),
+            EditPhase::Review if v.error.is_some() => (st.edit_reedit_prompt.to_string(), Color::Red),
+            EditPhase::Review => (
+                st.edit_apply_prompt.to_string(),
+                if v.diff.rejected() || v.diff.is_noop() { Color::Red } else { Color::Yellow },
+            ),
+        },
+    }
 }
 
 // The localised sentence for one guard-rail finding.
@@ -5718,7 +6237,7 @@ fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
     let title = format!(
-        " YAML {} [{}]  t {}  ↑↓ {}  ←→ {}  g/G {}  c {}  Esc {}{} ",
+        " YAML {} [{}]  t {}  ↑↓ {}  ←→ {}  g/G {}  c {}  e {}  Esc {}{} ",
         obj_title,
         mode_label,
         st.k_yaml_toggle,
@@ -5726,6 +6245,7 @@ fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         st.k_h_scroll,
         st.k_top_bot,
         st.k_copy,
+        st.k_edit,
         st.k_close,
         clip_suffix,
     );

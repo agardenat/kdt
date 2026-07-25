@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kube::api::DynamicObject;
+use kube::api::{ApiResource, DynamicObject};
 use kube::core::GroupVersionKind;
 use kube::discovery::{self, Scope};
 use kube::{Api, Client};
@@ -62,13 +62,24 @@ pub async fn fetch_yaml(
 }
 
 // Resolve any GVK through discovery and hand back the API, scoped the way the kind requires. Shared
-// with the delete flow, which needs the very same "reach any object by GVK" plumbing.
+// with the delete and edit flows, which need the very same "reach any object by GVK" plumbing.
 pub async fn dynamic_api(
     client: &Client,
     api_version: &str,
     kind: &str,
     namespace: &str,
 ) -> Result<Api<DynamicObject>, String> {
+    Ok(dynamic_resource(client, api_version, kind, namespace).await?.0)
+}
+
+// Same resolution, keeping the discovered [`ApiResource`]: the edit flow needs the plural and group
+// to ask the API server whether the user may update the object at all.
+pub async fn dynamic_resource(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+) -> Result<(Api<DynamicObject>, ApiResource), String> {
     let gvk = if let Some((g, v)) = api_version.split_once('/') {
         GroupVersionKind::gvk(g, v, kind)
     } else {
@@ -77,11 +88,12 @@ pub async fn dynamic_api(
     let (ar, caps) = discovery::pinned_kind(client, &gvk)
         .await
         .map_err(|e| format!("discovery {}/{} : {}", api_version, kind, e))?;
-    Ok(if caps.scope == Scope::Cluster {
+    let api = if caps.scope == Scope::Cluster {
         Api::all_with(client.clone(), &ar)
     } else {
         Api::namespaced_with(client.clone(), namespace, &ar)
-    })
+    };
+    Ok((api, ar))
 }
 
 async fn load_object(
@@ -106,7 +118,7 @@ async fn load_object(
     Ok(value)
 }
 
-fn to_yaml(value: &Value) -> String {
+pub fn to_yaml(value: &Value) -> String {
     serde_yaml::to_string(value).unwrap_or_else(|e| format!("sérialisation YAML impossible : {e}"))
 }
 
