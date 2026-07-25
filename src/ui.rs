@@ -50,6 +50,45 @@ pub enum TreeRow {
     Res(FlatTreeNode),
     Inv { ks_uid: String, depth: usize, item: InventoryItem },
 }
+use crate::certmanager::{
+    build_cert_tree, cert_tree_uid, chain_hints, chain_path, chain_subtree, fetch_certs,
+    in_flight_request, is_rate_limited, new_certs_state, owning_certificate, renew, retry_acme,
+    CertState, CmKind, CmReady, CmResource, HintLevel, SecretFacts, SharedCerts,
+};
+
+// A rendered row of the cert-manager chain: either a cert-manager object, or the TLS Secret a
+// Certificate produces, shown as its leaf. The Secret is a presentation row joined from the Secrets
+// view's state — it is never fetched twice.
+pub enum CertRow {
+    Res(FlatTreeNode),
+    Secret { depth: usize, namespace: String, name: String },
+}
+
+// How the certs tree is filtered (`f`): everything, only the chains with a problem, or only the
+// chains with issuance actually in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertFilter { All, Problems, InFlight }
+
+impl CertFilter {
+    fn label(self) -> &'static str {
+        match self {
+            CertFilter::All => "ALL",
+            CertFilter::Problems => "PROBLEMS",
+            CertFilter::InFlight => "IN-FLIGHT",
+        }
+    }
+    fn matches(self, r: &CmResource) -> bool {
+        match self {
+            CertFilter::All => true,
+            // Anything that is not settled-and-comfortable. Issuance in flight counts: a chain that
+            // has been "Issuing" for an hour is exactly what one opens this filter to find.
+            CertFilter::Problems => {
+                r.ready != CmReady::Ready || matches!(r.days_remaining, Some(d) if d < 30)
+            }
+            CertFilter::InFlight => r.ready == CmReady::InProgress,
+        }
+    }
+}
 use crate::lang;
 use crate::pdf;
 use crate::pods::{
@@ -208,7 +247,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -229,6 +268,8 @@ enum MenuAction {
     ScaleDelta(i32),
     ScaleZero,
     ScaleSet,
+    CertRenew,
+    CertAcmeRetry,
 }
 
 // One labelled choice in the action menu overlay, with an explanatory line shown under the list.
@@ -260,7 +301,10 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("flux-logs", &["logs", "fluxlogs", "fl-logs"]),
     ("rbac", &["rb", "roles", "bindings", "security", "sec"]),
     ("vuln", &["vulnerabilities", "vulns", "cve", "cves"]),
-    ("secrets", &["secret", "se", "tls", "certs", "certificates"]),
+    // `certs`/`certificates` belong to the cert-manager view: on a cluster running cert-manager that
+    // is what those words mean. The Secrets view keeps `secret`/`se`/`tls`.
+    ("secrets", &["secret", "se", "tls"]),
+    ("certs", &["certificates", "cert", "certmanager", "cert-manager", "issuers", "challenges", "acme"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -461,6 +505,18 @@ pub struct App {
     secrets_copy_menu: Option<SecretsCopyMenu>,
     pub secrets_detail_scroll: usize,
     pub secrets_refresh_handle: Option<JoinHandle<()>>,
+    pub certs_state: SharedCerts,
+    certs_tree: bool,
+    certs_collapsed: std::collections::HashSet<String>,
+    // Nodes the user folded/unfolded by hand. Auto-folding never overrides these.
+    certs_user_toggled: std::collections::HashSet<String>,
+    certs_tree_view: Vec<CertRow>,
+    certs_filter: CertFilter,
+    pub certs_detail_scroll: usize,
+    pub certs_refresh_handle: Option<JoinHandle<()>>,
+    // Landing target for a jump from the Secrets view, consumed once the tree contains it.
+    certs_pending_select: Option<String>,
+    last_certs_sel_uid: Option<String>,
     pub configmaps_state: SharedConfigMaps,
     pub configmaps_cursor: usize,
     configmaps_copy_menu: Option<ConfigmapsCopyMenu>,
@@ -594,6 +650,16 @@ impl App {
             secrets_copy_menu: None,
             secrets_detail_scroll: 0,
             secrets_refresh_handle: None,
+            certs_state: new_certs_state(),
+            certs_tree: true,
+            certs_collapsed: std::collections::HashSet::new(),
+            certs_user_toggled: std::collections::HashSet::new(),
+            certs_tree_view: Vec::new(),
+            certs_filter: CertFilter::All,
+            certs_detail_scroll: 0,
+            certs_refresh_handle: None,
+            certs_pending_select: None,
+            last_certs_sel_uid: None,
             configmaps_state: new_configmaps_state(),
             configmaps_cursor: 0,
             configmaps_copy_menu: None,
@@ -1240,7 +1306,9 @@ impl App {
             | Mode::Pods
             | Mode::PodsFull
             | Mode::Services
-            | Mode::ServicesFull => {
+            | Mode::ServicesFull
+            | Mode::Certs
+            | Mode::CertsFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -1472,6 +1540,7 @@ impl App {
             Mode::Services | Mode::ServicesFull => self.refresh_network(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
             Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
+            Mode::Certs | Mode::CertsFull => self.refresh_certs(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             _ => {}
         }
@@ -1795,6 +1864,11 @@ impl App {
                 self.leave_special_modes();
                 self.enter_secrets_mode();
             }
+            "certs" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_certs_mode();
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -1836,6 +1910,10 @@ impl App {
             }
             Mode::Secrets | Mode::SecretsFull => {
                 self.stop_secrets_auto_refresh();
+            }
+            Mode::Certs | Mode::CertsFull => {
+                self.stop_certs_auto_refresh();
+                self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
                 self.stop_configmaps_auto_refresh();
@@ -2839,6 +2917,420 @@ impl App {
         self.secrets_reveal = SecretReveal::Hidden;
     }
 
+    // --- cert-manager view ---------------------------------------------------------------------
+
+    fn enter_certs_mode(&mut self) {
+        self.mode = Mode::Certs;
+        self.detail_tab = DetailTab::Status;
+        self.certs_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_certs_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_certs();
+        // The Secret leaves and the "Secret absent/désynchronisé" hints are joined from the Secrets
+        // view's state, so make sure it has been loaded at least once.
+        if self.secrets_state.lock().expect("secrets poisoned").secrets.is_empty() {
+            self.refresh_secrets();
+        }
+        self.start_certs_auto_refresh();
+        self.refresh_certs_snapshot();
+    }
+
+    fn exit_certs_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_certs_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_certs_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_certs_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
+        self.certs_detail_scroll = 0;
+        self.mode = Mode::CertsFull;
+    }
+
+    fn exit_certs_full(&mut self) {
+        self.mode = Mode::Certs;
+    }
+
+    fn refresh_certs(&self) {
+        {
+            let mut s = self.certs_state.lock().expect("certs poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.certs_state.clone();
+        tokio::spawn(async move { fetch_certs(client, state).await; });
+    }
+
+    // 10s, matching Flux: certificates themselves change slowly, but an in-flight ACME challenge
+    // moves every few seconds and that is exactly when someone is watching this view.
+    fn start_certs_auto_refresh(&mut self) {
+        self.stop_certs_auto_refresh();
+        let client = self.client.clone();
+        let state = self.certs_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_certs(client.clone(), state.clone()).await;
+            }
+        });
+        self.certs_refresh_handle = Some(handle);
+    }
+
+    fn stop_certs_auto_refresh(&mut self) {
+        if let Some(h) = self.certs_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // The resources the active filter keeps. A filter never hides an object's ancestors: dropping the
+    // Issuer above a failing Certificate would strand it and lose the very context being looked for.
+    fn cert_rows(&self) -> Vec<CmResource> {
+        let s = self.certs_state.lock().expect("certs poisoned");
+        if self.certs_filter == CertFilter::All {
+            return s.resources.clone();
+        }
+        let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (i, r) in s.resources.iter().enumerate() {
+            if self.certs_filter.matches(r) {
+                keep.extend(chain_path(i, &s.resources));
+            }
+        }
+        let mut idx: Vec<usize> = keep.into_iter().collect();
+        idx.sort_unstable();
+        idx.into_iter().map(|i| s.resources[i].clone()).collect()
+    }
+
+    // Auto-folding: a healthy Certificate's chain is noise, a broken one's is the answer. Recomputed
+    // on every refresh so a certificate that starts failing opens itself — but never against a node
+    // the user has folded or unfolded by hand.
+    fn apply_certs_autofold(&mut self, resources: &[CmResource]) {
+        for r in resources {
+            if r.kind != CmKind::Certificate {
+                continue;
+            }
+            let uid = r.uid();
+            if self.certs_user_toggled.contains(&uid) {
+                continue;
+            }
+            if r.ready == CmReady::Ready {
+                self.certs_collapsed.insert(uid);
+            } else {
+                self.certs_collapsed.remove(&uid);
+            }
+        }
+    }
+
+    // Rebuilds `certs_tree_view` and `App::snapshot` in lockstep, so a selected index means the same
+    // row in both. That index alignment is what gives this view `y`, `Ctrl-D`, the AI panel and the
+    // Status/Related tabs without any code of its own.
+    fn refresh_certs_snapshot(&mut self) {
+        let resources = self.cert_rows();
+        self.apply_certs_autofold(&resources);
+
+        // (namespace, secretName) -> the Secrets view's facts, for the leaf rows.
+        let known_secrets: std::collections::HashSet<(String, String)> = {
+            let s = self.secrets_state.lock().expect("secrets poisoned");
+            s.secrets.iter().map(|x| (x.namespace.clone(), x.name.clone())).collect()
+        };
+
+        let mut view: Vec<CertRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+        if self.certs_tree {
+            for n in build_cert_tree(&resources, &self.certs_collapsed) {
+                let r = &resources[n.idx];
+                let depth = n.depth;
+                let collapsed = n.collapsed;
+                recs.push(synthetic_cert_record(r));
+                view.push(CertRow::Res(n));
+                // The produced Secret closes the chain: it is what the Ingress actually serves.
+                if r.kind == CmKind::Certificate && !collapsed {
+                    if let Some(sn) = &r.secret_name {
+                        if known_secrets.contains(&(r.namespace.clone(), sn.clone())) {
+                            recs.push(synthetic_cert_secret_record(&r.namespace, sn));
+                            view.push(CertRow::Secret {
+                                depth: depth + 1,
+                                namespace: r.namespace.clone(),
+                                name: sn.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            for r in &resources {
+                recs.push(synthetic_cert_record(r));
+            }
+        }
+        self.certs_tree_view = view;
+
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_certs_sel_uid = None;
+            return;
+        }
+        // A jump from the Secrets view lands as soon as its target shows up in the tree — the fetch
+        // may not have completed when the key was pressed.
+        let pending = self.certs_pending_select.as_ref().and_then(|uid| {
+            let target = format!("cm|{}", uid);
+            self.snapshot.iter().position(|r| r.uid == target)
+        });
+        if pending.is_some() {
+            self.certs_pending_select = None;
+        }
+        let idx = pending
+            .or_else(|| {
+                prev_uid
+                    .as_deref()
+                    .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            })
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_certs_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_certs_sel_uid = Some(cur_uid);
+            self.certs_detail_scroll = 0;
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_cert_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.certs_detail_scroll = 0;
+        self.refresh_certs_snapshot();
+    }
+
+    fn toggle_certs_tree(&mut self) {
+        self.certs_tree = !self.certs_tree;
+        self.refresh_certs_snapshot();
+    }
+
+    // The cert-manager object under the cursor, as an index into the *unfiltered* resource list.
+    // Secret leaves have no cert-manager object of their own and return None.
+    fn cert_selected_idx(&self, resources: &[CmResource]) -> Option<usize> {
+        let sel = self.table_state.selected()?;
+        match self.certs_tree_view.get(sel) {
+            Some(CertRow::Secret { .. }) => None,
+            _ => {
+                let rec = self.snapshot.get(sel)?;
+                let uid = rec.uid.strip_prefix("cm|")?;
+                resources.iter().position(|r| r.uid() == uid)
+            }
+        }
+    }
+
+    fn cert_selected(&self) -> Option<CmResource> {
+        let s = self.certs_state.lock().expect("certs poisoned");
+        self.cert_selected_idx(&s.resources).map(|i| s.resources[i].clone())
+    }
+
+    // Space: fold/unfold the selected node and remember that the choice was deliberate, so the
+    // auto-folding pass leaves it alone from now on.
+    fn toggle_cert_node(&mut self) {
+        let Some(r) = self.cert_selected() else { return };
+        let uid = r.uid();
+        if self.certs_collapsed.contains(&uid) {
+            self.certs_collapsed.remove(&uid);
+        } else {
+            self.certs_collapsed.insert(uid.clone());
+        }
+        self.certs_user_toggled.insert(uid);
+        self.refresh_certs_snapshot();
+    }
+
+    fn cycle_certs_filter(&mut self) {
+        self.certs_filter = match self.certs_filter {
+            CertFilter::All => CertFilter::Problems,
+            CertFilter::Problems => CertFilter::InFlight,
+            CertFilter::InFlight => CertFilter::All,
+        };
+        self.certs_detail_scroll = 0;
+        self.refresh_certs_snapshot();
+    }
+
+    // `s`: hand off to the Secrets view on the Secret this chain produces, where the X.509 decoding,
+    // the reveal and the per-key copy already live.
+    fn certs_open_secret(&mut self) {
+        let sel = self.table_state.selected();
+        let target = match sel.and_then(|i| self.certs_tree_view.get(i)) {
+            Some(CertRow::Secret { namespace, name, .. }) => Some((namespace.clone(), name.clone())),
+            _ => {
+                let s = self.certs_state.lock().expect("certs poisoned");
+                self.cert_selected_idx(&s.resources)
+                    .and_then(|i| owning_certificate(i, &s.resources))
+                    .and_then(|i| {
+                        s.resources[i]
+                            .secret_name
+                            .as_ref()
+                            .map(|sn| (s.resources[i].namespace.clone(), sn.clone()))
+                    })
+            }
+        };
+        let Some((ns, name)) = target else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucun Secret produit par cette chaîne".to_string(),
+            ));
+            return;
+        };
+        self.stop_certs_auto_refresh();
+        self.enter_secrets_mode();
+        // Land on the secret if it is already listed; otherwise the cursor stays put and the user
+        // still gets the view they asked for.
+        if let Some(pos) = self
+            .secret_rows()
+            .iter()
+            .position(|s| s.namespace == ns && s.name == name)
+        {
+            self.secrets_cursor = pos;
+        } else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("secret {}/{} pas encore chargé", ns, name),
+            ));
+        }
+    }
+
+    // `o` on a secret: jump to the cert-manager chain that produces it. Mirrors `o` in the RBAC view,
+    // which jumps to the Flux object managing a binding.
+    fn secrets_open_origin(&mut self) {
+        let Some(s) = self.secret_selected() else { return };
+        let Some(cert) = s.cert_manager.clone() else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                format!("{}/{} n'est pas issu de cert-manager", s.namespace, s.name),
+            ));
+            return;
+        };
+        self.stop_secrets_auto_refresh();
+        self.certs_tree = true;
+        self.enter_certs_mode();
+        let uid = cert_tree_uid("Certificate", &s.namespace, &cert);
+        // Force the target chain open even if it is healthy, otherwise the jump lands on a folded row.
+        self.certs_collapsed.remove(&uid);
+        self.certs_user_toggled.insert(uid.clone());
+        self.certs_pending_select = Some(uid);
+        self.refresh_certs_snapshot();
+    }
+
+    // `r`: the two write actions, behind the armed confirmation of the shared action menu.
+    fn open_certs_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let s = self.certs_state.lock().expect("certs poisoned");
+        let Some(idx) = self.cert_selected_idx(&s.resources) else {
+            drop(s);
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucun objet cert-manager sélectionné".to_string(),
+            ));
+            return;
+        };
+        let Some(cert_idx) = owning_certificate(idx, &s.resources) else {
+            drop(s);
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "aucun Certificate dans cette chaîne".to_string(),
+            ));
+            return;
+        };
+        let mut items = vec![ActionItem {
+            label: st.k_renew,
+            desc: st.desc_renew,
+            action: MenuAction::CertRenew,
+        }];
+        // Only offer the retry when there is actually a live request to restart.
+        if in_flight_request(cert_idx, &s.resources).is_some() {
+            items.push(ActionItem {
+                label: st.k_acme_retry,
+                desc: st.desc_acme_retry,
+                action: MenuAction::CertAcmeRetry,
+            });
+        }
+        drop(s);
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_certs_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    fn certs_renew(&mut self) {
+        let (api_version, namespace, name) = {
+            let s = self.certs_state.lock().expect("certs poisoned");
+            let Some(idx) = self.cert_selected_idx(&s.resources) else { return };
+            let Some(cert_idx) = owning_certificate(idx, &s.resources) else { return };
+            let c = &s.resources[cert_idx];
+            (c.api_version.clone(), c.namespace.clone(), c.name.clone())
+        };
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move { renew(client, api_version, namespace, name, status).await; });
+    }
+
+    // Restarts a stuck issuance by deleting the in-flight CertificateRequest, which takes its Order
+    // and Challenges with it. Refused outright under an ACME rate limit: retrying there only burns
+    // the remaining quota and pushes the recovery further away.
+    fn certs_acme_retry(&mut self) {
+        let target = {
+            let s = self.certs_state.lock().expect("certs poisoned");
+            let Some(idx) = self.cert_selected_idx(&s.resources) else { return };
+            let Some(cert_idx) = owning_certificate(idx, &s.resources) else { return };
+            if is_rate_limited(cert_idx, &s.resources) {
+                None
+            } else {
+                in_flight_request(cert_idx, &s.resources).map(|i| {
+                    let r = &s.resources[i];
+                    (r.api_version.clone(), r.namespace.clone(), r.name.clone())
+                })
+            }
+        };
+        let Some((api_version, namespace, name)) = target else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "relance refusée : rate limit ACME atteint (ou aucune requête en cours)".to_string(),
+            ));
+            return;
+        };
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move { retry_acme(client, api_version, namespace, name, status).await; });
+    }
+
     // Toggle the in-panel reveal of data values: pressing the same key again hides them.
     fn toggle_secret_reveal(&mut self, target: SecretReveal) {
         self.secrets_reveal = if self.secrets_reveal == target { SecretReveal::Hidden } else { target };
@@ -3437,6 +3929,8 @@ impl App {
             Some(MenuAction::Recycle) => self.pods_rescale(true),
             Some(MenuAction::Restart) => self.pods_restart(),
             Some(MenuAction::Reconcile(scope)) => self.reconcile_selected(scope),
+            Some(MenuAction::CertRenew) => self.certs_renew(),
+            Some(MenuAction::CertAcmeRetry) => self.certs_acme_retry(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::ScaleSet) | None => {}
@@ -3924,6 +4418,10 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
             app.refresh_net_snapshot();
         }
+        if matches!(app.mode, Mode::Certs | Mode::CertsFull) {
+            app.refresh_certs_snapshot();
+            app.drain_reconcile_status();
+        }
         if app.delete_view.is_some() {
             app.poll_delete();
         }
@@ -4036,17 +4534,17 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.enter_command();
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_yaml_view();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_delete_view();
         }
 
@@ -4337,6 +4835,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('b'), _, Mode::Secrets) => app.toggle_secret_reveal(SecretReveal::Base64),
         (KeyCode::Char('d'), _, Mode::Secrets) => app.toggle_secret_reveal(SecretReveal::Decoded),
         (KeyCode::Char('c'), _, Mode::Secrets) => app.open_secrets_copy_menu(),
+        // `o` = origin, same meaning as in the RBAC view: climb to whatever produced this row.
+        (KeyCode::Char('o'), _, Mode::Secrets) => app.secrets_open_origin(),
         (KeyCode::F(5), _, Mode::Secrets) => app.refresh_secrets(),
         (KeyCode::Esc, _, Mode::Secrets) => app.exit_secrets_mode(),
         (KeyCode::Char('i'), _, Mode::Secrets) => app.enter_ai_panel(),
@@ -4356,6 +4856,37 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::SecretsFull) => app.enter_ai_panel(),
         (KeyCode::Char('l'), _, Mode::SecretsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::SecretsFull) => {}
+
+        (KeyCode::Up, m, Mode::Certs) if m.contains(KeyModifiers::SHIFT) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Certs) if m.contains(KeyModifiers::SHIFT) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Certs) => app.move_cert_selection(-1),
+        (KeyCode::Down, _, Mode::Certs) => app.move_cert_selection(1),
+        (KeyCode::PageUp, _, Mode::Certs) => app.move_cert_selection(-10),
+        (KeyCode::PageDown, _, Mode::Certs) => app.move_cert_selection(10),
+        (KeyCode::Char(' '), _, Mode::Certs) => app.toggle_cert_node(),
+        (KeyCode::Char('t'), _, Mode::Certs) => app.toggle_certs_tree(),
+        (KeyCode::Char('f'), _, Mode::Certs) => app.cycle_certs_filter(),
+        (KeyCode::Char('r'), _, Mode::Certs) => app.open_certs_action_menu(),
+        (KeyCode::Char('s'), _, Mode::Certs) => app.certs_open_secret(),
+        (KeyCode::Enter, _, Mode::Certs) => app.enter_certs_full(),
+        (KeyCode::F(5), _, Mode::Certs) => app.refresh_certs(),
+        (KeyCode::Esc, _, Mode::Certs) => app.exit_certs_mode(),
+        (KeyCode::Char('i'), _, Mode::Certs) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Certs) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Certs) => {}
+
+        (KeyCode::Up, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::CertsFull) => app.certs_detail_scroll = 0,
+        (KeyCode::Char('r'), _, Mode::CertsFull) => app.open_certs_action_menu(),
+        (KeyCode::Char('s'), _, Mode::CertsFull) => app.certs_open_secret(),
+        (KeyCode::Enter, _, Mode::CertsFull) => app.exit_certs_full(),
+        (KeyCode::Esc, _, Mode::CertsFull) => app.exit_certs_full(),
+        (KeyCode::Char('i'), _, Mode::CertsFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::CertsFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::CertsFull) => {}
 
         (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
         (KeyCode::Down, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(1),
@@ -4515,7 +5046,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -4544,11 +5075,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps | Mode::Services => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Configmaps | Mode::Services => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -4564,8 +5095,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -4587,6 +5118,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Rbac | Mode::RbacFull => st.mode_rbac,
         Mode::Vuln | Mode::VulnFull => st.mode_vuln,
         Mode::Secrets | Mode::SecretsFull => st.mode_secrets,
+        Mode::Certs | Mode::CertsFull => st.mode_certs,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
     };
@@ -4632,6 +5164,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_vuln_table(f, app, ta);
         } else if draw_mode == Mode::Secrets {
             draw_secrets_table(f, app, ta);
+        } else if draw_mode == Mode::Certs {
+            if app.certs_tree {
+                draw_certs_tree(f, app, ta);
+            } else {
+                draw_certs_table(f, app, ta);
+            }
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Services {
@@ -4639,7 +5177,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -4813,7 +5351,32 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" d ", kbg), Span::raw(format!(" {}   ", st.k_reveal_plain)),
             footer_sep(),
             Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.secrets_filter.label())),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin_cert)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+        ],
+        Mode::Certs => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
+            Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.certs_filter.label())),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_cert_actions)),
+            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_goto_secret)),
+        ],
+        Mode::CertsFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_cert_actions)),
+            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_goto_secret)),
         ],
         Mode::SecretsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -6279,6 +6842,55 @@ fn synthetic_inventory_record(ks_uid: &str, it: &InventoryItem) -> EventRecord {
     }
 }
 
+// Snapshot record for a cert-manager object, so every row of the chain drives the shared YAML,
+// delete, AI and Status/Related machinery against the real object behind it. `enrich.rs` already
+// recognises these kinds, so the Related tab and the AI prompt get the chain context for free.
+fn synthetic_cert_record(r: &CmResource) -> EventRecord {
+    let (severity, reason) = match r.ready {
+        CmReady::Ready => (Severity::Normal, "Ready".to_string()),
+        CmReady::InProgress => (Severity::Normal, "Issuing".to_string()),
+        CmReady::Failed => (Severity::Warning, "Failed".to_string()),
+        CmReady::Unknown => (Severity::Warning, "Unknown".to_string()),
+    };
+    let message = if r.message.is_empty() {
+        format!("{} {}/{}", r.kind.as_str(), r.namespace, r.name)
+    } else {
+        r.message.clone()
+    };
+    EventRecord {
+        uid: format!("cm|{}", r.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: r.api_version.clone(),
+        kind: r.kind.as_str().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "cert-manager".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// Snapshot record for the TLS Secret leaf, so `y` and `Ctrl-D` on that row address the Secret itself.
+fn synthetic_cert_secret_record(namespace: &str, name: &str) -> EventRecord {
+    EventRecord {
+        uid: format!("cmsec|{}/{}", namespace, name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Secret".to_string(),
+        api_version: "v1".to_string(),
+        kind: "Secret".to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message: format!("Secret {}/{}", namespace, name),
+        component: "cert-manager".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 // Colour for a pod STATUS string: green when settled, red for crash/error states, yellow otherwise.
 // Row style from the status colour: red rows get a dark-red background, finished (faded) rows are
 // dimmed whole-row, everything else is default.
@@ -7591,6 +8203,496 @@ fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, 
     (title, lines)
 }
 
+// --- cert-manager view rendering ----------------------------------------------------------------
+
+// Same palette as the Flux view, so a readiness colour means the same thing everywhere in kdt.
+fn cert_ready_cell(r: CmReady) -> (&'static str, Color) {
+    match r {
+        CmReady::Ready => ("Ready", Color::Green),
+        CmReady::InProgress => ("Issuing", Color::Cyan),
+        CmReady::Failed => ("Failed", Color::Red),
+        CmReady::Unknown => ("Unknown", Color::Yellow),
+    }
+}
+
+fn cert_glyph(r: CmReady) -> &'static str {
+    match r {
+        CmReady::Ready => "✓",
+        CmReady::InProgress => "⟳",
+        CmReady::Failed => "✗",
+        CmReady::Unknown => "·",
+    }
+}
+
+fn cert_row_style(r: CmReady) -> Style {
+    match r {
+        CmReady::Failed => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+        CmReady::Unknown => Style::default().fg(Color::Yellow),
+        CmReady::InProgress => Style::default().fg(Color::Cyan),
+        CmReady::Ready => Style::default(),
+    }
+}
+
+// Expiry cell, reusing the Secrets view's urgency bands so a date reads identically in both views.
+fn cert_expiry_cell(days: Option<i64>) -> Cell<'static> {
+    match days {
+        Some(d) => Cell::from(format!("{d} j"))
+            .style(Style::default().fg(expiry_color(Expiry::from_days(d))).add_modifier(Modifier::BOLD)),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
+    }
+}
+
+// What a Certificate targets: its DNS names if it has them, otherwise the Secret it writes.
+fn cert_target(r: &CmResource) -> String {
+    if !r.dns_names.is_empty() {
+        let head = r.dns_names[0].clone();
+        if r.dns_names.len() > 1 {
+            return format!("{} +{}", head, r.dns_names.len() - 1);
+        }
+        return head;
+    }
+    match (&r.challenge, &r.secret_name, &r.issuer_type) {
+        (Some(c), _, _) if !c.dns_name.is_empty() => format!("{} {}", c.type_, c.dns_name),
+        (_, Some(sn), _) => format!("→ {sn}"),
+        (_, _, Some(t)) => t.clone(),
+        _ => String::new(),
+    }
+}
+
+// Counts are taken from the rows actually on screen, so a filter that hides everything cannot leave
+// the title claiming eight certificates over an empty table.
+fn certs_panel_title(app: &App, tree: bool, rows: &[CmResource]) -> String {
+    let (loading, error, acme_installed) = {
+        let s = app.certs_state.lock().expect("certs poisoned");
+        (s.loading, s.error.clone(), s.acme_installed)
+    };
+    let kind = if tree { "certs arbre" } else { "certs" };
+    if let Some(e) = &error {
+        return format!("{} (erreur: {})", kind, e);
+    }
+    if loading && rows.is_empty() {
+        return format!("{} (chargement...)", kind);
+    }
+    let (total, ready, failed, flight, expiring) = CertState {
+        resources: rows.to_vec(),
+        ..Default::default()
+    }
+    .counts();
+    let acme = if acme_installed { "" } else { " · sans ACME" };
+    format!(
+        "{} ({} certificats · ✓{} ✗{} ⟳{} · {} expirent <30j{}) · filtre={}",
+        kind, total, ready, failed, flight, expiring, acme, app.certs_filter.label()
+    )
+}
+
+// The chain as a tree: issuers at the root, the ACME lineage below each Certificate, and the TLS
+// Secret as the closing leaf.
+fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let resources = app.cert_rows();
+    let title = certs_panel_title(app, true, &resources);
+
+    let header_row = Row::new(vec![
+        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("CIBLE"),
+        Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("MESSAGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // First pass sizes the RESSOURCE column, which the MESSAGE wrap width depends on.
+    let labels: Vec<String> = app
+        .certs_tree_view
+        .iter()
+        .map(|row| match row {
+            CertRow::Res(n) => {
+                let Some(r) = resources.get(n.idx) else { return String::new() };
+                let marker = if n.has_children {
+                    if n.collapsed { "▸" } else { "▾" }
+                } else {
+                    " "
+                };
+                format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind.short(), r.name)
+            }
+            CertRow::Secret { depth, name, .. } => {
+                format!("{}→ Secret {}", "  ".repeat(*depth), name)
+            }
+        })
+        .collect();
+    let name_w = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("RESSOURCE".chars().count());
+    let name_col = (name_w as u16).clamp(28, 72);
+    let selected = app.table_state.selected();
+    // Six columns, so five inter-column gaps — and `highlight_symbol("> ")` takes two more cells off
+    // every row. Miss either and the wrapped message of the focused row runs into the right border.
+    // The trailing +1 keeps the longest wrapped line from sitting flush against that border.
+    let msg_w = flux_msg_width(area.width, name_col + 10 + 28 + 8 + 6 + HIGHLIGHT_W + 1, 6);
+
+    // Secret leaves are joined from the Secrets view rather than fetched again.
+    let secret_facts: std::collections::HashMap<(String, String), (Option<i64>, usize)> = {
+        let s = app.secrets_state.lock().expect("secrets poisoned");
+        s.secrets
+            .iter()
+            .map(|x| {
+                (
+                    (x.namespace.clone(), x.name.clone()),
+                    (x.tls.as_ref().map(|c| c.days_remaining), x.ingress_refs.len()),
+                )
+            })
+            .collect()
+    };
+
+    let rows: Vec<Row> = app
+        .certs_tree_view
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| {
+            let label = labels[vi].clone();
+            match row {
+                CertRow::Res(n) => {
+                    let Some(r) = resources.get(n.idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let (ready_txt, ready_color) = cert_ready_cell(r.ready);
+                    let msg_color = if r.ready == CmReady::Failed { Color::Red } else { DIM };
+                    // The focused row expands its message so the full reason is readable inline.
+                    let (msg_cell, height) = if selected == Some(vi) && !r.message.is_empty() {
+                        let wrapped = wrap_words(&r.message, msg_w).join("\n");
+                        let h = wrapped.lines().count().clamp(1, 8) as u16;
+                        (Cell::from(wrapped).style(Style::default().fg(msg_color)), h)
+                    } else {
+                        (Cell::from(r.message.clone()).style(Style::default().fg(msg_color)), 1)
+                    };
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(format!("{} {}", cert_glyph(r.ready), ready_txt))
+                            .style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+                        Cell::from(cert_target(r)).style(Style::default().fg(DIM)),
+                        cert_expiry_cell(r.days_remaining),
+                        Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                        msg_cell,
+                    ])
+                    .height(height)
+                    .style(cert_row_style(r.ready))
+                }
+                CertRow::Secret { namespace, name, .. } => {
+                    let (days, ingress) = secret_facts
+                        .get(&(namespace.clone(), name.clone()))
+                        .copied()
+                        .unwrap_or((None, 0));
+                    let consumers = match ingress {
+                        0 => "aucun ingress".to_string(),
+                        1 => "←1 ingress".to_string(),
+                        n => format!("←{n} ingress"),
+                    };
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(Color::Magenta)),
+                        Cell::from("TLS").style(Style::default().fg(Color::Magenta)),
+                        Cell::from(consumers).style(Style::default().fg(DIM)),
+                        cert_expiry_cell(days),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                }
+            }
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(28),
+        Constraint::Length(8), Constraint::Length(6), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Flat listing (`t`): every cert-manager object, no nesting — faster to scan when the hierarchy is
+// not the question.
+fn draw_certs_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let resources = app.cert_rows();
+    let title = certs_panel_title(app, false, &resources);
+
+    let header_row = Row::new(vec![
+        Cell::from("KIND"), Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
+        Cell::from("CIBLE"), Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("MESSAGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let name_col = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 20, 50);
+    let rows: Vec<Row> = resources
+        .iter()
+        .map(|r| {
+            let (ready_txt, ready_color) = cert_ready_cell(r.ready);
+            let msg_color = if r.ready == CmReady::Failed { Color::Red } else { DIM };
+            Row::new(vec![
+                Cell::from(r.kind.short()).style(Style::default().fg(Color::Cyan)),
+                Cell::from(r.namespace.clone()).style(Style::default().fg(DIM)),
+                Cell::from(r.name.clone()),
+                Cell::from(format!("{} {}", cert_glyph(r.ready), ready_txt))
+                    .style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
+                Cell::from(cert_target(r)).style(Style::default().fg(DIM)),
+                cert_expiry_cell(r.days_remaining),
+                Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                Cell::from(r.message.clone()).style(Style::default().fg(msg_color)),
+            ])
+            .style(cert_row_style(r.ready))
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(13), Constraint::Length(20), Constraint::Length(name_col),
+        Constraint::Length(10), Constraint::Length(28), Constraint::Length(8),
+        Constraint::Length(6), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let sel = app.table_state.selected();
+    let is_secret_row = matches!(sel.and_then(|i| app.certs_tree_view.get(i)), Some(CertRow::Secret { .. }));
+
+    let resources = app.cert_rows();
+    // A Secret leaf has no cert-manager object of its own; show the chain of the Certificate above it.
+    let idx = match app.cert_selected_idx(&resources) {
+        Some(i) => Some(i),
+        None if is_secret_row => sel
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| app.certs_tree_view.get(i))
+            .and_then(|row| match row {
+                CertRow::Res(n) => Some(n.idx),
+                CertRow::Secret { .. } => None,
+            }),
+        None => None,
+    };
+
+    let Some(idx) = idx else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un objet cert-manager ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" cert-manager "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let facts = cert_secret_facts(app, &resources, idx);
+    let (title, lines) = cert_chain_lines(idx, &resources, facts.as_ref());
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.certs_detail_scroll > max_scroll {
+        app.certs_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.certs_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// What the Secrets view knows about the Secret this chain produces. Read from the shared secrets
+// state rather than fetched, so the two views can never disagree.
+fn cert_secret_facts(app: &App, resources: &[CmResource], idx: usize) -> Option<SecretFacts> {
+    let cert = owning_certificate(idx, resources)?;
+    let sn = resources[cert].secret_name.as_ref()?;
+    let ns = &resources[cert].namespace;
+    let s = app.secrets_state.lock().expect("secrets poisoned");
+    // An empty (or errored) secrets state means "unknown", not "absent" — reporting a missing Secret
+    // on the strength of a list that never loaded would be a false alarm.
+    if s.secrets.is_empty() {
+        return None;
+    }
+    Some(match s.secrets.iter().find(|x| &x.namespace == ns && &x.name == sn) {
+        Some(found) => SecretFacts {
+            found: true,
+            days_remaining: found.tls.as_ref().map(|c| c.days_remaining),
+            ingress_refs: found.ingress_refs.len(),
+        },
+        None => SecretFacts::default(),
+    })
+}
+
+// The chain, rendered vertically from the trust anchor down to the consumers, followed by whatever
+// the diagnostics have to say. This is the "remonter la chaîne" answer, and it reads the same
+// whichever row of the chain the cursor is on.
+fn cert_chain_lines(
+    idx: usize,
+    resources: &[CmResource],
+    secret: Option<&SecretFacts>,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let sel = &resources[idx];
+    let (_, sel_color) = cert_ready_cell(sel.ready);
+    let title = Line::from(Span::styled(
+        format!(" {} {}/{} ", sel.kind.as_str(), sel.namespace, sel.name),
+        Style::default().fg(Color::Black).bg(sel_color).add_modifier(Modifier::BOLD),
+    ));
+
+    // Trailing space: "renouvellement" is exactly 14 wide, so the pad alone leaves no gap.
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<14} "), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Chaîne", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+
+    // Ancestors indent by their position in the path; descendants by their depth *below* the
+    // selected row, so siblings line up instead of cascading.
+    let ancestors = chain_path(idx, resources);
+    let base_depth = ancestors.len().saturating_sub(1);
+    let mut chain: Vec<(usize, usize)> =
+        ancestors.iter().enumerate().map(|(d, &i)| (i, d)).collect();
+    // An issuer's subtree is every certificate it signs — a list, not a lineage, and the table below
+    // already shows it. Summarise instead of dumping it here.
+    if !sel.kind.is_issuer() {
+        let mut sub = chain_subtree(idx, resources);
+        sub.sort_by_key(|&(i, d)| (d, resources[i].kind.as_str(), resources[i].name.clone()));
+        chain.extend(sub.into_iter().map(|(i, d)| (i, base_depth + d)));
+    }
+
+    for (pos, &(i, depth)) in chain.iter().enumerate() {
+        let r = &resources[i];
+        let (_, color) = cert_ready_cell(r.ready);
+        let branch = if pos == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth)) };
+        let here = if i == idx { "▶ " } else { "" };
+        let mut spans = vec![
+            Span::styled(branch, Style::default().fg(DIM)),
+            Span::styled(here, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} {}", r.kind.short(), r.name),
+                if i == idx {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} {}", cert_glyph(r.ready), cert_ready_cell(r.ready).0),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(t) = &r.issuer_type {
+            spans.push(Span::styled(format!(" · {t}"), Style::default().fg(DIM)));
+        }
+        if let Some(c) = &r.challenge {
+            if !c.dns_name.is_empty() {
+                spans.push(Span::styled(format!(" · {} {}", c.type_, c.dns_name), Style::default().fg(DIM)));
+            }
+        }
+        lines.push(Line::from(spans));
+        if i == idx && sel.kind.is_issuer() {
+            let signed = chain_subtree(idx, resources)
+                .into_iter()
+                .filter(|&(c, _)| resources[c].kind == CmKind::Certificate)
+                .count();
+            lines.push(Line::from(Span::styled(
+                format!("    {signed} certificats émis sous cet émetteur (détail dans l'arbre)"),
+                Style::default().fg(DIM),
+            )));
+        }
+        if !r.message.is_empty() && r.ready != CmReady::Ready {
+            for w in wrap_words(&r.message, 80).into_iter().take(3) {
+                lines.push(Line::from(Span::styled(
+                    format!("{}   {}", "  ".repeat(depth + 1), w),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+
+    // The produced Secret and its consumers close the chain: that is what is actually served.
+    if let Some(cert_idx) = owning_certificate(idx, resources) {
+        let cert = &resources[cert_idx];
+        if let Some(sn) = &cert.secret_name {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Secret produit", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            match secret {
+                Some(f) if f.found => {
+                    let exp = match f.days_remaining {
+                        Some(d) => format!(" · expire dans {d} j"),
+                        None => String::new(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  → Secret ", Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("{}/{}", cert.namespace, sn),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                        Span::styled(exp, Style::default().fg(DIM)),
+                    ]));
+                    let consumers = match f.ingress_refs {
+                        0 => "  aucun Ingress ne le référence".to_string(),
+                        1 => "  ← 1 Ingress le référence".to_string(),
+                        n => format!("  ← {n} Ingress le référencent"),
+                    };
+                    lines.push(Line::from(Span::styled(consumers, Style::default().fg(DIM))));
+                }
+                Some(_) => lines.push(Line::from(Span::styled(
+                    format!("  → Secret {}/{} : absent", cert.namespace, sn),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))),
+                None => lines.push(Line::from(Span::styled(
+                    format!("  → Secret {}/{}", cert.namespace, sn),
+                    Style::default().fg(DIM),
+                ))),
+            }
+        }
+        if let Some(rt) = &cert.renewal_time {
+            lines.push(label("renouvellement", rt[..rt.len().min(10)].to_string()));
+        }
+        if let Some(na) = &cert.not_after {
+            lines.push(label("expire le", na[..na.len().min(10)].to_string()));
+        }
+    }
+
+    let hints = chain_hints(idx, resources, secret);
+    if !hints.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Diagnostic", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for h in hints {
+            let (glyph, color) = match h.level {
+                HintLevel::Danger => ("⛔", Color::Red),
+                HintLevel::Warn => ("⚠", Color::Rgb(255, 140, 0)),
+                HintLevel::Info => ("·", DIM),
+            };
+            let mut first = true;
+            for w in wrap_words(&h.text, 76) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if first { format!("{glyph} ") } else { "  ".to_string() },
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(w, Style::default().fg(color)),
+                ]));
+                first = false;
+            }
+        }
+    }
+
+    (title, lines)
+}
+
 // --- ConfigMaps view rendering ----------------------------------------------------------------
 
 fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -8014,6 +9116,9 @@ fn flux_message_cell_wrapped(r: &FluxResource, msg_color: Color, width: usize) -
 
 // Width available for the flux MESSAGE column: inner width minus the fixed columns and the
 // inter-column spacing (ratatui's default column_spacing is 1).
+// Width taken off every table row by `highlight_symbol("> ")`.
+const HIGHLIGHT_W: u16 = 2;
+
 fn flux_msg_width(area_width: u16, fixed: u16, ncols: u16) -> usize {
     let inner = area_width.saturating_sub(2);
     inner.saturating_sub(fixed).saturating_sub(ncols.saturating_sub(1)).max(20) as usize
@@ -8173,6 +9278,13 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Secrets | Mode::SecretsFull));
     if is_secrets_mode {
         draw_secrets_detail(f, app, area);
+        return;
+    }
+    let is_certs_mode = matches!(app.mode, Mode::Certs | Mode::CertsFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Certs | Mode::CertsFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Certs | Mode::CertsFull));
+    if is_certs_mode {
+        draw_certs_detail(f, app, area);
         return;
     }
     let is_configmaps_mode = matches!(app.mode, Mode::Configmaps | Mode::ConfigmapsFull)

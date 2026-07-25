@@ -189,6 +189,11 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
 | `rbac` | `rb`, `roles`, `bindings`, `sec` | Vue sécurité RBAC (bindings scorés par sévérité) |
 | `vuln` | `cve`, `cves`, `vulns` | Vue vulnérabilités (images + version k8s) |
+| `secrets` | `secret`, `se`, `tls` | Vue Secrets et certificats TLS |
+| `certs` | `certificates`, `issuers`, `challenges`, `acme` | Vue cert-manager (chaîne d'émission) |
+| `configmaps` | `cm`, `config` | Vue ConfigMaps |
+| `services` | `svc`, `service` | Vue Services / Endpoints |
+| `ingress` | `ing`, `ingressclass` | Vue Ingress / IngressClass |
 | `quit` | `q` | Quitter |
 
 ### FluxCD (`:flux`)
@@ -422,6 +427,61 @@ Chaque script lance `cargo build --release`, récupère le binaire statique musl
 
 Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downloads`, nommés `kdt-extract-<contexte>-<timestamp>.pdf`. Le rendu PDF est généré via Typst (`typst` / `typst-pdf` / `typst-as-lib`, polices embarquées).
 
+### cert-manager (`:certs`)
+
+Vue dédiée à la chaîne d'émission cert-manager, pensée pour répondre à « pourquoi ce certificat
+est-il cassé / sur le point d'expirer ? » sans sortir de kdt. L'arbre part des émetteurs et descend
+jusqu'au Secret réellement servi :
+
+```
+▾ ClusterIssuer letsencrypt-prod            ✓ Ready · acme
+  ▾ Certificate monitoring/grafana-tls      ✗ Failed        12 j
+      CertRequest grafana-tls-2             ⟳ Issuing
+        Order grafana-tls-2-2891044         ⟳ pending
+          Challenge …-2891044-1867          ✗ dns-01 grafana.exemple.fr
+      → Secret grafana-tls                  TLS  ←1 ingress  12 j
+  ▸ Certificate web/site-tls                ✓ Ready         68 j
+```
+
+Les chaînes saines sont repliées automatiquement, celles en échec ou en cours d'émission sont
+dépliées : l'arbre montre d'emblée ce qui ne va pas. Un pli/dépli manuel (`Space`) est définitif,
+le repli automatique ne revient jamais dessus.
+
+Le panneau du haut affiche la chaîne complète depuis l'ancre de confiance jusqu'aux Ingress
+consommateurs, quelle que soit la ligne sélectionnée, suivie de diagnostics : propagation DNS
+lente, challenge http-01 non présenté, rate limit ACME, renouvellement en retard, Secret absent
+ou désynchronisé du Certificate, émetteur non prêt.
+
+| Touche | Action |
+|---|---|
+| `↑↓` / `PgUp` `PgDn` | Navigation |
+| `Space` | Plier / déplier la chaîne |
+| `t` | Bascule arbre ⇄ liste plate |
+| `f` | Filtre : `ALL` → `PROBLEMS` → `IN-FLIGHT` |
+| `Enter` | Plein écran sur la chaîne |
+| `s` | Ouvrir le Secret produit dans la vue Secrets |
+| `r` | Actions : renouveler, relancer le cycle ACME |
+| `F5` | Rafraîchir |
+| `Shift+↑↓` | Défilement du panneau de chaîne |
+
+Depuis la vue Secrets, `o` fait le chemin inverse : il ouvre la chaîne cert-manager qui produit le
+secret sélectionné (message explicite si le secret n'en vient pas).
+
+**Actions (`r`)**, toutes derrière la confirmation armée du menu :
+
+- **renouveler** — pose la condition `Issuing=True` sur le Certificate, l'équivalent de
+  `cmctl renew`. La liste de conditions est relue puis réécrite complète : un merge patch remplace
+  un tableau, écrire la seule condition `Issuing` effacerait `Ready`.
+- **relancer ACME** — supprime la `CertificateRequest` en cours, ce qui emporte son `Order` et ses
+  `Challenge` en cascade et fait repartir cert-manager sur une requête neuve. Supprimer le seul
+  Challenge ne sert à rien : son Order le recrée à l'identique. L'action n'est proposée que s'il y a
+  une requête en vol, et **refusée si un rate limit ACME est détecté** — relancer dans ce cas ne
+  ferait que consommer le quota restant.
+
+La vue fonctionne aussi sans cert-manager (message explicite) et sur un cluster sans le groupe
+`acme.cert-manager.io` (émetteurs CA / selfSigned uniquement), signalé par `· sans ACME` dans le
+bandeau.
+
 ## Architecture (`src/`)
 
 | Module | Rôle |
@@ -435,6 +495,7 @@ Les rapports PDF (diagnostic et extraction complète) sont écrits dans `~/Downl
 | `rbac.rs` | Bindings RBAC scorés par sévérité |
 | `vulnerabilities.rs` | CVE images (Trivy Operator) + risque version Kubernetes |
 | `secrets.rs` | Secrets et certificats TLS (expiration, consommateurs) |
+| `certmanager.rs` | cert-manager : chaîne Issuer → Certificate → Order → Challenge, diagnostics ACME |
 | `configmaps.rs` | ConfigMaps et leur contenu |
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
 | `ui.rs` | TUI ratatui : modes, rendu, gestion clavier |
