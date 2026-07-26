@@ -6364,7 +6364,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         global_spans.push(Span::styled(" e ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_edit)));
         global_spans.push(Span::styled(" h ", kbg));
-        global_spans.push(Span::raw(format!(" {}   ", st.k_touch)));
+        // In the event views a row is an Event, but every key on this bar addresses the object the
+        // event is about — `y`/`e`/`^D` and the Logs/Status/Related tabs all do. `h` is the only one
+        // that writes without a panel to name its target first, so it says so in the bar itself.
+        let touch_label = match draw_mode {
+            Mode::Selection | Mode::DetailFull => st.k_touch_object,
+            _ => st.k_touch,
+        };
+        global_spans.push(Span::raw(format!(" {}   ", touch_label)));
         global_spans.push(Span::styled(" ^D ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_delete)));
     }

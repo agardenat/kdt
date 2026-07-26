@@ -168,6 +168,8 @@ pub struct Strings {
     pub ed_partial_spec: &'static str,
 
     pub k_touch: &'static str,
+    /// Same key, said out loud where a row is an Event and not the object it patches.
+    pub k_touch_object: &'static str,
     pub touch_no_object: &'static str,
     pub touch_running: &'static str,
     pub touch_ok: &'static str,
@@ -419,6 +421,7 @@ pub const FR: Strings = Strings {
     ed_partial_spec: "{d} : spec en grande partie figée après création, la plupart des champs seront rejetés",
 
     k_touch: "toucher",
+    k_touch_object: "toucher l'objet",
     touch_no_object: "touch : aucun objet sélectionné",
     touch_running: "↻ touch {d}…",
     touch_ok: "✓ touché {d}",
@@ -670,6 +673,7 @@ pub const EN: Strings = Strings {
     ed_partial_spec: "{d}: the spec is mostly frozen after creation, most fields will be rejected",
 
     k_touch: "touch",
+    k_touch_object: "touch object",
     touch_no_object: "touch: no object selected",
     touch_running: "↻ touching {d}…",
     touch_ok: "✓ touched {d}",

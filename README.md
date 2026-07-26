@@ -228,6 +228,14 @@ modification concurrente.
 > toucher. Le bandeau du footer nomme toujours l'objet effectivement touché (`✓ touché
 > ConfigMap default/exemple`), ou affiche le refus de l'API (`✗ touch … is forbidden…`).
 
+Dans la vue évènements, une ligne est un Event, mais `h` patche **l'objet dont l'évènement parle**
+(son `involvedObject`, celui des colonnes `KIND`/`NAME`) — jamais l'Event lui-même. C'est le seul
+ciblage utile : aucun contrôleur ne réagit à un Event, le toucher ne rejouerait donc aucune
+admission, et l'objet est éphémère (ramassé au bout d'une heure) — l'annotation partirait avec lui.
+C'est aussi ce que font déjà `y`, `e`, `Ctrl-D` et les onglets Logs/Status/Related du panneau de
+détail. Comme `h` est la seule de ces touches à écrire sans panneau pour nommer sa cible d'abord, la
+barre de raccourcis l'annonce dans ces vues : `h  toucher l'objet` au lieu de `h  toucher`.
+
 Un objet piloté par GitOps se touche sans problème — l'annotation n'est pas dans le dépôt, donc rien
 ne la revendique, et Flux ou Argo la laissent en place jusqu'à ce qu'ils réécrivent l'objet.
 
