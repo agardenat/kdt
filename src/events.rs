@@ -162,6 +162,9 @@ pub struct LogState {
     pub lines: Vec<String>,
     pub error: Option<String>,
     pub loading: bool,
+    // Containers of the pod the lines came from, in spec order (init containers first). Filled by
+    // the fetch so narrowing to one costs no extra request.
+    pub containers: Vec<String>,
 }
 
 pub type SharedLog = Arc<Mutex<LogState>>;
@@ -170,11 +173,40 @@ pub fn new_log_state() -> SharedLog {
     Arc::new(Mutex::new(LogState::default()))
 }
 
-// Recent logs for every container (init + regular) of one pod, as display lines. Container headers
-// are added only when the pod has more than one container. Failures (get/logs) are embedded as
-// lines rather than aborting, so aggregating across several pods never drops the others.
-async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64) -> Vec<String> {
-    let containers: Vec<(String, bool)> = match api.get(pod).await {
+// What the Logs tab is asking for: one container or all of them, and the current run or the one
+// before it. `previous` is the reason this exists — on a CrashLoopBackOff the running container is
+// fresh and says nothing, and what killed the pod is only in the run that ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogOpts {
+    pub previous: bool,
+    // `None` means every container of the pod, which is the default.
+    pub container: Option<String>,
+}
+
+impl LogOpts {
+    // Short suffix identifying these options, appended to the log cache key so changing them
+    // refetches instead of showing what the previous options returned.
+    pub fn key_suffix(&self) -> String {
+        format!(
+            "|{}|{}",
+            if self.previous { "prev" } else { "cur" },
+            self.container.as_deref().unwrap_or("*"),
+        )
+    }
+}
+
+// Result of reading one pod's logs: the display lines, plus the containers the pod actually has so
+// the UI can offer to narrow to one of them without a second GET.
+pub struct PodLogs {
+    pub lines: Vec<String>,
+    pub containers: Vec<String>,
+}
+
+// Recent logs for the requested containers (init + regular) of one pod, as display lines. Container
+// headers are added only when more than one is shown. Failures (get/logs) are embedded as lines
+// rather than aborting, so aggregating across several pods never drops the others.
+async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> PodLogs {
+    let all: Vec<(String, bool)> = match api.get(pod).await {
         Ok(p) => {
             let mut names = Vec::new();
             if let Some(spec) = p.spec.as_ref() {
@@ -189,11 +221,36 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64) -> Vec<String> {
             }
             names
         }
-        Err(e) => return vec![format!("(échec récupération du pod {}: {})", pod, e)],
+        Err(e) => {
+            return PodLogs {
+                lines: vec![format!("(échec récupération du pod {}: {})", pod, e)],
+                containers: Vec::new(),
+            }
+        }
     };
 
+    let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
+    if all.is_empty() {
+        return PodLogs {
+            lines: vec!["aucun container trouvé sur ce pod".to_string()],
+            containers: names,
+        };
+    }
+
+    // A container filter that matches nothing is reported rather than silently showing everything:
+    // it means the selection moved to a pod that does not have that container.
+    let containers: Vec<(String, bool)> = match opts.container.as_deref() {
+        None => all.clone(),
+        Some(want) => all.iter().filter(|(n, _)| n == want).cloned().collect(),
+    };
     if containers.is_empty() {
-        return vec!["aucun container trouvé sur ce pod".to_string()];
+        return PodLogs {
+            lines: vec![format!(
+                "(ce pod n'a pas de container « {} »)",
+                opts.container.as_deref().unwrap_or(""),
+            )],
+            containers: names,
+        };
     }
 
     let multi = containers.len() > 1;
@@ -209,6 +266,7 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64) -> Vec<String> {
         let lp = LogParams {
             tail_lines: Some(per_container_tail),
             container: Some(cname.clone()),
+            previous: opts.previous,
             ..Default::default()
         };
         match api.logs(pod, &lp).await {
@@ -218,18 +276,29 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64) -> Vec<String> {
                     out.push(line.to_string());
                     count += 1;
                 }
-                if multi && count == 0 {
-                    out.push("(aucun log)".to_string());
+                if count == 0 {
+                    out.push(if opts.previous {
+                        "(aucun log — ce container n'a pas de run précédent)".to_string()
+                    } else {
+                        "(aucun log)".to_string()
+                    });
                 }
             }
             Err(e) => {
-                out.push(format!("(échec récupération logs de {}: {})", cname, e));
+                // Asking for a run that never happened is the expected answer on a container that
+                // has not restarted, not a failure worth showing as one.
+                let msg = e.to_string();
+                if opts.previous && msg.contains("not found") {
+                    out.push(format!("({}: pas de run précédent)", cname));
+                } else {
+                    out.push(format!("(échec récupération logs de {}: {})", cname, msg));
+                }
             }
         }
         if multi { out.push(String::new()); }
     }
 
-    out
+    PodLogs { lines: out, containers: names }
 }
 
 // Fetch recent logs for every container (init + regular) of a pod. The `tail` budget is split
@@ -241,14 +310,16 @@ pub async fn fetch_logs(
     key: String,
     state: SharedLog,
     tail: i64,
+    opts: LogOpts,
 ) {
     let api: Api<Pod> = Api::namespaced(client, &namespace);
-    let lines = pod_log_lines(&api, &pod, tail).await;
+    let logs = pod_log_lines(&api, &pod, tail, &opts).await;
 
     let mut s = state.lock().expect("log state poisoned");
     if s.current_key.as_deref() != Some(&key) { return; }
     s.loading = false;
-    s.lines = lines;
+    s.lines = logs.lines;
+    s.containers = logs.containers;
     s.error = None;
 }
 
@@ -262,6 +333,7 @@ pub async fn fetch_workload_logs(
     key: String,
     state: SharedLog,
     tail: i64,
+    opts: LogOpts,
 ) {
     if pods.is_empty() {
         let mut s = state.lock().expect("log state poisoned");
@@ -275,16 +347,22 @@ pub async fn fetch_workload_logs(
     let api: Api<Pod> = Api::namespaced(client, &namespace);
     let per_pod_tail = (tail / pods.len() as i64).max(80);
     let mut all_lines: Vec<String> = Vec::new();
+    // The pods of a workload run the same spec, so the container list of any of them describes the
+    // whole thing — the last one read wins, and they all agree.
+    let mut containers: Vec<String> = Vec::new();
     for (i, pod) in pods.iter().enumerate() {
         if i > 0 { all_lines.push(String::new()); }
         all_lines.push(format!("▼ pod {}", pod));
-        all_lines.extend(pod_log_lines(&api, pod, per_pod_tail).await);
+        let logs = pod_log_lines(&api, pod, per_pod_tail, &opts).await;
+        all_lines.extend(logs.lines);
+        if !logs.containers.is_empty() { containers = logs.containers; }
     }
 
     let mut s = state.lock().expect("log state poisoned");
     if s.current_key.as_deref() != Some(&key) { return; }
     s.loading = false;
     s.lines = all_lines;
+    s.containers = containers;
     s.error = None;
 }
 

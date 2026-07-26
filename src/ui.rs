@@ -291,8 +291,8 @@ use crate::events::{
     fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
     new_cluster_info_state,
     new_log_state, new_node_list_state, new_node_usage_state, new_ns_list_state, spawn_watcher,
-    EventRecord, LineColor, Severity, SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList,
-    SharedNodeUsage, SharedNsList, SharedStatus,
+    EventRecord, LineColor, LogOpts, Severity, SharedBuffer, SharedClusterInfo, SharedLog,
+    SharedNodeList, SharedNodeUsage, SharedNsList, SharedStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,7 +324,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull, Kyverno, KyvernoFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull, Kyverno, KyvernoFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -368,6 +368,95 @@ struct ActionMenu {
     confirm: bool,
     confirming: bool,
     input: Option<String>,
+}
+
+// The view a drawing pass should behave as. The AI panel, the command palette and the search prompt
+// are overlays: they capture keys but the panels underneath must keep rendering the view they were
+// opened from, so every "which view am I in" test in the draw path resolves through here.
+fn view_mode(app: &App) -> Mode {
+    match app.mode {
+        Mode::AiPanel => app.return_mode,
+        Mode::Command => app.command_return_mode,
+        Mode::Search => app.search_return_mode,
+        m => m,
+    }
+}
+
+// Views whose body is a scrolled panel rather than a row list — every full-screen detail mode, plus
+// the standalone panels. There `/` highlights and jumps through the matches instead of narrowing a
+// table the user cannot see, and it uses `text_query` rather than `search_query`.
+fn is_text_panel_mode(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::DetailFull
+            | Mode::AiPanel
+            | Mode::Diagnostic
+            | Mode::FluxLogs
+            | Mode::NodesFull
+            | Mode::FluxFull
+            | Mode::PodsFull
+            | Mode::RbacFull
+            | Mode::VulnFull
+            | Mode::SecretsFull
+            | Mode::CertsFull
+            | Mode::KyvernoFull
+            | Mode::ConfigmapsFull
+            | Mode::ServicesFull
+    )
+}
+
+// `run_text_search` for a panel that scrolls from the top, guarded on this panel being the one the
+// user is actually looking at — `owner` is the mode it is the body of.
+//
+// The guard has to be that precise for two reasons. These same renderers draw the split view, where
+// `/` narrows the table instead and highlighting would answer a different question. And they keep
+// drawing as the *background* of a popup mode (the diagnostic, the AI panel): letting a background
+// panel run the search would have it swallow the Ctrl-N jump meant for the popup on top.
+fn text_search_top(
+    app: &mut App,
+    owner: Mode,
+    lines: &mut Vec<Line<'static>>,
+    visible: usize,
+    scroll: usize,
+    max_scroll: usize,
+) -> usize {
+    if view_mode(app) != owner { return scroll; }
+    run_text_search(app, lines, visible, scroll).min(max_scroll)
+}
+
+// Does this record match the search query? Case-insensitive substring over the fields a user would
+// actually type — what identifies the object, plus the reason/message that say what happened to it.
+// `q` is already lowercased by `search_run`.
+fn record_matches_search(rec: &EventRecord, q: &str) -> bool {
+    [&rec.namespace, &rec.name, &rec.kind, &rec.reason, &rec.message]
+        .iter()
+        .any(|f| f.to_lowercase().contains(q))
+}
+
+// Same test against an arbitrary set of fields, for the views that render straight from their own
+// state instead of going through `snapshot`.
+fn fields_match_search<S: AsRef<str>>(fields: &[S], q: &str) -> bool {
+    fields.iter().any(|f| f.as_ref().to_lowercase().contains(q))
+}
+
+// Which rows of a freshly rebuilt snapshot survive the active query, or `None` when there is
+// nothing to drop. Five views keep a display-row vector index-aligned with `snapshot`, so callers
+// feed the *same* keep-set to both: filtering one alone silently desyncs the rendering from the
+// selection. It is a free function precisely so a caller can hold `&mut self.snapshot` and
+// `&mut self.<rows>` at once — and so the filtering never depends on the current mode, which a
+// background refresh can have left somewhere else entirely.
+fn search_keep(query: Option<&str>, snapshot: &[EventRecord]) -> Option<Vec<bool>> {
+    let q = query?;
+    let keep: Vec<bool> = snapshot.iter().map(|r| record_matches_search(r, q)).collect();
+    if keep.iter().all(|k| *k) { return None; }
+    Some(keep)
+}
+
+// Drop the elements whose `keep` flag is false. `keep` is index-aligned with `v`, and `Vec::retain`
+// visits elements in order, so the two stay in step.
+fn retain_aligned<T>(v: &mut Vec<T>, keep: &[bool]) {
+    let mut flags = keep.iter();
+    v.retain(|_| *flags.next().unwrap_or(&true));
 }
 
 // Command palette entries: (canonical name, aliases). Drives `:` palette resolution/completion.
@@ -494,6 +583,13 @@ pub struct App {
     pub log_state: SharedLog,
     pub status_state: SharedStatus,
     pub detail_tab: DetailTab,
+    // What the Logs tab asks the API for: previous run (`p`) and/or a single container (`c`).
+    // Part of the log cache key, so flipping either one refetches.
+    pub log_opts: LogOpts,
+    // `f` re-reads the tail on a timer instead of only when the selection changes. Polling, like
+    // the Flux controller logs, rather than a streamed watch: same cadence, no new machinery.
+    pub log_follow: bool,
+    pub last_log_follow_tick: std::time::Instant,
     pub log_scroll: usize,
     pub status_scroll: usize,
     pub related_scroll: usize,
@@ -530,6 +626,23 @@ pub struct App {
     pub command_input: String,
     pub command_cursor: usize,
     pub command_return_mode: Mode,
+    // Text search (`/`). One query for the whole app rather than one per view: following an object
+    // from one view to the next is the case that matters, and it survives the switch.
+    // `search_query` is what filters; `search_input` is only the buffer being typed in `Mode::Search`.
+    pub search_query: Option<String>,
+    pub search_input: String,
+    pub search_return_mode: Mode,
+    // The full-screen text panels get their own query: there the search highlights and jumps
+    // instead of filtering, and it must not silently re-filter the table underneath — in
+    // `DetailFull` that table is what decides which object the panel is showing.
+    pub text_query: Option<String>,
+    // Line numbers matching `text_query` in the panel currently drawn, and which of them the
+    // viewport is parked on. Recomputed by the draw pass, the only place that knows what is on
+    // screen. `text_search_follow` is set by Ctrl-N/Ctrl-P and consumed by that same pass, which
+    // is where the panel height — and so the scroll arithmetic — is known.
+    pub text_search_hits: Vec<usize>,
+    pub text_search_idx: usize,
+    pub text_search_follow: bool,
     pub flux_state: SharedFlux,
     pub reconcile_status: SharedReconcile,
     // Outcome of the last `h` touch. Its own channel rather than `reconcile_status`, which is only
@@ -682,6 +795,9 @@ impl App {
             log_state,
             status_state,
             detail_tab: DetailTab::Logs,
+            log_opts: LogOpts::default(),
+            log_follow: false,
+            last_log_follow_tick: std::time::Instant::now(),
             log_scroll: 0,
             status_scroll: 0,
             related_scroll: 0,
@@ -717,6 +833,13 @@ impl App {
             command_input: String::new(),
             command_cursor: 0,
             command_return_mode: Mode::Selection,
+            search_query: None,
+            search_input: String::new(),
+            search_return_mode: Mode::Selection,
+            text_query: None,
+            text_search_hits: Vec::new(),
+            text_search_idx: 0,
+            text_search_follow: false,
             flux_state: new_flux_state(),
             reconcile_status: new_reconcile_status(),
             touch_status: new_reconcile_status(),
@@ -838,6 +961,18 @@ impl App {
         // The watcher emits (and re-emits on reconnect) in arbitrary order, so sort by timestamp
         // to present events chronologically with the newest at the bottom (where following anchors).
         snap.sort_by_key(|r| r.time);
+        // The events view has no display-row vector alongside `snapshot`, so the query is applied
+        // here rather than through `apply_search`.
+        if let Some(q) = self.search_query.as_deref() {
+            snap.retain(|r| record_matches_search(r, q));
+            // A query that matches nothing has to empty the view — unlike an empty buffer, which
+            // leaves the last snapshot in place rather than blanking a live feed on a hiccup.
+            if snap.is_empty() {
+                self.snapshot.clear();
+                self.table_state.select(None);
+                return;
+            }
+        }
         if snap.is_empty() { return; }
         let last = snap.len() - 1;
         let idx = match self.selected_uid.as_ref() {
@@ -971,7 +1106,13 @@ impl App {
         // logs of all its pods (one `▼ pod <name>` section each).
         if matches!(self.mode, Mode::Pods | Mode::PodsFull) {
             if let Some((namespace, pods)) = self.selected_workload_pods() {
-                let key = format!("wl-logs:{}|{}/{}", rec.kind, rec.namespace, rec.name);
+                let key = format!(
+                    "wl-logs:{}|{}/{}{}",
+                    rec.kind,
+                    rec.namespace,
+                    rec.name,
+                    self.log_opts.key_suffix()
+                );
                 if self.last_pod_key.as_deref() == Some(&key) { return; }
                 self.last_pod_key = Some(key.clone());
                 {
@@ -983,8 +1124,9 @@ impl App {
                 }
                 let client = self.client.clone();
                 let log_state = self.log_state.clone();
+                let opts = self.log_opts.clone();
                 tokio::spawn(async move {
-                    fetch_workload_logs(client, namespace, pods, key, log_state, 500).await;
+                    fetch_workload_logs(client, namespace, pods, key, log_state, 500, opts).await;
                 });
                 return;
             }
@@ -998,7 +1140,7 @@ impl App {
             self.last_pod_key = None;
             return;
         }
-        let key = format!("{}/{}", rec.namespace, rec.name);
+        let key = format!("{}/{}{}", rec.namespace, rec.name, self.log_opts.key_suffix());
         if self.last_pod_key.as_deref() == Some(&key) { return; }
         self.last_pod_key = Some(key.clone());
         {
@@ -1012,9 +1154,66 @@ impl App {
         let log_state = self.log_state.clone();
         let namespace = rec.namespace.clone();
         let pod = rec.name.clone();
+        let opts = self.log_opts.clone();
         tokio::spawn(async move {
-            fetch_logs(client, namespace, pod, key, log_state, 500).await;
+            fetch_logs(client, namespace, pod, key, log_state, 500, opts).await;
         });
+    }
+
+    // `p` flips the Logs tab between the running container and the run before it. The whole point
+    // of the feature is the CrashLoopBackOff, where the live container was just started and the
+    // reason it died is only in the previous run.
+    fn toggle_log_previous(&mut self) {
+        self.log_opts.previous = !self.log_opts.previous;
+        // A finished run does not grow: following it would poll for lines that can never come.
+        if self.log_opts.previous { self.log_follow = false; }
+        self.reload_logs();
+    }
+
+    // `f` keeps the tail refreshing on its own. Off when showing a previous run, which is finished.
+    fn toggle_log_follow(&mut self) {
+        if self.log_opts.previous {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                "suivi impossible sur un run précédent (terminé)".to_string(),
+            ));
+            return;
+        }
+        self.log_follow = !self.log_follow;
+        self.last_log_follow_tick = std::time::Instant::now();
+    }
+
+    // One follow tick: re-read with the same options. The scroll is left alone — it counts up from
+    // the bottom, so a reader parked above the tail stays the same distance from it.
+    fn follow_logs_tick(&mut self) {
+        self.last_pod_key = None;
+        self.maybe_fetch_logs();
+    }
+
+    // `c` narrows the Logs tab to one container, cycling spec order and back to "all". Does nothing
+    // on a single-container pod, where there is nothing to choose.
+    fn cycle_log_container(&mut self) {
+        let containers = self.log_state.lock().expect("log state poisoned").containers.clone();
+        if containers.len() < 2 { return; }
+        self.log_opts.container = match &self.log_opts.container {
+            None => containers.first().cloned(),
+            Some(cur) => match containers.iter().position(|c| c == cur) {
+                // Past the last one, back to showing every container.
+                Some(i) if i + 1 >= containers.len() => None,
+                Some(i) => containers.get(i + 1).cloned(),
+                // The selection moved to a pod without that container: start over.
+                None => None,
+            },
+        };
+        self.reload_logs();
+    }
+
+    // Drop the cached key so the next tick refetches with the options as they now stand. The lines
+    // are left on screen meanwhile rather than blanked — the panel is about to be replaced anyway.
+    fn reload_logs(&mut self) {
+        self.last_pod_key = None;
+        self.log_scroll = 0;
+        self.maybe_fetch_logs();
     }
 
     fn maybe_fetch_status(&mut self) {
@@ -2134,6 +2333,124 @@ impl App {
         }
     }
 
+    // `/` opens the search prompt, pre-filled with the query in force for the view it was opened
+    // from, so refining it does not mean retyping it. The query itself stays applied while typing:
+    // the view keeps showing the last validated result rather than flickering on every keystroke.
+    fn enter_search(&mut self) {
+        if self.mode == Mode::Search { return; }
+        self.search_return_mode = self.mode;
+        self.search_input = if self.searching_text() {
+            self.text_query.clone().unwrap_or_default()
+        } else {
+            self.search_query.clone().unwrap_or_default()
+        };
+        self.mode = Mode::Search;
+    }
+
+    // Move to the next/previous match in a text panel, wrapping around at the ends. Only the index
+    // moves here: where the viewport has to land depends on the panel's height, which the draw pass
+    // is the one to know, so it is flagged and settled there.
+    fn jump_text_match(&mut self, delta: i32) {
+        if self.text_search_hits.is_empty() { return; }
+        let n = self.text_search_hits.len() as i32;
+        self.text_search_idx = (self.text_search_idx as i32 + delta).rem_euclid(n) as usize;
+        self.text_search_follow = true;
+    }
+
+    // How many rows the current view is showing. Only used to report the effect of a search, so it
+    // goes through the very helpers the views draw from rather than second-guessing them.
+    fn visible_row_count(&self) -> usize {
+        match self.mode {
+            Mode::Rbac | Mode::RbacFull => self.rbac_visible().len(),
+            Mode::Vuln | Mode::VulnFull => self.vuln_rows().len(),
+            Mode::Secrets | Mode::SecretsFull => self.secret_rows().len(),
+            Mode::Configmaps | Mode::ConfigmapsFull => self.configmap_rows().len(),
+            _ => self.snapshot.len(),
+        }
+    }
+
+    // Whether `/` in the current context searches scrolled text rather than narrowing a row list.
+    // The YAML overlay counts whatever view it was opened from: it is a document on screen, and the
+    // table it covers is not.
+    fn searching_text(&self) -> bool {
+        self.yaml_view.is_some() || is_text_panel_mode(view_mode(self))
+    }
+
+    // The query in force for the current view, whichever of the two slots it lives in.
+    pub fn active_query(&self) -> Option<&str> {
+        if self.searching_text() {
+            self.text_query.as_deref()
+        } else {
+            self.search_query.as_deref()
+        }
+    }
+
+    fn exit_search(&mut self) {
+        self.mode = self.search_return_mode;
+        self.search_input.clear();
+    }
+
+    fn search_push(&mut self, c: char) {
+        self.search_input.push(c);
+    }
+
+    fn search_backspace(&mut self) {
+        self.search_input.pop();
+    }
+
+    // Validate the typed query. An empty input clears the search rather than matching everything.
+    // Which of the two queries it lands in depends on the view it was typed from, never on the view
+    // it may end up in.
+    fn search_run(&mut self) {
+        let q = self.search_input.trim().to_lowercase();
+        let q = if q.is_empty() { None } else { Some(q) };
+        self.mode = self.search_return_mode;
+        self.search_input.clear();
+        if self.searching_text() {
+            self.text_query = q;
+            self.text_search_hits.clear();
+            self.text_search_idx = 0;
+        } else {
+            self.search_query = q;
+            self.on_search_changed();
+        }
+    }
+
+    // Drop whichever query is in force for the current view and put it back the way it was.
+    fn clear_search(&mut self) {
+        if self.searching_text() {
+            self.text_query = None;
+            self.text_search_hits.clear();
+            self.text_search_idx = 0;
+        } else if self.search_query.is_some() {
+            self.search_query = None;
+            self.on_search_changed();
+        }
+    }
+
+    // Re-apply the view to the new query without waiting for a network refresh: every view can be
+    // rebuilt from the state it already holds. The cursors of the views that index into a filtered
+    // list go back to the top, since the row they pointed at may no longer be there.
+    fn on_search_changed(&mut self) {
+        // The table's scroll offset survives the rebuild, and a query that cuts a long list down to
+        // a few rows would leave it scrolled past all of them — a view that looks empty but counts
+        // three matches. It only ever grows again from a scroll, so resetting it here is enough.
+        *self.table_state.offset_mut() = 0;
+        self.rbac_cursor = 0;
+        self.vuln_cursor = 0;
+        self.secrets_cursor = 0;
+        self.configmaps_cursor = 0;
+        match self.mode {
+            Mode::Selection => self.refresh_live_snapshot(),
+            Mode::Flux | Mode::FluxFull => self.refresh_flux_snapshot(),
+            Mode::Pods | Mode::PodsFull => self.refresh_pods_snapshot(),
+            Mode::Services | Mode::ServicesFull => self.refresh_net_snapshot(),
+            Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
+            Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
+            _ => {}
+        }
+    }
+
     fn command_run(&mut self) {
         // Enter runs the highlighted suggestion (or the raw input if nothing matches).
         let suggestions = self.command_suggestions();
@@ -2364,6 +2681,10 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.flux_tree_view, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
             self.last_flux_sel_uid = None;
@@ -2927,6 +3248,10 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.net_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
             self.last_net_sel_uid = None;
@@ -3024,11 +3349,20 @@ impl App {
     }
 
     // Indices of bindings passing the active severity floor, highest severity first (already sorted).
+    // The one place the RBAC rows are derived: both the table and the selection go through it, so
+    // the search filter lands here and the cursor can never point past the visible list.
     fn rbac_visible(&self) -> Vec<RbacBinding> {
         let s = self.rbac_state.lock().expect("rbac poisoned");
         s.bindings
             .iter()
             .filter(|b| b.severity >= self.rbac_min_sev)
+            .filter(|b| match self.search_query.as_deref() {
+                None => true,
+                Some(q) => fields_match_search(
+                    &[&b.binding_kind, &b.binding_name, &b.role_ref.label(), &b.scope.label()],
+                    q,
+                ) || b.subjects.iter().any(|s| fields_match_search(&[&s.label()], q)),
+            })
             .cloned()
             .collect()
     }
@@ -3153,12 +3487,24 @@ impl App {
         let s = self.vuln_state.lock().expect("vuln poisoned");
         let mut rows: Vec<VulnRow> = Vec::new();
         if let Some(k8s) = &s.k8s {
-            rows.push(VulnRow::K8s(k8s.clone()));
+            // The k8s row is about the cluster itself, not an image: a search still has to be able
+            // to exclude it, so it is matched on what it actually shows.
+            let keep = match self.search_query.as_deref() {
+                None => true,
+                Some(q) => fields_match_search(&["kubernetes", k8s.server_version.as_str()], q),
+            };
+            if keep {
+                rows.push(VulnRow::K8s(k8s.clone()));
+            }
         }
         rows.extend(
             s.components
                 .iter()
                 .filter(|c| c.max_sev >= self.vuln_min_sev)
+                .filter(|c| match self.search_query.as_deref() {
+                    None => true,
+                    Some(q) => fields_match_search(&[&c.namespace, &c.workload, &c.image, &c.version], q),
+                })
                 .cloned()
                 .map(VulnRow::Image),
         );
@@ -3253,7 +3599,20 @@ impl App {
     // The secrets passing the active filter (already sorted urgent-TLS-first by the fetcher).
     fn secret_rows(&self) -> Vec<SecretInfo> {
         let s = self.secrets_state.lock().expect("secrets poisoned");
-        s.secrets.iter().filter(|x| self.secrets_filter.matches(x)).cloned().collect()
+        s.secrets
+            .iter()
+            .filter(|x| self.secrets_filter.matches(x))
+            // Keys are matched, values never are: the search must not become a way to grep a
+            // secret's content.
+            .filter(|x| match self.search_query.as_deref() {
+                None => true,
+                Some(q) => {
+                    fields_match_search(&[&x.namespace, &x.name, &x.type_], q)
+                        || fields_match_search(&x.data_keys, q)
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     fn secret_selected(&self) -> Option<SecretInfo> {
@@ -3454,6 +3813,10 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.certs_tree_view, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
             self.last_certs_sel_uid = None;
@@ -3747,6 +4110,10 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.ky_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
             self.last_ky_sel_uid = None;
@@ -4227,7 +4594,16 @@ impl App {
     }
 
     fn configmap_rows(&self) -> Vec<ConfigMapInfo> {
-        self.configmaps_state.lock().expect("configmaps poisoned").items.clone()
+        let items = self.configmaps_state.lock().expect("configmaps poisoned").items.clone();
+        let Some(q) = self.search_query.as_deref() else { return items };
+        items
+            .into_iter()
+            .filter(|c| {
+                fields_match_search(&[&c.namespace, &c.name], q)
+                    || fields_match_search(&c.binary_keys, q)
+                    || c.data.iter().any(|(k, _)| k.to_lowercase().contains(q))
+            })
+            .collect()
     }
 
     fn configmap_selected(&self) -> Option<ConfigMapInfo> {
@@ -4396,6 +4772,10 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.pods_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
             self.last_pods_sel_uid = None;
@@ -5205,6 +5585,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull) {
             app.refresh_kyverno_snapshot();
         }
+        // Follow re-reads the tail on the same ~3 s cadence as the Flux controller logs.
+        if app.log_follow && app.last_log_follow_tick.elapsed() >= Duration::from_secs(3) {
+            app.last_log_follow_tick = std::time::Instant::now();
+            app.follow_logs_tick();
+        }
         if app.delete_view.is_some() {
             app.poll_delete();
         }
@@ -5265,10 +5650,16 @@ async fn edit_externally(terminal: &mut DefaultTerminal, path: &std::path::Path)
 fn handle_event(app: &mut App, ev: Event) {
     let Event::Key(k) = ev else { return };
     if k.kind != KeyEventKind::Press { return; }
-    // The YAML panel grabs all input while open (Ctrl-C still quits).
-    if app.yaml_view.is_some() {
+    // The YAML panel grabs all input while open (Ctrl-C still quits) — except while its own search
+    // prompt is up, which the normal dispatcher owns.
+    if app.yaml_view.is_some() && app.mode != Mode::Search {
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('/'), _) => app.enter_search(),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) => app.jump_text_match(1),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.jump_text_match(-1),
+            // Esc gives back the search before it gives back the panel, as everywhere else.
+            (KeyCode::Esc, _) if app.text_query.is_some() => app.clear_search(),
             (KeyCode::Esc | KeyCode::Char('q' | 'y'), _) => app.close_yaml_view(),
             // Straight from reading the object to editing it, on the same selection.
             (KeyCode::Char('e'), _) => {
@@ -5364,6 +5755,32 @@ fn handle_event(app: &mut App, ev: Event) {
     match (k.code, k.modifiers, app.mode) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL, _) => app.should_quit = true,
 
+        // Esc drops the active search before anything else: the query is the most recent thing the
+        // user added to the view, so it is the first thing Esc should take away. The prompt modes
+        // are excluded — there Esc still means "close this prompt".
+        (KeyCode::Esc, _, _)
+            if !matches!(app.mode, Mode::Search | Mode::Command | Mode::NsPicker)
+                && app.active_query().is_some() =>
+        {
+            app.clear_search();
+        }
+
+        // Ctrl-N/Ctrl-P walk the matches in a text panel. `n`/`N` would have been the vim reflex but
+        // both are taken in the table views (namespace filter, Nodes view), and this has to mean the
+        // same thing everywhere.
+        (KeyCode::Char('n'), KeyModifiers::CONTROL, _) if is_text_panel_mode(app.mode) => {
+            app.jump_text_match(1);
+        }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL, _) if is_text_panel_mode(app.mode) => {
+            app.jump_text_match(-1);
+        }
+
+        (KeyCode::Esc, _, Mode::Search) => app.exit_search(),
+        (KeyCode::Enter, _, Mode::Search) => app.search_run(),
+        (KeyCode::Backspace, _, Mode::Search) => app.search_backspace(),
+        (KeyCode::Char(c), m, Mode::Search) if !m.contains(KeyModifiers::CONTROL) => app.search_push(c),
+        (_, _, Mode::Search) => {}
+
         (KeyCode::Esc, _, Mode::Command) => app.exit_command(),
         (KeyCode::Enter, _, Mode::Command) => app.command_run(),
         (KeyCode::Up, _, Mode::Command) => app.move_command_selection(-1),
@@ -5375,6 +5792,31 @@ fn handle_event(app: &mut App, ev: Event) {
 
         (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.enter_command();
+        }
+
+        // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
+        // full-screen text panels. Deliberately absent from the Nodes view, which reads its rows
+        // straight from the shared state with no single place to filter them.
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+            app.enter_search();
+        }
+
+        // Logs tab controls, bound in the views that show it: `p` swaps to the previous run of the
+        // container, `C` narrows to one container, `f` keeps the tail refreshing.
+        (KeyCode::Char('p'), _, Mode::Selection | Mode::DetailFull | Mode::Pods | Mode::PodsFull)
+            if app.detail_tab == DetailTab::Logs =>
+        {
+            app.toggle_log_previous();
+        }
+        (KeyCode::Char('C'), _, Mode::Selection | Mode::DetailFull | Mode::Pods | Mode::PodsFull)
+            if app.detail_tab == DetailTab::Logs =>
+        {
+            app.cycle_log_container();
+        }
+        (KeyCode::Char('f'), _, Mode::Selection | Mode::DetailFull | Mode::Pods | Mode::PodsFull)
+            if app.detail_tab == DetailTab::Logs =>
+        {
+            app.toggle_log_follow();
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
@@ -5912,10 +6354,13 @@ fn handle_event(app: &mut App, ev: Event) {
 // Overlay modes (AI panel, pickers, command palette) reuse a base mode's layout then draw on top.
 fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let area = f.area();
-    if app.mode == Mode::FluxLogs {
+    // The search prompt is an overlay like the palette: everything below it is drawn as the view it
+    // was opened from, so the layout is picked from that view and not from `Mode::Search`.
+    let base_mode = if app.mode == Mode::Search { app.search_return_mode } else { app.mode };
+    if base_mode == Mode::FluxLogs {
         return draw_flux_logs(f, app);
     }
-    let draw_mode = match app.mode {
+    let draw_mode = match base_mode {
         Mode::NsPicker => Mode::Selection,
         Mode::AiPanel => match app.return_mode {
             Mode::NodeUsage => Mode::Nodes,
@@ -5930,6 +6375,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
             _ => Mode::Selection,
         },
+        // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
+        Mode::Search => Mode::Selection,
         m => m,
     };
 
@@ -5969,7 +6416,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
     let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
@@ -5978,7 +6425,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
     let st = lang::t(app.ai_language);
@@ -5993,6 +6440,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => st.mode_diagnostic,
         Mode::Extract => st.mode_extract,
         Mode::Command => st.mode_command,
+        Mode::Search => st.mode_search,
         Mode::Flux | Mode::FluxFull => st.mode_flux,
         Mode::FluxLogs => st.mode_flux,
         Mode::Pods | Mode::PodsFull => st.mode_pods,
@@ -6019,6 +6467,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 if app.mode == Mode::Selection && !app.scroll_frozen { "↻" } else { "" },
                 app.ai_language.label(),
             )),
+            // An active search is announced in the banner and not only by the shorter list: a view
+            // that hides rows must say so, otherwise a missing object reads as a cluster problem.
+            search_banner_span(app),
         ]),
         cluster_banner_line(app),
     ]);
@@ -6065,7 +6516,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -6119,15 +6570,28 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
         ],
-        Mode::DetailFull => vec![
-            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            footer_sep(),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
-            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
-            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
-        ],
+        Mode::DetailFull => {
+            let mut v = vec![
+                Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+                Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
+                Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
+                Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            ];
+            // The log keys only do something on the Logs tab, so they are only offered there.
+            if app.detail_tab == DetailTab::Logs {
+                v.push(footer_sep());
+                v.push(Span::styled(" p ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_prev)));
+                v.push(Span::styled(" C ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_container)));
+                v.push(Span::styled(" f ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_follow)));
+            }
+            v
+        }
         Mode::Nodes => vec![
             Span::styled(" Esc/N ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
@@ -6188,13 +6652,25 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
         ],
-        Mode::PodsFull => vec![
-            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
-            footer_sep(),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
-        ],
+        Mode::PodsFull => {
+            let mut v = vec![
+                Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+                Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            ];
+            if app.detail_tab == DetailTab::Logs {
+                v.push(footer_sep());
+                v.push(Span::styled(" p ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_prev)));
+                v.push(Span::styled(" C ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_container)));
+                v.push(Span::styled(" f ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_log_follow)));
+            }
+            v
+        }
         Mode::Rbac => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
@@ -6345,7 +6821,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
+        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
     // Second line: the tool bar available in every view, always grouped at the same place.
     let has_copy = !matches!(
@@ -6353,6 +6829,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull
     );
     let mut global_spans = Vec::new();
+    // `/` works in every view this bar is drawn under, so it belongs here rather than repeated in
+    // each per-mode footer.
+    global_spans.push(Span::styled(" / ", kbg));
+    global_spans.push(Span::raw(format!(" {}   ", st.k_search)));
     if has_copy {
         global_spans.push(Span::styled(" c ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_copy)));
@@ -6417,23 +6897,25 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         footer_a,
     );
 
-    if app.mode == Mode::NsPicker {
+    // These popups are the body of their mode, not decorations on top of it: they are keyed on
+    // `base_mode` so opening the search prompt over one does not make it vanish.
+    if base_mode == Mode::NsPicker {
         draw_ns_picker_popup(f, app, area);
     }
-    if app.mode == Mode::NodeUsage
-        || (app.mode == Mode::AiPanel && app.return_mode == Mode::NodeUsage)
+    if base_mode == Mode::NodeUsage
+        || (base_mode == Mode::AiPanel && app.return_mode == Mode::NodeUsage)
     {
         draw_node_usage_popup(f, app, area);
     }
-    if app.mode == Mode::Diagnostic
-        || (app.mode == Mode::AiPanel && app.return_mode == Mode::Diagnostic)
+    if base_mode == Mode::Diagnostic
+        || (base_mode == Mode::AiPanel && app.return_mode == Mode::Diagnostic)
     {
         draw_diagnostic_popup(f, app, area);
     }
-    if app.mode == Mode::Extract {
+    if base_mode == Mode::Extract {
         draw_extract_popup(f, app, area);
     }
-    if app.mode == Mode::AiPanel {
+    if base_mode == Mode::AiPanel {
         draw_ai_panel_popup(f, app, area);
     }
     if app.mode == Mode::Command {
@@ -6456,6 +6938,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.edit_view.is_some() {
         draw_edit_popup(f, app, area);
+    }
+    // Last, so the prompt sits on top of whatever panel it was opened over — the YAML overlay
+    // included, which is drawn well after the base view.
+    if app.mode == Mode::Search {
+        draw_search_popup(f, app, area);
     }
 
     visible_rows
@@ -6797,6 +7284,38 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 // Full-screen YAML of the selected object, in its neat or raw form. Only the visible window is
 // built and colourised, so a large manifest costs the same to draw as a small one.
+// Match the query against the whole YAML document, park the window on the current match when the
+// user just asked to jump, and return that match's absolute line. Separate from `run_text_search`
+// because this panel owns its slicing: the lines it hands to the Paragraph are already the window.
+fn yaml_text_search(app: &mut App, doc: &[&str], inner_h: usize, scroll: &mut usize) -> Option<usize> {
+    let Some(q) = app.text_query.clone() else {
+        app.text_search_hits.clear();
+        return None;
+    };
+    let hits: Vec<usize> = doc
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect();
+    if hits.is_empty() {
+        app.text_search_hits.clear();
+        app.text_search_idx = 0;
+        app.text_search_follow = false;
+        return None;
+    }
+    if app.text_search_idx >= hits.len() {
+        app.text_search_idx = hits.len() - 1;
+    }
+    if app.text_search_follow {
+        app.text_search_follow = false;
+        *scroll = hits[app.text_search_idx].saturating_sub(inner_h / 2);
+    }
+    let current = hits[app.text_search_idx];
+    app.text_search_hits = hits;
+    Some(current)
+}
+
 fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (loading, error, content) = {
         let s = app.yaml_state.lock().expect("yaml state poisoned");
@@ -6831,17 +7350,34 @@ fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         scroll = 0;
         (vec![Line::from(Span::styled(st.lbl_loading, Style::default().fg(Color::Yellow)))], Color::Yellow)
     } else {
-        let total = content.lines().count();
-        scroll = scroll.min(total.saturating_sub(inner_h));
-        (
-            content
-                .lines()
-                .skip(scroll)
-                .take(inner_h)
-                .map(|l| colorize_yaml_line(&slice_from(l, h_scroll)))
-                .collect(),
-            Color::Cyan,
-        )
+        // Unlike the other panels this one slices the document itself rather than letting the
+        // Paragraph scroll it, so the search runs over the whole manifest here and the highlight is
+        // mapped back onto the window that ends up on screen.
+        let all: Vec<&str> = content.lines().collect();
+        let current_hit = yaml_text_search(app, &all, inner_h, &mut scroll);
+        scroll = scroll.min(all.len().saturating_sub(inner_h));
+        let mut lines: Vec<Line<'static>> = all
+            .iter()
+            .skip(scroll)
+            .take(inner_h)
+            .map(|l| colorize_yaml_line(&slice_from(l, h_scroll)))
+            .collect();
+        let window: Vec<usize> = app
+            .text_search_hits
+            .iter()
+            .filter(|&&i| i >= scroll && i < scroll + inner_h)
+            .map(|&i| i - scroll)
+            .collect();
+        if !window.is_empty() {
+            // The current match may be scrolled out of the window; `usize::MAX` then matches no
+            // rank, so the visible ones are all painted as ordinary matches.
+            let rank = current_hit
+                .and_then(|abs| abs.checked_sub(scroll))
+                .and_then(|rel| window.iter().position(|&w| w == rel))
+                .unwrap_or(usize::MAX);
+            highlight_text_matches(&mut lines, &window, rank);
+        }
+        (lines, Color::Cyan)
     };
     if let Some(v) = app.yaml_view.as_mut() {
         v.scroll = scroll;
@@ -6852,19 +7388,31 @@ fn draw_yaml_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .clipboard_status_active()
         .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
-    let title = format!(
-        " YAML {} [{}]  t {}  ↑↓ {}  ←→ {}  g/G {}  c {}  e {}  Esc {}{} ",
-        obj_title,
-        mode_label,
-        st.k_yaml_toggle,
-        st.k_scroll,
-        st.k_h_scroll,
-        st.k_top_bot,
-        st.k_copy,
-        st.k_edit,
-        st.k_close,
-        clip_suffix,
-    );
+    // The banner is covered by this popup, so the search state has to be said in the title. The key
+    // hints step aside for it rather than being appended: the title is already close to the popup's
+    // width, and a state that gets truncated away is worse than a reminder the user no longer needs.
+    let tail = match app.text_query.as_deref() {
+        Some(q) => {
+            let pos = if app.text_search_hits.is_empty() {
+                "0".to_string()
+            } else {
+                format!("{}/{}", app.text_search_idx + 1, app.text_search_hits.len())
+            };
+            format!("  /{} ({})  ^N/^P {}  Esc {}", q, pos, st.k_nav, st.k_close)
+        }
+        None => format!(
+            "  t {}  ↑↓ {}  ←→ {}  g/G {}  / {}  c {}  e {}  Esc {}",
+            st.k_yaml_toggle,
+            st.k_scroll,
+            st.k_h_scroll,
+            st.k_top_bot,
+            st.k_search,
+            st.k_copy,
+            st.k_edit,
+            st.k_close,
+        ),
+    };
+    let title = format!(" YAML {} [{}]{}{} ", obj_title, mode_label, tail, clip_suffix);
 
     let p = Paragraph::new(lines).block(
         Block::default()
@@ -7523,6 +8071,47 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
     ]
 }
 
+// The banner tail announcing the active search, with how many rows survived it. Empty when nothing
+// is filtered, so the header reads exactly as before when the feature is not in use.
+fn search_banner_span(app: &App) -> Span<'static> {
+    let Some(q) = app.active_query() else { return Span::raw("") };
+    let label = if app.searching_text() {
+        // In a text panel the query jumps rather than filters: the useful number is the position
+        // within the matches, and there is no "n of m rows" to report.
+        if app.text_search_hits.is_empty() {
+            format!("  /{}  (0)", q)
+        } else {
+            format!(
+                "  /{}  ({}/{})",
+                q,
+                app.text_search_idx + 1,
+                app.text_search_hits.len()
+            )
+        }
+    } else {
+        format!("  /{}  ({})", q, app.visible_row_count())
+    };
+    Span::styled(
+        label,
+        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )
+}
+
+// The search state as a title suffix, for the panels that cover the banner where it normally sits.
+// Empty when no text query is active, so those titles are untouched the rest of the time.
+fn text_search_title_suffix(app: &App) -> String {
+    match app.text_query.as_deref() {
+        None => String::new(),
+        Some(q) if app.text_search_hits.is_empty() => format!(" · /{} (0) ", q),
+        Some(q) => format!(
+            " · /{} ({}/{}) ^N/^P ",
+            q,
+            app.text_search_idx + 1,
+            app.text_search_hits.len()
+        ),
+    }
+}
+
 fn cluster_banner_line(app: &App) -> Line<'static> {
     let info = app.cluster_info.lock().expect("cluster info poisoned").clone();
     let label = Style::default().fg(SYS_DIM);
@@ -7711,6 +8300,9 @@ fn draw_diagnostic_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let visible_h = body_a.height.saturating_sub(2) as usize;
     let max_scroll = all_lines.len().saturating_sub(visible_h);
     if app.diagnostic_scroll > max_scroll { app.diagnostic_scroll = max_scroll; }
+    // This panel scrolls from the top, so the offset `run_text_search` returns is used as is.
+    let top = run_text_search(app, &mut all_lines, visible_h, app.diagnostic_scroll);
+    app.diagnostic_scroll = top.min(max_scroll);
 
     let p = Paragraph::new(all_lines)
         .scroll((app.diagnostic_scroll as u16, 0))
@@ -7718,7 +8310,14 @@ fn draw_diagnostic_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} ({} ok / {} warn / {} err) ", st.lbl_steps, ok_n, warn_n, err_n)),
+                .title(format!(
+                    " {} ({} ok / {} warn / {} err){}",
+                    st.lbl_steps,
+                    ok_n,
+                    warn_n,
+                    err_n,
+                    text_search_title_suffix(app),
+                )),
         );
     f.render_widget(p, body_a);
 
@@ -7766,7 +8365,7 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
     let title = format!(
-        " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}  m {}{}  c copier  Esc {}{}{} ",
+        " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}  m {}{}  c copier  Esc {}{}{}{} ",
         st.title_ai_analysis,
         app.ai_language.label(),
         app.ai_provider_name(),
@@ -7777,11 +8376,12 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         st.k_provider,
         extra_keys,
         st.k_close,
+        text_search_title_suffix(app),
         export_suffix,
         clip_suffix,
     );
 
-    let (lines, border_color): (Vec<Line<'static>>, Color) = if let Some(e) = error {
+    let (mut lines, border_color): (Vec<Line<'static>>, Color) = if let Some(e) = error {
         (
             e.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red)))).collect(),
             Color::Red,
@@ -7798,6 +8398,9 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_h);
     if app.ai_scroll > max_scroll { app.ai_scroll = max_scroll; }
+    // This panel scrolls from the top, so the offset `run_text_search` returns is used as is.
+    let top = run_text_search(app, &mut lines, inner_h, app.ai_scroll);
+    app.ai_scroll = top.min(max_scroll);
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -8904,6 +9507,7 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if app.rbac_detail_scroll > max_scroll {
         app.rbac_detail_scroll = max_scroll;
     }
+    app.rbac_detail_scroll = text_search_top(app, Mode::RbacFull, &mut lines, visible, app.rbac_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.rbac_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -9069,7 +9673,7 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let (title, lines) = match &row {
+    let (title, mut lines) = match &row {
         VulnRow::K8s(k) => vuln_k8s_lines(k),
         VulnRow::Image(c) => vuln_image_lines(c),
     };
@@ -9079,6 +9683,7 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if app.vuln_detail_scroll > max_scroll {
         app.vuln_detail_scroll = max_scroll;
     }
+    app.vuln_detail_scroll = text_search_top(app, Mode::VulnFull, &mut lines, visible, app.vuln_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.vuln_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -9303,13 +9908,14 @@ fn draw_secrets_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let (title, lines) = secret_detail_lines(&s, app.secrets_reveal);
+    let (title, mut lines) = secret_detail_lines(&s, app.secrets_reveal);
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     if app.secrets_detail_scroll > max_scroll {
         app.secrets_detail_scroll = max_scroll;
     }
+    app.secrets_detail_scroll = text_search_top(app, Mode::SecretsFull, &mut lines, visible, app.secrets_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.secrets_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -9735,13 +10341,14 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let facts = cert_secret_facts(app, &resources, idx);
-    let (title, lines) = cert_chain_lines(idx, &resources, facts.as_ref());
+    let (title, mut lines) = cert_chain_lines(idx, &resources, facts.as_ref());
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     if app.certs_detail_scroll > max_scroll {
         app.certs_detail_scroll = max_scroll;
     }
+    app.certs_detail_scroll = text_search_top(app, Mode::CertsFull, &mut lines, visible, app.certs_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.certs_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -10393,6 +11000,7 @@ fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if app.ky_detail_scroll > max_scroll {
         app.ky_detail_scroll = max_scroll;
     }
+    app.ky_detail_scroll = text_search_top(app, Mode::KyvernoFull, &mut lines, visible, app.ky_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.ky_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -10846,13 +11454,14 @@ fn draw_configmaps_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let (title, lines) = configmap_detail_lines(&cm);
+    let (title, mut lines) = configmap_detail_lines(&cm);
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     if app.configmaps_detail_scroll > max_scroll {
         app.configmaps_detail_scroll = max_scroll;
     }
+    app.configmaps_detail_scroll = text_search_top(app, Mode::ConfigmapsFull, &mut lines, visible, app.configmaps_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
         .scroll((app.configmaps_detail_scroll as u16, app.configmaps_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -11208,6 +11817,39 @@ fn flux_msg_width(area_width: u16, fixed: u16, ncols: u16) -> usize {
     inner.saturating_sub(fixed).saturating_sub(ncols.saturating_sub(1)).max(20) as usize
 }
 
+// The `/` prompt. A single input line, no suggestion list: unlike the palette there is no closed
+// set of valid answers to complete against. The hint line says what the query will do, which is not
+// the same thing in a table view and in a scrolled text panel.
+fn draw_search_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let popup_w = 56.min(area.width.saturating_sub(2)).max(20);
+    let popup_area = centered_rect(popup_w, 4, area);
+    f.render_widget(Clear, popup_area);
+
+    let st = lang::t(app.ai_language);
+    let hint = if is_text_panel_mode(app.search_return_mode) {
+        st.search_hint_text
+    } else {
+        st.search_hint_table
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                app.search_input.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(Span::styled(format!("  {}", hint), Style::default().fg(DIM))),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" {} · Enter={} Esc ", st.mode_search, st.k_confirm));
+    f.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
 fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let suggestions = app.command_suggestions();
 
@@ -11324,12 +11966,73 @@ fn line_plain(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+// Indices of the lines containing the query. `q` is already lowercased.
+fn text_match_lines(lines: &[Line], q: &str) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| line_plain(l).to_lowercase().contains(q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// Paint the matching lines, the current one brighter. The whole line is highlighted rather than the
+// matched substring: the spans already carry their own colours, and splitting them to inject a
+// boundary would mean rebuilding every styled segment of a log line. Only the background is set —
+// the spans keep their foreground, so nothing becomes unreadable.
+fn highlight_text_matches(lines: &mut [Line<'static>], hits: &[usize], current: usize) {
+    for (rank, &i) in hits.iter().enumerate() {
+        let Some(line) = lines.get_mut(i) else { continue };
+        let bg = if rank == current { Color::Rgb(140, 110, 0) } else { Color::Rgb(60, 48, 0) };
+        line.style = line.style.bg(bg);
+    }
+}
+
+// Recompute the matches of a text panel, park the viewport on the current one when the user just
+// asked to jump, and highlight them. Returns the scroll offset the panel should use, counted from
+// the *top* — callers on the bottom-anchored convention convert it.
+//
+// It all happens in the draw pass because that is the only place that knows the panel's height,
+// which is what decides where a match has to sit for the user to see it.
+fn run_text_search(
+    app: &mut App,
+    lines: &mut Vec<Line<'static>>,
+    visible: usize,
+    current_top: usize,
+) -> usize {
+    let Some(q) = app.text_query.clone() else {
+        app.text_search_hits.clear();
+        return current_top;
+    };
+    let hits = text_match_lines(lines, &q);
+    if hits.is_empty() {
+        app.text_search_hits.clear();
+        app.text_search_idx = 0;
+        app.text_search_follow = false;
+        return current_top;
+    }
+    // The panel's content changes under the search (logs stream, a diagnostic re-runs), so the
+    // index is clamped every frame rather than assumed still valid.
+    if app.text_search_idx >= hits.len() {
+        app.text_search_idx = hits.len() - 1;
+    }
+    let top = if app.text_search_follow {
+        app.text_search_follow = false;
+        // Centre the match rather than putting it on the first line: in a log, the lines around a
+        // match are most of the reason for looking for it.
+        hits[app.text_search_idx].saturating_sub(visible / 2)
+    } else {
+        current_top
+    };
+    highlight_text_matches(lines, &hits, app.text_search_idx);
+    app.text_search_hits = hits;
+    top
+}
+
 // Plain text of the detail panel tab currently displayed, matching draw_detail's tab/node logic
 // (RBAC has its own panel and is not handled here — copy is not wired for those modes).
 fn detail_visible_text(app: &App) -> String {
-    let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Nodes | Mode::NodesFull));
+    let is_node_mode = matches!(view_mode(app), Mode::Nodes | Mode::NodesFull | Mode::NodeUsage);
     let lines = if is_node_mode {
         status_lines(app)
     } else {
@@ -11343,52 +12046,38 @@ fn detail_visible_text(app: &App) -> String {
 }
 
 fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let is_rbac_mode = matches!(app.mode, Mode::Rbac | Mode::RbacFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Rbac | Mode::RbacFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Rbac | Mode::RbacFull));
+    let is_rbac_mode = matches!(view_mode(app), Mode::Rbac | Mode::RbacFull);
     if is_rbac_mode {
         draw_rbac_detail(f, app, area);
         return;
     }
-    let is_vuln_mode = matches!(app.mode, Mode::Vuln | Mode::VulnFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Vuln | Mode::VulnFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Vuln | Mode::VulnFull));
+    let is_vuln_mode = matches!(view_mode(app), Mode::Vuln | Mode::VulnFull);
     if is_vuln_mode {
         draw_vuln_detail(f, app, area);
         return;
     }
-    let is_secrets_mode = matches!(app.mode, Mode::Secrets | Mode::SecretsFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Secrets | Mode::SecretsFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Secrets | Mode::SecretsFull));
+    let is_secrets_mode = matches!(view_mode(app), Mode::Secrets | Mode::SecretsFull);
     if is_secrets_mode {
         draw_secrets_detail(f, app, area);
         return;
     }
-    let is_certs_mode = matches!(app.mode, Mode::Certs | Mode::CertsFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Certs | Mode::CertsFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Certs | Mode::CertsFull));
+    let is_certs_mode = matches!(view_mode(app), Mode::Certs | Mode::CertsFull);
     if is_certs_mode {
         draw_certs_detail(f, app, area);
         return;
     }
 
-    let is_kyverno_mode = matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Kyverno | Mode::KyvernoFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Kyverno | Mode::KyvernoFull));
+    let is_kyverno_mode = matches!(view_mode(app), Mode::Kyverno | Mode::KyvernoFull);
     if is_kyverno_mode {
         draw_kyverno_detail(f, app, area);
         return;
     }
-    let is_configmaps_mode = matches!(app.mode, Mode::Configmaps | Mode::ConfigmapsFull)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Configmaps | Mode::ConfigmapsFull))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Configmaps | Mode::ConfigmapsFull));
+    let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
     if is_configmaps_mode {
         draw_configmaps_detail(f, app, area);
         return;
     }
-    let is_node_mode = matches!(app.mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage)
-        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Nodes | Mode::NodesFull | Mode::NodeUsage))
-        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Nodes | Mode::NodesFull));
+    let is_node_mode = matches!(view_mode(app), Mode::Nodes | Mode::NodesFull | Mode::NodeUsage);
     let title = if is_node_mode {
         let name = {
             let s = app.node_list_state.lock().expect("node list poisoned");
@@ -11399,16 +12088,22 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             tab_span("Logs", app.detail_tab == DetailTab::Logs),
             Span::raw(" │ "),
             tab_span("Status", app.detail_tab == DetailTab::Status),
             Span::raw(" │ "),
             tab_span("Related", app.detail_tab == DetailTab::Related),
-        ])
+        ];
+        // What the Logs tab is actually showing has to be on screen: an empty panel means one thing
+        // on the running container and the exact opposite on a previous run.
+        if app.detail_tab == DetailTab::Logs {
+            spans.extend(log_opts_spans(app));
+        }
+        Line::from(spans)
     };
 
-    let lines: Vec<Line<'static>> = if is_node_mode {
+    let mut lines: Vec<Line<'static>> = if is_node_mode {
         status_lines(app)
     } else {
         match app.detail_tab {
@@ -11433,11 +12128,27 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         *target
     };
 
-    let scroll = if total > visible {
+    let mut scroll = if total > visible {
         (total - visible).saturating_sub(scroll_offset) as u16
     } else {
         0
     };
+
+    // The search only runs when this panel is the whole screen: in the split view `/` filters the
+    // table it follows, and under a popup (diagnostic, AI) the search belongs to the popup — running
+    // it here would swallow the jump meant for what is on top.
+    if matches!(
+        view_mode(app),
+        Mode::DetailFull | Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::ServicesFull
+    ) {
+        let top = run_text_search(app, &mut lines, visible, scroll as usize);
+        if top != scroll as usize {
+            scroll = top.min(max_scroll) as u16;
+            // The panel's own scroll counts up from the bottom; store the jump there too, or the
+            // next arrow key would yank the viewport back to where it was.
+            *app.scroll_target() = max_scroll.saturating_sub(scroll as usize);
+        }
+    }
 
     // Wrap the Status tab (and node status) so long condition messages — typically a Flux
     // reconciliation error — are fully visible instead of being cut at the right edge. Logs and
@@ -11458,6 +12169,35 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     f.render_widget(p, area);
 }
 
+
+// Badges appended to the detail tabs saying what the Logs tab is reading: the previous run, a
+// single container, and whether the tail is refreshing on its own. Nothing is shown when all three
+// are at their defaults, so the usual case reads exactly as before.
+fn log_opts_spans(app: &App) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if app.log_opts.previous {
+        out.push(Span::raw("  "));
+        out.push(Span::styled(
+            " previous ",
+            Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(c) = &app.log_opts.container {
+        out.push(Span::raw(" "));
+        out.push(Span::styled(
+            format!(" {} ", c),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ));
+    }
+    if app.log_follow {
+        out.push(Span::raw(" "));
+        out.push(Span::styled(
+            " ↻ follow ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
+    }
+    out
+}
 
 fn tab_span(label: &str, active: bool) -> Span<'static> {
     if active {
@@ -11662,7 +12402,7 @@ fn draw_flux_logs(f: &mut ratatui::Frame, app: &mut App) -> usize {
     ]);
     f.render_widget(header, layout[0]);
 
-    let lines = flux_logs_lines(app);
+    let mut lines = flux_logs_lines(app);
     let visible = layout[1].height.saturating_sub(2) as usize;
     let total = lines.len();
     let max_scroll = total.saturating_sub(visible);
@@ -11671,11 +12411,16 @@ fn draw_flux_logs(f: &mut ratatui::Frame, app: &mut App) -> usize {
         if *target > max_scroll { *target = max_scroll; }
         *target
     };
-    let scroll = if total > visible {
+    let mut scroll = if total > visible {
         (total - visible).saturating_sub(scroll_offset) as u16
     } else {
         0
     };
+    let top = run_text_search(app, &mut lines, visible, scroll as usize);
+    if top != scroll as usize {
+        scroll = top.min(max_scroll) as u16;
+        *app.scroll_target() = max_scroll.saturating_sub(scroll as usize);
+    }
     let p = Paragraph::new(lines)
         .scroll((scroll, 0))
         .block(Block::default().borders(Borders::ALL).title("flux logs"));

@@ -5,7 +5,8 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 ## Fonctionnalités
 
 - **Flux d'évènements live** : watch des `Event` Kubernetes avec filtrage All / Warnings / Errors et mise en évidence des `reason` critiques.
-- **Vue détail** : logs du pod concerné, status de l'objet, et ressources liées (onglets Logs / Status / Related).
+- **Vue détail** : logs du pod concerné, status de l'objet, et ressources liées (onglets Logs / Status / Related). Les logs se lisent sur le **run précédent** (`p` — le cas du `CrashLoopBackOff`, où le container qui tourne ne dit rien), container par container (`C`), et en **suivi** (`f`).
+- **Recherche (`/`)** : depuis toutes les vues. Dans une table elle ne garde que les lignes qui correspondent ; dans un panneau texte (logs, diagnostic, IA, YAML) elle surligne et saute d'une occurrence à l'autre (`Ctrl-N`/`Ctrl-P`). Le bandeau annonce toujours la requête active et son effet.
 - **Vue Nodes** : liste des nœuds, détail plein écran, et vue d'usage (CPU/mémoire requests, tri configurable).
 - **Diagnostic cluster** : batterie de vérifications (version, namespaces système, kube-system, CoreDNS, CNI, webhooks, Rancher, pods en erreur, PV, évènements warning récents…).
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
@@ -100,6 +101,8 @@ défilement live est actif.
 | `g` / `G` | Haut / bas du détail |
 | `a` / `w` / `x` | Filtre All / Warnings / Errors |
 | `:` | Palette de commandes (style k9s) |
+| `/` | Recherche |
+| `p` / `C` / `f` | Logs : run précédent / container / suivi (onglet Logs) |
 | `n` | Filtrer sur le namespace de l'évènement sélectionné |
 | `0` | Retirer le filtre namespace (tous namespaces confondus) |
 | `N` | Nodes du pod sélectionné |
@@ -114,6 +117,54 @@ défilement live est actif.
 | `m` | Fournisseur IA suivant |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
+
+### Recherche (`/`)
+
+Disponible depuis **toutes les vues**. `/` ouvre une invite, `Entrée` valide, `Esc` annule.
+La requête est insensible à la casse et **survit au changement de vue** : c'est le cas utile
+quand on suit un objet d'une vue à l'autre. Le bandeau affiche la requête active et son effet
+(`/coredns  (3)`) — une vue qui cache des lignes doit le dire, sinon un objet manquant se lit
+comme un problème de cluster. `Esc` retire la recherche **avant** de faire quoi que ce soit
+d'autre.
+
+Ce que `/` fait dépend de ce qui est affiché :
+
+- **Vue tabulaire** : ne garde que les lignes qui correspondent. Sont testés le namespace, le
+  nom, le kind, la `reason` et le message — et, selon la vue, ce qui l'identifie : sujets et
+  rôles en RBAC, image et workload en vulnérabilités, clés (jamais les valeurs) en
+  secrets/configmaps. Dans les vues arborescentes, un parent qui ne correspond pas disparaît et
+  ses enfants s'affichent à plat.
+- **Panneau texte** (détail plein écran, logs Flux, diagnostic, panneau IA, YAML) : surligne les
+  lignes correspondantes et saute de l'une à l'autre avec `Ctrl-N` / `Ctrl-P` (avec bouclage).
+  Le bandeau indique la position (`/glob  (3/500)`). `n`/`N` ne sont pas utilisés : ils sont déjà
+  pris par le filtre namespace et la vue Nodes.
+
+Les deux requêtes sont indépendantes : filtrer une table sur `coredns` puis chercher `image`
+dans son YAML ne mélange pas les deux.
+
+> La vue Nodes est la seule sans recherche : elle lit ses lignes directement dans l'état partagé,
+> sans endroit unique où les filtrer.
+
+### Logs d'un pod (`p` / `C` / `f`)
+
+Dans l'onglet **Logs** du panneau détail (vue évènements, workloads, et leurs plein écran) :
+
+| Touche | Action |
+|---|---|
+| `p` | Bascule sur le **run précédent** du container (`--previous`) |
+| `C` | Restreint à **un container** (ordre du spec, init d'abord), puis retour à tous |
+| `f` | **Suivi** : relit la fin des logs toutes les ~3 s |
+
+`p` est le raccourci qui compte sur un `CrashLoopBackOff` : le container qui tourne vient d'être
+relancé et ne dit rien, ce qui l'a tué n'est que dans le run qui s'est terminé. Quand ce run
+n'existe pas, kdt le dit (`pas de run précédent`) au lieu de remonter une erreur d'API.
+
+L'état courant est affiché en badge à côté des onglets (` previous `, le nom du container,
+` ↻ follow `) : un panneau vide ne veut pas dire la même chose sur un container qui tourne et sur
+un run terminé. Le suivi est refusé sur un run précédent, qui par définition ne grossit plus.
+
+`C` ne fait rien sur un pod à un seul container. Si la sélection passe à un pod qui n'a pas le
+container demandé, kdt le signale plutôt que d'afficher silencieusement autre chose.
 
 ### YAML de l'objet (`y`)
 
@@ -134,11 +185,12 @@ Deux affichages, bascule par `t` :
 |---|---|
 | `y` | Ouvrir (depuis une vue) / fermer |
 | `t` | Basculer **neat** ↔ **brut** |
+| `/` | Rechercher dans le manifeste (`Ctrl-N`/`Ctrl-P` d'une occurrence à l'autre) |
 | `c` | Copier le YAML affiché |
 | `↑/↓`, `PgUp/PgDn`, `g`/`G` | Scroll |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `r` / `F5` | Recharger l'objet |
-| `Esc` / `q` | Fermer |
+| `Esc` / `q` | Fermer (`Esc` retire d'abord la recherche) |
 
 > Sur un `Secret`, le manifeste contient les valeurs `data` en base64, comme `kubectl get -o yaml`.
 
