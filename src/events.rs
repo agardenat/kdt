@@ -1251,6 +1251,9 @@ pub fn parse_quantity_memory_bytes(q: &str) -> Option<i64> {
         ("E", 1_000_000_000_000_000_000), ("P", 1_000_000_000_000_000),
         ("T", 1_000_000_000_000), ("G", 1_000_000_000),
         ("M", 1_000_000), ("K", 1_000),
+        // Kubernetes writes kilo in lower case ("1k"), the one SI prefix that is not capitalised —
+        // and the one a ResourceQuota uses to say "a thousand pods".
+        ("k", 1_000),
     ];
     for (suf, mult) in suffixes {
         if let Some(s) = q.strip_suffix(suf) {

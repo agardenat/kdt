@@ -205,7 +205,9 @@ pub fn plan(node: &str, pods: &[Pod]) -> Vec<Candidate> {
     out
 }
 
-fn skip_reason(p: &Pod) -> Option<Skip> {
+// Shared with [`crate::capacity`], which asks the same question for the opposite reason: a pod the
+// drain would not move is also a pod the "if this node goes" simulation must not try to re-place.
+pub fn skip_reason(p: &Pod) -> Option<Skip> {
     if p.metadata.deletion_timestamp.is_some() {
         return Some(Skip::Terminating);
     }
@@ -437,8 +439,9 @@ fn selector_matches(
 }
 
 // The pod's effective requests, the way the scheduler computes them: the sum over the containers,
-// floored by the largest init container, which runs alone before them.
-fn pod_requests(p: &Pod) -> (i64, i64) {
+// floored by the largest init container, which runs alone before them. Shared with
+// [`crate::capacity`], so the scheduler's arithmetic is written in one place.
+pub fn pod_requests(p: &Pod) -> (i64, i64) {
     let Some(spec) = &p.spec else { return (0, 0) };
     let sum = spec.containers.iter().fold((0, 0), |(c, m), ct| {
         let (cc, cm) = container_requests(ct.resources.as_ref());

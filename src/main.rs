@@ -4,6 +4,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod ai;
+mod capacity;
 mod certmanager;
 mod cli;
 mod clip;

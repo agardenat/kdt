@@ -147,6 +147,10 @@ use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
 use crate::touch;
+use crate::capacity::{
+    self as cap, fetch_capacity, new_capacity_state, Homeless as CapHomeless, Loss as CapLoss,
+    NodeRoom, Qos as CapQos, QuotaPressure, SharedCapacity, WorkloadSizing,
+};
 use crate::exec;
 use crate::nodeops::{self, new_node_op_state, Reason as NodeReason, SharedNodeOp};
 use crate::yaml::{fetch_yaml, new_yaml_state, SharedYaml};
@@ -296,8 +300,41 @@ impl StoRow {
 }
 
 // How the storage view is filtered (`f`): everything, or only the rows carrying a real problem.
+// The capacity view reuses it: the question — "show me only what is actually wrong" — is the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoFilter { All, Problems }
+
+// The three questions of the capacity view, cycled with `g` off a single fetch: what each node has
+// left (and what its loss would cost), how the workloads are sized, and which quota is about to
+// refuse the next deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapWorld {
+    Nodes,
+    Workloads,
+    Quotas,
+}
+
+// One visual row of the capacity view, index-aligned with the snapshot like every other view.
+#[derive(Debug, Clone)]
+enum CapRow {
+    Node(Box<NodeRoom>),
+    Workload(WorkloadSizing),
+    Quota(QuotaPressure),
+}
+
+impl CapRow {
+    fn hints(&self) -> &[crate::storage::Hint] {
+        match self {
+            CapRow::Node(n) => &n.hints,
+            CapRow::Workload(w) => &w.hints,
+            CapRow::Quota(q) => &q.hints,
+        }
+    }
+
+    fn has_problem(&self) -> bool {
+        self.hints().iter().any(|h| h.level >= StoHintLevel::Warn)
+    }
+}
 
 impl StoFilter {
     fn label(self) -> &'static str {
@@ -387,7 +424,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Certs, CertsFull, Kyverno, KyvernoFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -469,6 +506,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::ConfigmapsFull
             | Mode::ServicesFull
             | Mode::StorageFull
+            | Mode::CapacityFull
     )
 }
 
@@ -558,6 +596,10 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // `:pvc` land on the side of the view the user was already thinking in.
     ("storage", &["stockage", "pvc", "claims", "volumes"]),
     ("pv", &["persistentvolume", "persistentvolumes", "sc", "storageclass", "storageclasses"]),
+    // Headroom: `:capacity` opens on the nodes, `:quota` straight on the quotas — the two ways one
+    // arrives at this view. The workloads world is one `g` away.
+    ("capacity", &["cap", "capacite", "marge", "headroom"]),
+    ("quota", &["quotas", "rq", "resourcequota", "resourcequotas"]),
     ("quit", &["q"]),
 ];
 
@@ -785,6 +827,13 @@ pub struct App {
     // Scroll of the storage detail panel, which is a rendered text panel of its own rather than the
     // generic Logs/Status/Related body.
     sto_detail_scroll: usize,
+    capacity_state: SharedCapacity,
+    cap_rows: Vec<CapRow>,
+    cap_world: CapWorld,
+    cap_filter: StoFilter,
+    pub cap_refresh_handle: Option<JoinHandle<()>>,
+    last_cap_sel_uid: Option<String>,
+    cap_detail_scroll: usize,
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
     pub rbac_state: SharedRbac,
@@ -981,6 +1030,13 @@ impl App {
             sto_world: StoWorld::Claims,
             sto_group: true,
             sto_filter: StoFilter::All,
+            capacity_state: new_capacity_state(),
+            cap_rows: Vec::new(),
+            cap_world: CapWorld::Nodes,
+            cap_filter: StoFilter::All,
+            cap_refresh_handle: None,
+            last_cap_sel_uid: None,
+            cap_detail_scroll: 0,
             sto_refresh_handle: None,
             last_sto_sel_uid: None,
             sto_detail_scroll: 0,
@@ -1758,6 +1814,8 @@ impl App {
             | Mode::ServicesFull
             | Mode::Storage
             | Mode::StorageFull
+            | Mode::Capacity
+            | Mode::CapacityFull
             | Mode::Certs
             | Mode::CertsFull
             | Mode::Kyverno
@@ -2465,6 +2523,7 @@ impl App {
             Mode::Pods | Mode::PodsFull => self.schedule_pods_refresh(800),
             Mode::Services | Mode::ServicesFull => self.refresh_network(),
             Mode::Storage | Mode::StorageFull => self.refresh_storage(),
+            Mode::Capacity | Mode::CapacityFull => self.refresh_capacity(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
             Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
@@ -2839,6 +2898,7 @@ impl App {
             Mode::Pods | Mode::PodsFull => self.refresh_pods_snapshot(),
             Mode::Services | Mode::ServicesFull => self.refresh_net_snapshot(),
             Mode::Storage | Mode::StorageFull => self.refresh_storage_snapshot(),
+            Mode::Capacity | Mode::CapacityFull => self.refresh_capacity_snapshot(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
             _ => {}
@@ -2961,6 +3021,16 @@ impl App {
                 self.leave_special_modes();
                 self.enter_storage_mode(StoWorld::Claims);
             }
+            "capacity" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_capacity_mode(CapWorld::Nodes);
+            }
+            "quota" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_capacity_mode(CapWorld::Quotas);
+            }
             "pv" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -3010,6 +3080,10 @@ impl App {
             }
             Mode::Storage | Mode::StorageFull => {
                 self.stop_storage_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Capacity | Mode::CapacityFull => {
+                self.stop_capacity_auto_refresh();
                 self.clear_status_state();
             }
             _ => {}
@@ -3907,6 +3981,179 @@ impl App {
     // The row under the cursor, for the detail panel.
     fn storage_selected(&self) -> Option<&StoRow> {
         self.sto_rows.get(self.table_state.selected()?)
+    }
+
+    // --- Capacity / headroom view -------------------------------------------------------------
+
+    fn enter_capacity_mode(&mut self, world: CapWorld) {
+        self.mode = Mode::Capacity;
+        self.cap_world = world;
+        self.cap_rows.clear();
+        self.detail_tab = DetailTab::Status;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_cap_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.cap_detail_scroll = 0;
+        self.reset_scroll();
+        self.refresh_capacity();
+        self.start_capacity_auto_refresh();
+        self.refresh_capacity_snapshot();
+    }
+
+    fn exit_capacity_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_capacity_auto_refresh();
+        self.cap_rows.clear();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_cap_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_capacity_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.mode = Mode::CapacityFull;
+    }
+
+    fn exit_capacity_full(&mut self) {
+        self.mode = Mode::Capacity;
+    }
+
+    // `g`: the same snapshot answered from a different angle — no reload, the three worlds come
+    // from one fetch.
+    fn cycle_capacity_world(&mut self) {
+        self.cap_world = match self.cap_world {
+            CapWorld::Nodes => CapWorld::Workloads,
+            CapWorld::Workloads => CapWorld::Quotas,
+            CapWorld::Quotas => CapWorld::Nodes,
+        };
+        self.last_cap_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.cap_detail_scroll = 0;
+        self.reset_scroll();
+        self.refresh_capacity_snapshot();
+    }
+
+    fn cycle_capacity_filter(&mut self) {
+        self.cap_filter = match self.cap_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_capacity_snapshot();
+    }
+
+    fn refresh_capacity(&self) {
+        {
+            let mut s = self.capacity_state.lock().expect("capacity poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.capacity_state.clone();
+        tokio::spawn(async move { fetch_capacity(client, state).await; });
+    }
+
+    // The fetch walks every pod, every node and every ReplicaSet in the cluster and then simulates a
+    // placement per node: a 30 s ticker, not the usual 5 s. None of what it computes moves faster
+    // than a rollout anyway.
+    fn start_capacity_auto_refresh(&mut self) {
+        self.stop_capacity_auto_refresh();
+        let client = self.client.clone();
+        let state = self.capacity_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_capacity(client.clone(), state.clone()).await;
+            }
+        });
+        self.cap_refresh_handle = Some(handle);
+    }
+
+    fn stop_capacity_auto_refresh(&mut self) {
+        if let Some(h) = self.cap_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    fn refresh_capacity_snapshot(&mut self) {
+        let rows: Vec<CapRow> = {
+            let s = self.capacity_state.lock().expect("capacity poisoned");
+            match self.cap_world {
+                CapWorld::Nodes => {
+                    s.nodes.iter().cloned().map(|n| CapRow::Node(Box::new(n))).collect()
+                }
+                CapWorld::Workloads => {
+                    s.workloads.iter().cloned().map(CapRow::Workload).collect()
+                }
+                CapWorld::Quotas => s.quotas.iter().cloned().map(CapRow::Quota).collect(),
+            }
+        };
+        let rows: Vec<CapRow> = match self.cap_filter {
+            StoFilter::All => rows,
+            StoFilter::Problems => rows.into_iter().filter(CapRow::has_problem).collect(),
+        };
+        let recs: Vec<EventRecord> = rows.iter().map(synthetic_capacity_record).collect();
+        self.cap_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.cap_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_cap_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_cap_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_cap_sel_uid = Some(cur_uid);
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_capacity_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_cap_sel_uid = self.selected_uid.clone();
+        self.cap_detail_scroll = 0;
+        self.reset_scroll();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
+    }
+
+    fn capacity_selected(&self) -> Option<&CapRow> {
+        self.cap_rows.get(self.table_state.selected()?)
     }
 
     // --- RBAC security view -------------------------------------------------------------------
@@ -6212,6 +6459,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Storage | Mode::StorageFull) {
             app.refresh_storage_snapshot();
         }
+        if matches!(app.mode, Mode::Capacity | Mode::CapacityFull) {
+            app.refresh_capacity_snapshot();
+        }
         if matches!(app.mode, Mode::Certs | Mode::CertsFull) {
             app.refresh_certs_snapshot();
             app.drain_reconcile_status();
@@ -6460,13 +6710,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_search();
         }
 
@@ -6489,12 +6739,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_edit_view();
         }
 
@@ -6507,12 +6757,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_delete_view();
         }
 
@@ -6957,6 +7207,45 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::ServicesFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ServicesFull) => {}
 
+        (KeyCode::Up, m, Mode::Capacity) if m.contains(KeyModifiers::SHIFT) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_sub(1);
+        }
+        (KeyCode::Down, m, Mode::Capacity) if m.contains(KeyModifiers::SHIFT) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_add(1);
+        }
+        (KeyCode::Up, _, Mode::Capacity) => app.move_capacity_selection(-1),
+        (KeyCode::Down, _, Mode::Capacity) => app.move_capacity_selection(1),
+        (KeyCode::PageUp, _, Mode::Capacity) => app.move_capacity_selection(-10),
+        (KeyCode::PageDown, _, Mode::Capacity) => app.move_capacity_selection(10),
+        (KeyCode::Enter, _, Mode::Capacity) => app.enter_capacity_full(),
+        (KeyCode::Esc, _, Mode::Capacity) => app.exit_capacity_mode(),
+        (KeyCode::Char('g'), _, Mode::Capacity) => app.cycle_capacity_world(),
+        (KeyCode::Char('f'), _, Mode::Capacity) => app.cycle_capacity_filter(),
+        (KeyCode::F(5), _, Mode::Capacity) => app.refresh_capacity(),
+        (KeyCode::Char('i'), _, Mode::Capacity) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Capacity) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Capacity) => {}
+
+        (KeyCode::Up, m, Mode::CapacityFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_sub(1);
+        }
+        (KeyCode::Down, m, Mode::CapacityFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_add(1);
+        }
+        (KeyCode::PageUp, _, Mode::CapacityFull) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_sub(10);
+        }
+        (KeyCode::PageDown, _, Mode::CapacityFull) => {
+            app.cap_detail_scroll = app.cap_detail_scroll.saturating_add(10);
+        }
+        (KeyCode::Char('g'), _, Mode::CapacityFull) => app.cap_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::CapacityFull) => app.cap_detail_scroll = usize::MAX / 2,
+        (KeyCode::Enter, _, Mode::CapacityFull) => app.exit_capacity_full(),
+        (KeyCode::Esc, _, Mode::CapacityFull) => app.exit_capacity_full(),
+        (KeyCode::Char('i'), _, Mode::CapacityFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::CapacityFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::CapacityFull) => {}
+
         (KeyCode::Up, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
         (KeyCode::Left, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
@@ -7091,7 +7380,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -7122,11 +7411,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -7142,8 +7431,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -7171,6 +7460,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
         Mode::Storage | Mode::StorageFull => st.mode_storage,
+        Mode::Capacity | Mode::CapacityFull => st.mode_capacity,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -7235,10 +7525,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_net_tree(f, app, ta);
         } else if draw_mode == Mode::Storage {
             draw_storage_table(f, app, ta);
+        } else if draw_mode == Mode::Capacity {
+            draw_capacity_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -7575,6 +7867,32 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_sto_filter, app.sto_filter.label())),
             ]
         }
+        Mode::Capacity => {
+            let (world, next) = match app.cap_world {
+                CapWorld::Nodes => (st.k_cap_nodes, st.k_cap_workloads),
+                CapWorld::Workloads => (st.k_cap_workloads, st.k_cap_quotas),
+                CapWorld::Quotas => (st.k_cap_quotas, st.k_cap_nodes),
+            };
+            let _ = world;
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Shift+↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_sto_filter, app.cap_filter.label())),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::CapacityFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+        ],
         Mode::StorageFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
@@ -7947,27 +8265,45 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
 // text holds words that do not fit the remainder — and a panel that under-counts its own height
 // pushes its last line, which is always the prompt, off the bottom.
 fn wrapped_rows(line: &Line, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let mut rows = 1usize;
+    wrap_text(&text, width).len()
+}
+
+// Greedy word wrap, breaking mid-word only for a word that cannot fit a line on its own — the same
+// rule `Paragraph`'s `Wrap` follows. Used both to measure a popup and to lay out the panels that
+// scroll, where one `Line` has to be one screen row or the scroll and the search stop agreeing.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
     let mut used = 0usize;
     for word in text.split_whitespace() {
         let w = word.chars().count();
         if used > 0 && used + 1 + w > width {
-            rows += 1;
+            out.push(std::mem::take(&mut cur));
             used = 0;
         }
         if used == 0 {
-            // A word longer than the line is the one case wrapping breaks mid-word.
-            rows += (w.saturating_sub(1)) / width;
-            used = if w == 0 { 0 } else { w - (w.saturating_sub(1) / width) * width };
+            let mut rest = word.chars().peekable();
+            while rest.peek().is_some() {
+                let chunk: String = rest.by_ref().take(width).collect();
+                used = chunk.chars().count();
+                cur.push_str(&chunk);
+                if rest.peek().is_some() {
+                    out.push(std::mem::take(&mut cur));
+                    used = 0;
+                }
+            }
         } else {
+            cur.push(' ');
+            cur.push_str(word);
             used += 1 + w;
         }
     }
-    rows
+    out.push(cur);
+    out
 }
 
 // Ctrl-D panel: the target, what the guard-rails found, and the confirmation prompt matching the
@@ -9861,6 +10197,96 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
 // The EventRecord a storage row stands in for. Severity is taken from the diagnosis rather than from
 // the phase: a Pending claim on a WaitForFirstConsumer class is normal, and a Bound one whose volume
 // will be deleted with it is not — the rules already made that call.
+// Adapt a capacity row into an EventRecord, so the search, the AI panel and the generic object
+// machinery (`y`, Related) work here as everywhere else. The identity is the *object* behind the
+// row — the Node, the workload, the ResourceQuota — not the finding about it.
+fn synthetic_capacity_record(row: &CapRow) -> EventRecord {
+    let now = k8s_openapi::jiff::Timestamp::now();
+    let severity = if row.has_problem() { Severity::Warning } else { Severity::Normal };
+    match row {
+        CapRow::Node(n) => EventRecord {
+            uid: format!("cap|{}", n.uid()),
+            time: now,
+            severity,
+            reason: loss_word(&n.loss).to_string(),
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: String::new(),
+            name: n.name.clone(),
+            message: format!(
+                "réservé cpu {}/{} mem {}/{} · {} pods · {}",
+                cap::cpu_text(n.req_cpu),
+                cap::cpu_text(n.alloc_cpu),
+                cap::mem_text(n.req_mem),
+                cap::mem_text(n.alloc_mem),
+                n.pods,
+                n.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
+            ),
+            component: String::new(),
+            host: n.name.clone(),
+            count: 1,
+        },
+        CapRow::Workload(w) => EventRecord {
+            uid: format!("cap|{}", w.uid()),
+            time: now,
+            severity,
+            reason: w.qos.label().to_string(),
+            api_version: workload_api_version(&w.kind).to_string(),
+            kind: w.kind.clone(),
+            namespace: w.namespace.clone(),
+            name: w.name.clone(),
+            message: format!(
+                "{} pod(s) · requests cpu {} mem {} · {}",
+                w.pods,
+                cap::cpu_text(w.cpu_req),
+                cap::mem_text(w.mem_req),
+                w.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+        CapRow::Quota(q) => EventRecord {
+            uid: format!("cap|{}", q.uid()),
+            time: now,
+            severity,
+            reason: format!("{}%", q.worst_pct()),
+            api_version: "v1".to_string(),
+            kind: "ResourceQuota".to_string(),
+            namespace: q.namespace.clone(),
+            name: q.name.clone(),
+            message: q
+                .items
+                .iter()
+                .map(|i| format!("{} {}/{}", i.resource, i.used_text, i.hard_text))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+    }
+}
+
+// The apiVersion a workload kind lives under, so `y` on a capacity row fetches the right object.
+fn workload_api_version(kind: &str) -> &'static str {
+    match kind {
+        "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" => "apps/v1",
+        "Job" => "batch/v1",
+        "CronJob" => "batch/v1",
+        _ => "v1",
+    }
+}
+
+fn loss_word(loss: &CapLoss) -> &'static str {
+    match loss {
+        CapLoss::Alone => "SeulNoeud",
+        CapLoss::Fits => "Absorbable",
+        CapLoss::Tight => "Juste",
+        CapLoss::Homeless(_) => "SansPlace",
+    }
+}
+
 fn synthetic_storage_record(row: &StoRow) -> EventRecord {
     let now = k8s_openapi::jiff::Timestamp::now();
     let severity = |r: &StoRow| {
@@ -11603,6 +12029,445 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // Storage detail: the facts of the selected object, then what the rules make of them. The cluster's
 // own findings (no default class, storage sleeping in Released volumes) are appended whatever the
 // selection is — they explain rows that look fine on their own line.
+// The capacity table: one shape per world, because the three questions have nothing in common but
+// the fetch. A bar shows the reserved share against the measured one, so "reserved but idle" reads
+// at a glance — that gap *is* the headroom this view is about.
+fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_nodes, n_wl, n_q, metrics) = {
+        let s = app.capacity_state.lock().expect("capacity poisoned");
+        (
+            s.loading,
+            s.error.clone(),
+            s.nodes.len(),
+            s.workloads.len(),
+            s.quotas.len(),
+            s.metrics_available,
+        )
+    };
+    let src = &app.cap_rows;
+    let (world, next) = match app.cap_world {
+        CapWorld::Nodes => ("noeuds", "workloads"),
+        CapWorld::Workloads => ("workloads", "quotas"),
+        CapWorld::Quotas => ("quotas", "noeuds"),
+    };
+    let title = if let Some(e) = &error {
+        format!("capacité (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "capacité (chargement...)".to_string()
+    } else {
+        format!(
+            "capacité/{} ({} noeuds · {} workloads · {} quotas){} · [g] {} · [f] {}",
+            world,
+            n_nodes,
+            n_wl,
+            n_q,
+            if metrics { "" } else { " · sans metrics-server" },
+            next,
+            app.cap_filter.label(),
+        )
+    };
+
+    let (header_row, widths) = match app.cap_world {
+        CapWorld::Nodes => (
+            Row::new(vec![
+                Cell::from("NODE"), Cell::from("CPU RÉSERVÉ"), Cell::from("MEM RÉSERVÉE"),
+                Cell::from("CPU UTIL."), Cell::from("MEM UTIL."), Cell::from("PODS"),
+                Cell::from("SI PERDU"),
+            ]),
+            vec![
+                Constraint::Min(20), Constraint::Length(18), Constraint::Length(18),
+                Constraint::Length(11), Constraint::Length(11), Constraint::Length(8),
+                Constraint::Min(22),
+            ],
+        ),
+        CapWorld::Workloads => (
+            Row::new(vec![
+                Cell::from("NAMESPACE"), Cell::from("KIND"), Cell::from("NAME"), Cell::from("PODS"),
+                Cell::from("CPU REQ→UTIL."), Cell::from("MEM REQ→UTIL."), Cell::from("QOS"),
+                Cell::from("CONSTAT"),
+            ]),
+            vec![
+                Constraint::Length(18), Constraint::Length(12), Constraint::Min(18),
+                Constraint::Length(6), Constraint::Length(16), Constraint::Length(16),
+                Constraint::Length(11), Constraint::Min(20),
+            ],
+        ),
+        CapWorld::Quotas => (
+            Row::new(vec![
+                Cell::from("NAMESPACE"), Cell::from("QUOTA"), Cell::from("RESSOURCE"),
+                Cell::from("UTILISÉ"), Cell::from("PLAFOND"), Cell::from("%"),
+            ]),
+            vec![
+                Constraint::Length(24), Constraint::Min(18), Constraint::Min(22),
+                Constraint::Length(14), Constraint::Length(14), Constraint::Length(6),
+            ],
+        ),
+    };
+    let header_row = header_row
+        .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = src.iter().map(cap_row_cells).collect();
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn cap_row_cells(row: &CapRow) -> Row<'static> {
+    let flag = sto_hint_color(row.hints());
+    let name_style = match flag {
+        Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+        None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    };
+    let dim = Style::default().fg(DIM);
+    match row {
+        CapRow::Node(n) => {
+            let (loss_text, loss_color) = match &n.loss {
+                CapLoss::Alone => ("seul noeud".to_string(), DIM),
+                CapLoss::Fits => ("absorbé ailleurs".to_string(), Color::Green),
+                CapLoss::Tight => ("absorbé, il ne reste rien".to_string(), Color::Rgb(255, 140, 0)),
+                CapLoss::Homeless(v) => {
+                    (format!("{} pod(s) sans place", v.len()), Color::Red)
+                }
+            };
+            Row::new(vec![
+                Cell::from(n.name.clone()).style(name_style),
+                Cell::from(ratio_text(
+                    cap::cpu_text(n.req_cpu),
+                    cap::cpu_text(n.alloc_cpu),
+                    cap::pct(n.req_cpu, n.alloc_cpu),
+                ))
+                .style(pct_style(cap::pct(n.req_cpu, n.alloc_cpu))),
+                Cell::from(ratio_text(
+                    cap::mem_text(n.req_mem),
+                    cap::mem_text(n.alloc_mem),
+                    cap::pct(n.req_mem, n.alloc_mem),
+                ))
+                .style(pct_style(cap::pct(n.req_mem, n.alloc_mem))),
+                match n.use_cpu {
+                    Some(v) => Cell::from(format!("{} ({}%)", cap::cpu_text(v), cap::pct(v, n.alloc_cpu)))
+                        .style(pct_style(cap::pct(v, n.alloc_cpu))),
+                    None => Cell::from("—").style(dim),
+                },
+                match n.use_mem {
+                    Some(v) => Cell::from(format!("{} ({}%)", cap::mem_text(v), cap::pct(v, n.alloc_mem)))
+                        .style(pct_style(cap::pct(v, n.alloc_mem))),
+                    None => Cell::from("—").style(dim),
+                },
+                Cell::from(if n.pod_capacity > 0 {
+                    format!("{}/{}", n.pods, n.pod_capacity)
+                } else {
+                    n.pods.to_string()
+                })
+                .style(dim),
+                Cell::from(loss_text).style(Style::default().fg(loss_color).add_modifier(Modifier::BOLD)),
+            ])
+        }
+        CapRow::Workload(w) => {
+            let arrow = |req: i64, used: Option<i64>, text: fn(i64) -> String| match used {
+                Some(u) => Cell::from(format!("{} → {}", text(req), text(u))),
+                None => Cell::from(text(req)).style(dim),
+            };
+            let qos_color = match w.qos {
+                CapQos::Guaranteed => Color::Green,
+                CapQos::Burstable => DIM,
+                CapQos::BestEffort => Color::Rgb(255, 140, 0),
+            };
+            Row::new(vec![
+                Cell::from(w.namespace.clone()).style(dim),
+                Cell::from(w.kind.clone()).style(dim),
+                Cell::from(w.name.clone()).style(name_style),
+                Cell::from(w.pods.to_string()).style(dim),
+                arrow(w.cpu_req, w.cpu_use, cap::cpu_text),
+                arrow(w.mem_req, w.mem_use, cap::mem_text),
+                Cell::from(w.qos.label()).style(Style::default().fg(qos_color)),
+                Cell::from(
+                    w.hints.first().map(|h| first_sentence(&h.text)).unwrap_or_default(),
+                )
+                .style(Style::default().fg(flag.unwrap_or(DIM))),
+            ])
+        }
+        CapRow::Quota(q) => {
+            // A quota is one object with several counters; the row shows the tightest one, which is
+            // the one that will refuse the next creation, and the panel lists them all.
+            let worst = q.items.first();
+            Row::new(vec![
+                Cell::from(q.namespace.clone()).style(dim),
+                Cell::from(q.name.clone()).style(name_style),
+                Cell::from(worst.map(|i| i.resource.clone()).unwrap_or_default()),
+                Cell::from(worst.map(|i| i.used_text.clone()).unwrap_or_default()),
+                Cell::from(worst.map(|i| i.hard_text.clone()).unwrap_or_default()).style(dim),
+                Cell::from(worst.map(|i| format!("{}%", i.pct())).unwrap_or_default())
+                    .style(pct_style(worst.map(|i| i.pct()).unwrap_or(0))),
+            ])
+        }
+    }
+}
+
+fn ratio_text(used: String, total: String, pct: i64) -> String {
+    format!("{}/{} ({}%)", used, total, pct)
+}
+
+// The same thresholds the rules use, so a coloured cell and a finding never disagree.
+fn pct_style(pct: i64) -> Style {
+    if pct >= 100 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if pct >= 90 {
+        Style::default().fg(Color::Rgb(255, 140, 0))
+    } else if pct >= 70 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    }
+}
+
+// The findings are written as full sentences for the panel; a table cell takes the head of one.
+fn first_sentence(text: &str) -> String {
+    match text.find(" : ") {
+        Some(i) => text[..i].to_string(),
+        None => text.split(" — ").next().unwrap_or(text).to_string(),
+    }
+}
+
+// Capacity detail: the numbers behind the row, then the findings as sentences — and, on a node, the
+// pods that would have nowhere to go, which is the answer this whole view exists for.
+fn draw_capacity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(row) = app.capacity_selected().cloned() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un noeud, un workload ou un quota ",
+            Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" capacité "));
+        f.render_widget(p, area);
+        return;
+    };
+    let cluster_hints = {
+        let s = app.capacity_state.lock().expect("capacity poisoned");
+        s.cluster_hints.clone()
+    };
+    // The findings are sentences, and a sentence that runs off the right edge is a sentence nobody
+    // reads: they are wrapped here, where the width is known, one Line per screen row so the scroll
+    // and the search keep counting the same things.
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let (title, mut lines) = capacity_detail_lines(&row, &cluster_hints, inner_w);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.cap_detail_scroll > max_scroll {
+        app.cap_detail_scroll = max_scroll;
+    }
+    app.cap_detail_scroll = text_search_top(
+        app, Mode::CapacityFull, &mut lines, visible, app.cap_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .scroll((app.cap_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn capacity_detail_lines(
+    row: &CapRow,
+    cluster_hints: &[crate::storage::Hint],
+    width: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<18}", k), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let title = match row {
+        CapRow::Node(n) => {
+            lines.push(label(
+                "CPU",
+                format!(
+                    "réservé {} · limites {} · allocatable {}",
+                    cap::cpu_text(n.req_cpu),
+                    cap::cpu_text(n.lim_cpu),
+                    cap::cpu_text(n.alloc_cpu)
+                ),
+            ));
+            lines.push(label(
+                "mémoire",
+                format!(
+                    "réservée {} · limites {} · allocatable {}",
+                    cap::mem_text(n.req_mem),
+                    cap::mem_text(n.lim_mem),
+                    cap::mem_text(n.alloc_mem)
+                ),
+            ));
+            match (n.use_cpu, n.use_mem) {
+                (Some(c), Some(m)) => lines.push(label(
+                    "utilisé",
+                    format!("cpu {} · mem {}", cap::cpu_text(c), cap::mem_text(m)),
+                )),
+                _ => lines.push(label("utilisé", "— (metrics-server absent)".to_string())),
+            }
+            lines.push(label(
+                "pods",
+                if n.pod_capacity > 0 {
+                    format!("{} sur {} possibles", n.pods, n.pod_capacity)
+                } else {
+                    n.pods.to_string()
+                },
+            ));
+            lines.push(label(
+                "état",
+                format!(
+                    "{} · {}",
+                    if n.ready { "Ready" } else { "NotReady" },
+                    if n.schedulable { "ordonnançable" } else { "cordonné" }
+                ),
+            ));
+            lines.push(Line::from(""));
+            match &n.loss {
+                CapLoss::Alone => lines.push(Line::from(Span::styled(
+                    "  Seul noeud ordonnançable : il n'y a pas d'ailleurs à simuler.",
+                    Style::default().fg(DIM),
+                ))),
+                CapLoss::Fits => lines.push(Line::from(Span::styled(
+                    "  Si ce noeud tombe : tout se replace ailleurs, avec de la marge.",
+                    Style::default().fg(Color::Green),
+                ))),
+                CapLoss::Tight => lines.push(Line::from(Span::styled(
+                    "  Si ce noeud tombe : tout se replace, mais il ne restera presque rien.",
+                    Style::default().fg(Color::Rgb(255, 140, 0)),
+                ))),
+                CapLoss::Homeless(pods) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("  Si ce noeud tombe : {} pod(s) sans place —", pods.len()),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                    for p in pods {
+                        let why = match p.why {
+                            CapHomeless::NoRoom => "aucun noeud restant n'a la place",
+                            CapHomeless::Taints => "aucun noeud restant dont il tolère les taints",
+                            CapHomeless::Selector => "aucun noeud restant ne satisfait son sélecteur",
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "    {}/{}  (cpu {} · mem {})  {}",
+                                p.namespace,
+                                p.name,
+                                cap::cpu_text(p.cpu),
+                                cap::mem_text(p.mem),
+                                why
+                            ),
+                            Style::default().fg(Color::Red),
+                        )));
+                    }
+                    for chunk in wrap_text(
+                        "Simulation en first-fit sur les requests : elle tient compte des taints et des sélecteurs, pas des affinités souples. Le vrai scheduler ne fera pas mieux.",
+                        width.saturating_sub(4).max(20),
+                    ) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", chunk),
+                            Style::default().fg(DIM),
+                        )));
+                    }
+                }
+            }
+            Line::from(Span::styled(
+                format!(" Noeud {} ", n.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        CapRow::Workload(w) => {
+            lines.push(label("pods", w.pods.to_string()));
+            lines.push(label("QoS", w.qos.label().to_string()));
+            lines.push(label(
+                "CPU",
+                match w.cpu_use {
+                    Some(u) => format!(
+                        "requests {} · limites {} · utilisé {}",
+                        cap::cpu_text(w.cpu_req),
+                        cap::cpu_text(w.cpu_lim),
+                        cap::cpu_text(u)
+                    ),
+                    None => format!(
+                        "requests {} · limites {}",
+                        cap::cpu_text(w.cpu_req),
+                        cap::cpu_text(w.cpu_lim)
+                    ),
+                },
+            ));
+            lines.push(label(
+                "mémoire",
+                match w.mem_use {
+                    Some(u) => format!(
+                        "requests {} · limites {} · utilisé {}",
+                        cap::mem_text(w.mem_req),
+                        cap::mem_text(w.mem_lim),
+                        cap::mem_text(u)
+                    ),
+                    None => format!(
+                        "requests {} · limites {}",
+                        cap::mem_text(w.mem_req),
+                        cap::mem_text(w.mem_lim)
+                    ),
+                },
+            ));
+            Line::from(Span::styled(
+                format!(" {} {}/{} ", w.kind, w.namespace, w.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        CapRow::Quota(q) => {
+            for i in &q.items {
+                lines.push(label(
+                    &i.resource,
+                    format!("{} / {}  ({}%)", i.used_text, i.hard_text, i.pct()),
+                ));
+            }
+            Line::from(Span::styled(
+                format!(" ResourceQuota {}/{} ", q.namespace, q.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+    };
+
+    let hints = row.hints();
+    if !hints.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(hint_lines(hints, width));
+    }
+    if !cluster_hints.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Cluster",
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(hint_lines(cluster_hints, width));
+    }
+    (title, lines)
+}
+
+// One finding, wrapped, with its marker on the first row and the continuation aligned under the
+// text rather than under the marker.
+fn hint_lines(hints: &[crate::storage::Hint], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for h in hints {
+        let (marker, color) = match h.level {
+            StoHintLevel::Danger => ("  ✗ ", Color::Red),
+            StoHintLevel::Warn => ("  ▲ ", Color::Rgb(255, 140, 0)),
+            StoHintLevel::Info => ("  · ", DIM),
+        };
+        let indent = "    ";
+        let body = width.saturating_sub(marker.chars().count()).max(20);
+        for (i, chunk) in wrap_text(&h.text, body).into_iter().enumerate() {
+            let prefix = if i == 0 { marker.to_string() } else { indent.to_string() };
+            out.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(color)),
+                Span::styled(chunk, Style::default().fg(color)),
+            ]));
+        }
+    }
+    out
+}
+
 fn draw_storage_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(row) = app.storage_selected().cloned() else {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -13453,6 +14318,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_storage_detail(f, app, area);
         return;
     }
+    let is_capacity_mode = matches!(view_mode(app), Mode::Capacity | Mode::CapacityFull);
+    if is_capacity_mode {
+        draw_capacity_detail(f, app, area);
+        return;
+    }
     let is_kyverno_mode = matches!(view_mode(app), Mode::Kyverno | Mode::KyvernoFull);
     if is_kyverno_mode {
         draw_kyverno_detail(f, app, area);
@@ -14774,6 +15644,14 @@ mod popup_tests {
         let line = Line::from("aaaaaa bbbbbb cccccc");
         assert_eq!(line.width().div_ceil(10), 2);
         assert_eq!(wrapped_rows(&line, 10), 3, "words never straddle two rows");
+    }
+
+    #[test]
+    fn wrapping_keeps_whole_words_and_breaks_only_what_cannot_fit() {
+        assert_eq!(wrap_text("un deux trois", 9), vec!["un deux", "trois"]);
+        // A word longer than the line is the one case that breaks mid-word.
+        assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_text("", 10), vec![""]);
     }
 
     #[test]

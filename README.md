@@ -16,6 +16,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
 - **Édition avec garde-fous (`e`)** : l'objet part dans `$EDITOR` (vim &co.) puis revient par un `PUT` verrouillé sur son `resourceVersion`. Avant, kdt dit ce qui rendra l'édition vaine — objet GitOps réécrit au prochain reconcile, spec tenue par un contrôleur, `can-i update` refusé ; après, il classe chaque champ modifié entre *appliqué*, *ignoré* et *rejeté par l'API*.
 - **Suppression avec garde-fous (`Ctrl-D`)** : relit l'objet avant tout, avertit s'il est déployé par un moteur GitOps (Flux, Argo CD, Helm) ou si la suppression cascade (namespace, CRD, point d'entrée GitOps) ; l'avertissement se passe outre, mais en retapant le nom de l'objet.
+- **Capacité et marge de manœuvre (`:capacity`)** : la vue qui répond à « qu'est-ce qui va casser », pas à « voici l'usage ». Par nœud : ce qui est réservé contre ce qui existe, et surtout la simulation **« si ce nœud tombe, ces pods n'ont nulle part où aller »** (requests, taints, sélecteurs). Par workload : les pods invisibles au scheduler (sans requests), ceux qui réservent bien plus qu'ils n'utilisent, ceux qui touchent leur propre limite. Par namespace : le `ResourceQuota` sur le point de refuser le prochain déploiement.
 - **Opérations sur les nœuds (`o`)** : `cordon` / `uncordon` en un patch réversible, et un **drain avec garde-fous** — avant la moindre éviction, kdt dit ce qui va coincer : pods qu'aucun contrôleur ne recréera, `PodDisruptionBudget` qui refusera, place qui n'existe pas ailleurs, données `emptyDir` perdues, pods statiques qui resteront.
 - **Shell dans un pod (`E`)** : ouvre `kubectl exec -it` en rendant le terminal, comme `e` le rend à `$EDITOR`.
 - **Touch (`h`)** : pose `kdt.io/touched-at` (horodatage à la milliseconde) et `kdt.io/touched-by` sur l'objet sélectionné, pour lui faire retraverser la chaîne d'admission — réévaluer une règle Kyverno, réveiller un contrôleur. Sans confirmation : c'est un merge patch de deux annotations, et le bandeau nomme l'objet touché.
@@ -534,6 +535,61 @@ les pods de DaemonSet, les pods statiques et les pods terminés sont laissés en
 > `Ctrl-O` avance dans la confirmation, `Entrée`/`Esc` annulent — la réponse par défaut est non,
 > comme pour `Ctrl-D`. Ce doit être un accord de touches : l'invite stricte, elle, reçoit chaque
 > caractère tapé.
+
+### Capacité / marge de manœuvre (`:capacity`, `:quota`)
+
+Toutes les autres vues disent l'état ; celle-ci dit **la marge**. Un seul fetch alimente trois
+mondes, `g` passe de l'un à l'autre :
+
+**noeuds** (`:capacity`) — ce que chaque nœud a de réservé (requests, ce que le scheduler empile),
+de limité, et d'effectivement utilisé. La colonne qui compte est la dernière, **SI PERDU** :
+
+| Verdict | Ce qu'il dit |
+|---|---|
+| `absorbé ailleurs` | Tous ses pods se replacent, avec de la marge |
+| `absorbé, il ne reste rien` | Ils se replacent, et le cluster est ensuite à sec |
+| `n pod(s) sans place` | Ces pods-là n'ont **nulle part** où aller — le détail les nomme, avec leur taille et la raison |
+| `seul noeud` | Il n'y a pas d'ailleurs à simuler |
+
+La simulation est un **first-fit, le plus gros pod d'abord** (placer les petits en premier est
+précisément ce qui échoue à caser le gros). Elle compte les requests, décrémente la place à mesure
+qu'elle place, et respecte les règles dures : taints/tolérations, `nodeSelector`, node affinity
+`required`. Elle ignore les règles souples (affinité `preferred`, spread, affinité inter-pods), qui
+ne peuvent que **dégrader** le résultat réel — donc « ça passe » est la borne optimiste, et c'est
+le bon sens de l'erreur. Les pods de DaemonSet, les pods statiques et les pods terminés ne sont pas
+replacés, comme au drain.
+
+Trois raisons distinctes de n'avoir nulle part où aller, parce qu'elles ne se corrigent pas
+pareil : **aucune place** (ajouter de la capacité), **taints** ou **sélecteur** (changer le pod —
+aucun nœud supplémentaire n'y changera rien).
+
+**workloads** (`g`) — une ligne par workload, `requests → utilisé` sur les deux axes :
+
+- **pas de requests** : invisible au scheduler, qui le place comme s'il ne coûtait rien, et premier
+  évincé quand le nœud manque. C'est aussi ce qui fausse tous les autres calculs de la vue, d'où le
+  constat au niveau cluster ;
+- **QoS BestEffort** : premier de la file des évictions ;
+- **surdimensionné** : réserve ≥ 4× ce qu'il utilise — mais seulement au-delà d'un plancher absolu
+  (200m CPU, 512Mi), sinon chaque sidecar à 50m se ferait épingler pour rien ;
+- **au plafond de sa propre limite** (≥ 90%) : throttling côté CPU (avertissement), OOMKill côté
+  mémoire (alerte rouge — au plafond ce n'est pas un ralentissement).
+
+**quotas** (`:quota`) — les `ResourceQuota` triés par le compteur le plus tendu, celui qui refusera
+la prochaine création. Le détail les liste tous.
+
+| Touche | Action |
+|---|---|
+| `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
+| `Enter` | Détail plein écran |
+| `Shift+↑↓` | Scroll du détail |
+| `g` | Monde suivant (noeuds → workloads → quotas) |
+| `f` | Ne garder que les lignes à problème |
+| `/` | Recherche |
+| `F5` | Rafraîchir (auto toutes les 30 s) |
+| `i` | Panneau IA |
+
+> Sans **metrics-server**, la moitié des règles n'a rien à comparer : elles se taisent au lieu de
+> lire une mesure absente comme un zéro, et le bandeau le dit. Les colonnes `utilisé` affichent `—`.
 
 ### Diagnostic
 | Touche | Action |
