@@ -91,6 +91,48 @@ impl CertFilter {
         }
     }
 }
+
+// A rendered row of the Kyverno view. The same enum serves both orientations: policy-centric nests
+// Rule and Violation under Policy, resource-centric nests Violation under Resource under Namespace.
+// Whichever is active, the vector stays index-aligned with `App::snapshot`.
+pub enum KyRow {
+    // Index into the filtered policy list.
+    Policy { idx: usize, collapsed: bool, has_children: bool },
+    Rule { policy: usize, rule: usize, collapsed: bool, has_children: bool },
+    // Index into the filtered violation list.
+    Violation { idx: usize, depth: usize },
+    Exception { policy: usize, exception: usize },
+    Namespace { name: String, collapsed: bool, counts: KyCounts },
+    Resource { kind: String, namespace: String, name: String, collapsed: bool, counts: KyCounts },
+}
+
+// How the Kyverno tree is filtered (`f`): everything, only what needs a human, or only the policies
+// that actually block writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KyvernoFilter { All, Problems, Enforce }
+
+impl KyvernoFilter {
+    fn label(self) -> &'static str {
+        match self {
+            KyvernoFilter::All => "ALL",
+            KyvernoFilter::Problems => "PROBLEMS",
+            KyvernoFilter::Enforce => "ENFORCE",
+        }
+    }
+    fn matches(self, p: &KyPolicy) -> bool {
+        match self {
+            KyvernoFilter::All => true,
+            // A policy that cannot evaluate is as much a problem as one that rejects things: it is
+            // silently protecting nothing.
+            KyvernoFilter::Problems => p.has_problem(),
+            KyvernoFilter::Enforce => p.action.blocks(),
+        }
+    }
+}
+use crate::kyverno::{
+    fetch_kyverno, is_admission_denial, new_kyverno_state, parse_denial_message, KyAction, KyCounts,
+    KyPolicy, KyReady, KyResult, KyViolation, SharedKyverno,
+};
 use crate::lang;
 use crate::pdf;
 use crate::pods::{
@@ -282,7 +324,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull, Kyverno, KyvernoFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -342,6 +384,9 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // is what those words mean. The Secrets view keeps `secret`/`se`/`tls`.
     ("secrets", &["secret", "se", "tls"]),
     ("certs", &["certificates", "cert", "certmanager", "cert-manager", "issuers", "challenges", "acme"]),
+    // `policy`/`policies` belong here rather than to RBAC: on a cluster running Kyverno that is
+    // what those words mean.
+    ("kyverno", &["ky", "kv", "policies", "policy", "polr", "cpol", "admission"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -558,6 +603,23 @@ pub struct App {
     // Landing target for a jump from the Secrets view, consumed once the tree contains it.
     certs_pending_select: Option<String>,
     last_certs_sel_uid: Option<String>,
+    pub kyverno_state: SharedKyverno,
+    // Which way the join is read: policy -> rule -> offending resources (false), or
+    // namespace -> resource -> violated policies (true). Toggled with `t`.
+    ky_by_resource: bool,
+    ky_collapsed: std::collections::HashSet<String>,
+    // Nodes the user folded/unfolded by hand. Auto-folding never overrides these.
+    ky_user_toggled: std::collections::HashSet<String>,
+    ky_rows: Vec<KyRow>,
+    // The filtered policies and violations the current rows index into. Snapshotted once per
+    // refresh so the draw pass never re-locks or re-filters, and so a row index can never point
+    // past a list that changed underneath it.
+    ky_view_policies: Vec<KyPolicy>,
+    ky_view_violations: Vec<KyViolation>,
+    ky_filter: KyvernoFilter,
+    pub ky_detail_scroll: usize,
+    pub ky_refresh_handle: Option<JoinHandle<()>>,
+    last_ky_sel_uid: Option<String>,
     pub configmaps_state: SharedConfigMaps,
     pub configmaps_cursor: usize,
     configmaps_copy_menu: Option<ConfigmapsCopyMenu>,
@@ -711,6 +773,17 @@ impl App {
             certs_refresh_handle: None,
             certs_pending_select: None,
             last_certs_sel_uid: None,
+            kyverno_state: new_kyverno_state(),
+            ky_by_resource: false,
+            ky_collapsed: std::collections::HashSet::new(),
+            ky_user_toggled: std::collections::HashSet::new(),
+            ky_rows: Vec::new(),
+            ky_view_policies: Vec::new(),
+            ky_view_violations: Vec::new(),
+            ky_filter: KyvernoFilter::All,
+            ky_detail_scroll: 0,
+            ky_refresh_handle: None,
+            last_ky_sel_uid: None,
             configmaps_state: new_configmaps_state(),
             configmaps_cursor: 0,
             configmaps_copy_menu: None,
@@ -1362,7 +1435,9 @@ impl App {
             | Mode::Services
             | Mode::ServicesFull
             | Mode::Certs
-            | Mode::CertsFull => {
+            | Mode::CertsFull
+            | Mode::Kyverno
+            | Mode::KyvernoFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -1821,6 +1896,7 @@ impl App {
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
             Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
+            Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             _ => {}
         }
@@ -2149,6 +2225,11 @@ impl App {
                 self.leave_special_modes();
                 self.enter_certs_mode();
             }
+            "kyverno" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_kyverno_mode();
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -2193,6 +2274,10 @@ impl App {
             }
             Mode::Certs | Mode::CertsFull => {
                 self.stop_certs_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Kyverno | Mode::KyvernoFull => {
+                self.stop_kyverno_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -3503,6 +3588,416 @@ impl App {
         }
     }
 
+    // --- Kyverno ---------------------------------------------------------------------------------
+
+    fn enter_kyverno_mode(&mut self) {
+        self.mode = Mode::Kyverno;
+        self.detail_tab = DetailTab::Status;
+        self.ky_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_ky_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_kyverno();
+        self.start_kyverno_auto_refresh();
+        self.refresh_kyverno_snapshot();
+    }
+
+    fn exit_kyverno_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_kyverno_auto_refresh();
+        self.snapshot.clear();
+        self.ky_rows.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_ky_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_kyverno_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        if self.detail_tab == DetailTab::Status { self.maybe_fetch_status(); }
+        self.ky_detail_scroll = 0;
+        self.mode = Mode::KyvernoFull;
+    }
+
+    fn exit_kyverno_full(&mut self) {
+        self.mode = Mode::Kyverno;
+    }
+
+    fn refresh_kyverno(&self) {
+        {
+            let mut s = self.kyverno_state.lock().expect("kyverno poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.kyverno_state.clone();
+        tokio::spawn(async move { fetch_kyverno(client, state).await; });
+    }
+
+    // 15s: policies themselves barely move, but the reports behind them are rewritten on every
+    // admission review, and that is what someone watching this view is waiting on. Slower than the
+    // certs view because a full pass lists every PolicyReport on the cluster.
+    fn start_kyverno_auto_refresh(&mut self) {
+        self.stop_kyverno_auto_refresh();
+        let client = self.client.clone();
+        let state = self.kyverno_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_kyverno(client.clone(), state.clone()).await;
+            }
+        });
+        self.ky_refresh_handle = Some(handle);
+    }
+
+    fn stop_kyverno_auto_refresh(&mut self) {
+        if let Some(h) = self.ky_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    fn ky_policy_uid(p: &KyPolicy) -> String {
+        p.uid()
+    }
+
+    fn ky_rule_uid(p: &KyPolicy, rule: &str) -> String {
+        format!("{}|rule|{}", p.uid(), rule)
+    }
+
+    // Auto-folding: a healthy policy's rules are noise, a failing one's are the answer. Recomputed
+    // on every refresh so a policy that starts rejecting things opens itself — but never against a
+    // node the user has folded or unfolded by hand.
+    fn apply_kyverno_autofold(&mut self, policies: &[KyPolicy]) {
+        for p in policies {
+            let uid = p.uid();
+            if !self.ky_user_toggled.contains(&uid) {
+                if p.has_problem() {
+                    self.ky_collapsed.remove(&uid);
+                } else {
+                    self.ky_collapsed.insert(uid.clone());
+                }
+            }
+            for r in &p.rules {
+                let ruid = Self::ky_rule_uid(p, &r.name);
+                if self.ky_user_toggled.contains(&ruid) {
+                    continue;
+                }
+                if r.counts.problems() > 0 {
+                    self.ky_collapsed.remove(&ruid);
+                } else {
+                    self.ky_collapsed.insert(ruid);
+                }
+            }
+        }
+    }
+
+    // Rebuilds `ky_rows` and `App::snapshot` in lockstep, so a selected index means the same row in
+    // both. That index alignment is what gives this view `y`, `e`, `h`, `Ctrl-D`, the AI panel and
+    // the Status/Related tabs without any code of its own.
+    fn refresh_kyverno_snapshot(&mut self) {
+        let (policies, violations) = {
+            let s = self.kyverno_state.lock().expect("kyverno poisoned");
+            let policies: Vec<KyPolicy> = s
+                .policies
+                .iter()
+                .filter(|p| self.ky_filter.matches(p))
+                .cloned()
+                .collect();
+            let kept: std::collections::HashSet<String> =
+                policies.iter().map(|p| p.uid()).collect();
+            // A violation is only ever shown under its policy, so dropping a policy drops its
+            // violations with it — except in the resource view, where an orphaned violation (its
+            // policy deleted but the report not yet collected) is still worth showing.
+            let violations: Vec<KyViolation> = s
+                .violations
+                .iter()
+                .filter(|v| kept.contains(&v.policy_uid) || v.policy_uid.is_empty())
+                .cloned()
+                .collect();
+            (policies, violations)
+        };
+        self.apply_kyverno_autofold(&policies);
+
+        let (rows, recs) = if self.ky_by_resource {
+            self.build_ky_resource_rows(&policies, &violations)
+        } else {
+            self.build_ky_policy_rows(&policies, &violations)
+        };
+        self.ky_rows = rows;
+        self.ky_view_policies = policies;
+        self.ky_view_violations = violations;
+
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_ky_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_ky_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_ky_sel_uid = Some(cur_uid);
+            self.ky_detail_scroll = 0;
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    // Policy -> rule (+ the autogen ones) -> the resources that fail it, then the exceptions that
+    // excuse it. Answers "what does this policy do, and what is it breaking?".
+    fn build_ky_policy_rows(
+        &self,
+        policies: &[KyPolicy],
+        violations: &[KyViolation],
+    ) -> (Vec<KyRow>, Vec<EventRecord>) {
+        let mut rows: Vec<KyRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        for (pi, p) in policies.iter().enumerate() {
+            let uid = p.uid();
+            let collapsed = self.ky_collapsed.contains(&uid);
+            let has_children = !p.rules.is_empty() || !p.exceptions.is_empty();
+            rows.push(KyRow::Policy { idx: pi, collapsed, has_children });
+            recs.push(synthetic_policy_record(p));
+            if collapsed {
+                continue;
+            }
+
+            for (ri, r) in p.rules.iter().enumerate() {
+                let ruid = Self::ky_rule_uid(p, &r.name);
+                let rule_violations: Vec<usize> = violations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.policy_uid == uid && v.rule == r.name)
+                    .map(|(i, _)| i)
+                    .collect();
+                let rcollapsed = self.ky_collapsed.contains(&ruid);
+                rows.push(KyRow::Rule {
+                    policy: pi,
+                    rule: ri,
+                    collapsed: rcollapsed,
+                    has_children: !rule_violations.is_empty(),
+                });
+                // A rule is not an API object of its own: point the record at the policy so `y` and
+                // `e` open the thing that can actually be edited.
+                recs.push(synthetic_rule_record(p, &r.name));
+                if rcollapsed {
+                    continue;
+                }
+                for vi in rule_violations {
+                    rows.push(KyRow::Violation { idx: vi, depth: 2 });
+                    recs.push(synthetic_violation_record(&violations[vi]));
+                }
+            }
+
+            for (ei, e) in p.exceptions.iter().enumerate() {
+                rows.push(KyRow::Exception { policy: pi, exception: ei });
+                recs.push(synthetic_exception_record(e));
+            }
+        }
+        (rows, recs)
+    }
+
+    // Namespace -> resource -> the policies it violates. The same join read the other way round:
+    // answers "what is wrong in this namespace?".
+    fn build_ky_resource_rows(
+        &self,
+        _policies: &[KyPolicy],
+        violations: &[KyViolation],
+    ) -> (Vec<KyRow>, Vec<EventRecord>) {
+        // Preserve the violation ordering (worst result first) while grouping, so the namespace and
+        // resource that need attention stay at the top.
+        let mut ns_order: Vec<String> = Vec::new();
+        let mut by_ns: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, v) in violations.iter().enumerate() {
+            let ns = v.namespace.clone();
+            if !by_ns.contains_key(&ns) {
+                ns_order.push(ns.clone());
+            }
+            by_ns.entry(ns).or_default().push(i);
+        }
+
+        let mut rows: Vec<KyRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        for ns in ns_order {
+            let idxs = &by_ns[&ns];
+            let mut counts = KyCounts::default();
+            for i in idxs {
+                counts.add_result(violations[*i].result);
+            }
+            let nuid = format!("ns|{}", ns);
+            let ncollapsed = self.ky_collapsed.contains(&nuid);
+            rows.push(KyRow::Namespace { name: ns.clone(), collapsed: ncollapsed, counts });
+            recs.push(synthetic_namespace_record(&ns, &counts));
+            if ncollapsed {
+                continue;
+            }
+
+            let mut res_order: Vec<(String, String)> = Vec::new();
+            let mut by_res: std::collections::HashMap<(String, String), Vec<usize>> =
+                std::collections::HashMap::new();
+            for i in idxs {
+                let key = (violations[*i].kind.clone(), violations[*i].name.clone());
+                if !by_res.contains_key(&key) {
+                    res_order.push(key.clone());
+                }
+                by_res.entry(key).or_default().push(*i);
+            }
+
+            for key in res_order {
+                let vis = &by_res[&key];
+                let mut rcounts = KyCounts::default();
+                for i in vis {
+                    rcounts.add_result(violations[*i].result);
+                }
+                let ruid = format!("res|{}/{}/{}", ns, key.0, key.1);
+                let rcollapsed = self.ky_collapsed.contains(&ruid);
+                rows.push(KyRow::Resource {
+                    kind: key.0.clone(),
+                    namespace: ns.clone(),
+                    name: key.1.clone(),
+                    collapsed: rcollapsed,
+                    counts: rcounts,
+                });
+                recs.push(synthetic_violation_record(&violations[vis[0]]));
+                if rcollapsed {
+                    continue;
+                }
+                for i in vis {
+                    rows.push(KyRow::Violation { idx: *i, depth: 2 });
+                    recs.push(synthetic_violation_record(&violations[*i]));
+                }
+            }
+        }
+        (rows, recs)
+    }
+
+    fn move_ky_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.ky_detail_scroll = 0;
+        self.refresh_kyverno_snapshot();
+    }
+
+    // The fold key of the row under the cursor, or None for a leaf that cannot be folded.
+    fn ky_fold_key(&self) -> Option<String> {
+        let sel = self.table_state.selected()?;
+        match self.ky_rows.get(sel)? {
+            KyRow::Policy { idx, .. } => self.ky_view_policies.get(*idx).map(Self::ky_policy_uid),
+            KyRow::Rule { policy, rule, .. } => {
+                let p = self.ky_view_policies.get(*policy)?;
+                let r = p.rules.get(*rule)?;
+                Some(Self::ky_rule_uid(p, &r.name))
+            }
+            KyRow::Namespace { name, .. } => Some(format!("ns|{}", name)),
+            KyRow::Resource { kind, namespace, name, .. } => {
+                Some(format!("res|{}/{}/{}", namespace, kind, name))
+            }
+            KyRow::Violation { .. } | KyRow::Exception { .. } => None,
+        }
+    }
+
+    // Space: fold/unfold the selected node and remember that the choice was deliberate, so the
+    // auto-folding pass leaves it alone from now on.
+    fn toggle_ky_node(&mut self) {
+        let Some(uid) = self.ky_fold_key() else { return };
+        if self.ky_collapsed.contains(&uid) {
+            self.ky_collapsed.remove(&uid);
+        } else {
+            self.ky_collapsed.insert(uid.clone());
+        }
+        self.ky_user_toggled.insert(uid);
+        self.refresh_kyverno_snapshot();
+    }
+
+    // `t`: read the same join the other way round. The fold state is per-orientation by
+    // construction (the keys differ), so switching back finds the tree as it was left.
+    fn toggle_ky_orientation(&mut self) {
+        self.ky_by_resource = !self.ky_by_resource;
+        self.ky_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_kyverno_snapshot();
+    }
+
+    fn cycle_ky_filter(&mut self) {
+        self.ky_filter = match self.ky_filter {
+            KyvernoFilter::All => KyvernoFilter::Problems,
+            KyvernoFilter::Problems => KyvernoFilter::Enforce,
+            KyvernoFilter::Enforce => KyvernoFilter::All,
+        };
+        self.ky_detail_scroll = 0;
+        self.refresh_kyverno_snapshot();
+    }
+
+    // The policy the detail panel should describe: the one under the cursor, or the one that owns
+    // the rule/violation/exception under the cursor.
+    fn ky_selected_policy(&self) -> Option<&KyPolicy> {
+        let sel = self.table_state.selected()?;
+        match self.ky_rows.get(sel)? {
+            KyRow::Policy { idx, .. } => self.ky_view_policies.get(*idx),
+            KyRow::Rule { policy, .. } | KyRow::Exception { policy, .. } => {
+                self.ky_view_policies.get(*policy)
+            }
+            KyRow::Violation { idx, .. } => {
+                let v = self.ky_view_violations.get(*idx)?;
+                self.ky_view_policies.iter().find(|p| p.uid() == v.policy_uid)
+            }
+            KyRow::Namespace { .. } | KyRow::Resource { .. } => None,
+        }
+    }
+
+
+    // Kyverno's admission denials, pulled from the event buffer the app already holds. They exist
+    // nowhere else: the rejected resource was never created, so no PolicyReport describes it.
+    // The Event's involvedObject is the policy, which is what makes this join possible at all.
+    fn ky_denials(&self, policy: &str, limit: usize) -> Vec<(String, String, String)> {
+        let buf = self.buffer.lock().expect("buffer poisoned");
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for rec in buf.iter().rev() {
+            if rec.name != policy || !is_admission_denial(&rec.component, &rec.message) {
+                continue;
+            }
+            let (target, rule) = parse_denial_message(&rec.message)
+                .unwrap_or_else(|| (rec.message.clone(), String::new()));
+            out.push((crate::events::format_age(&rec.time), target, rule));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     // `o` on a secret: jump to the cert-manager chain that produces it. Mirrors `o` in the RBAC view,
     // which jumps to the Flux object managing a binding.
     fn secrets_open_origin(&mut self) {
@@ -4707,6 +5202,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             app.refresh_certs_snapshot();
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull) {
+            app.refresh_kyverno_snapshot();
+        }
         if app.delete_view.is_some() {
             app.poll_delete();
         }
@@ -4875,29 +5373,29 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.enter_command();
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_edit_view();
         }
 
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
             app.open_delete_view();
         }
 
@@ -5241,6 +5739,34 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::CertsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::CertsFull) => {}
 
+        (KeyCode::Up, m, Mode::Kyverno) if m.contains(KeyModifiers::SHIFT) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Kyverno) if m.contains(KeyModifiers::SHIFT) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Kyverno) => app.move_ky_selection(-1),
+        (KeyCode::Down, _, Mode::Kyverno) => app.move_ky_selection(1),
+        (KeyCode::PageUp, _, Mode::Kyverno) => app.move_ky_selection(-10),
+        (KeyCode::PageDown, _, Mode::Kyverno) => app.move_ky_selection(10),
+        (KeyCode::Char(' '), _, Mode::Kyverno) => app.toggle_ky_node(),
+        (KeyCode::Char('t'), _, Mode::Kyverno) => app.toggle_ky_orientation(),
+        (KeyCode::Char('f'), _, Mode::Kyverno) => app.cycle_ky_filter(),
+        (KeyCode::Enter, _, Mode::Kyverno) => app.enter_kyverno_full(),
+        (KeyCode::F(5), _, Mode::Kyverno) => app.refresh_kyverno(),
+        (KeyCode::Esc, _, Mode::Kyverno) => app.exit_kyverno_mode(),
+        (KeyCode::Char('i'), _, Mode::Kyverno) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Kyverno) => app.ai_language = app.ai_language.toggle(),
+        // Catch-all: without it the global keys (`q`, the horizontal scroll) leak into this view.
+        (_, _, Mode::Kyverno) => {}
+
+        (KeyCode::Up, _, Mode::KyvernoFull) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, _, Mode::KyvernoFull) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::KyvernoFull) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::KyvernoFull) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_add(10),
+        (KeyCode::Char('g'), _, Mode::KyvernoFull) => app.ky_detail_scroll = 0,
+        (KeyCode::Enter, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
+        (KeyCode::Esc, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
+        (KeyCode::Char('i'), _, Mode::KyvernoFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::KyvernoFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::KyvernoFull) => {}
+
         (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
         (KeyCode::Down, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Configmaps) => app.move_configmap_selection(-1),
@@ -5401,7 +5927,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         m => m,
@@ -5430,11 +5956,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Configmaps | Mode::Services => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -5450,8 +5976,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::FluxLogs => unreachable!(),
     };
 
@@ -5474,6 +6000,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Vuln | Mode::VulnFull => st.mode_vuln,
         Mode::Secrets | Mode::SecretsFull => st.mode_secrets,
         Mode::Certs | Mode::CertsFull => st.mode_certs,
+        Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
     };
@@ -5525,6 +6052,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             } else {
                 draw_certs_table(f, app, ta);
             }
+        } else if draw_mode == Mode::Kyverno {
+            if app.ky_by_resource {
+                draw_kyverno_resource_tree(f, app, ta);
+            } else {
+                draw_kyverno_tree(f, app, ta);
+            }
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Services {
@@ -5532,7 +6065,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -5732,6 +6265,29 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_cert_actions)),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_goto_secret)),
+        ],
+        Mode::Kyverno => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            // `t` names the orientation it switches *to*, not the one in force.
+            Span::styled(" t ", kbg),
+            Span::raw(format!(
+                " {}   ",
+                if app.ky_by_resource { st.k_ky_by_policy } else { st.k_ky_by_resource }
+            )),
+            Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_ky_filter, app.ky_filter.label())),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+        ],
+        Mode::KyvernoFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
         Mode::SecretsFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -7451,6 +8007,106 @@ fn synthetic_cert_record(r: &CmResource) -> EventRecord {
         name: r.name.clone(),
         message,
         component: "cert-manager".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// Snapshot records for the Kyverno view. What each record points at decides what the shared `y`,
+// `e`, `h` and `Ctrl-D` act on, and that differs by row: a policy row addresses the policy, a
+// violation row addresses the *offending resource* — which is what makes `h` on a violation
+// re-trigger admission and have Kyverno re-evaluate it on the spot.
+fn synthetic_policy_record(p: &KyPolicy) -> EventRecord {
+    let (severity, reason) = match p.ready {
+        KyReady::Ready if p.counts.error > 0 => (Severity::Warning, "PolicyError".to_string()),
+        KyReady::Ready if p.counts.fail > 0 => (Severity::Warning, "PolicyViolation".to_string()),
+        KyReady::Ready => (Severity::Normal, "Ready".to_string()),
+        KyReady::NotReady => (Severity::Warning, "NotReady".to_string()),
+        KyReady::Unknown => (Severity::Normal, "Unknown".to_string()),
+    };
+    let message = if p.ready_message.is_empty() {
+        format!("{} {} · {}", p.kind.as_str(), p.name, p.action.label())
+    } else {
+        p.ready_message.clone()
+    };
+    EventRecord {
+        uid: format!("ky|{}", p.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: p.api_version.clone(),
+        kind: p.kind.as_str().to_string(),
+        namespace: p.namespace.clone(),
+        name: p.name.clone(),
+        message,
+        component: "kyverno".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// A rule is not an API object: the record addresses the policy that declares it, so `y` and `e` on
+// a rule row open the document the rule actually lives in.
+fn synthetic_rule_record(p: &KyPolicy, rule: &str) -> EventRecord {
+    EventRecord {
+        uid: format!("kyrule|{}|{}", p.uid(), rule),
+        reason: "Rule".to_string(),
+        severity: Severity::Normal,
+        message: format!("{} · règle {}", p.name, rule),
+        ..synthetic_policy_record(p)
+    }
+}
+
+fn synthetic_violation_record(v: &KyViolation) -> EventRecord {
+    let severity = if v.result == KyResult::Warn { Severity::Normal } else { Severity::Warning };
+    EventRecord {
+        uid: format!("kyvio|{}", v.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: v.result.label().to_string(),
+        // Reports do not always name the apiVersion; `current_object_ref` defaults it to v1, which
+        // is right for the core kinds and harmless elsewhere since discovery resolves the kind.
+        api_version: v.api_version.clone(),
+        kind: v.kind.clone(),
+        namespace: v.namespace.clone(),
+        name: v.name.clone(),
+        message: v.message.clone(),
+        component: "kyverno".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_exception_record(e: &crate::kyverno::KyException) -> EventRecord {
+    EventRecord {
+        uid: format!("kyexc|{}/{}", e.namespace, e.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Exception".to_string(),
+        api_version: e.api_version.clone(),
+        kind: "PolicyException".to_string(),
+        namespace: e.namespace.clone(),
+        name: e.name.clone(),
+        message: format!("exclut {}", e.match_summary),
+        component: "kyverno".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// A namespace grouping row addresses the Namespace object itself, so `y` on it is still useful.
+fn synthetic_namespace_record(ns: &str, counts: &KyCounts) -> EventRecord {
+    EventRecord {
+        uid: format!("kyns|{}", ns),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: if counts.fail + counts.error > 0 { Severity::Warning } else { Severity::Normal },
+        reason: "Namespace".to_string(),
+        api_version: "v1".to_string(),
+        kind: if ns.is_empty() { String::new() } else { "Namespace".to_string() },
+        namespace: String::new(),
+        name: ns.to_string(),
+        message: counts.summary(),
+        component: "kyverno".to_string(),
         host: String::new(),
         count: 1,
     }
@@ -9278,6 +9934,844 @@ fn cert_chain_lines(
 
 // --- ConfigMaps view rendering ----------------------------------------------------------------
 
+// --- Kyverno rendering ---------------------------------------------------------------------------
+
+fn ky_action_cell(a: KyAction) -> Cell<'static> {
+    let color = match a {
+        // Enforce is the only posture that can break a deployment at 3am: it reads as a warning.
+        KyAction::Enforce => Color::LightRed,
+        KyAction::Warn => Color::Yellow,
+        KyAction::Audit => Color::Cyan,
+        KyAction::None => DIM,
+    };
+    Cell::from(a.label()).style(Style::default().fg(color))
+}
+
+fn ky_ready_cell(r: KyReady) -> Cell<'static> {
+    let (txt, color) = match r {
+        KyReady::Ready => ("✓ Ready", Color::Green),
+        KyReady::NotReady => ("✗ NotReady", Color::Red),
+        KyReady::Unknown => ("· ?", Color::Yellow),
+    };
+    Cell::from(txt).style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn ky_result_color(r: KyResult) -> Color {
+    match r {
+        // An `error` is a broken policy, not a non-compliant resource: a different colour so the
+        // two never get read as the same problem.
+        KyResult::Error => Color::Magenta,
+        KyResult::Fail => Color::Red,
+        KyResult::Warn => Color::Yellow,
+        KyResult::Pass => Color::Green,
+        KyResult::Skip => DIM,
+    }
+}
+
+// A policy that cannot evaluate, or that is erroring, gets a dark red bed so it stands out from the
+// merely-failing ones even when scrolled past.
+fn ky_policy_row_style(p: &KyPolicy) -> Style {
+    if p.ready == KyReady::NotReady || p.counts.error > 0 {
+        Style::default().bg(Color::Rgb(40, 0, 0))
+    } else {
+        Style::default()
+    }
+}
+
+// The scope a policy applies to, taken from its authored rules — the autogen ones only restate the
+// same match against the workload kinds Kyverno derived.
+fn ky_policy_scope(p: &KyPolicy) -> String {
+    if let Some(s) = p.schedule.as_ref() {
+        return format!("cron {}", s);
+    }
+    p.rules
+        .iter()
+        .find(|r| !r.autogen)
+        .map(|r| r.match_summary.clone())
+        .unwrap_or_default()
+}
+
+fn kyverno_panel_title(app: &App) -> String {
+    let s = app.kyverno_state.lock().expect("kyverno poisoned");
+    let kind = if app.ky_by_resource { "kyverno par ressource" } else { "kyverno par policy" };
+    if let Some(e) = &s.error {
+        return format!("{} (erreur: {})", kind, e);
+    }
+    if s.loading && s.policies.is_empty() {
+        return format!("{} (chargement...)", kind);
+    }
+    if s.policies.is_empty() {
+        return format!("{} (aucune policy sur ce cluster) · filtre={}", kind, app.ky_filter.label());
+    }
+    let (total, enforce, not_ready, fail, warn, error) = s.counts();
+    let mut parts = vec![format!("{} policies", total), format!("{} enforce", enforce)];
+    let mut counters: Vec<String> = Vec::new();
+    if error > 0 {
+        counters.push(format!("×{}", error));
+    }
+    if fail > 0 {
+        counters.push(format!("✗{}", fail));
+    }
+    if warn > 0 {
+        counters.push(format!("!{}", warn));
+    }
+    if !counters.is_empty() {
+        parts.push(counters.join(" "));
+    }
+    if not_ready > 0 {
+        parts.push(format!("{} non-Ready", not_ready));
+    }
+    format!("{} ({}) · filtre={}", kind, parts.join(" · "), app.ky_filter.label())
+}
+
+// Policy -> rule -> the resources that fail it. The column headers stay fixed while the meaning of
+// each cell shifts with the row type, which is what lets one table carry the whole join.
+fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let title = kyverno_panel_title(app);
+
+    let header_row = Row::new(vec![
+        Cell::from("RESSOURCE"), Cell::from("ACTION"), Cell::from("ÉTAT"),
+        Cell::from("PORTÉE"), Cell::from("DÉTAIL"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // First pass sizes the RESSOURCE column, which the DÉTAIL wrap width depends on.
+    let labels: Vec<String> = app
+        .ky_rows
+        .iter()
+        .map(|row| match row {
+            KyRow::Policy { idx, collapsed, has_children } => {
+                let Some(p) = app.ky_view_policies.get(*idx) else { return String::new() };
+                format!("{} {} {}", fold_marker(*has_children, *collapsed), p.kind.short(), p.name)
+            }
+            KyRow::Rule { policy, rule, collapsed, has_children } => {
+                let Some(r) = app.ky_view_policies.get(*policy).and_then(|p| p.rules.get(*rule))
+                else {
+                    return String::new();
+                };
+                format!("  {} {}", fold_marker(*has_children, *collapsed), r.name)
+            }
+            KyRow::Violation { idx, depth } => {
+                let Some(v) = app.ky_view_violations.get(*idx) else { return String::new() };
+                format!("{}{} {}", "  ".repeat(*depth), v.result.glyph(), ky_target_label(v))
+            }
+            KyRow::Exception { policy, exception } => {
+                let Some(e) = app
+                    .ky_view_policies
+                    .get(*policy)
+                    .and_then(|p| p.exceptions.get(*exception))
+                else {
+                    return String::new();
+                };
+                format!("  – polex {}", e.name)
+            }
+            KyRow::Namespace { name, collapsed, .. } => {
+                format!("{} ns {}", fold_marker(true, *collapsed), ns_label(name))
+            }
+            KyRow::Resource { kind, name, collapsed, .. } => {
+                format!("  {} {} {}", fold_marker(true, *collapsed), kind, name)
+            }
+        })
+        .collect();
+    let name_w = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("RESSOURCE".chars().count());
+    let name_col = (name_w as u16).clamp(30, 64);
+    let selected = app.table_state.selected();
+    // Five columns, so four inter-column gaps — and `highlight_symbol("> ")` takes two more cells
+    // off every row. Miss either and the wrapped detail of the focused row runs into the right
+    // border. The trailing +1 keeps the longest wrapped line off that border.
+    let msg_w = flux_msg_width(area.width, name_col + 9 + 11 + 26 + HIGHLIGHT_W + 1, 5);
+
+    let rows: Vec<Row> = app
+        .ky_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| {
+            let label = labels[vi].clone();
+            match row {
+                KyRow::Policy { idx, .. } => {
+                    let Some(p) = app.ky_view_policies.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let detail = if p.ready == KyReady::NotReady && !p.ready_message.is_empty() {
+                        Cell::from(p.ready_message.clone()).style(Style::default().fg(Color::Red))
+                    } else if p.counts.total() == 0 {
+                        Cell::from(p.title.clone()).style(Style::default().fg(DIM))
+                    } else {
+                        Cell::from(p.counts.summary())
+                    };
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
+                        ky_action_cell(p.action),
+                        ky_ready_cell(p.ready),
+                        Cell::from(ky_policy_scope(p)).style(Style::default().fg(DIM)),
+                        detail,
+                    ])
+                    .style(ky_policy_row_style(p))
+                }
+                KyRow::Rule { policy, rule, .. } => {
+                    let Some(r) = app.ky_view_policies.get(*policy).and_then(|p| p.rules.get(*rule))
+                    else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    // The autogen marker sits where a policy shows its readiness: these rules are
+                    // Kyverno's, not the author's, and the reports name them rather than the
+                    // original.
+                    let origin = if r.autogen { "(autogen)" } else { "" };
+                    let detail = if r.counts.total() == 0 {
+                        Cell::from(r.message.clone()).style(Style::default().fg(DIM))
+                    } else {
+                        Cell::from(r.counts.summary())
+                    };
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(r.verb.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(origin).style(Style::default().fg(DIM)),
+                        Cell::from(r.match_summary.clone()).style(Style::default().fg(Color::Cyan)),
+                        detail,
+                    ])
+                }
+                KyRow::Violation { idx, .. } => {
+                    let Some(v) = app.ky_view_violations.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    ky_violation_row(label, v, selected == Some(vi), msg_w)
+                }
+                KyRow::Exception { policy, exception } => {
+                    let Some(e) = app
+                        .ky_view_policies
+                        .get(*policy)
+                        .and_then(|p| p.exceptions.get(*exception))
+                    else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let rules = if e.rules.is_empty() {
+                        "toutes les règles".to_string()
+                    } else {
+                        e.rules.join(", ")
+                    };
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(Color::Magenta)),
+                        Cell::from("exception").style(Style::default().fg(Color::Magenta)),
+                        Cell::from(""),
+                        Cell::from(e.match_summary.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(rules).style(Style::default().fg(DIM)),
+                    ])
+                }
+                _ => Row::new(vec![Cell::from(label)]),
+            }
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(name_col), Constraint::Length(9), Constraint::Length(11),
+        Constraint::Length(26), Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Namespace -> resource -> the policies it violates: the same join read from the other end, for
+// when the question is "what is wrong here?" rather than "what does this policy break?".
+fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let title = kyverno_panel_title(app);
+
+    let header_row = Row::new(vec![
+        Cell::from("RESSOURCE"), Cell::from("RÉSULTAT"), Cell::from("POLICY / RÈGLE"),
+        Cell::from("MESSAGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let labels: Vec<String> = app
+        .ky_rows
+        .iter()
+        .map(|row| match row {
+            KyRow::Namespace { name, collapsed, .. } => {
+                format!("{} ns {}", fold_marker(true, *collapsed), ns_label(name))
+            }
+            KyRow::Resource { kind, name, collapsed, .. } => {
+                format!("  {} {} {}", fold_marker(true, *collapsed), kind, name)
+            }
+            KyRow::Violation { idx, depth } => {
+                let Some(v) = app.ky_view_violations.get(*idx) else { return String::new() };
+                // The leaf's identity here is the verdict, not the object: the object is the
+                // Resource row above it. Severity rides along so the RÉSULTAT column stays free
+                // for the group counters.
+                let sev = if v.severity.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", v.severity)
+                };
+                format!(
+                    "{}{} {}{}",
+                    "  ".repeat(*depth),
+                    v.result.glyph(),
+                    v.result.label(),
+                    sev
+                )
+            }
+            _ => String::new(),
+        })
+        .collect();
+    let name_w = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("RESSOURCE".chars().count());
+    let name_col = (name_w as u16).clamp(30, 64);
+    let selected = app.table_state.selected();
+    // Four columns, so three gaps, plus the two cells of `highlight_symbol` and one of margin.
+    let msg_w = flux_msg_width(area.width, name_col + 10 + 34 + HIGHLIGHT_W + 1, 4);
+
+    let rows: Vec<Row> = app
+        .ky_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| {
+            let label = labels[vi].clone();
+            match row {
+                KyRow::Namespace { counts, .. } => Row::new(vec![
+                    Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(counts.summary()),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(if counts.error + counts.fail > 0 {
+                    Style::default().bg(Color::Rgb(40, 0, 0))
+                } else {
+                    Style::default()
+                }),
+                KyRow::Resource { counts, .. } => Row::new(vec![
+                    Cell::from(label),
+                    Cell::from(counts.summary()),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]),
+                KyRow::Violation { idx, .. } => {
+                    let Some(v) = app.ky_view_violations.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let color = ky_result_color(v.result);
+                    let (msg_cell, height) = ky_message_cell(v, selected == Some(vi), msg_w);
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(color)),
+                        Cell::from(""),
+                        Cell::from(format!("{}/{}", v.policy, v.rule))
+                            .style(Style::default().fg(Color::Cyan)),
+                        msg_cell,
+                    ])
+                    .height(height)
+                }
+                _ => Row::new(vec![Cell::from(label)]),
+            }
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(34),
+        Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn ky_violation_row(label: String, v: &KyViolation, focused: bool, msg_w: usize) -> Row<'static> {
+    let color = ky_result_color(v.result);
+    let (msg_cell, height) = ky_message_cell(v, focused, msg_w);
+    Row::new(vec![
+        Cell::from(label).style(Style::default().fg(color)),
+        Cell::from(v.result.label()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Cell::from(v.kind.clone()).style(Style::default().fg(DIM)),
+        Cell::from(v.severity.clone()).style(Style::default().fg(DIM)),
+        msg_cell,
+    ])
+    .height(height)
+}
+
+// The focused row expands its message so the full reason is readable inline, which matters here:
+// a Kyverno validation message is usually one long sentence naming the exact failing path.
+fn ky_message_cell(v: &KyViolation, focused: bool, msg_w: usize) -> (Cell<'static>, u16) {
+    let color = ky_result_color(v.result);
+    if focused && !v.message.is_empty() {
+        let wrapped = wrap_words(&v.message, msg_w).join("\n");
+        let h = wrapped.lines().count().clamp(1, 8) as u16;
+        (Cell::from(wrapped).style(Style::default().fg(color)), h)
+    } else {
+        (Cell::from(v.message.clone()).style(Style::default().fg(color)), 1)
+    }
+}
+
+fn fold_marker(has_children: bool, collapsed: bool) -> &'static str {
+    if !has_children {
+        " "
+    } else if collapsed {
+        "▸"
+    } else {
+        "▾"
+    }
+}
+
+// Cluster-scoped results carry no namespace; naming that explicitly beats a blank cell.
+fn ns_label(ns: &str) -> &str {
+    if ns.is_empty() { "(cluster)" } else { ns }
+}
+
+fn ky_target_label(v: &KyViolation) -> String {
+    if v.namespace.is_empty() {
+        v.name.clone()
+    } else {
+        format!("{}/{}", v.namespace, v.name)
+    }
+}
+
+fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let width = area.width.saturating_sub(4) as usize;
+    let (title, mut lines) = ky_health_lines(app);
+
+    match app.table_state.selected().and_then(|i| app.ky_rows.get(i)) {
+        Some(KyRow::Violation { idx, .. }) => {
+            let v = app.ky_view_violations[*idx].clone();
+            let policy = app.ky_selected_policy().cloned();
+            lines.extend(ky_violation_lines(&v, policy.as_ref(), width));
+        }
+        Some(KyRow::Namespace { name, counts, .. }) => {
+            lines.extend(ky_namespace_lines(name, counts));
+        }
+        Some(KyRow::Resource { kind, namespace, name, .. }) => {
+            let vios: Vec<KyViolation> = app
+                .ky_view_violations
+                .iter()
+                .filter(|v| &v.kind == kind && &v.namespace == namespace && &v.name == name)
+                .cloned()
+                .collect();
+            lines.extend(ky_resource_lines(kind, namespace, name, &vios, width));
+        }
+        Some(_) => {
+            if let Some(p) = app.ky_selected_policy().cloned() {
+                let vios: Vec<KyViolation> = app
+                    .ky_view_violations
+                    .iter()
+                    .filter(|v| v.policy_uid == p.uid())
+                    .cloned()
+                    .collect();
+                let denials = app.ky_denials(&p.name, 6);
+                lines.extend(ky_policy_lines(&p, &vios, &denials, width));
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            " sélectionnez une policy ",
+            Style::default().fg(DIM),
+        ))),
+    }
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.ky_detail_scroll > max_scroll {
+        app.ky_detail_scroll = max_scroll;
+    }
+    let p = Paragraph::new(lines)
+        .scroll((app.ky_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// The two-line "is Kyverno actually doing anything?" band, shown whatever the selection is. The
+// webhook counts are the load-bearing part: every controller can be green while no policy is
+// intercepting a thing, and nothing else on the cluster says so.
+fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
+    let (health, cel, reports) = {
+        let s = app.kyverno_state.lock().expect("kyverno poisoned");
+        (s.health.clone(), s.cel_installed, s.health.reports)
+    };
+
+    let ok = health.controllers_ok();
+    let (badge, badge_color) = if health.controllers.is_empty() {
+        (" kyverno ", Color::DarkGray)
+    } else if !ok {
+        (" kyverno dégradé ", Color::Red)
+    } else if health.silently_inactive() {
+        (" kyverno inactif ", Color::Yellow)
+    } else {
+        (" kyverno ", Color::Green)
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            badge,
+            Style::default().fg(Color::Black).bg(badge_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(if health.version.is_empty() {
+            String::new()
+        } else {
+            format!(" v{}", health.version)
+        }),
+    ];
+    if health.controllers.is_empty() {
+        spans.push(Span::styled(
+            "  contrôleurs introuvables dans le namespace kyverno",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    for (name, ready, desired) in &health.controllers {
+        let up = ready >= desired && *desired > 0;
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{} {}/{} {}", name, ready, desired, if up { "✓" } else { "✗" }),
+            Style::default().fg(if up { Color::Green } else { Color::Red }),
+        ));
+    }
+
+    let mut second = vec![Span::raw(" webhooks ressources: ")];
+    let hook_color = |n: usize| if n == 0 { Color::Yellow } else { Color::Green };
+    second.push(Span::styled(
+        format!("validating {}", health.validating_webhooks),
+        Style::default().fg(hook_color(health.validating_webhooks)),
+    ));
+    second.push(Span::raw(" · "));
+    second.push(Span::styled(
+        format!("mutating {}", health.mutating_webhooks),
+        Style::default().fg(hook_color(health.mutating_webhooks)),
+    ));
+    second.push(Span::styled(
+        format!("  ·  {} rapports", reports),
+        Style::default().fg(DIM),
+    ));
+    if !cel {
+        second.push(Span::styled(
+            "  ·  moteur CEL absent",
+            Style::default().fg(DIM),
+        ));
+    }
+    if health.silently_inactive() {
+        second.push(Span::styled(
+            "  ·  aucun webhook enregistré : rien n'est intercepté",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    let lines = vec![Line::from(spans), Line::from(second), Line::from("")];
+    (" kyverno ".to_string(), lines)
+}
+
+fn section(label: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {} ", label),
+        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn field(key: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        // Padded to the longest key, plus a guaranteed space: without it "s'applique à" runs
+        // straight into its value.
+        Span::styled(format!("  {:<13} ", key), Style::default().fg(DIM)),
+        Span::raw(value),
+    ])
+}
+
+fn ky_policy_lines(
+    p: &KyPolicy,
+    violations: &[KyViolation],
+    denials: &[(String, String, String)],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let header = if p.namespace.is_empty() {
+        format!(" {} {} ", p.kind.as_str(), p.name)
+    } else {
+        format!(" {} {}/{} ", p.kind.as_str(), p.namespace, p.name)
+    };
+    let header_color = match p.ready {
+        KyReady::NotReady => Color::Red,
+        _ if p.counts.error > 0 => Color::Magenta,
+        _ if p.counts.fail > 0 => Color::Yellow,
+        _ => Color::Green,
+    };
+    out.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(Color::Black).bg(header_color).add_modifier(Modifier::BOLD),
+    )));
+    if !p.title.is_empty() {
+        out.push(Line::from(Span::styled(format!("  {}", p.title), Style::default().fg(DIM))));
+    }
+
+    // A policy that cannot evaluate is protecting nothing, whatever its rules say. That goes first.
+    if p.ready == KyReady::NotReady {
+        out.push(Line::from(""));
+        for l in wrap_words(&format!("non-Ready : {}", p.ready_message), width) {
+            out.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Red))));
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(section("posture"));
+    out.push(field("action", p.action.label().to_string()));
+    out.push(field(
+        "admission",
+        if p.admission { "oui".into() } else { "non (scan de fond seulement)".to_string() },
+    ));
+    out.push(field(
+        "background",
+        if p.background {
+            "oui".to_string()
+        } else {
+            "non (les objets existants ne sont pas scannés)".to_string()
+        },
+    ));
+    if let Some(s) = &p.schedule {
+        out.push(field("schedule", s.clone()));
+    }
+    out.push(field("âge", p.age.clone()));
+    for o in &p.overrides {
+        // Without this the ACTION column lies on every cluster phasing Enforce in namespace by
+        // namespace.
+        out.push(Line::from(vec![
+            Span::styled("  override    ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{} sur ns {}", o.action.label(), o.namespaces.join(", "))),
+        ]));
+    }
+
+    if !p.rules.is_empty() {
+        out.push(Line::from(""));
+        out.push(section("règles"));
+        for r in &p.rules {
+            let mut spans = vec![
+                Span::styled(format!("  {}", r.name), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {}", r.verb), Style::default().fg(DIM)),
+            ];
+            if r.autogen {
+                spans.push(Span::styled(
+                    "  (autogen)",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if r.action != p.action {
+                spans.push(Span::styled(
+                    format!("  {}", r.action.label()),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            let summary = r.counts.summary();
+            if !summary.is_empty() {
+                spans.push(Span::raw(format!("  {}", summary)));
+            }
+            out.push(Line::from(spans));
+            out.push(Line::from(Span::styled(
+                format!("      s'applique à {}", r.match_summary),
+                Style::default().fg(Color::Cyan),
+            )));
+            for l in wrap_words(&r.message, width.saturating_sub(6)) {
+                out.push(Line::from(Span::styled(
+                    format!("      « {} »", l),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+
+    if !p.exceptions.is_empty() {
+        out.push(Line::from(""));
+        out.push(section("exceptions"));
+        for e in &p.exceptions {
+            out.push(Line::from(vec![
+                Span::styled(format!("  – {}/{}", e.namespace, e.name), Style::default().fg(Color::Magenta)),
+                Span::styled(format!("  exclut {}", e.match_summary), Style::default().fg(DIM)),
+            ]));
+            if !e.rules.is_empty() {
+                out.push(Line::from(Span::styled(
+                    format!("      pour les règles {}", e.rules.join(", ")),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+
+    // The two halves of "what is this policy rejecting?": what the reports know, and what only the
+    // events know.
+    if !violations.is_empty() {
+        out.push(Line::from(""));
+        out.push(section("ressources en échec"));
+        for v in violations.iter().take(12) {
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} {:<12}", v.result.glyph(), v.kind),
+                    Style::default().fg(ky_result_color(v.result)),
+                ),
+                Span::raw(ky_target_label(v)),
+                Span::styled(format!("  {}", v.rule), Style::default().fg(DIM)),
+            ]));
+        }
+        if violations.len() > 12 {
+            out.push(Line::from(Span::styled(
+                format!("  … et {} de plus", violations.len() - 12),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(section("refus d'admission récents"));
+    if denials.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  aucun dans le tampon d'events",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        // These never appear in a PolicyReport: the resource was refused, so it does not exist and
+        // nothing describes it. The event is the only trace.
+        for (age, target, rule) in denials {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {:<6}", age), Style::default().fg(DIM)),
+                Span::styled(target.clone(), Style::default().fg(Color::Red)),
+                Span::styled(format!("  {}", rule), Style::default().fg(DIM)),
+            ]));
+        }
+    }
+    out
+}
+
+fn ky_violation_lines(
+    v: &KyViolation,
+    policy: Option<&KyPolicy>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let color = ky_result_color(v.result);
+    out.push(Line::from(Span::styled(
+        format!(" {} {} ", v.result.label(), v.kind),
+        Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD),
+    )));
+    out.push(Line::from(""));
+    out.push(field("ressource", ky_target_label(v)));
+    if !v.api_version.is_empty() {
+        out.push(field("apiVersion", v.api_version.clone()));
+    }
+    out.push(field("policy", format!("{} / {}", v.policy, v.rule)));
+    if !v.severity.is_empty() {
+        out.push(field("severity", v.severity.clone()));
+    }
+    if !v.category.is_empty() {
+        out.push(field("category", v.category.clone()));
+    }
+    if !v.process.is_empty() {
+        out.push(field("origine", v.process.clone()));
+    }
+    if !v.age.is_empty() {
+        out.push(field("évalué", format!("il y a {}", v.age)));
+    }
+
+    out.push(Line::from(""));
+    out.push(section("message"));
+    for l in wrap_words(&v.message, width.saturating_sub(2)) {
+        out.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(color))));
+    }
+
+    // An `error` is the policy failing to run, not the resource failing the policy — different
+    // problem, different fix, and the distinction is easy to miss in a wall of red.
+    if v.result == KyResult::Error {
+        out.push(Line::from(""));
+        for l in wrap_words(
+            "La règle n'a pas pu s'évaluer : c'est la policy qui est en cause, pas la ressource.",
+            width.saturating_sub(2),
+        ) {
+            out.push(Line::from(Span::styled(
+                format!("  {}", l),
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+    }
+
+    if let Some(p) = policy {
+        if let Some(r) = p.rules.iter().find(|r| r.name == v.rule) {
+            out.push(Line::from(""));
+            out.push(section("la règle"));
+            out.push(field("s'applique à", r.match_summary.clone()));
+            out.push(field("action", r.action.label().to_string()));
+            for l in wrap_words(&r.message, width.saturating_sub(4)) {
+                out.push(Line::from(Span::styled(
+                    format!("    « {} »", l),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        "  h : re-déclencher l'admission sur cette ressource (Kyverno la réévalue)",
+        Style::default().fg(Color::Cyan),
+    )));
+    out
+}
+
+fn ky_namespace_lines(ns: &str, counts: &KyCounts) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!(" namespace {} ", ns_label(ns)),
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        field("erreurs", counts.error.to_string()),
+        field("échecs", counts.fail.to_string()),
+        field("warnings", counts.warn.to_string()),
+    ]
+}
+
+fn ky_resource_lines(
+    kind: &str,
+    ns: &str,
+    name: &str,
+    violations: &[KyViolation],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![
+        Line::from(Span::styled(
+            format!(" {} {} ", kind, name),
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        field("namespace", ns_label(ns).to_string()),
+        Line::from(""),
+        section("policies violées"),
+    ];
+    for v in violations {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("  {} {}", v.result.glyph(), v.policy),
+                Style::default().fg(ky_result_color(v.result)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" / {}", v.rule), Style::default().fg(DIM)),
+        ]));
+        for l in wrap_words(&v.message, width.saturating_sub(4)) {
+            out.push(Line::from(Span::styled(format!("    {}", l), Style::default().fg(DIM))));
+        }
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        "  h : re-déclencher l'admission sur cette ressource",
+        Style::default().fg(Color::Cyan),
+    )));
+    out
+}
+
 fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (loading, error, total) = {
         let s = app.configmaps_state.lock().expect("configmaps poisoned");
@@ -9868,6 +11362,14 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Certs | Mode::CertsFull));
     if is_certs_mode {
         draw_certs_detail(f, app, area);
+        return;
+    }
+
+    let is_kyverno_mode = matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull)
+        || (app.mode == Mode::AiPanel && matches!(app.return_mode, Mode::Kyverno | Mode::KyvernoFull))
+        || (app.mode == Mode::Command && matches!(app.command_return_mode, Mode::Kyverno | Mode::KyvernoFull));
+    if is_kyverno_mode {
+        draw_kyverno_detail(f, app, area);
         return;
     }
     let is_configmaps_mode = matches!(app.mode, Mode::Configmaps | Mode::ConfigmapsFull)
@@ -11086,7 +12588,7 @@ fn line_color_to_pdf(c: LineColor) -> &'static str {
 mod glyph_guard {
     // Vérifiés dans DejaVu Sans Mono (présents, avance 1233 = une cellule) et absents de Noto
     // Color Emoji.
-    const APPROVED: &str = "·»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
+    const APPROVED: &str = "·«»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
 
     #[test]
     fn sources_use_only_font_safe_glyphs() {

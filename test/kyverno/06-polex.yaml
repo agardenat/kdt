@@ -1,0 +1,30 @@
+# Exception : dispense `legacy-excepted` de la règle require-limits/validate-resources.
+#
+# Prérequis : Kyverno démarre avec `--enablePolicyException=false`. Sans le flag à `true` sur les
+# contrôleurs admission et background, l'objet existe mais n'est jamais pris en compte — la vue le
+# liste quand même, mais le `fail` de `legacy-excepted` ne disparaît pas. Voir README.md.
+#
+# La règle matchée est la règle autogen, pas la règle d'origine : la policy matche des Pods, donc
+# c'est `autogen-validate-resources` qui s'applique au Deployment.
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: legacy-allow
+  namespace: kdt-kyverno-test
+spec:
+  exceptions:
+    - policyName: require-limits
+      ruleNames:
+        - validate-resources
+        - autogen-validate-resources
+  match:
+    any:
+      - resources:
+          kinds:
+            - Deployment
+            - Pod
+          namespaces:
+            - kdt-kyverno-test
+          names:
+            - legacy-excepted
+            - legacy-excepted-*

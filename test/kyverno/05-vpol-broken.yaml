@@ -1,0 +1,29 @@
+# Moteur CEL (policies.kyverno.io/v1) : posture via `spec.validationActions` et portée via
+# `spec.matchConstraints`, rien à voir avec la forme kyverno.io/v1.
+#
+# L'expression compile mais explose à l'évaluation (index hors bornes) : Kyverno produit alors des
+# résultats `error` — la règle n'a pas pu s'évaluer — et non des `fail`. C'est un bug de policy, pas
+# un problème de ressource, et la vue doit le remonter au-dessus des `fail`.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: broken-cel-check
+spec:
+  validationActions:
+    - Audit
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kdt-kyverno-test
+  validations:
+    - expression: >-
+        object.spec.template.spec.containers[42].image != "nope"
+      message: "expression volontairement cassée (index hors bornes)"

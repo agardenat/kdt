@@ -77,6 +77,14 @@ impl EventRecord {
             .source
             .map(|s| (s.component.unwrap_or_default(), s.host.unwrap_or_default()))
             .unwrap_or_default();
+        // The events API v1 carries the emitter in `reportingComponent` and leaves `source` empty.
+        // Kyverno's admission controller is one of those emitters, so without this fallback its
+        // denials — the only trace an `Enforce` block ever leaves — arrive with no component at all.
+        let component = if component.is_empty() {
+            ev.reporting_component.unwrap_or_default()
+        } else {
+            component
+        };
         Self {
             uid,
             time,

@@ -1,0 +1,38 @@
+# Enforce, cantonnée au namespace de test : une ClusterPolicy Enforce non scopée bloquerait des
+# créations réelles ailleurs sur le cluster.
+#
+# La règle matche des Pods : c'est ce qui déclenche l'autogen Kyverno (status.autogen.rules), qui
+# produit les règles `autogen-*` pour Deployment/DaemonSet/StatefulSet/Job/CronJob. Ce sont ces
+# règles-là que les PolicyReport nomment — sans elles, la jointure violation -> règle échoue.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-limits
+  annotations:
+    policies.kyverno.io/title: Requests et limits obligatoires
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  background: true
+  rules:
+    - name: validate-resources
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - kdt-kyverno-test
+      validate:
+        failureAction: Enforce
+        message: "Les requests et limits CPU/mémoire sont obligatoires."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"

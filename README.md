@@ -286,6 +286,7 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `vuln` | `cve`, `cves`, `vulns` | Vue vulnérabilités (images + version k8s) |
 | `secrets` | `secret`, `se`, `tls` | Vue Secrets et certificats TLS |
 | `certs` | `certificates`, `issuers`, `challenges`, `acme` | Vue cert-manager (chaîne d'émission) |
+| `kyverno` | `ky`, `policies`, `polr`, `cpol`, `admission` | Vue Kyverno (policies, règles, violations) |
 | `configmaps` | `cm`, `config` | Vue ConfigMaps |
 | `services` | `svc`, `service` | Vue Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Vue Ingress / IngressClass |
@@ -577,6 +578,68 @@ La vue fonctionne aussi sans cert-manager (message explicite) et sur un cluster 
 `acme.cert-manager.io` (émetteurs CA / selfSigned uniquement), signalé par `· sans ACME` dans le
 bandeau.
 
+### Kyverno (`:kyverno`)
+
+Vue dédiée au moteur d'admission, pensée pour répondre à « qu'est-ce que Kyverno applique, à quoi,
+et qu'est-ce qui casse ? » sans faire la jointure à la main. Un `PolicyReport` ne nomme sa policy et
+sa règle que par une chaîne de caractères : pour savoir ce qui était vérifié il faut aller relire la
+policy. Cette jointure est faite une fois pour toutes ici.
+
+```
+▾ ClusterPolicy require-limits                Enforce   ✓ Ready    Pod · ns prod      ✗9 ✓3
+  ▾ validate-resources                        validate             Pod · ns prod      ✗3 ✓1
+      ✗ prod/api-7f9c-x2k                     fail      Pod        medium             validation error: …
+  ▾ autogen-validate-resources                validate  (autogen)  DaemonSet, Deploy  ✗6 ✓2
+      ✗ prod/api                              fail      Deployment medium             validation error: …
+  – polex legacy-allow                        exception            Deployment · ns …  validate-resources
+▾ ValidatingPolicy no-latest-tag              Audit     ✗ NotReady compilation CEL    ×4
+```
+
+`t` bascule vers la lecture inverse — namespace → ressource → policies violées — quand la question
+n'est plus « que casse cette policy ? » mais « qu'est-ce qui cloche dans ce namespace ? ». Les
+policies saines sont repliées automatiquement, celles en échec sont dépliées ; un pli manuel
+(`Space`) est définitif.
+
+Trois choses que cette vue montre et qu'un `kubectl get polr` ne donne pas :
+
+- **Les règles autogen.** Une règle qui matche des `Pod` fait générer par Kyverno des règles
+  `autogen-*` pour Deployment, StatefulSet, Job, CronJob… Ce sont **elles** que les rapports
+  nomment. Elles sont chargées, marquées, et les résultats leur sont rattachés — sans quoi la
+  jointure échoue silencieusement sur exactement les objets qu'on regarde.
+- **La différence entre `fail` et `error`.** `fail` = la ressource viole la règle ; `error` = la
+  règle n'a pas pu s'évaluer (CEL invalide, contexte manquant). C'est un bug de policy, pas un
+  problème de ressource : couleur distincte, tri plus haut, et une note explicite dans le détail.
+- **Les refus d'admission.** Une policy `Enforce` qui bloque une création ne laisse **aucune trace
+  dans les PolicyReports** : la ressource refusée n'existe pas, donc rien ne la décrit. Elle
+  n'existe que sous forme d'Event. Le panneau de détail les joint depuis le tampon d'events déjà en
+  mémoire, sous « refus d'admission récents ».
+
+Le bandeau de tête du panneau de détail répond au « est-ce que ça tourne ? » : version, état des
+quatre contrôleurs, et le nombre de webhooks `kyverno-resource-*` enregistrés. **Ce dernier compteur
+à zéro veut dire que Kyverno n'intercepte plus rien** — tous les contrôleurs peuvent être verts
+pendant qu'aucune policy n'est appliquée, et rien d'autre sur le cluster ne le dit.
+
+| Touche | Action |
+|---|---|
+| `↑↓` / `PgUp` `PgDn` | Navigation |
+| `Space` | Plier / déplier |
+| `t` | Bascule par policy ⇄ par ressource |
+| `f` | Filtre : `ALL` → `PROBLEMS` → `ENFORCE` |
+| `Enter` | Plein écran sur le détail |
+| `F5` | Rafraîchir |
+| `Shift+↑↓` | Défilement du panneau de détail |
+
+Les actions communes portent sur ce que désigne la ligne : `y`/`e`/`Ctrl-D` sur une ligne de policy
+ou de règle visent la policy, sur une ligne de violation ils visent **la ressource fautive**. C'est
+ce qui rend `h` utile ici : toucher la ressource en échec la fait retraverser l'admission, et
+Kyverno la réévalue sur le champ.
+
+La vue fonctionne sans Kyverno (message explicite), sur un cluster où il est installé mais sans
+aucune policy, et sur un cluster antérieur à Kyverno 1.14 dépourvu du moteur CEL
+`policies.kyverno.io` (signalé par `moteur CEL absent` dans le bandeau).
+
+Le jeu de manifestes de `test/kyverno/` produit chacun de ces cas sur un cluster de test.
+
 ## Architecture (`src/`)
 
 | Module | Rôle |
@@ -591,6 +654,7 @@ bandeau.
 | `vulnerabilities.rs` | CVE images (Trivy Operator) + risque version Kubernetes |
 | `secrets.rs` | Secrets et certificats TLS (expiration, consommateurs) |
 | `certmanager.rs` | cert-manager : chaîne Issuer → Certificate → Order → Challenge, diagnostics ACME |
+| `kyverno.rs` | Kyverno : policies, règles (dont autogen), PolicyReports, exceptions, santé des contrôleurs |
 | `configmaps.rs` | ConfigMaps et leur contenu |
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
 | `edit.rs` | Édition d'un objet via `$EDITOR` : garde-fous, diff, écriture |

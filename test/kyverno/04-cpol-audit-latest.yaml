@@ -1,0 +1,44 @@
+# Audit : la ressource passe l'admission, la violation n'existe que dans le PolicyReport.
+# Deux règles, dont une en Audit et une en Enforce, pour vérifier que la colonne ACTION agrège bien
+# la posture la plus forte au niveau policy tout en gardant l'action par règle dans le détail.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Interdire le tag latest
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: low
+spec:
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - kdt-kyverno-test
+      validate:
+        failureAction: Audit
+        message: "Une image doit porter un tag explicite."
+        pattern:
+          spec:
+            containers:
+              - image: "*:*"
+    - name: validate-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - kdt-kyverno-test
+      validate:
+        failureAction: Audit
+        message: "Le tag `latest` est interdit."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"

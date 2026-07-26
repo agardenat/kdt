@@ -1,0 +1,80 @@
+# Charges de travail jetables, appliquées AVANT les policies Enforce : une ressource refusée à
+# l'admission n'existe pas, donc n'apparaît dans aucun PolicyReport. Ces objets-là existent et
+# violent les règles, ce qui est le cas que le scan de fond rapporte.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-limits
+  namespace: kdt-kyverno-test
+  labels: { app: bad-limits }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bad-limits }
+  template:
+    metadata:
+      labels: { app: bad-limits }
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          # ni requests ni limits -> viole require-limits
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-latest
+  namespace: kdt-kyverno-test
+  labels: { app: bad-latest }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bad-latest }
+  template:
+    metadata:
+      labels: { app: bad-latest }
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest # viole disallow-latest-tag (Audit) ET require-limits
+---
+# Conforme : sert de témoin `pass` dans les compteurs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: good
+  namespace: kdt-kyverno-test
+  labels: { app: good }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: good }
+  template:
+    metadata:
+      labels: { app: good }
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 50m, memory: 32Mi }
+---
+# Viole require-limits mais est couvert par le PolicyException de 06-polex.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-excepted
+  namespace: kdt-kyverno-test
+  labels: { app: legacy-excepted }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: legacy-excepted }
+  template:
+    metadata:
+      labels: { app: legacy-excepted }
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9

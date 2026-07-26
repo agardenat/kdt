@@ -1,0 +1,36 @@
+# Le contrôleur de cleanup refuse une policy portant sur un kind qu'il n'a pas le droit de
+# supprimer : ses permissions sont agrégées depuis les ClusterRole portant ce label.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kdt-kyverno-test-cleanup-jobs
+  labels:
+    rbac.kyverno.io/aggregate-to-cleanup-controller: "true"
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+# Une CleanupPolicy n'a ni règles ni PolicyReport : elle n'existe que par sa crontab. Elle sert de
+# cas limite au rendu (ligne sans compteur de résultat, colonne PORTÉE remplie par le schedule).
+# Le sélecteur ne matche rien de réel : cette policy ne doit jamais rien supprimer.
+apiVersion: kyverno.io/v2
+kind: CleanupPolicy
+metadata:
+  name: stale-test-jobs
+  namespace: kdt-kyverno-test
+spec:
+  schedule: "0 3 * * *"
+  match:
+    any:
+      - resources:
+          kinds:
+            - Job
+          selector:
+            matchLabels:
+              kdt.io/disposable: "true"
+  conditions:
+    all:
+      - key: "{{ target.status.succeeded || `0` }}"
+        operator: Equals
+        value: 1

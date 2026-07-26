@@ -17,6 +17,7 @@ mod events;
 mod extract;
 mod flux;
 mod glyphs;
+mod kyverno;
 mod lang;
 mod pdf;
 mod pods;
