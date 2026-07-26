@@ -7,7 +7,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Flux d'évènements live** : watch des `Event` Kubernetes avec filtrage All / Warnings / Errors et mise en évidence des `reason` critiques.
 - **Vue détail** : logs du pod concerné, status de l'objet, et ressources liées (onglets Logs / Status / Related). Les logs se lisent sur le **run précédent** (`p` — le cas du `CrashLoopBackOff`, où le container qui tourne ne dit rien), container par container (`C`), et en **suivi** (`f`).
 - **Recherche (`/`)** : depuis toutes les vues. Dans une table elle ne garde que les lignes qui correspondent ; dans un panneau texte (logs, diagnostic, IA, YAML) elle surligne et saute d'une occurrence à l'autre (`Ctrl-N`/`Ctrl-P`). Le bandeau annonce toujours la requête active et son effet.
-- **Vue Nodes** : liste des nœuds, détail plein écran, et vue d'usage (CPU/mémoire requests, tri configurable).
+- **Vue Nodes** : liste des nœuds (recherche `/` comprise), détail plein écran, vue d'usage (CPU/mémoire requests, tri configurable) et opérations `o` (voir plus bas).
 - **Diagnostic cluster** : batterie de vérifications (version, namespaces système, kube-system, CoreDNS, CNI, webhooks, Rancher, pods en erreur, PV, évènements warning récents…).
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
 - **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais. La réponse est **streamée** (SSE) et s'affiche au fil de l'eau.
@@ -331,15 +331,15 @@ l'API a accepté la demande.
 Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` complète,
 `Enter` valide, `Esc` annule.
 
-`events`, `namespace` et `pods` acceptent un **nom de namespace** en argument
+`events`, `namespace` et `workloads` acceptent un **nom de namespace** en argument
 (`:ns kube-system`, `:pods istio-system`, `:events monitoring`) avec autocomplétion (`Tab`).
 `all` (ou `*`/`0`) cible tous les namespaces.
 
 | Commande | Alias | Action |
 |---|---|---|
-| `events [ns]` | `ev` | Vue évènements (optionnellement filtrée sur `ns`) |
-| `namespace [ns]` | `ns` | Sélecteur de namespace (ou bascule directe sur `ns`) |
-| `pods [ns]` | `po`, `pod` | Vue Pods (optionnellement filtrée sur `ns`) |
+| `events [ns]` | `ev`, `event` | Vue évènements (optionnellement filtrée sur `ns`) |
+| `namespace [ns]` | `ns`, `namespaces` | Sélecteur de namespace (ou bascule directe sur `ns`) |
+| `workloads [ns]` | `wl`, `pods`, `po`, `deploy` | Vue Workloads / Pods (optionnellement filtrée sur `ns`) |
 | `nodes` | `no`, `node` | Vue Nodes |
 | `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
@@ -353,6 +353,8 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `ingress` | `ing`, `ingressclass` | Vue Ingress / IngressClass |
 | `storage` | `stockage`, `pvc`, `claims` | Vue stockage, côté demandes (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Vue stockage, côté volumes (StorageClass → PV) |
+| `capacity` | `cap`, `marge`, `headroom` | Vue capacité, côté nœuds (marge et perte d'un nœud) |
+| `quota` | `quotas`, `rq`, `resourcequota` | Vue capacité, côté quotas |
 | `quit` | `q` | Quitter |
 
 ### FluxCD (`:flux`)
@@ -405,27 +407,33 @@ l'onglet **Inventory**.
 Vue plein écran agrégeant les logs de tous les controllers de `flux-system` (suivi ~3 s),
 triés par horodatage. `Esc` pour revenir.
 
-### Pods (`:pods`)
+### Workloads (`:workloads`, alias `:pods`)
 
-Liste des pods du namespace courant ; `o` bascule sur l'**objet d'origine** (workload propriétaire)
-pour le piloter, `Esc`/`o` revient à la liste.
+Par défaut une **liste plate des pods** du namespace courant ; `t` bascule sur l'arbre
+workloads → pods, où chaque Deployment/StatefulSet/DaemonSet/Job porte ses pods en dessous. Un
+workload scalé à 0 reste visible dans l'arbre, ce qu'une liste de pods ne peut pas montrer.
+
+Les actions visent le **workload**, qu'on soit sur sa ligne ou sur celle d'un de ses pods : c'est
+l'objet qui se scale et se redémarre. Les logs d'une ligne de workload sont l'agrégat de ceux de
+ses pods, avec un en-tête par pod.
 
 | Touche | Action |
 |---|---|
 | `↑` / `↓` / `PgUp` / `PgDn` | Navigation |
 | `Enter` / `Tab` | Détail plein écran / changer d'onglet |
-| `o` | Basculer sur l'objet d'origine (workload) |
+| `t` | Basculer liste plate ↔ arbre workloads → pods |
 | `n` | Filtrer sur le namespace du pod sélectionné |
 | `0` | Retirer le filtre namespace |
 | `s` | Menu **scale** : `+1` / `-1` / `0` / définir un nombre exact de répliques |
 | `r` | Menu **actions** : `rescale` / `recyclage` / `restart`, avec confirmation |
 | `E` | Shell dans le pod (`kubectl exec -it`) |
+| `p` / `C` / `f` | Logs : run précédent / container / suivi (onglet Logs) |
 | `i` | Panneau IA |
 
-Le menu `r` (sur l'objet d'origine) propose, avec explication et confirmation :
-**rescale** (rétablit le nombre de répliques initial mémorisé), **recyclage** (scale 0 puis remonte,
-recrée tous les pods) et **restart** (`rollout restart` progressif). Le menu `s` permet le scaling
-incrémental ou la saisie directe d'un nombre de répliques.
+Le menu `r` propose, avec explication et confirmation : **rescale** (rétablit le nombre de
+répliques initial mémorisé), **recyclage** (scale 0 puis remonte, recrée tous les pods) et
+**restart** (`rollout restart` progressif). Le menu `s` permet le scaling incrémental ou la saisie
+directe d'un nombre de répliques.
 
 ### Shell dans un pod (`E`)
 
@@ -672,6 +680,8 @@ La valeur n'est jamais transmise à l'API : elle ne sert qu'au rognage local. Re
 | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | Endpoint compatible OpenAI |
 | `OPENAI_MODEL` | Modèle à utiliser |
 | `OPENAI_CONTEXT_WINDOW` | Fenêtre de contexte en tokens du fournisseur `default` (budget de prompt) |
+| `KDT_KUBECTL` | Binaire utilisé par le shell `E` (défaut : `kubectl`, cherché dans le `PATH`) |
+| `KDT_EXEC_SHELL` | Commande passée à `sh -c` dans le container par `E` (défaut : `bash` s'il existe, sinon `sh`) |
 | `KDT_CONFIG` / `KEV_CONFIG` | Chemin du fichier de config |
 | `KDT_LOG` / `KEV_LOG` | Chemin du fichier de log |
 | `RUST_LOG` | Filtre de logs (`warn` par défaut) |
@@ -681,7 +691,7 @@ La valeur n'est jamais transmise à l'API : elle ne sert qu'au rognage local. Re
 - **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives. Le payload est compacté avant envoi (JSON sans espaces, lignes répétées des logs/status fusionnées, événements liés dédupliqués) et borné par section, ainsi que globalement quand `context_window` est défini.
 - **Endpoint** : un `base_url` en `http://` envoie la clé `Authorization: Bearer` et le payload en clair. Préfère `https://` (ou un endpoint local pour de l'inférence offline).
 - **Clé API** : stockée en clair dans `config.json` ; restreins les permissions du fichier (`chmod 600`). La clé n'est jamais journalisée.
-- **Accès cluster** : toute la navigation est en lecture seule (`get`/`list`/`watch`/`logs`). Les seules écritures sont celles qu'une touche déclenche explicitement — scale / restart / recyclage, reconcile et suspend Flux, renew cert-manager, édition (`e`, un `PUT`), suppression (`Ctrl-D`), touch (`h`, un patch de deux annotations) — et elles sont refusées par l'API si le kubeconfig n'en a pas le droit. Un seul shell-out : `$EDITOR`, lancé par `e`.
+- **Accès cluster** : toute la navigation est en lecture seule (`get`/`list`/`watch`/`logs`). Les seules écritures sont celles qu'une touche déclenche explicitement — scale / restart / recyclage, reconcile et suspend Flux, renew cert-manager, édition (`e`, un `PUT`), suppression (`Ctrl-D`), touch (`h`, un patch de deux annotations), cordon/uncordon et drain d'un nœud (`o` : un patch de `spec.unschedulable`, puis des évictions) — et elles sont refusées par l'API si le kubeconfig n'en a pas le droit. Deux shell-out, tous deux à la demande : `$EDITOR` lancé par `e`, et `kubectl exec -it` lancé par `E` — ce dernier est la seule dépendance de kdt à un binaire externe, et son absence est dite avant que l'écran ne soit rendu.
 - **Rendu PDF** : le contenu IA est échappé avant d'être évalué comme markup Typst (`convert_inline_md`), ce qui neutralise l'injection de code Typst ; les blocs de code passent par `raw()` (jamais évalué).
 
 ## Logs
