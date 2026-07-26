@@ -169,7 +169,7 @@ container demandé, kdt le signale plutôt que d'afficher silencieusement autre 
 ### YAML de l'objet (`y`)
 
 Disponible depuis **toutes les vues** (évènements, nodes, workloads, flux, services/ingress,
-RBAC, secrets, configmaps) : `y` ouvre le manifeste de l'objet sous le curseur, récupéré en
+stockage, RBAC, secrets, configmaps) : `y` ouvre le manifeste de l'objet sous le curseur, récupéré en
 direct via l'API (découverte de GVK, donc les CRD marchent comme les kinds natifs).
 
 Deux affichages, bascule par `t` :
@@ -350,6 +350,8 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `configmaps` | `cm`, `config` | Vue ConfigMaps |
 | `services` | `svc`, `service` | Vue Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Vue Ingress / IngressClass |
+| `storage` | `stockage`, `pvc`, `claims` | Vue stockage, côté demandes (PVC → PV) |
+| `pv` | `sc`, `storageclass`, `persistentvolume` | Vue stockage, côté volumes (StorageClass → PV) |
 | `quit` | `q` | Quitter |
 
 ### FluxCD (`:flux`)
@@ -700,6 +702,52 @@ aucune policy, et sur un cluster antérieur à Kyverno 1.14 dépourvu du moteur 
 
 Le jeu de manifestes de `test/kyverno/` produit chacun de ces cas sur un cluster de test.
 
+### Stockage (`:storage`, `:pv`)
+
+Le stockage est la deuxième source d'incidents après le réseau, et `kubectl get pvc` sait dire
+qu'un PVC est `Pending` sans jamais dire **pourquoi**. Cette vue répond à la deuxième question.
+
+Deux mondes, `g` bascule de l'un à l'autre :
+
+- **claims** (`:storage`, `:pvc`) — les `PersistentVolumeClaim`, avec le `PersistentVolume` auquel
+  chacun est lié imbriqué en dessous (`t`), et les pods qui le montent ;
+- **volumes** (`:pv`, `:sc`) — les `PersistentVolume` groupés sous la `StorageClass` qui les
+  provisionne, celles-ci portant leur provisioner, leur `reclaimPolicy` et leur `bindingMode`.
+
+Le panneau de détail donne les faits de l'objet puis le **diagnostic**, et termine par les constats
+qui appartiennent au cluster et non à une ligne. Ce que les règles savent dire :
+
+- un PVC `Pending` **et sa cause** : StorageClass nommée introuvable, aucune classe par défaut,
+  `storageClassName: ""` (provisionnement dynamique explicitement refusé), classe en
+  `WaitForFirstConsumer` qui attend un pod — ce dernier cas est un simple constat, pas une alerte —
+  ou classe sans provisioner, avec alors le décompte des PV `Available` assez grands pour convenir.
+  Quand le provisioner a laissé un évènement (`ProvisioningFailed`), c'est **son** message qui est
+  affiché en premier : il bat toute déduction ;
+- les PV `Released` : de la donnée gardée pour des PVC qui n'existent plus, dont le total est
+  rappelé dans le bandeau de la table (`3.0Gi dorment en Released`) ;
+- `reclaimPolicy: Delete`, rappelé **sur le PVC** — l'objet qu'on supprime — et pas seulement sur le
+  PV où l'information vit ;
+- un PVC lié que plus aucun pod ne monte ; un PVC `RWO` monté par plusieurs pods ;
+- l'absence de StorageClass par défaut, ou la présence de deux, qui rend indéterminée la classe
+  qu'obtient un PVC qui n'en nomme aucune ;
+- les classes sans `allowVolumeExpansion`, où agrandir un volume impose de le recréer ;
+- la `nodeAffinity` d'un PV, qui explique pourquoi un volume ne se lie que d'un côté du cluster.
+
+`f` ne garde que les lignes qui portent un vrai problème (les constats en `·` ne comptent pas) :
+sur un cluster sain la vue se vide, ce qui est la réponse attendue.
+
+| Touche | Action |
+|---|---|
+| `g` | Bascule claims ↔ volumes |
+| `t` | Imbrication parent/enfant |
+| `f` | Filtre : tout / problèmes seulement |
+| `n` / `0` | Filtrer sur le namespace de la ligne / revenir à tous |
+| `Enter` | Détail plein écran |
+| `Shift+↑↓` | Défilement du panneau de détail |
+
+La vue est en lecture seule ; `y`, `e` et `Ctrl-D` restent disponibles et passent par les garde-fous
+habituels, qui traitent déjà PVC et PV comme de la donnée persistante.
+
 ## Architecture (`src/`)
 
 | Module | Rôle |
@@ -716,6 +764,7 @@ Le jeu de manifestes de `test/kyverno/` produit chacun de ces cas sur un cluster
 | `certmanager.rs` | cert-manager : chaîne Issuer → Certificate → Order → Challenge, diagnostics ACME |
 | `kyverno.rs` | Kyverno : policies, règles (dont autogen), PolicyReports, exceptions, santé des contrôleurs |
 | `configmaps.rs` | ConfigMaps et leur contenu |
+| `storage.rs` | Stockage : PVC / PV / StorageClass et les règles de diagnostic associées |
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |
 | `edit.rs` | Édition d'un objet via `$EDITOR` : garde-fous, diff, écriture |
 | `delete.rs` | Suppression d'un objet : garde-fous et exécution |

@@ -241,6 +241,54 @@ enum NetRow {
     Ingress(IngressResource),
     IngressClass(IngressClassResource),
 }
+use crate::storage::{
+    fetch_storage, new_storage_state, volume_in_class, HintLevel as StoHintLevel, PvResource,
+    PvcResource, ScResource, SharedStorage,
+};
+
+// The two object worlds the storage view toggles between (`g`): claims — what a workload asked for
+// and whether it got it — and volumes, grouped under the class that provisions them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoWorld {
+    Claims,
+    Volumes,
+}
+
+// One visual row of the storage view. Kept index-aligned with the snapshot so the detail panel and
+// the generic object machinery (`y`, `Ctrl-D`, Related) track the selection.
+#[derive(Debug, Clone)]
+enum StoRow {
+    Claim(PvcResource),
+    Volume(PvResource),
+    Class(ScResource),
+}
+
+impl StoRow {
+    // The row's diagnosis, used both by the detail panel and by the `f` filter.
+    fn hints(&self) -> &[crate::storage::Hint] {
+        match self {
+            StoRow::Claim(c) => &c.hints,
+            StoRow::Volume(v) => &v.hints,
+            StoRow::Class(c) => &c.hints,
+        }
+    }
+
+    // Worth a human's attention: an Info hint is context ("this class does not expand"), a Warn or
+    // Danger one is something that is, or is about to be, a problem.
+    fn has_problem(&self) -> bool {
+        self.hints().iter().any(|h| h.level >= StoHintLevel::Warn)
+    }
+}
+
+// How the storage view is filtered (`f`): everything, or only the rows carrying a real problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoFilter { All, Problems }
+
+impl StoFilter {
+    fn label(self) -> &'static str {
+        match self { StoFilter::All => "ALL", StoFilter::Problems => "PROBLEMS" }
+    }
+}
 use crate::enrich::{fetch_related, gather_extra_context_with_progress, new_related_state, SharedRelated};
 
 // In-panel reveal of a secret's data values (`b`/`d`). Hidden by default and reset whenever the
@@ -324,7 +372,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Certs, CertsFull, Kyverno, KyvernoFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Certs, CertsFull, Kyverno, KyvernoFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -402,6 +450,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::KyvernoFull
             | Mode::ConfigmapsFull
             | Mode::ServicesFull
+            | Mode::StorageFull
     )
 }
 
@@ -479,6 +528,10 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
+    // The claims world answers to the PVC words, the volumes world to the PV/class ones — `:pv` and
+    // `:pvc` land on the side of the view the user was already thinking in.
+    ("storage", &["stockage", "pvc", "claims", "volumes"]),
+    ("pv", &["persistentvolume", "persistentvolumes", "sc", "storageclass", "storageclasses"]),
     ("quit", &["q"]),
 ];
 
@@ -499,15 +552,24 @@ fn resolve_command(input: &str) -> Option<&'static str> {
     if matches.len() == 1 { Some(matches[0]) } else { None }
 }
 
+// Completion candidates, best first. `resolve_command` already treats an exact name or alias as
+// beating any prefix, and Enter runs the *highlighted* suggestion rather than the raw input — so the
+// same rule has to hold here, or a word that is one command's exact alias silently runs another
+// whose alias merely starts with it (`:pv` landing on `storage`, whose alias `pvc` starts with it).
 fn command_name_suggestions(input: &str) -> Vec<&'static str> {
     let q = input.trim().to_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|(name, aliases)| {
-            q.is_empty() || name.starts_with(&q) || aliases.iter().any(|a| a.starts_with(&q))
-        })
-        .map(|(name, _)| *name)
-        .collect()
+    let exact = |name: &str, aliases: &[&str]| {
+        !q.is_empty() && (name == q || aliases.contains(&q.as_str()))
+    };
+    let mut hits: Vec<&'static str> = Vec::new();
+    let mut rest: Vec<&'static str> = Vec::new();
+    for (name, aliases) in COMMANDS {
+        let prefix = q.is_empty() || name.starts_with(&q) || aliases.iter().any(|a| a.starts_with(&q));
+        if !prefix { continue; }
+        if exact(name, aliases) { hits.push(name) } else { rest.push(name) }
+    }
+    hits.extend(rest);
+    hits
 }
 
 // Commands that take an optional namespace argument (`:ns/pods/events <name>`).
@@ -685,6 +747,18 @@ pub struct App {
     net_group: bool,
     pub net_refresh_handle: Option<JoinHandle<()>>,
     last_net_sel_uid: Option<String>,
+    // Storage view: same shape as the network view above — shared inventory, flattened display rows
+    // index-aligned with the snapshot, the active world, the `t` grouping and the `f` filter.
+    pub storage_state: SharedStorage,
+    sto_rows: Vec<StoRow>,
+    sto_world: StoWorld,
+    sto_group: bool,
+    sto_filter: StoFilter,
+    pub sto_refresh_handle: Option<JoinHandle<()>>,
+    last_sto_sel_uid: Option<String>,
+    // Scroll of the storage detail panel, which is a rendered text panel of its own rather than the
+    // generic Logs/Status/Related body.
+    sto_detail_scroll: usize,
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
     pub rbac_state: SharedRbac,
@@ -865,6 +939,14 @@ impl App {
             net_group: false,
             net_refresh_handle: None,
             last_net_sel_uid: None,
+            storage_state: new_storage_state(),
+            sto_rows: Vec::new(),
+            sto_world: StoWorld::Claims,
+            sto_group: true,
+            sto_filter: StoFilter::All,
+            sto_refresh_handle: None,
+            last_sto_sel_uid: None,
+            sto_detail_scroll: 0,
             pods_saved_replicas: std::collections::HashMap::new(),
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
@@ -1633,6 +1715,8 @@ impl App {
             | Mode::PodsFull
             | Mode::Services
             | Mode::ServicesFull
+            | Mode::Storage
+            | Mode::StorageFull
             | Mode::Certs
             | Mode::CertsFull
             | Mode::Kyverno
@@ -2092,6 +2176,7 @@ impl App {
             Mode::Flux | Mode::FluxFull => self.refresh_flux(),
             Mode::Pods | Mode::PodsFull => self.schedule_pods_refresh(800),
             Mode::Services | Mode::ServicesFull => self.refresh_network(),
+            Mode::Storage | Mode::StorageFull => self.refresh_storage(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
             Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
@@ -2445,6 +2530,7 @@ impl App {
             Mode::Flux | Mode::FluxFull => self.refresh_flux_snapshot(),
             Mode::Pods | Mode::PodsFull => self.refresh_pods_snapshot(),
             Mode::Services | Mode::ServicesFull => self.refresh_net_snapshot(),
+            Mode::Storage | Mode::StorageFull => self.refresh_storage_snapshot(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
             _ => {}
@@ -2562,6 +2648,16 @@ impl App {
                 self.leave_special_modes();
                 self.enter_network_mode(NetWorld::Ingress);
             }
+            "storage" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_storage_mode(StoWorld::Claims);
+            }
+            "pv" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_storage_mode(StoWorld::Volumes);
+            }
             _ => self.exit_command(),
         }
     }
@@ -2602,6 +2698,10 @@ impl App {
             }
             Mode::Services | Mode::ServicesFull => {
                 self.stop_network_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Storage | Mode::StorageFull => {
+                self.stop_storage_auto_refresh();
                 self.clear_status_state();
             }
             _ => {}
@@ -3284,6 +3384,221 @@ impl App {
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
         self.maybe_fetch_related();
+    }
+
+    // --- Storage view ---------------------------------------------------------------------------
+
+    // Open the storage view in the given world. Both worlds share one fetch and one shared state, so
+    // switching world only re-renders; the namespace scope drives the claims part of the fetch.
+    fn enter_storage_mode(&mut self, world: StoWorld) {
+        self.mode = Mode::Storage;
+        self.sto_world = world;
+        self.sto_rows.clear();
+        // Storage objects have no logs of their own: Status is the useful default tab.
+        self.detail_tab = DetailTab::Status;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_sto_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_storage();
+        self.start_storage_auto_refresh();
+        self.refresh_storage_snapshot();
+    }
+
+    fn exit_storage_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_storage_auto_refresh();
+        self.sto_rows.clear();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_sto_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_storage_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.mode = Mode::StorageFull;
+    }
+
+    fn exit_storage_full(&mut self) {
+        self.mode = Mode::Storage;
+    }
+
+    // `t`: nest children under their parent — the bound PV under its claim, the volumes under the
+    // class that provisions them.
+    fn toggle_storage_group(&mut self) {
+        self.sto_group = !self.sto_group;
+        self.refresh_storage_snapshot();
+    }
+
+    // `g`: switch between the Claims and Volumes worlds (same inventory, no reload).
+    fn cycle_storage_world(&mut self) {
+        self.sto_world = match self.sto_world {
+            StoWorld::Claims => StoWorld::Volumes,
+            StoWorld::Volumes => StoWorld::Claims,
+        };
+        self.last_sto_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.sto_detail_scroll = 0;
+        self.reset_scroll();
+        self.refresh_storage_snapshot();
+    }
+
+    // `f`: keep only what carries a Warn/Danger hint. On a healthy cluster this empties the view,
+    // which is exactly the answer the filter is asked for.
+    fn cycle_storage_filter(&mut self) {
+        self.sto_filter = match self.sto_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_storage_snapshot();
+    }
+
+    fn refresh_storage(&self) {
+        {
+            let mut s = self.storage_state.lock().expect("storage poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.storage_state.clone();
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move { fetch_storage(client, ns, state).await; });
+    }
+
+    // Storage moves slowly, and the fetch walks the pod list to know what mounts what: a 15 s ticker
+    // keeps a Pending claim's story current without re-listing every pod every five seconds.
+    fn start_storage_auto_refresh(&mut self) {
+        self.stop_storage_auto_refresh();
+        let client = self.client.clone();
+        let state = self.storage_state.clone();
+        let ns = self.current_ns_opt();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_storage(client.clone(), ns.clone(), state.clone()).await;
+            }
+        });
+        self.sto_refresh_handle = Some(handle);
+    }
+
+    fn stop_storage_auto_refresh(&mut self) {
+        if let Some(h) = self.sto_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuild the flattened rows and the index-aligned snapshot from the shared state, honoring the
+    // active world, the `t` grouping and the `f` filter. Selection is preserved by uid across
+    // refreshes and toggles. Mirrors `refresh_net_snapshot`.
+    fn refresh_storage_snapshot(&mut self) {
+        let rows: Vec<StoRow> = {
+            let s = self.storage_state.lock().expect("storage poisoned");
+            match (self.sto_world, self.sto_group) {
+                // Claims, grouped: each claim followed by the volume it is bound to — the two halves
+                // of the same question ("did it get what it asked for?") on adjacent lines.
+                (StoWorld::Claims, true) => {
+                    let mut rows: Vec<StoRow> = Vec::with_capacity(s.pvcs.len() * 2);
+                    for pvc in &s.pvcs {
+                        rows.push(StoRow::Claim(pvc.clone()));
+                        if let Some(name) = &pvc.volume_name {
+                            if let Some(pv) = s.pvs.iter().find(|p| &p.name == name) {
+                                rows.push(StoRow::Volume(pv.clone()));
+                            }
+                        }
+                    }
+                    rows
+                }
+                (StoWorld::Claims, false) => s.pvcs.iter().cloned().map(StoRow::Claim).collect(),
+                // Volumes, grouped by class: each class followed by its volumes, then the volumes
+                // whose class is empty or unknown, which is where hand-made PVs end up.
+                (StoWorld::Volumes, true) => {
+                    let mut rows: Vec<StoRow> =
+                        Vec::with_capacity(s.pvs.len() + s.classes.len());
+                    for sc in &s.classes {
+                        rows.push(StoRow::Class(sc.clone()));
+                        for pv in s.pvs.iter().filter(|p| volume_in_class(p, sc)) {
+                            rows.push(StoRow::Volume(pv.clone()));
+                        }
+                    }
+                    let known: Vec<&str> = s.classes.iter().map(|c| c.name.as_str()).collect();
+                    for pv in s.pvs.iter().filter(|p| !known.contains(&p.storage_class.as_str())) {
+                        rows.push(StoRow::Volume(pv.clone()));
+                    }
+                    rows
+                }
+                (StoWorld::Volumes, false) => s.pvs.iter().cloned().map(StoRow::Volume).collect(),
+            }
+        };
+        // The `f` filter drops rows before the search does, and both must cut `sto_rows` and the
+        // snapshot with the same keep-set or the selection stops matching what is drawn.
+        let rows: Vec<StoRow> = match self.sto_filter {
+            StoFilter::All => rows,
+            StoFilter::Problems => rows.into_iter().filter(StoRow::has_problem).collect(),
+        };
+        let recs: Vec<EventRecord> = rows.iter().map(synthetic_storage_record).collect();
+        self.sto_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.sto_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_sto_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_sto_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_sto_sel_uid = Some(cur_uid);
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_storage_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_sto_sel_uid = self.selected_uid.clone();
+        self.sto_detail_scroll = 0;
+        self.reset_scroll();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
+    }
+
+    // The row under the cursor, for the detail panel.
+    fn storage_selected(&self) -> Option<&StoRow> {
+        self.sto_rows.get(self.table_state.selected()?)
     }
 
     // --- RBAC security view -------------------------------------------------------------------
@@ -5484,12 +5799,16 @@ impl App {
         }
         let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
         let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
+        let was_sto = matches!(self.mode, Mode::Storage | Mode::StorageFull);
         let net_world = self.net_world;
+        let sto_world = self.sto_world;
         self.apply_namespace(Some(ns));
         if was_pods {
             self.enter_pods_mode();
         } else if was_net {
             self.enter_network_mode(net_world);
+        } else if was_sto {
+            self.enter_storage_mode(sto_world);
         } else {
             self.mode = Mode::Selection;
         }
@@ -5506,12 +5825,16 @@ impl App {
         }
         let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
         let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
+        let was_sto = matches!(self.mode, Mode::Storage | Mode::StorageFull);
         let net_world = self.net_world;
+        let sto_world = self.sto_world;
         self.apply_namespace(None);
         if was_pods {
             self.enter_pods_mode();
         } else if was_net {
             self.enter_network_mode(net_world);
+        } else if was_sto {
+            self.enter_storage_mode(sto_world);
         } else {
             self.mode = Mode::Selection;
         }
@@ -5577,6 +5900,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
             app.refresh_net_snapshot();
+        }
+        if matches!(app.mode, Mode::Storage | Mode::StorageFull) {
+            app.refresh_storage_snapshot();
         }
         if matches!(app.mode, Mode::Certs | Mode::CertsFull) {
             app.refresh_certs_snapshot();
@@ -5790,14 +6116,14 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels. Deliberately absent from the Nodes view, which reads its rows
         // straight from the shared state with no single place to filter them.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.enter_search();
         }
 
@@ -5820,24 +6146,24 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.open_edit_view();
         }
 
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.open_delete_view();
         }
 
@@ -6281,6 +6607,49 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::ServicesFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ServicesFull) => {}
 
+        (KeyCode::Up, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::Left, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
+        (KeyCode::Right, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
+        (KeyCode::Up, _, Mode::Storage) => app.move_storage_selection(-1),
+        (KeyCode::Down, _, Mode::Storage) => app.move_storage_selection(1),
+        (KeyCode::PageUp, _, Mode::Storage) => app.move_storage_selection(-10),
+        (KeyCode::PageDown, _, Mode::Storage) => app.move_storage_selection(10),
+        (KeyCode::Tab, _, Mode::Storage) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::Storage) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::Storage) => app.enter_storage_full(),
+        (KeyCode::Esc, _, Mode::Storage) => app.exit_storage_mode(),
+        (KeyCode::Char('n'), _, Mode::Storage) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Storage) => app.clear_namespace_filter(),
+        (KeyCode::Char('t'), _, Mode::Storage) => app.toggle_storage_group(),
+        (KeyCode::Char('g'), _, Mode::Storage) => app.cycle_storage_world(),
+        (KeyCode::Char('f'), _, Mode::Storage) => app.cycle_storage_filter(),
+        (KeyCode::F(5), _, Mode::Storage) => app.refresh_storage(),
+        (KeyCode::Char('i'), _, Mode::Storage) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Storage) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Storage) => {}
+
+        (KeyCode::Up, m, Mode::StorageFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::StorageFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::StorageFull) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::StorageFull) => app.scroll_detail(-10),
+        (KeyCode::Left, m, Mode::StorageFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5)
+        }
+        (KeyCode::Right, m, Mode::StorageFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.detail_h_scroll = app.detail_h_scroll.saturating_add(5)
+        }
+        (KeyCode::Home, _, Mode::StorageFull) => app.detail_h_scroll = 0,
+        (KeyCode::Tab, _, Mode::StorageFull) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::StorageFull) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::StorageFull) => app.exit_storage_full(),
+        (KeyCode::Esc, _, Mode::StorageFull) => app.exit_storage_full(),
+        (KeyCode::Char('g'), _, Mode::StorageFull) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::StorageFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('i'), _, Mode::StorageFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::StorageFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::StorageFull) => {}
+
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_sub(5);
         }
@@ -6372,7 +6741,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -6403,11 +6772,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -6423,8 +6792,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -6451,6 +6820,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
+        Mode::Storage | Mode::StorageFull => st.mode_storage,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -6513,10 +6883,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Services {
             draw_net_tree(f, app, ta);
+        } else if draw_mode == Mode::Storage {
+            draw_storage_table(f, app, ta);
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -6815,6 +7187,31 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             ]
         }
         Mode::ServicesFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+        ],
+        Mode::Storage => {
+            // `t` and `g` name what they switch *to*, so the bar reads as the next action.
+            let toggle_label = if app.sto_group { st.k_sto_flat } else { st.k_sto_grouped };
+            let world_label = if app.sto_world == StoWorld::Claims { st.k_sto_volumes } else { st.k_sto_claims };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+                footer_sep(),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+                Span::styled(" t ", kbg), Span::raw(format!(" {}   ", toggle_label)),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", world_label)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_sto_filter, app.sto_filter.label())),
+            ]
+        }
+        Mode::StorageFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             footer_sep(),
@@ -8888,6 +9285,82 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
     }
 }
 
+// The EventRecord a storage row stands in for. Severity is taken from the diagnosis rather than from
+// the phase: a Pending claim on a WaitForFirstConsumer class is normal, and a Bound one whose volume
+// will be deleted with it is not — the rules already made that call.
+fn synthetic_storage_record(row: &StoRow) -> EventRecord {
+    let now = k8s_openapi::jiff::Timestamp::now();
+    let severity = |r: &StoRow| {
+        if r.has_problem() { Severity::Warning } else { Severity::Normal }
+    };
+    match row {
+        StoRow::Claim(c) => EventRecord {
+            uid: format!("sto|{}", c.uid),
+            time: now,
+            severity: severity(row),
+            reason: c.phase.clone(),
+            api_version: "v1".to_string(),
+            kind: "PersistentVolumeClaim".to_string(),
+            namespace: c.namespace.clone(),
+            name: c.name.clone(),
+            message: format!(
+                "{} {} class={} pv={} monté par {}",
+                if c.capacity.is_empty() { c.requested.clone() } else { c.capacity.clone() },
+                c.access_modes,
+                c.storage_class.clone().unwrap_or_else(|| "—".to_string()),
+                c.volume_name.clone().unwrap_or_else(|| "—".to_string()),
+                if c.mounted_by.is_empty() { "—".to_string() } else { c.mounted_by.join(",") },
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+        StoRow::Volume(v) => EventRecord {
+            uid: format!("sto|{}", v.uid),
+            time: now,
+            severity: severity(row),
+            reason: v.phase.clone(),
+            api_version: "v1".to_string(),
+            kind: "PersistentVolume".to_string(),
+            namespace: String::new(),
+            name: v.name.clone(),
+            message: format!(
+                "{} {} reclaim={} class={} claim={} {}",
+                v.capacity,
+                v.access_modes,
+                v.reclaim_policy,
+                v.storage_class,
+                v.claim.clone().unwrap_or_else(|| "—".to_string()),
+                v.source,
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+        StoRow::Class(c) => EventRecord {
+            uid: format!("sto|{}", c.uid),
+            time: now,
+            severity: severity(row),
+            reason: "StorageClass".to_string(),
+            api_version: "storage.k8s.io/v1".to_string(),
+            kind: "StorageClass".to_string(),
+            namespace: String::new(),
+            name: c.name.clone(),
+            message: format!(
+                "{} reclaim={} binding={} expansion={}{}",
+                c.provisioner,
+                c.reclaim_policy,
+                c.binding_mode,
+                c.allow_expansion,
+                if c.is_default { " (default)" } else { "" },
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
+    }
+}
+
 // A usage value (CPU millicores / memory bytes) formatted, or a dim "—" when metrics are unavailable.
 fn usage_cell(v: Option<i64>, fmt: fn(i64) -> String) -> Cell<'static> {
     match v {
@@ -9296,6 +9769,205 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(14), Constraint::Length(name_w), Constraint::Length(20),
         Constraint::Length(24), Constraint::Min(20), Constraint::Length(4),
         Constraint::Length(18), Constraint::Length(5),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// --- Storage view rendering ---------------------------------------------------------------------
+
+// The colour a diagnosis lends to the row that carries it: the table has to show at a glance which
+// lines are worth opening, without the user filtering first.
+fn sto_hint_color(hints: &[crate::storage::Hint]) -> Option<Color> {
+    let worst = hints.iter().map(|h| h.level).max()?;
+    match worst {
+        StoHintLevel::Danger => Some(Color::Red),
+        StoHintLevel::Warn => Some(Color::Rgb(255, 140, 0)),
+        StoHintLevel::Info => None,
+    }
+}
+
+// The phase cell, coloured by what the phase actually means for the operator: Bound is fine, Pending
+// is a question, Released/Failed/Lost are money or data at stake.
+fn sto_phase_cell(phase: &str) -> Cell<'static> {
+    let color = match phase {
+        "Bound" => Color::Green,
+        "Available" => Color::Cyan,
+        "Pending" => Color::Yellow,
+        "Released" => Color::Rgb(255, 140, 0),
+        "Failed" | "Lost" => Color::Red,
+        _ => DIM,
+    };
+    Cell::from(phase.to_string()).style(Style::default().fg(color))
+}
+
+// The grouping marker a claim gets: `▾` only when a volume is actually nested under it, so a Pending
+// claim does not advertise a child it does not have. The blank keeps the names column-aligned.
+fn sto_claim_prefix(grouped: bool, c: &PvcResource) -> &'static str {
+    match (grouped, c.volume_name.is_some()) {
+        (true, true) => "▾ ",
+        (true, false) => "  ",
+        (false, _) => "",
+    }
+}
+
+// Storage table: one shape for both worlds, because the columns answer the same questions (what,
+// how much, in what state, on which class) whichever object owns the row.
+fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_pvc, n_pv, n_sc, released) = {
+        let s = app.storage_state.lock().expect("storage poisoned");
+        (s.loading, s.error.clone(), s.pvcs.len(), s.pvs.len(), s.classes.len(), s.released_bytes)
+    };
+    let src = &app.sto_rows;
+
+    let world = if app.sto_world == StoWorld::Claims { "claims" } else { "volumes" };
+    // Released bytes go in the title rather than in a row: it is the one number that belongs to the
+    // cluster and not to any single volume, and it is the reason to open this view at all.
+    let waste = if released > 0 {
+        format!(" · {} dorment en Released", format_memory_bytes(released))
+    } else {
+        String::new()
+    };
+    let title = if let Some(e) = &error {
+        format!("stockage (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "stockage (chargement...)".to_string()
+    } else {
+        format!(
+            "stockage/{} ({} pvc · {} pv · {} class){} · ns={} · [g] {} · [f] {}",
+            world,
+            n_pvc,
+            n_pv,
+            n_sc,
+            waste,
+            app.namespace_label,
+            if app.sto_world == StoWorld::Claims { "volumes" } else { "claims" },
+            app.sto_filter.label(),
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("PHASE"),
+        Cell::from("SIZE"), Cell::from("ACCESS"), Cell::from("CLASS"), Cell::from("RECLAIM"),
+        Cell::from("USED BY"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // Children are indented only when the grouping actually nests them: a volume is a child in both
+    // worlds, a claim never is.
+    let indent = if app.sto_group { "    " } else { "" };
+    let blank = || Cell::from("");
+    let rows: Vec<Row> = src
+        .iter()
+        .map(|row| {
+            let flag = sto_hint_color(row.hints());
+            match row {
+                StoRow::Claim(c) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    };
+                    let prefix = sto_claim_prefix(app.sto_group, c);
+                    let size = if c.capacity.is_empty() { c.requested.clone() } else { c.capacity.clone() };
+                    let used = match c.mounted_by.len() {
+                        0 => Cell::from("—").style(Style::default().fg(DIM)),
+                        1 => Cell::from(c.mounted_by[0].clone()),
+                        n => Cell::from(format!("{} ({} pods)", c.mounted_by[0], n)),
+                    };
+                    Row::new(vec![
+                        Cell::from(c.namespace.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(format!("{}{}", prefix, c.name)).style(name_style),
+                        Cell::from("PVC").style(Style::default().fg(DIM)),
+                        sto_phase_cell(&c.phase),
+                        Cell::from(size),
+                        Cell::from(c.access_modes.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(c.storage_class.clone().unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        blank(),
+                        used,
+                        Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                StoRow::Volume(v) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color),
+                        None => Style::default(),
+                    };
+                    // Delete is the policy that loses data on a `kubectl delete pvc`, so it is the
+                    // only one the table shouts about.
+                    let reclaim_color = if v.reclaim_policy == "Delete" { Color::Yellow } else { DIM };
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(format!("{}{}", indent, v.name)).style(name_style),
+                        Cell::from("PV").style(Style::default().fg(DIM)),
+                        sto_phase_cell(&v.phase),
+                        Cell::from(v.capacity.clone()),
+                        Cell::from(v.access_modes.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(v.storage_class.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(v.reclaim_policy.clone()).style(Style::default().fg(reclaim_color)),
+                        Cell::from(v.claim.clone().unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(v.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                StoRow::Class(c) => {
+                    let label = if c.is_default {
+                        format!("▾ {} (default)", c.name)
+                    } else {
+                        format!("▾ {}", c.name)
+                    };
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    };
+                    // A class has no phase, no size and no access mode; what identifies it is who
+                    // provisions it and when it binds, and that goes in the widest column rather
+                    // than being clipped into the narrow PHASE one.
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(label).style(name_style),
+                        Cell::from("SC").style(Style::default().fg(DIM)),
+                        blank(),
+                        blank(),
+                        blank(),
+                        blank(),
+                        Cell::from(c.reclaim_policy.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(format!("{} · {}", c.provisioner, c.binding_mode))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+            }
+        })
+        .collect();
+
+    let ns_values = src.iter().map(|r| match r {
+        StoRow::Claim(c) => c.namespace.as_str(),
+        _ => "",
+    });
+    // Width is measured on the strings actually drawn, marker and indent included — measuring the
+    // bare names would size the column two characters short and clip every claim.
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            StoRow::Claim(c) => format!("{}{}", sto_claim_prefix(app.sto_group, c), c.name),
+            StoRow::Volume(v) => format!("{}{}", indent, v.name),
+            StoRow::Class(c) => format!("▾ {}{}", c.name, if c.is_default { " (default)" } else { "" }),
+        })
+        .collect();
+    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40);
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(4),
+        Constraint::Length(10), Constraint::Length(8), Constraint::Length(8),
+        Constraint::Length(16), Constraint::Length(8), Constraint::Min(16),
+        Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -10353,6 +11025,142 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .scroll((app.certs_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
+}
+
+// Storage detail: the facts of the selected object, then what the rules make of them. The cluster's
+// own findings (no default class, storage sleeping in Released volumes) are appended whatever the
+// selection is — they explain rows that look fine on their own line.
+fn draw_storage_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(row) = app.storage_selected().cloned() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez un PVC, un PV ou une StorageClass ", Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" stockage "));
+        f.render_widget(p, area);
+        return;
+    };
+    let cluster_hints = {
+        let s = app.storage_state.lock().expect("storage poisoned");
+        s.cluster_hints.clone()
+    };
+    let (title, mut lines) = storage_detail_lines(&row, &cluster_hints);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.sto_detail_scroll > max_scroll {
+        app.sto_detail_scroll = max_scroll;
+    }
+    app.sto_detail_scroll = text_search_top(
+        app, Mode::StorageFull, &mut lines, visible, app.sto_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .scroll((app.sto_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// The detail body, split out so it stays a pure function of the row and the cluster findings.
+fn storage_detail_lines(
+    row: &StoRow,
+    cluster_hints: &[crate::storage::Hint],
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<16}", k), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let title = match row {
+        StoRow::Claim(c) => {
+            lines.push(label("phase", c.phase.clone()));
+            lines.push(label("demandé", dash(&c.requested)));
+            lines.push(label("obtenu", dash(&c.capacity)));
+            lines.push(label("accessModes", dash(&c.access_modes)));
+            lines.push(label(
+                "storageClass",
+                match c.storage_class.as_deref() {
+                    // The empty string is a decision, not an absence: it is worth spelling out.
+                    Some("") => "\"\" (provisionnement dynamique refusé)".to_string(),
+                    Some(name) => name.to_string(),
+                    None => "— (classe par défaut)".to_string(),
+                },
+            ));
+            lines.push(label("volume", dash(c.volume_name.as_deref().unwrap_or(""))));
+            lines.push(label("âge", c.age.clone()));
+            let mounted = if c.mounted_by.is_empty() {
+                "aucun pod".to_string()
+            } else {
+                c.mounted_by.join(", ")
+            };
+            lines.push(label("monté par", mounted));
+            Line::from(Span::styled(
+                format!(" PVC {}/{} ", c.namespace, c.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::Volume(v) => {
+            lines.push(label("phase", v.phase.clone()));
+            lines.push(label("capacité", dash(&v.capacity)));
+            lines.push(label("accessModes", dash(&v.access_modes)));
+            lines.push(label("reclaimPolicy", v.reclaim_policy.clone()));
+            lines.push(label("storageClass", dash(&v.storage_class)));
+            lines.push(label("claimRef", dash(v.claim.as_deref().unwrap_or(""))));
+            lines.push(label("backend", dash(&v.source)));
+            lines.push(label("nodeAffinity", dash(&v.node_affinity)));
+            lines.push(label("âge", v.age.clone()));
+            Line::from(Span::styled(
+                format!(" PV {} ", v.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::Class(c) => {
+            lines.push(label("provisioner", dash(&c.provisioner)));
+            lines.push(label("reclaimPolicy", c.reclaim_policy.clone()));
+            lines.push(label("bindingMode", c.binding_mode.clone()));
+            lines.push(label("expansion", if c.allow_expansion { "oui".into() } else { "non".to_string() }));
+            lines.push(label("par défaut", if c.is_default { "oui".into() } else { "non".to_string() }));
+            lines.push(label("âge", c.age.clone()));
+            Line::from(Span::styled(
+                format!(" StorageClass {} ", c.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+    };
+
+    push_storage_hints(&mut lines, "Diagnostic", row.hints());
+    push_storage_hints(&mut lines, "Cluster", cluster_hints);
+    (title, lines)
+}
+
+// A titled block of hints, wrapped and glyphed like the cert-manager diagnostics so the two views
+// read the same way. Nothing is drawn when there is nothing to say.
+fn push_storage_hints(lines: &mut Vec<Line<'static>>, title: &str, hints: &[crate::storage::Hint]) {
+    if hints.is_empty() { return; }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        title.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    for h in hints {
+        let (glyph, color) = match h.level {
+            StoHintLevel::Danger => ("✗", Color::Red),
+            StoHintLevel::Warn => ("▲", Color::Rgb(255, 140, 0)),
+            StoHintLevel::Info => ("·", DIM),
+        };
+        let mut first = true;
+        for w in wrap_words(&h.text, 76) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if first { format!("{glyph} ") } else { "  ".to_string() },
+                    Style::default().fg(color),
+                ),
+                Span::styled(w, Style::default().fg(color)),
+            ]));
+            first = false;
+        }
+    }
 }
 
 // What the Secrets view knows about the Secret this chain produces. Read from the shared secrets
@@ -12067,6 +12875,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         return;
     }
 
+    let is_storage_mode = matches!(view_mode(app), Mode::Storage | Mode::StorageFull);
+    if is_storage_mode {
+        draw_storage_detail(f, app, area);
+        return;
+    }
     let is_kyverno_mode = matches!(view_mode(app), Mode::Kyverno | Mode::KyvernoFull);
     if is_kyverno_mode {
         draw_kyverno_detail(f, app, area);
@@ -13369,6 +14182,35 @@ mod glyph_guard {
             "glyphes hors liste, potentiellement absents de la police mono du terminal : {}",
             offenders.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    // Enter runs the highlighted suggestion, so the first entry *is* what a typed word does. A word
+    // that is one command's exact alias must never be beaten by another whose alias merely starts
+    // with it — `pvc` belongs to `storage`, and `pv` is a command of its own.
+    #[test]
+    fn exact_match_outranks_prefix_match() {
+        assert_eq!(command_name_suggestions("pv").first(), Some(&"pv"));
+        assert_eq!(command_name_suggestions("pvc").first(), Some(&"storage"));
+        assert_eq!(command_name_suggestions("storage").first(), Some(&"storage"));
+        assert_eq!(command_name_suggestions("sc").first(), Some(&"pv"));
+        assert_eq!(command_name_suggestions("ns").first(), Some(&"namespace"));
+    }
+
+    // Prefix completion still works where nothing matches exactly, and both storage worlds stay
+    // reachable from the words that describe them.
+    #[test]
+    fn prefix_completion_still_offers_both_storage_worlds() {
+        let stock = command_name_suggestions("stock");
+        assert_eq!(stock, vec!["storage"]);
+        let sto = command_name_suggestions("storagec");
+        assert_eq!(sto, vec!["pv"]);
+        assert_eq!(resolve_command("volumes"), Some("storage"));
+        assert_eq!(resolve_command("persistentvolume"), Some("pv"));
     }
 }
 

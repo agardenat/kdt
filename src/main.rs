@@ -23,6 +23,7 @@ mod pdf;
 mod pods;
 mod rbac;
 mod secrets;
+mod storage;
 mod svc;
 mod touch;
 mod ui;
