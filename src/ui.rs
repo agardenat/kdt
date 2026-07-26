@@ -147,6 +147,8 @@ use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
 use crate::touch;
+use crate::exec;
+use crate::nodeops::{self, new_node_op_state, Reason as NodeReason, SharedNodeOp};
 use crate::yaml::{fetch_yaml, new_yaml_state, SharedYaml};
 
 // The `y` overlay: the YAML of the object selected in whichever view was on screen. Only the
@@ -172,6 +174,19 @@ struct DeleteView {
     armed: bool,
     typed: Option<String>,
     // Set once the successful deletion has triggered a refresh of the underlying view.
+    refreshed: bool,
+}
+
+// The drain overlay: which node is about to be emptied and how far the confirmation has got. The
+// guard-rails, the eviction plan and the progress live in `App::node_op_state`, written by the
+// background task. Same two confirmation paths as `DeleteView`, and the same rule — the key that
+// advances is the one that opened the gesture, never Enter.
+struct NodeOpView {
+    node: String,
+    key: String,
+    armed: bool,
+    typed: Option<String>,
+    // Set once the finished drain has triggered a refresh of the node list.
     refreshed: bool,
 }
 
@@ -339,8 +354,8 @@ use crate::events::{
     fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
     new_cluster_info_state,
     new_log_state, new_node_list_state, new_node_usage_state, new_ns_list_state, spawn_watcher,
-    EventRecord, LineColor, LogOpts, Severity, SharedBuffer, SharedClusterInfo, SharedLog,
-    SharedNodeList, SharedNodeUsage, SharedNsList, SharedStatus,
+    EventRecord, LineColor, LogOpts, NodeSummary, Severity, SharedBuffer, SharedClusterInfo,
+    SharedLog, SharedNodeList, SharedNodeUsage, SharedNsList, SharedStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +412,9 @@ enum MenuAction {
     ScaleSet,
     CertRenew,
     CertAcmeRetry,
+    // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
+    NodeCordon(bool),
+    NodeDrain,
 }
 
 // One labelled choice in the action menu overlay, with an explanatory line shown under the list.
@@ -486,6 +504,14 @@ fn record_matches_search(rec: &EventRecord, q: &str) -> bool {
 // state instead of going through `snapshot`.
 fn fields_match_search<S: AsRef<str>>(fields: &[S], q: &str) -> bool {
     fields.iter().any(|f| f.as_ref().to_lowercase().contains(q))
+}
+
+// A node row against the query, matched on what the table actually shows — including the alerts
+// column, so `/cordoned` and `/diskpressure` pick out exactly the nodes one goes looking for.
+fn node_matches_search(n: &NodeSummary, q: &str) -> bool {
+    fields_match_search(&[&n.name, &n.roles, &n.version, &n.ready], q)
+        || fields_match_search(&n.abnormal, q)
+        || (!n.schedulable && "cordoned".contains(q))
 }
 
 // Which rows of a freshly rebuilt snapshot survive the active query, or `None` when there is
@@ -831,6 +857,16 @@ pub struct App {
     // Set when the panel wants `$EDITOR`: only the run loop can honour it, since handing the
     // terminal over means tearing down the very event stream the key was read from.
     pending_editor: Option<PathBuf>,
+    // Drain overlay (`o` → drain): `None` when closed. Guard-rails, progress and outcome sit in
+    // `node_op_state`. Cordon/uncordon have no panel — they report through `node_op_status`.
+    node_op_view: Option<NodeOpView>,
+    node_op_state: SharedNodeOp,
+    node_op_status: SharedReconcile,
+    // Set when `E` asks for a shell: honoured by the run loop, for the same reason as the editor.
+    pending_exec: Option<crate::exec::Target>,
+    // The `--context` kdt was started with, passed on to `kubectl exec` so the shell lands in the
+    // cluster on screen rather than in whatever the kubeconfig currently points at.
+    kube_context: Option<String>,
 }
 
 impl App {
@@ -849,6 +885,7 @@ impl App {
         watcher_handle: JoinHandle<()>,
         buffer_capacity: usize,
         file_config: FileConfig,
+        kube_context: Option<String>,
     ) -> Self {
         let initial_lang = config::initial_language(&file_config).unwrap_or(AiLanguage::Fr);
         let ai_providers = resolve_providers(&file_config);
@@ -1005,6 +1042,11 @@ impl App {
             edit_view: None,
             edit_state: new_edit_state(),
             pending_editor: None,
+            node_op_view: None,
+            node_op_state: new_node_op_state(),
+            node_op_status: new_reconcile_status(),
+            pending_exec: None,
+            kube_context,
         }
     }
 
@@ -1682,9 +1724,8 @@ impl App {
     fn current_object_ref(&self) -> Option<(String, String, String, String)> {
         match self.mode {
             Mode::Nodes | Mode::NodesFull => {
-                let s = self.node_list_state.lock().expect("node list poisoned");
-                let n = s.nodes.get(self.node_cursor)?;
-                Some(("v1".to_string(), "Node".to_string(), String::new(), n.name.clone()))
+                let n = self.selected_node()?;
+                Some(("v1".to_string(), "Node".to_string(), String::new(), n.name))
             }
             Mode::Rbac | Mode::RbacFull => {
                 let b = self.rbac_selected()?;
@@ -1917,6 +1958,253 @@ impl App {
         if let Some(buf) = self.delete_view.as_mut().and_then(|v| v.typed.as_mut()) {
             buf.pop();
         }
+    }
+
+    // `o` in the Nodes view: pick an operation for the selected node. Cordon and uncordon go through
+    // straight away — they are one reversible field — while the drain opens its own guarded panel,
+    // which is why this menu does not confirm anything itself.
+    fn open_node_ops_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        if self.selected_node().is_none() {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.node_no_selection.to_string()));
+            return;
+        }
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_node_title,
+            items: vec![
+                ActionItem { label: st.k_cordon, desc: st.desc_cordon, action: MenuAction::NodeCordon(true) },
+                ActionItem { label: st.k_uncordon, desc: st.desc_uncordon, action: MenuAction::NodeCordon(false) },
+                ActionItem { label: st.k_drain, desc: st.desc_drain, action: MenuAction::NodeDrain },
+            ],
+            cursor: 0,
+            confirm: false,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    // Cordon (`unschedulable: true`) or uncordon the selected node. No panel: the field is one
+    // boolean, it is reversible from the same menu, and nothing is destroyed — a node already in the
+    // asked-for state is answered from what is on screen rather than with a write.
+    fn node_cordon(&mut self, unschedulable: bool) {
+        let st = lang::t(self.ai_language);
+        let Some(n) = self.selected_node() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.node_no_selection.to_string()));
+            return;
+        };
+        if n.schedulable != unschedulable {
+            let already = if unschedulable { st.node_already_cordoned } else { st.node_already_schedulable };
+            self.clipboard_status =
+                Some((std::time::Instant::now(), already.replace("{d}", &n.name)));
+            return;
+        }
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            st.node_cordon_running.replace("{d}", &n.name),
+        ));
+        let client = self.client.clone();
+        let status = self.node_op_status.clone();
+        let list = self.node_list_state.clone();
+        let name = n.name.clone();
+        tokio::spawn(async move {
+            let result = nodeops::set_cordon(&client, &name, unschedulable).await;
+            // Re-read before announcing: the toast is the only feedback, and it must not claim a
+            // state the table underneath does not yet show.
+            fetch_nodes(client, list).await;
+            let msg = match result {
+                Ok(()) if unschedulable => st.node_cordon_ok.replace("{d}", &name),
+                Ok(()) => st.node_uncordon_ok.replace("{d}", &name),
+                Err(e) => st.node_cordon_failed.replace("{d}", &name).replace("{e}", &e),
+            };
+            if let Ok(mut s) = status.lock() {
+                *s = Some((std::time::Instant::now(), msg));
+            }
+        });
+    }
+
+    // Open the drain panel on the selected node and run the guard-rails. Nothing is evicted here:
+    // the panel shows what the checks found — pods nothing would recreate, budgets that will refuse,
+    // room that does not exist elsewhere — and waits for the confirmation.
+    fn open_node_drain(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(n) = self.selected_node() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.node_no_selection.to_string()));
+            return;
+        };
+        let key = format!("drain|{}", n.name);
+        self.node_op_view = Some(NodeOpView {
+            node: n.name.clone(),
+            key: key.clone(),
+            armed: false,
+            typed: None,
+            refreshed: false,
+        });
+        {
+            let mut s = self.node_op_state.lock().expect("node op state poisoned");
+            *s = crate::nodeops::NodeOpState { key: key.clone(), loading: true, ..Default::default() };
+        }
+        let client = self.client.clone();
+        let state = self.node_op_state.clone();
+        let name = n.name.clone();
+        tokio::spawn(async move {
+            nodeops::preflight(client, name, key, state).await;
+        });
+    }
+
+    // `d`: walk one step down the confirmation — arm, open the type-the-name prompt, or start the
+    // drain. A no-op while the checks are running or once it is under way. Only this key advances.
+    fn node_drain_confirm(&mut self) {
+        let (loading, strict, busy) = {
+            let s = self.node_op_state.lock().expect("node op state poisoned");
+            (s.loading, s.needs_strict_confirm(), s.running || s.done.is_some())
+        };
+        if loading || busy {
+            return;
+        }
+        let Some(v) = self.node_op_view.as_mut() else { return };
+        if strict {
+            match v.typed.as_ref() {
+                None => {
+                    v.typed = Some(String::new());
+                    return;
+                }
+                Some(buf) if buf.trim() != v.node => return,
+                Some(_) => {}
+            }
+        } else if !v.armed {
+            v.armed = true;
+            return;
+        }
+        self.spawn_drain();
+    }
+
+    fn spawn_drain(&mut self) {
+        let Some(v) = self.node_op_view.as_ref() else { return };
+        let (node, key) = (v.node.clone(), v.key.clone());
+        {
+            let mut s = self.node_op_state.lock().expect("node op state poisoned");
+            s.running = true;
+            s.done = None;
+            s.evicted.clear();
+            s.waiting.clear();
+            s.failed.clear();
+        }
+        let client = self.client.clone();
+        let state = self.node_op_state.clone();
+        tokio::spawn(async move {
+            nodeops::run_drain(client, node, key, state).await;
+        });
+    }
+
+    // Enter and Esc both cancel, whatever step the gesture has reached. An eviction already sent is
+    // not taken back by closing the panel — it is the API's now — but nothing new is started.
+    fn node_drain_cancel(&mut self) {
+        self.node_op_view = None;
+    }
+
+    fn node_drain_input(&mut self, c: char) {
+        if let Some(buf) = self.node_op_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            if buf.len() < 253 {
+                buf.push(c);
+            }
+        }
+    }
+
+    fn node_drain_backspace(&mut self) {
+        if let Some(buf) = self.node_op_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            buf.pop();
+        }
+    }
+
+    // Polled every tick while the panel is open: a finished drain refreshes the node list once, so
+    // the row shows the cordon and the emptied node when the panel closes.
+    fn poll_node_op(&mut self) {
+        let finished = {
+            let s = self.node_op_state.lock().expect("node op state poisoned");
+            s.done.is_some()
+        };
+        if !finished {
+            return;
+        }
+        let Some(v) = self.node_op_view.as_mut() else { return };
+        if v.refreshed {
+            return;
+        }
+        v.refreshed = true;
+        self.refresh_nodes();
+    }
+
+    // Folds the outcome of a cordon/uncordon into the shared toast, replacing the "in flight" line.
+    fn drain_node_op_status(&mut self) {
+        if let Some(msg) = self.node_op_status.lock().ok().and_then(|mut s| s.take()) {
+            self.clipboard_status = Some(msg);
+        }
+    }
+
+    // `E`: hand the terminal to `kubectl exec -it` on the selected pod. The container is whichever
+    // one the Logs tab is narrowed to, so the two keys agree on what "this container" means.
+    fn exec_selected(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(target) = self.exec_target() else {
+            self.clipboard_status = Some((std::time::Instant::now(), st.exec_no_pod.to_string()));
+            return;
+        };
+        // The one feature that needs a binary next to kdt: say so here rather than by blanking the
+        // screen and coming straight back from a command that could not start.
+        let binary = crate::exec::kubectl_binary();
+        if crate::exec::locate(&binary).is_none() {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.exec_no_kubectl.replace("{d}", &binary)));
+            return;
+        }
+        if let Some(reason) = self.exec_blocked(&target) {
+            self.clipboard_status = Some((std::time::Instant::now(), reason));
+            return;
+        }
+        self.pending_exec = Some(target);
+    }
+
+    // The pod to open a shell in: the selected object when it is a pod, and otherwise — on a
+    // workload row — the first pod it owns, which is what one means by "a shell in this deployment".
+    fn exec_target(&self) -> Option<crate::exec::Target> {
+        let container = self.log_opts.container.clone();
+        if let Some((_, kind, namespace, name)) = self.current_object_ref() {
+            if kind == "Pod" && !namespace.is_empty() {
+                return Some(crate::exec::Target { namespace, pod: name, container });
+            }
+        }
+        let (namespace, pods) = self.selected_workload_pods()?;
+        let pod = pods.into_iter().next()?;
+        Some(crate::exec::Target { namespace, pod, container })
+    }
+
+    // Why the shell would not open, when the view knows enough to say so. `kubectl exec` on a
+    // finished pod fails with an exit code and a message on a screen kdt is about to wipe, so the
+    // one case the pods view can name from what it already has is named here instead.
+    fn exec_blocked(&self, target: &crate::exec::Target) -> Option<String> {
+        let st = lang::t(self.ai_language);
+        let s = self.pods_state.lock().expect("pods poisoned");
+        let p = s
+            .pods
+            .iter()
+            .find(|p| p.namespace == target.namespace && p.name == target.pod)?;
+        (p.status != "Running")
+            .then(|| st.exec_not_running.replace("{d}", &p.status))
+    }
+
+    // Back from the shell: the screen it wrote on is gone, so the exit status is the only trace of
+    // what happened in there.
+    fn exec_returned(&mut self, target: &crate::exec::Target, outcome: Result<(), String>) {
+        let st = lang::t(self.ai_language);
+        let label = format!("{}/{}", target.namespace, target.pod);
+        let msg = match outcome {
+            Ok(()) => st.exec_ok.replace("{d}", &label),
+            Err(e) => st.exec_failed.replace("{d}", &label).replace("{e}", &e),
+        };
+        self.clipboard_status = Some((std::time::Instant::now(), msg));
     }
 
     // Polled every tick: once the API has accepted a deletion, refresh the view behind the panel so
@@ -2277,10 +2565,7 @@ impl App {
         };
         let Some(name) = target else { return; };
         self.enter_nodes_mode();
-        let pos = {
-            let s = self.node_list_state.lock().expect("node list poisoned");
-            s.nodes.iter().position(|n| n.name == name)
-        };
+        let pos = self.node_rows().iter().position(|n| n.name == name);
         if let Some(pos) = pos {
             self.node_cursor = pos;
             self.last_node_status_key = None;
@@ -2320,9 +2605,24 @@ impl App {
         }
     }
 
+    // The node rows as the view shows them: the shared list narrowed by the active query. The Nodes
+    // view is the only one with no `snapshot` to filter, so this is its single point of derivation —
+    // `node_cursor` indexes into *this*, never into the raw list, and every reader goes through here
+    // or through `selected_node`.
+    pub fn node_rows(&self) -> Vec<NodeSummary> {
+        let s = self.node_list_state.lock().expect("node list poisoned");
+        match self.search_query.as_deref() {
+            None => s.nodes.clone(),
+            Some(q) => s.nodes.iter().filter(|n| node_matches_search(n, q)).cloned().collect(),
+        }
+    }
+
+    fn selected_node(&self) -> Option<NodeSummary> {
+        self.node_rows().get(self.node_cursor).cloned()
+    }
+
     fn enter_nodes_full(&mut self) {
-        let len = self.node_list_state.lock().expect("node list poisoned").nodes.len();
-        if len == 0 { return; }
+        if self.node_rows().is_empty() { return; }
         self.mode = Mode::NodesFull;
     }
 
@@ -2331,7 +2631,7 @@ impl App {
     }
 
     fn move_node_selection(&mut self, delta: i32) {
-        let len = self.node_list_state.lock().expect("node list poisoned").nodes.len();
+        let len = self.node_rows().len();
         if len == 0 { return; }
         let cur = self.node_cursor as i32;
         let max = len as i32 - 1;
@@ -2446,6 +2746,7 @@ impl App {
     // goes through the very helpers the views draw from rather than second-guessing them.
     fn visible_row_count(&self) -> usize {
         match self.mode {
+            Mode::Nodes | Mode::NodesFull => self.node_rows().len(),
             Mode::Rbac | Mode::RbacFull => self.rbac_visible().len(),
             Mode::Vuln | Mode::VulnFull => self.vuln_rows().len(),
             Mode::Secrets | Mode::SecretsFull => self.secret_rows().len(),
@@ -2525,7 +2826,14 @@ impl App {
         self.vuln_cursor = 0;
         self.secrets_cursor = 0;
         self.configmaps_cursor = 0;
+        // The node cursor follows the same rule, and the status panel underneath has to be told the
+        // selection moved or it keeps showing the node the cursor was on before the query.
+        if self.node_cursor != 0 {
+            self.node_cursor = 0;
+            self.last_node_status_key = None;
+        }
         match self.mode {
+            Mode::Nodes | Mode::NodesFull => self.maybe_fetch_node_status(),
             Mode::Selection => self.refresh_live_snapshot(),
             Mode::Flux | Mode::FluxFull => self.refresh_flux_snapshot(),
             Mode::Pods | Mode::PodsFull => self.refresh_pods_snapshot(),
@@ -5403,6 +5711,8 @@ impl App {
             Some(MenuAction::CertAcmeRetry) => self.certs_acme_retry(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
+            Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
+            Some(MenuAction::NodeDrain) => self.open_node_drain(),
             Some(MenuAction::ScaleSet) | None => {}
         }
     }
@@ -5436,11 +5746,7 @@ impl App {
     }
 
     fn maybe_fetch_node_status(&mut self) {
-        let name = {
-            let s = self.node_list_state.lock().expect("node list poisoned");
-            s.nodes.get(self.node_cursor).map(|n| n.name.clone())
-        };
-        let Some(name) = name else { return; };
+        let Some(name) = self.selected_node().map(|n| n.name) else { return; };
         let key = format!("Node|{}", name);
         if self.last_node_status_key.as_deref() == Some(&key) { return; }
         self.last_node_status_key = Some(key.clone());
@@ -5467,11 +5773,7 @@ impl App {
     }
 
     fn enter_node_usage(&mut self) {
-        let name = {
-            let s = self.node_list_state.lock().expect("node list poisoned");
-            s.nodes.get(self.node_cursor).map(|n| n.name.clone())
-        };
-        let Some(name) = name else { return; };
+        let Some(name) = self.selected_node().map(|n| n.name) else { return; };
         self.mode = Mode::NodeUsage;
         self.node_usage_scroll = 0;
         let client = self.client.clone();
@@ -5484,11 +5786,7 @@ impl App {
     }
 
     fn refresh_node_usage(&self) {
-        let name = {
-            let s = self.node_list_state.lock().expect("node list poisoned");
-            s.nodes.get(self.node_cursor).map(|n| n.name.clone())
-        };
-        let Some(name) = name else { return; };
+        let Some(name) = self.selected_node().map(|n| n.name) else { return; };
         let client = self.client.clone();
         let state = self.node_usage_state.clone();
         tokio::spawn(async move { fetch_node_usage(client, name, state).await; });
@@ -5720,8 +6018,7 @@ impl App {
     }
 
     fn synthetic_node_record(&self) -> Option<EventRecord> {
-        let s = self.node_list_state.lock().expect("node list poisoned");
-        let n = s.nodes.get(self.node_cursor)?;
+        let n = self.selected_node()?;
         let abnormal = if n.abnormal.is_empty() {
             "aucune condition anormale".to_string()
         } else {
@@ -5881,8 +6178,19 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
         // `h` fires from every view, so its outcome is collected before anything mode-specific.
         app.drain_touch_status();
+        // Cordon/uncordon can be fired from the Nodes view and answered while the user has already
+        // moved on, so the toast is drained unconditionally, like the touch one.
+        app.drain_node_op_status();
         if app.mode == Mode::Selection && !app.scroll_frozen {
             app.refresh_live_snapshot();
+        }
+        // The node status panel is keyed on the selected node, and the fetch is a no-op once it
+        // matches. Entering the view fires it while the node list is still empty — and so did every
+        // path that moves the cursor without going through `move_node_selection`, which left the
+        // panel showing the *previous* view's status under a "Node detail:" title. Asking here, once
+        // per tick, is what every other view already does with its snapshot.
+        if matches!(app.mode, Mode::Nodes | Mode::NodesFull) {
+            app.maybe_fetch_node_status();
         }
         if matches!(app.mode, Mode::Flux | Mode::FluxFull) {
             app.refresh_flux_snapshot();
@@ -5922,14 +6230,26 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.edit_view.is_some() {
             app.poll_edit();
         }
+        if app.node_op_view.is_some() {
+            app.poll_node_op();
+        }
         // Handing the terminal to `$EDITOR` means giving up the input stream too: a live
         // `EventStream` would eat the keystrokes meant for the editor. It is dropped here and built
         // again on return, which is why this can only happen in the loop and not in a key handler.
         if let Some(path) = app.pending_editor.take() {
             drop(events);
-            let outcome = edit_externally(terminal, &path).await;
+            let outcome = suspended(terminal, edit::run_editor(&path)).await;
             events = EventStream::new();
             app.editor_returned(outcome);
+            continue;
+        }
+        // A shell is the same trade as the editor — the terminal, and the input stream with it.
+        if let Some(target) = app.pending_exec.take() {
+            drop(events);
+            let context = app.kube_context.clone();
+            let outcome = suspended(terminal, exec::run(&target, context.as_deref())).await;
+            events = EventStream::new();
+            app.exec_returned(&target, outcome);
             continue;
         }
         terminal.draw(|f| visible_rows = draw(f, app))?;
@@ -5947,11 +6267,15 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-// Give the terminal back to the shell for the duration of the editor: leave the alternate screen so
-// the editor draws on a clean, scrollable screen, then take everything back — raw mode, alternate
-// screen, hidden cursor — and repaint from scratch, since whatever the editor left behind is not
-// something ratatui's diffing knows about.
-async fn edit_externally(terminal: &mut DefaultTerminal, path: &std::path::Path) -> Result<(), String> {
+// Give the terminal back to the shell for the duration of `run`: leave the alternate screen so the
+// program draws on a clean, scrollable screen, then take everything back — raw mode, alternate
+// screen, hidden cursor — and repaint from scratch, since whatever it left behind is not something
+// ratatui's diffing knows about. Shared by `$EDITOR` and `kubectl exec`, which want the terminal on
+// exactly the same terms.
+async fn suspended(
+    terminal: &mut DefaultTerminal,
+    run: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
     use crossterm::cursor::{Hide, Show};
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -5962,9 +6286,9 @@ async fn edit_externally(terminal: &mut DefaultTerminal, path: &std::path::Path)
     if let Err(e) = suspend {
         return Err(e.to_string());
     }
-    let result = edit::run_editor(path).await;
-    // The terminal has to come back whatever the editor did, or kdt is left drawing into a screen
-    // it no longer owns — so the restore errors are folded in rather than short-circuiting.
+    let result = run.await;
+    // The terminal has to come back whatever ran in there, or kdt is left drawing into a screen it
+    // no longer owns — so the restore errors are folded in rather than short-circuiting.
     let restore = enable_raw_mode()
         .and_then(|()| crossterm::execute!(std::io::stdout(), EnterAlternateScreen, Hide))
         .and_then(|()| terminal.clear());
@@ -6024,6 +6348,26 @@ fn handle_event(app: &mut App, ev: Event) {
                 app.delete_input(c)
             }
             (KeyCode::Char('q'), _) => app.delete_cancel(),
+            _ => {}
+        }
+        return;
+    }
+    // The drain panel grabs all input while open (Ctrl-C still quits): same deal as the delete
+    // panel, and the same default answer — no. Only Ctrl-O moves towards the eviction, the chord
+    // form of the `o` that opened the operations menu: it has to be a chord, because the strict
+    // confirmation types the node name and every printable key belongs to that buffer.
+    if app.node_op_view.is_some() {
+        let typing = app.node_op_view.as_ref().is_some_and(|v| v.typed.is_some());
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => app.node_drain_confirm(),
+            (KeyCode::Enter | KeyCode::Esc, _) => app.node_drain_cancel(),
+            (KeyCode::Backspace, _) => app.node_drain_backspace(),
+            // Once the name prompt is open every printable key feeds it, `q` included.
+            (KeyCode::Char(c), m) if typing && !m.contains(KeyModifiers::CONTROL) => {
+                app.node_drain_input(c)
+            }
+            (KeyCode::Char('q'), _) => app.node_drain_cancel(),
             _ => {}
         }
         return;
@@ -6121,9 +6465,8 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
-        // full-screen text panels. Deliberately absent from the Nodes view, which reads its rows
-        // straight from the shared state with no single place to filter them.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
+        // full-screen text panels.
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.enter_search();
         }
 
@@ -6153,6 +6496,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `e` edits the selected object in `$EDITOR`, from the same views.
         (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull) => {
             app.open_edit_view();
+        }
+
+        // `E` opens a shell in the selected pod, through `kubectl exec`. Bound only where a row can
+        // resolve to a pod — a workload row lands in the first pod it owns.
+        (KeyCode::Char('E'), _, Mode::Selection | Mode::DetailFull | Mode::Pods | Mode::PodsFull) => {
+            app.exec_selected();
         }
 
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
@@ -6247,6 +6596,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::Nodes) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('N'), _, Mode::Nodes) => app.exit_nodes_mode(),
         (KeyCode::Char('u'), _, Mode::Nodes) => app.enter_node_usage(),
+        (KeyCode::Char('o'), _, Mode::Nodes | Mode::NodesFull) => app.open_node_ops_menu(),
 
         (KeyCode::Esc, _, Mode::NodeUsage) => app.exit_node_usage(),
         (KeyCode::Char('u'), _, Mode::NodeUsage) => app.exit_node_usage(),
@@ -6917,7 +7267,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     let footer_spans = match draw_mode {
         // Each mode lists its shortcuts as groups of related keys, separated by footer_sep():
         // entry/exit · navigation · view-specific filters · view-specific actions.
-        Mode::Selection => vec![
+        Mode::Selection => {
+            let mut v = vec![
             Span::styled(" q ", kbg), Span::raw(format!(" {}   ", st.k_quit)),
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
@@ -6941,7 +7292,15 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" D ", kbg), Span::raw(format!(" {}   ", st.k_diag)),
             Span::styled(" X ", kbg), Span::raw(format!(" {}   ", st.k_extract)),
-        ],
+            ];
+            // Here a row is an Event about anything at all, so the shell is only offered when the
+            // one under the cursor is about a pod — the rest of the time the key has nothing to open.
+            if app.exec_target().is_some() {
+                v.push(Span::styled(" E ", kbg));
+                v.push(Span::raw(format!(" {}   ", st.k_exec)));
+            }
+            v
+        }
         Mode::DetailFull => {
             let mut v = vec![
                 Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -6973,6 +7332,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" u ", kbg), Span::raw(format!(" {}   ", st.k_node_usage)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            footer_sep(),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_node_ops)),
         ],
         Mode::NodesFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -6981,6 +7342,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" PgUp/PgDn ", kbg), Span::raw(format!(" {}   ", st.k_page)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_node_ops)),
         ],
         Mode::Flux => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
@@ -7023,6 +7386,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
+            Span::styled(" E ", kbg), Span::raw(format!(" {}   ", st.k_exec)),
         ],
         Mode::PodsFull => {
             let mut v = vec![
@@ -7336,6 +7700,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if app.edit_view.is_some() {
         draw_edit_popup(f, app, area);
     }
+    if app.node_op_view.is_some() {
+        draw_node_op_popup(f, app, area);
+    }
     // Last, so the prompt sits on top of whatever panel it was opened over — the YAML overlay
     // included, which is drawn well after the base view.
     if app.mode == Mode::Search {
@@ -7575,6 +7942,34 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
     }
 }
 
+// How many rows a line will actually take once wrapped. `Paragraph`'s `Wrap { trim: true }` breaks
+// on word boundaries, so dividing the total width by the available one under-counts as soon as the
+// text holds words that do not fit the remainder — and a panel that under-counts its own height
+// pushes its last line, which is always the prompt, off the bottom.
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for word in text.split_whitespace() {
+        let w = word.chars().count();
+        if used > 0 && used + 1 + w > width {
+            rows += 1;
+            used = 0;
+        }
+        if used == 0 {
+            // A word longer than the line is the one case wrapping breaks mid-word.
+            rows += (w.saturating_sub(1)) / width;
+            used = if w == 0 { 0 } else { w - (w.saturating_sub(1) / width) * width };
+        } else {
+            used += 1 + w;
+        }
+    }
+    rows
+}
+
 // Ctrl-D panel: the target, what the guard-rails found, and the confirmation prompt matching the
 // severity — a yes/no for a standalone object, retyping the name once anything dangerous shows up.
 fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -7650,12 +8045,9 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
 
     let popup_w = (area.width * 70 / 100).max(56).min(area.width);
-    // The findings wrap, so size the popup on the longest one rather than on the line count alone.
+    // The findings wrap, so size the popup on how they actually wrap rather than on the line count.
     let inner_w = popup_w.saturating_sub(4).max(1) as usize;
-    let height: usize = lines
-        .iter()
-        .map(|l| (l.width().max(1)).div_ceil(inner_w))
-        .sum();
+    let height: usize = lines.iter().map(|l| wrapped_rows(l, inner_w)).sum();
     let popup_h = (height as u16 + 2).clamp(7, area.height);
     let popup_area = centered_rect(popup_w, popup_h, area);
     f.render_widget(Clear, popup_area);
@@ -7668,6 +8060,186 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Color::Yellow
     };
     let title = format!(" {}  ·  {} {} ", st.delete_title, st.delete_cancel_keys, st.k_cancel);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(border)),
+        );
+    f.render_widget(p, popup_area);
+}
+
+// The localised sentence for one drain guard-rail. The pod lists are the point of most of these —
+// "some pods have no controller" is not actionable, "these three do" is — so they are spelled out,
+// capped at what fits without turning the panel into a listing.
+fn drain_reason_text(st: &lang::Strings, reason: &NodeReason) -> String {
+    let joined = |pods: &[String]| -> String {
+        const MAX: usize = 4;
+        if pods.len() <= MAX {
+            return pods.join(", ");
+        }
+        format!("{}, +{}", pods[..MAX].join(", "), pods.len() - MAX)
+    };
+    match reason {
+        NodeReason::Unmanaged { pods } => st.dr_unmanaged.replace("{d}", &joined(pods)),
+        NodeReason::PdbBlocked { pdbs } => st.dr_pdb_blocked.replace("{d}", &joined(pdbs)),
+        NodeReason::OnlySchedulable => st.dr_only_schedulable.to_string(),
+        NodeReason::PdbTight { pdbs } => st.dr_pdb_tight.replace("{d}", &joined(pdbs)),
+        NodeReason::NoRoom { cpu_short, mem_short } => match (cpu_short, mem_short) {
+            (true, true) => st.dr_no_room_both.to_string(),
+            (true, false) => st.dr_no_room_cpu.to_string(),
+            _ => st.dr_no_room_mem.to_string(),
+        },
+        NodeReason::PodTooBig { pods } => st.dr_pod_too_big.replace("{d}", &joined(pods)),
+        NodeReason::LocalStorage { pods } => st.dr_local_storage.replace("{d}", &joined(pods)),
+        NodeReason::StaticPods { pods } => st.dr_static_pods.replace("{d}", &joined(pods)),
+        NodeReason::ControlPlane => st.dr_control_plane.to_string(),
+        NodeReason::AlreadyCordoned => st.dr_already_cordoned.to_string(),
+        NodeReason::NotReady => st.dr_not_ready.to_string(),
+        NodeReason::DaemonSetPods { count } => st.dr_daemonsets.replace("{n}", &count.to_string()),
+    }
+}
+
+// Drain panel: the node, what the guard-rails found, how many pods are about to move, and the
+// confirmation matching the severity — then the same panel turns into the progress report, because
+// an eviction that a budget holds back is exactly what one stays to watch.
+fn draw_node_op_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(v) = app.node_op_view.as_ref() else { return };
+    let s = app.node_op_state.lock().expect("node op state poisoned").clone();
+    let st = lang::t(app.ai_language);
+
+    // Head and tail are never dropped; only the findings in between give way when the panel would
+    // outgrow the screen, because the prompt is what the user needs in order to answer at all.
+    let head: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", st.drain_target), Style::default().fg(DIM)),
+            Span::styled(
+                v.node.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+
+    if s.loading {
+        lines.push(Line::from(Span::styled(st.drain_checking, Style::default().fg(Color::Yellow))));
+    } else if let Some(e) = &s.error {
+        lines.push(Line::from(Span::styled(
+            st.drain_check_failed.replace("{e}", e),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        let to_evict = s.to_evict();
+        let skipped = s.candidates.len() - to_evict;
+        let mut plan = st.drain_plan.replace("{n}", &to_evict.to_string());
+        if skipped > 0 {
+            plan.push_str(&format!(
+                " · {}",
+                st.drain_plan_skipped.replace("{n}", &skipped.to_string())
+            ));
+        }
+        lines.push(Line::from(Span::styled(plan, Style::default().fg(Color::Cyan))));
+        if s.reasons.is_empty() {
+            lines.push(Line::from(Span::styled(
+                st.drain_no_finding,
+                Style::default().fg(Color::Green),
+            )));
+        } else {
+            for r in &s.reasons {
+                let (marker, color) = match r.level() {
+                    DelLevel::Danger => ("✗ ", Color::Red),
+                    DelLevel::Warn => ("▲ ", Color::Yellow),
+                    DelLevel::Info => ("· ", DIM),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(color)),
+                    Span::styled(drain_reason_text(st, r), Style::default().fg(color)),
+                ]));
+            }
+        }
+    }
+
+    // Progress, once there is any: the counter, then the two lists worth naming.
+    let mut tail: Vec<Line> = Vec::new();
+    if s.running || s.done.is_some() {
+        tail.push(Line::from(""));
+        tail.push(Line::from(Span::styled(
+            st.drain_progress
+                .replace("{n}", &s.evicted.len().to_string())
+                .replace("{m}", &s.to_evict().to_string()),
+            Style::default().fg(Color::Cyan),
+        )));
+        if !s.waiting.is_empty() {
+            tail.push(Line::from(Span::styled(
+                st.drain_waiting.replace("{d}", &s.waiting.join(", ")),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        for (pod, err) in &s.failed {
+            tail.push(Line::from(Span::styled(
+                st.drain_failed_pods.replace("{d}", &format!("{} : {}", pod, err)),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+    tail.push(Line::from(""));
+
+    let (prompt, prompt_color) = match (&s.done, s.running) {
+        (Some(Ok(())), _) => (st.drain_ok.to_string(), Color::Green),
+        (Some(Err(e)), _) => (st.drain_failed.replace("{e}", e), Color::Red),
+        (None, true) => (st.drain_running.to_string(), Color::Yellow),
+        (None, false) if s.loading => (String::new(), DIM),
+        (None, false) => match v.typed.as_ref() {
+            Some(buf) => {
+                let mut p = st.drain_strict_prompt.replace("{n}", buf);
+                if buf.trim() != v.node {
+                    p.push_str(&format!(
+                        "  ({})",
+                        st.drain_strict_mismatch.replace("{name}", &v.node)
+                    ));
+                }
+                (p, Color::Red)
+            }
+            None if s.needs_strict_confirm() => (st.drain_strict_hint.to_string(), Color::Red),
+            None if v.armed => (st.drain_confirm_prompt.to_string(), Color::Yellow),
+            None => (st.drain_arm_prompt.to_string(), Color::Yellow),
+        },
+    };
+    if !prompt.is_empty() {
+        tail.push(Line::from(Span::styled(
+            prompt,
+            Style::default().fg(prompt_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    let popup_w = (area.width * 70 / 100).max(56).min(area.width);
+    let inner_w = popup_w.saturating_sub(4).max(1) as usize;
+    let rows = |ls: &[Line]| -> usize { ls.iter().map(|l| wrapped_rows(l, inner_w)).sum() };
+    // A node with thirty unmanaged pods produces more findings than any terminal has rows. Drop them
+    // from the end until the whole thing fits: better a truncated list than a prompt off-screen, and
+    // the ones that go are the least severe, since `assess` sorts by level.
+    let budget = area.height.saturating_sub(2) as usize;
+    let fixed = rows(&head) + rows(&tail);
+    while lines.len() > 1 && fixed + rows(&lines) > budget {
+        lines.pop();
+    }
+    let lines: Vec<Line> = head.into_iter().chain(lines).chain(tail).collect();
+
+    let popup_h = (rows(&lines) as u16 + 2).clamp(7, area.height);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let border = if s.done.as_ref().is_some_and(|r| r.is_ok()) {
+        Color::Green
+    } else if s.needs_strict_confirm() || v.armed {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let title = format!(" {}  ·  {} {} ", st.drain_title, st.drain_cancel_keys, st.k_cancel);
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .block(
@@ -8855,10 +9427,11 @@ fn draw_ns_picker_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (nodes, loading, error) = {
+    let (loading, error) = {
         let s = app.node_list_state.lock().expect("node list poisoned");
-        (s.nodes.clone(), s.loading, s.error.clone())
+        (s.loading, s.error.clone())
     };
+    let nodes = app.node_rows();
 
     if let Some(target) = app.pending_node_select.clone() {
         if let Some(pos) = nodes.iter().position(|n| n.name == target) {
@@ -14182,6 +14755,31 @@ mod glyph_guard {
             "glyphes hors liste, potentiellement absents de la police mono du terminal : {}",
             offenders.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod popup_tests {
+    use super::*;
+
+    #[test]
+    fn a_line_of_long_words_wraps_wider_than_a_plain_division() {
+        // 24 characters over a width of 10: the division says 3 rows, but no break fits before
+        // column 10, so it really takes 4. Under-counting here is what pushes a prompt off-screen.
+        let line = Line::from("flux-system/kustomize-cx");
+        assert_eq!(line.width(), 24);
+        assert_eq!(line.width().div_ceil(10), 3);
+        assert_eq!(wrapped_rows(&line, 10), 3, "one word longer than the width breaks mid-word");
+
+        let line = Line::from("aaaaaa bbbbbb cccccc");
+        assert_eq!(line.width().div_ceil(10), 2);
+        assert_eq!(wrapped_rows(&line, 10), 3, "words never straddle two rows");
+    }
+
+    #[test]
+    fn an_empty_line_still_takes_a_row() {
+        assert_eq!(wrapped_rows(&Line::from(""), 20), 1);
+        assert_eq!(wrapped_rows(&Line::from("short"), 20), 1);
     }
 }
 

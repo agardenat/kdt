@@ -16,6 +16,8 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
 - **Édition avec garde-fous (`e`)** : l'objet part dans `$EDITOR` (vim &co.) puis revient par un `PUT` verrouillé sur son `resourceVersion`. Avant, kdt dit ce qui rendra l'édition vaine — objet GitOps réécrit au prochain reconcile, spec tenue par un contrôleur, `can-i update` refusé ; après, il classe chaque champ modifié entre *appliqué*, *ignoré* et *rejeté par l'API*.
 - **Suppression avec garde-fous (`Ctrl-D`)** : relit l'objet avant tout, avertit s'il est déployé par un moteur GitOps (Flux, Argo CD, Helm) ou si la suppression cascade (namespace, CRD, point d'entrée GitOps) ; l'avertissement se passe outre, mais en retapant le nom de l'objet.
+- **Opérations sur les nœuds (`o`)** : `cordon` / `uncordon` en un patch réversible, et un **drain avec garde-fous** — avant la moindre éviction, kdt dit ce qui va coincer : pods qu'aucun contrôleur ne recréera, `PodDisruptionBudget` qui refusera, place qui n'existe pas ailleurs, données `emptyDir` perdues, pods statiques qui resteront.
+- **Shell dans un pod (`E`)** : ouvre `kubectl exec -it` en rendant le terminal, comme `e` le rend à `$EDITOR`.
 - **Touch (`h`)** : pose `kdt.io/touched-at` (horodatage à la milliseconde) et `kdt.io/touched-by` sur l'objet sélectionné, pour lui faire retraverser la chaîne d'admission — réévaluer une règle Kyverno, réveiller un contrôleur. Sans confirmation : c'est un merge patch de deux annotations, et le bandeau nomme l'objet touché.
 - **Copie presse-papier** : via séquence OSC 52 (fonctionne à travers SSH/terminal compatible).
 
@@ -110,6 +112,7 @@ défilement live est actif.
 | `e` | Éditer l'objet sélectionné dans `$EDITOR` (avec garde-fous) |
 | `h` | Toucher l'objet sélectionné (annotation horodatée, sans confirmation) |
 | `Ctrl-D` | Supprimer l'objet sélectionné (avec garde-fous) |
+| `E` | Shell dans le pod sélectionné (`kubectl exec -it`) |
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
 | `i` | Panneau IA |
@@ -141,9 +144,6 @@ Ce que `/` fait dépend de ce qui est affiché :
 
 Les deux requêtes sont indépendantes : filtrer une table sur `coredns` puis chercher `image`
 dans son YAML ne mélange pas les deux.
-
-> La vue Nodes est la seule sans recherche : elle lit ses lignes directement dans l'état partagé,
-> sans endroit unique où les filtrer.
 
 ### Logs d'un pod (`p` / `C` / `f`)
 
@@ -418,12 +418,41 @@ pour le piloter, `Esc`/`o` revient à la liste.
 | `0` | Retirer le filtre namespace |
 | `s` | Menu **scale** : `+1` / `-1` / `0` / définir un nombre exact de répliques |
 | `r` | Menu **actions** : `rescale` / `recyclage` / `restart`, avec confirmation |
+| `E` | Shell dans le pod (`kubectl exec -it`) |
 | `i` | Panneau IA |
 
 Le menu `r` (sur l'objet d'origine) propose, avec explication et confirmation :
 **rescale** (rétablit le nombre de répliques initial mémorisé), **recyclage** (scale 0 puis remonte,
 recrée tous les pods) et **restart** (`rollout restart` progressif). Le menu `s` permet le scaling
 incrémental ou la saisie directe d'un nombre de répliques.
+
+### Shell dans un pod (`E`)
+
+`E` ouvre un shell interactif dans le pod sélectionné, depuis la vue évènements comme depuis la
+vue workloads. Sur une ligne de workload, kdt descend dans le **premier pod** qu'il possède ; le
+container est celui sur lequel l'onglet Logs est réglé (`C`), pour que les deux touches parlent du
+même container.
+
+kdt n'implémente pas le protocole exec : il **rend le terminal à `kubectl exec -it`**, exactement
+comme `e` le rend à `$EDITOR`, et le reprend quand le shell se termine. Un TUI ne peut pas
+multiplexer un PTY dans un panneau sans devenir un émulateur de terminal, et `kubectl` sait déjà
+négocier l'upgrade, la taille de fenêtre et le TTY.
+
+C'est la seule fonction de kdt qui a besoin d'un binaire à côté de lui : son absence est dite
+**avant** de rendre l'écran (`shell : kubectl introuvable dans le PATH`), pas après un aller-retour
+sur un écran noir. Un pod qui n'est pas `Running` est refusé de la même façon, avec son état.
+
+| Variable | Effet |
+|---|---|
+| `KDT_KUBECTL` | Binaire à utiliser (défaut : `kubectl`, cherché dans le `PATH`) |
+| `KDT_EXEC_SHELL` | Commande passée à `sh -c` dans le container (défaut : `bash` s'il existe, sinon `sh`) |
+
+Le `--context` passé à kdt est repassé à `kubectl`, pour que le shell atterrisse dans le cluster
+affiché et non dans celui que le kubeconfig désigne à cet instant.
+
+> Le repli par défaut est `command -v bash >/dev/null 2>&1 && exec bash || exec sh` : un `exec`
+> qui échoue **tue** le shell au lieu de passer à la suite, donc le choix se fait avant l'exec, pas
+> après.
 
 ### Vulnérabilités (`:vuln`)
 
@@ -463,9 +492,48 @@ Le détail (`Enter`) liste chaque CVE : `SÉV  score  ID  paquet  installé → 
 | `u` | Vue usage (CPU/mémoire) |
 | `s` | Changer le tri (usage) |
 | `r` | Rafraîchir |
+| `/` | Recherche (nom, rôles, version, alertes — `/cordoned` isole les nœuds cordonnés) |
+| `o` | Menu **opérations** : `cordon` / `uncordon` / `drain` |
 | `Enter` | Détail nœud plein écran |
 | `i` | Panneau IA |
 | `p` / `P` | Export PDF (depuis usage/diagnostic) |
+
+#### Opérations sur un nœud (`o`)
+
+**`cordon` / `uncordon`** passent `spec.unschedulable` et rien d'autre : un champ, réversible depuis
+le même menu, sans panneau — le bandeau dit ce qui a été fait. Un nœud déjà dans l'état demandé est
+répondu depuis ce qui est à l'écran, sans écriture.
+
+**`drain`** ouvre un panneau qui ne draine rien : il relit le cluster et affiche ce qui va coincer.
+Les constats sont classés par gravité, et rien ne bloque — mais un constat rouge impose de **retaper
+le nom du nœud** avant de passer outre.
+
+| Constat | Gravité | Ce qu'il dit |
+|---|---|---|
+| Pods sans contrôleur | ✗ | L'éviction les supprime pour de bon : rien ne les recréera ailleurs |
+| PDB à 0 disruption autorisée | ✗ | L'API refusera l'éviction, le drain n'avancera pas |
+| Dernier nœud ordonnançable | ✗ | Les pods évincés resteront `Pending` : il n'y a nulle part où aller |
+| PDB plus étroit que le nombre de pods | ▲ | Le drain avancera au rythme des redémarrages |
+| Place manquante ailleurs | ▲ | La somme des requests à déplacer dépasse ce qui reste sur les autres nœuds |
+| Pod trop gros | ▲ | Aucun nœud restant ne peut le prendre à lui seul (les totaux ne suffisent pas : un pod atterrit sur **un** nœud) |
+| Données `emptyDir` | ▲ | Elles partent avec le pod |
+| Pods statiques | ▲ | L'API ne peut pas les évincer, ils resteront en place |
+| Nœud du plan de contrôle | ▲ | — |
+| Déjà cordonné / `NotReady` / pods DaemonSet | · | Contexte : le drain saute le cordon, et laisse les DaemonSets |
+
+La place restante est comptée sur les **requests** (c'est ce que le scheduler empile), nœud par
+nœud, en ne comptant que ceux qui pourraient réellement prendre un pod — ni `NotReady`, ni déjà
+cordonnés. Un `PodDisruptionBudget` dont le `status` n'a pas encore été calculé ne dit rien plutôt
+que de crier au loup.
+
+Le drain lui-même cordonne d'abord (pour que rien ne revienne se poser derrière l'éviction), puis
+évince, en **réessayant** les pods qu'un budget retient — le panneau devient alors le rapport
+d'avancement (`n/m pods évincés`, pods retenus, échecs). Comme `kubectl drain --ignore-daemonsets`,
+les pods de DaemonSet, les pods statiques et les pods terminés sont laissés en place.
+
+> `Ctrl-O` avance dans la confirmation, `Entrée`/`Esc` annulent — la réponse par défaut est non,
+> comme pour `Ctrl-D`. Ce doit être un accord de touches : l'invite stricte, elle, reçoit chaque
+> caractère tapé.
 
 ### Diagnostic
 | Touche | Action |

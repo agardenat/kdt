@@ -14,11 +14,13 @@ mod diagnostic;
 mod edit;
 mod enrich;
 mod events;
+mod exec;
 mod extract;
 mod flux;
 mod glyphs;
 mod kyverno;
 mod lang;
+mod nodeops;
 mod pdf;
 mod pods;
 mod rbac;
@@ -117,7 +119,7 @@ async fn main() -> Result<()> {
 
     let ai_state = ai::new_ai_state();
     let file_config = config::load();
-    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config);
+    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
     ui::run(app).await
 }
 
