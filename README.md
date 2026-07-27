@@ -348,6 +348,7 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `secrets` | `secret`, `se`, `tls` | Vue Secrets et certificats TLS |
 | `certs` | `certificates`, `issuers`, `challenges`, `acme` | Vue cert-manager (chaîne d'émission) |
 | `kyverno` | `ky`, `policies`, `polr`, `cpol`, `admission` | Vue Kyverno (policies, règles, violations) |
+| `reflector` | `refl`, `mirror`, `miroir` | Vue reflector (sources, miroirs, orphelins) |
 | `configmaps` | `cm`, `config` | Vue ConfigMaps |
 | `services` | `svc`, `service` | Vue Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Vue Ingress / IngressClass |
@@ -880,6 +881,65 @@ aucune policy, et sur un cluster antérieur à Kyverno 1.14 dépourvu du moteur 
 
 Le jeu de manifestes de `test/kyverno/` produit chacun de ces cas sur un cluster de test.
 
+### Reflector (`:reflector`)
+
+Vue dédiée à [kubernetes-reflector](https://github.com/emberstack/kubernetes-reflector), qui
+recopie un Secret ou un ConfigMap depuis une source unique vers d'autres namespaces. Elle répond à
+« pourquoi ce miroir n'est-il pas là, ou plus à jour ? » — la question qui coûte l'après-midi, parce
+que **reflector est muet quand il décide de ne rien faire** : ni Event, ni condition, ni champ de
+statut, seulement une ligne de log de niveau debug dans le contrôleur.
+
+```
+▾ kube-system/registry-pull   Secret  source       3/3      …989063  1h
+    qpool                     Secret  miroir auto  SYNC     …989063  31m
+    historik                  Secret  miroir auto  PÉRIMÉ   …988240  31m   version enregistrée …
+    wiki-mcp                  Secret  attendu      BLOQUÉ   —        —     le nom est déjà pris par …
+```
+
+`g` fait tourner trois mondes : **sources** (l'arbre ci-dessus), **miroirs** (à plat, pour aligner
+les versions) et **orphelins** (les copies qu'aucune source ne revendique plus).
+
+Ce que cette vue montre et qu'un `kubectl get secret -A` ne donne pas :
+
+- **Le namespace bloqué.** Reflector ne crée un miroir que là où **aucun objet du même nom n'existe
+  déjà**. Un objet quelconque qui porte ce nom fait sauter le namespace, en silence et
+  définitivement. C'est exactement ce qui arrive quand on migre d'un secret par application vers une
+  source unique : le miroir n'apparaît jamais et rien ne l'explique.
+- **Le miroir divergent.** Reflector ne compare que `reflected-version`, jamais le contenu. Un
+  miroir modifié à la main garde une version « à jour » et un contenu faux — il ne sera **jamais**
+  corrigé tout seul. kdt compare les charges utiles et le dit.
+- **La portée réelle.** Les listes de namespaces sont des **regex ancrées sur tout le nom**, et une
+  liste **vide vaut « tous les namespaces »** — kube-system et flux-system compris. kdt évalue ces
+  règles à l'identique du moteur amont, affiche la portée résolue sur le cluster du jour, et signale
+  les motifs qui ne désignent rien. Quand un sélecteur de labels est illisible, il s'abstient au
+  lieu d'inventer une liste de destinations.
+- **Qui attend la copie.** Les pods et ServiceAccounts qui réclament le nom sont joints : un miroir
+  absent devient une panne nommée (`ImagePullBackOff`) plutôt qu'une ligne grise. Un namespace hors
+  portée dont les pods réclament le nom est signalé au niveau du cluster — la cause vit trois
+  namespaces plus loin.
+
+`r` propose la **re-réflexion forcée**. Elle vide `reflected-version` sur le miroir et — pour un
+miroir *auto*, que reflector ne repousse **qu'en voyant sa source** — horodate aussi la source, puis
+retire son horodatage pour ne rien laisser traîner sur un objet géré par Flux. Seules des
+annotations sont écrites, jamais les données. Sur un miroir bloqué, absent ou orphelin, l'action
+n'est **pas proposée** : forcer n'y changerait rien, et le panneau dit quoi faire à la place.
+
+| Touche | Action |
+|---|---|
+| `↑↓` / `PgUp` `PgDn` | Navigation |
+| `Space` | Plier / déplier la source |
+| `g` | Monde : `sources` → `miroirs` → `orphelins` |
+| `f` | Filtre : `ALL` → `PROBLEMS` |
+| `s` | Aller à la source du miroir sélectionné |
+| `r` | Forcer la re-réflexion |
+| `Enter` | Plein écran sur le détail |
+| `F5` | Rafraîchir |
+| `Shift+↑↓` | Défilement du panneau de détail |
+
+La vue fonctionne sans reflector installé : elle le dit dans le bandeau (« contrôleur absent »), ce
+qui est déjà la réponse quand rien ne bouge. Elle distingue « absent » de « non vérifié » — le RBAC
+peut masquer le déploiement.
+
 ### Stockage (`:storage`, `:pv`)
 
 Le stockage est la deuxième source d'incidents après le réseau, et `kubectl get pvc` sait dire
@@ -942,6 +1002,7 @@ habituels, qui traitent déjà PVC et PV comme de la donnée persistante.
 | `secrets.rs` | Secrets et certificats TLS (expiration, consommateurs) |
 | `certmanager.rs` | cert-manager : chaîne Issuer → Certificate → Order → Challenge, diagnostics ACME |
 | `kyverno.rs` | Kyverno : policies, règles (dont autogen), PolicyReports, exceptions, santé des contrôleurs |
+| `reflector.rs` | Reflector : portée des sources, état des miroirs, orphelins, re-réflexion forcée |
 | `configmaps.rs` | ConfigMaps et leur contenu |
 | `storage.rs` | Stockage : PVC / PV / StorageClass et les règles de diagnostic associées |
 | `yaml.rs` | Manifeste YAML d'un objet (formes brute et *neat*) |

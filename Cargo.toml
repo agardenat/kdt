@@ -22,6 +22,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Reflector compare ses listes de namespaces avec des regex .NET : la vue `:reflector` doit les
+# évaluer à l'identique pour dire où un miroir est attendu. Déjà présente en dépendance
+# transitive — la déclarer ici ne coûte aucune compilation supplémentaire.
+regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 http = "1"
 base64 = "0.22"

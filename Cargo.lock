@@ -2113,6 +2113,7 @@ dependencies = [
  "kube",
  "mimalloc",
  "ratatui",
+ "regex",
  "reqwest",
  "rustls",
  "serde",

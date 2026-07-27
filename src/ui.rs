@@ -284,6 +284,46 @@ use crate::storage::{
     fetch_storage, new_storage_state, volume_in_class, HintLevel as StoHintLevel, PvResource,
     PvcResource, ScResource, SharedStorage,
 };
+use crate::reflector::{
+    apply_force, fetch_reflector, force_plan, new_reflector_state, ForceWrite,
+    HintLevel as ReflHintLevel, ReflOrphan, ReflSource, ReflTarget, SharedReflector, TargetStatus,
+};
+
+// The three ways to look at reflector's work (`g`). Sources is the tree everything hangs from;
+// Mirrors flattens the copies so one can scan versions side by side; Orphans isolates the copies no
+// source claims any more, which is where the surprises live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflWorld {
+    Sources,
+    Mirrors,
+    Orphans,
+}
+
+// How the reflector view is filtered (`f`): everything, or only what needs a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflFilter {
+    All,
+    Problems,
+}
+
+impl ReflFilter {
+    fn label(self) -> &'static str {
+        match self {
+            ReflFilter::All => "ALL",
+            ReflFilter::Problems => "PROBLEMS",
+        }
+    }
+}
+
+// One visual row of the reflector view, index-aligned with `App::snapshot` like every other tree
+// view here. `Target` carries its source's index so the detail panel can show both sides of the
+// pair without looking anything up.
+#[derive(Debug, Clone)]
+enum ReflRow {
+    Source { idx: usize, collapsed: bool },
+    Target { src: usize, target: usize },
+    Orphan { idx: usize },
+}
 
 // The two object worlds the storage view toggles between (`g`): claims — what a workload asked for
 // and whether it got it — and volumes, grouped under the class that provisions them.
@@ -444,7 +484,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -469,6 +509,8 @@ enum MenuAction {
     ScaleSet,
     CertRenew,
     CertAcmeRetry,
+    // Clear the recorded version on the selected mirror(s) so reflector pushes the source again.
+    ReflForce,
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
@@ -523,6 +565,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::SecretsFull
             | Mode::CertsFull
             | Mode::KyvernoFull
+            | Mode::ReflectorFull
             | Mode::ConfigmapsFull
             | Mode::ServicesFull
             | Mode::StorageFull
@@ -609,6 +652,9 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // `policy`/`policies` belong here rather than to RBAC: on a cluster running Kyverno that is
     // what those words mean.
     ("kyverno", &["ky", "kv", "policies", "policy", "polr", "cpol", "admission"]),
+    // `mirror`/`miroir` belong here rather than to the Secrets view: on a cluster running reflector
+    // that is what those words mean.
+    ("reflector", &["refl", "reflect", "reflection", "mirror", "mirrors", "miroir", "miroirs"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -902,6 +948,20 @@ pub struct App {
     pub ky_detail_scroll: usize,
     pub ky_refresh_handle: Option<JoinHandle<()>>,
     last_ky_sel_uid: Option<String>,
+    pub reflector_state: SharedReflector,
+    refl_world: ReflWorld,
+    refl_filter: ReflFilter,
+    // Sources the user folded (`Espace`), keyed by "ns/name".
+    refl_collapsed: std::collections::HashSet<String>,
+    refl_rows: Vec<ReflRow>,
+    // The filtered sources and orphans the current rows index into. Snapshotted once per refresh so
+    // the draw pass never re-locks, and so a row index can never point past a list that moved
+    // underneath it.
+    refl_view_sources: Vec<ReflSource>,
+    refl_view_orphans: Vec<ReflOrphan>,
+    pub refl_detail_scroll: usize,
+    pub refl_refresh_handle: Option<JoinHandle<()>>,
+    last_refl_sel_uid: Option<String>,
     pub configmaps_state: SharedConfigMaps,
     pub configmaps_cursor: usize,
     configmaps_copy_menu: Option<ConfigmapsCopyMenu>,
@@ -1105,6 +1165,16 @@ impl App {
             ky_detail_scroll: 0,
             ky_refresh_handle: None,
             last_ky_sel_uid: None,
+            reflector_state: new_reflector_state(),
+            refl_world: ReflWorld::Sources,
+            refl_filter: ReflFilter::All,
+            refl_collapsed: std::collections::HashSet::new(),
+            refl_rows: Vec::new(),
+            refl_view_sources: Vec::new(),
+            refl_view_orphans: Vec::new(),
+            refl_detail_scroll: 0,
+            refl_refresh_handle: None,
+            last_refl_sel_uid: None,
             configmaps_state: new_configmaps_state(),
             configmaps_cursor: 0,
             configmaps_copy_menu: None,
@@ -2745,6 +2815,7 @@ impl App {
             Mode::Secrets | Mode::SecretsFull => self.refresh_secrets(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno(),
+            Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             _ => {}
         }
@@ -3118,6 +3189,7 @@ impl App {
             Mode::Capacity | Mode::CapacityFull => self.refresh_capacity_snapshot(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
+            Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
             _ => {}
         }
     }
@@ -3218,6 +3290,13 @@ impl App {
                 self.leave_special_modes();
                 self.enter_kyverno_mode();
             }
+            "reflector" => {
+                // Always opens: without the controller the view says so, which is itself the answer
+                // to "why is nothing being mirrored".
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_reflector_mode();
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -3286,6 +3365,10 @@ impl App {
             }
             Mode::Kyverno | Mode::KyvernoFull => {
                 self.stop_kyverno_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Reflector | Mode::ReflectorFull => {
+                self.stop_reflector_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -5420,6 +5503,409 @@ impl App {
         }
     }
 
+    // --- Reflector view -------------------------------------------------------------------------
+
+    fn enter_reflector_mode(&mut self) {
+        self.mode = Mode::Reflector;
+        self.detail_tab = DetailTab::Status;
+        self.refl_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_refl_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_reflector();
+        self.start_reflector_auto_refresh();
+        self.refresh_reflector_snapshot();
+    }
+
+    fn exit_reflector_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_reflector_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_refl_sel_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_reflector_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.refl_detail_scroll = 0;
+        self.mode = Mode::ReflectorFull;
+    }
+
+    fn exit_reflector_full(&mut self) {
+        self.mode = Mode::Reflector;
+    }
+
+    fn refresh_reflector(&self) {
+        {
+            let mut s = self.reflector_state.lock().expect("reflector poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.reflector_state.clone();
+        tokio::spawn(async move { fetch_reflector(client, state).await; });
+    }
+
+    // 20s: reflected objects move slowly, and the fetch walks the whole Secret, ConfigMap and Pod
+    // lists. The moment one actually wants to watch — a forced re-reflection — is covered by the
+    // explicit refresh the action itself triggers.
+    fn start_reflector_auto_refresh(&mut self) {
+        self.stop_reflector_auto_refresh();
+        let client = self.client.clone();
+        let state = self.reflector_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_reflector(client.clone(), state.clone()).await;
+            }
+        });
+        self.refl_refresh_handle = Some(handle);
+    }
+
+    fn stop_reflector_auto_refresh(&mut self) {
+        if let Some(h) = self.refl_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `refl_rows` and `App::snapshot` in lockstep, so a selected index means the same row
+    // in both. That alignment is what gives this view `y`, `Ctrl-D`, the AI panel and the Related
+    // tab without any code of its own.
+    fn refresh_reflector_snapshot(&mut self) {
+        let (mut sources, mut orphans) = {
+            let s = self.reflector_state.lock().expect("reflector poisoned");
+            (s.sources.clone(), s.orphans.clone())
+        };
+        // The Problems filter never hides a source above a failing target: dropping it would strand
+        // the target and lose the very context one came looking for.
+        if self.refl_filter == ReflFilter::Problems {
+            sources.retain(|s| s.worst().is_some_and(|l| l >= ReflHintLevel::Warn));
+            orphans.retain(|o| o.worst().is_some_and(|l| l >= ReflHintLevel::Warn));
+        }
+
+        let mut rows: Vec<ReflRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+        match self.refl_world {
+            ReflWorld::Sources => {
+                for (i, src) in sources.iter().enumerate() {
+                    let collapsed = self.refl_collapsed.contains(&refl_source_key(src));
+                    recs.push(synthetic_refl_source_record(src));
+                    rows.push(ReflRow::Source { idx: i, collapsed });
+                    if collapsed { continue; }
+                    for (j, t) in src.targets.iter().enumerate() {
+                        // In the Problems filter a clean target under a flagged source is noise.
+                        if self.refl_filter == ReflFilter::Problems
+                            && !t.worst().is_some_and(|l| l >= ReflHintLevel::Warn)
+                        {
+                            continue;
+                        }
+                        recs.push(synthetic_refl_target_record(src, t));
+                        rows.push(ReflRow::Target { src: i, target: j });
+                    }
+                }
+            }
+            // Flat: every copy that exists, whatever source it belongs to, so versions line up.
+            ReflWorld::Mirrors => {
+                for (i, src) in sources.iter().enumerate() {
+                    for (j, t) in src.targets.iter().enumerate() {
+                        if t.mirror.is_none() { continue; }
+                        recs.push(synthetic_refl_target_record(src, t));
+                        rows.push(ReflRow::Target { src: i, target: j });
+                    }
+                }
+                for (i, o) in orphans.iter().enumerate() {
+                    recs.push(synthetic_refl_orphan_record(o));
+                    rows.push(ReflRow::Orphan { idx: i });
+                }
+            }
+            ReflWorld::Orphans => {
+                for (i, o) in orphans.iter().enumerate() {
+                    recs.push(synthetic_refl_orphan_record(o));
+                    rows.push(ReflRow::Orphan { idx: i });
+                }
+            }
+        }
+        self.refl_view_sources = sources;
+        self.refl_view_orphans = orphans;
+        self.refl_rows = rows;
+
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.refl_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_refl_sel_uid = None;
+            return;
+        }
+        // Keep the cursor on the same object across refreshes; fall back to clamping when the row
+        // it was on is gone.
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_refl_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.refl_detail_scroll = 0;
+        self.refresh_reflector_snapshot();
+    }
+
+    // Space: fold/unfold the source under the cursor. Only sources have children.
+    fn toggle_refl_node(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return };
+        let key = match self.refl_rows.get(sel) {
+            Some(ReflRow::Source { idx, .. }) => {
+                self.refl_view_sources.get(*idx).map(refl_source_key)
+            }
+            // On a target, fold the source it belongs to: the cursor is already inside the node one
+            // wants to close, and hunting back up for the parent row is busywork.
+            Some(ReflRow::Target { src, .. }) => {
+                self.refl_view_sources.get(*src).map(refl_source_key)
+            }
+            _ => None,
+        };
+        let Some(key) = key else { return };
+        if self.refl_collapsed.contains(&key) {
+            self.refl_collapsed.remove(&key);
+        } else {
+            self.refl_collapsed.insert(key);
+        }
+        self.refresh_reflector_snapshot();
+    }
+
+    fn cycle_refl_world(&mut self) {
+        self.refl_world = match self.refl_world {
+            ReflWorld::Sources => ReflWorld::Mirrors,
+            ReflWorld::Mirrors => ReflWorld::Orphans,
+            ReflWorld::Orphans => ReflWorld::Sources,
+        };
+        self.refl_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_reflector_snapshot();
+    }
+
+    fn cycle_refl_filter(&mut self) {
+        self.refl_filter = match self.refl_filter {
+            ReflFilter::All => ReflFilter::Problems,
+            ReflFilter::Problems => ReflFilter::All,
+        };
+        self.refl_detail_scroll = 0;
+        self.refresh_reflector_snapshot();
+    }
+
+    // `s`: jump from a mirror to the source it reflects. In the Sources world that means folding
+    // everything else away and landing on the parent; from an orphan it means going to look for a
+    // source that may not exist, which the landing itself will make obvious.
+    fn refl_goto_source(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return };
+        let target = match self.refl_rows.get(sel) {
+            Some(ReflRow::Target { src, .. }) => {
+                self.refl_view_sources.get(*src).map(|s| (s.namespace.clone(), s.name.clone()))
+            }
+            Some(ReflRow::Orphan { idx }) => self
+                .refl_view_orphans
+                .get(*idx)
+                .and_then(|o| o.props.reflects.clone()),
+            _ => None,
+        };
+        let Some((ns, name)) = target else { return };
+        self.refl_world = ReflWorld::Sources;
+        self.refl_filter = ReflFilter::All;
+        self.refl_collapsed.clear();
+        self.refresh_reflector_snapshot();
+        let uid = format!("refl|src|{ns}/{name}");
+        match self.snapshot.iter().position(|r| r.uid == uid) {
+            Some(i) => {
+                self.table_state.select(Some(i));
+                self.selected_uid = Some(uid);
+                self.refl_detail_scroll = 0;
+            }
+            // Saying nothing here would read as "the key does nothing". The source genuinely is not
+            // in the view, and that is the answer.
+            None => {
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    format!("source {ns}/{name} absente du cluster"),
+                ));
+            }
+        }
+    }
+
+    // The source under the cursor, or the one that owns the target under it.
+    fn refl_selected_source(&self) -> Option<&ReflSource> {
+        let sel = self.table_state.selected()?;
+        match self.refl_rows.get(sel)? {
+            ReflRow::Source { idx, .. } => self.refl_view_sources.get(*idx),
+            ReflRow::Target { src, .. } => self.refl_view_sources.get(*src),
+            ReflRow::Orphan { .. } => None,
+        }
+    }
+
+    fn refl_selected_target(&self) -> Option<&ReflTarget> {
+        let sel = self.table_state.selected()?;
+        match self.refl_rows.get(sel)? {
+            ReflRow::Target { src, target } => {
+                self.refl_view_sources.get(*src)?.targets.get(*target)
+            }
+            _ => None,
+        }
+    }
+
+    fn refl_selected_orphan(&self) -> Option<&ReflOrphan> {
+        let sel = self.table_state.selected()?;
+        match self.refl_rows.get(sel)? {
+            ReflRow::Orphan { idx } => self.refl_view_orphans.get(*idx),
+            _ => None,
+        }
+    }
+
+    // The writes a forced re-reflection would perform from the current row, mirrors first. Empty
+    // when there is nothing a force can move — the menu then does not offer the action at all.
+    //
+    // An orphan is deliberately excluded: its source is gone or no longer permits it, so no amount
+    // of clearing will bring reflector back to it. Saying that is more useful than a write that
+    // silently achieves nothing.
+    fn refl_force_writes(&self) -> Vec<ForceWrite> {
+        let Some(src) = self.refl_selected_source() else { return Vec::new() };
+        let plan_for = |t: &ReflTarget| {
+            let set = t.mirror.as_ref().is_some_and(|m| m.reflected_version_set);
+            force_plan(src.kind, &t.namespace, &src.name, set, t.auto, &src.namespace)
+        };
+        match self.refl_selected_target() {
+            // On a target row: that mirror alone, and only if a force can move it.
+            Some(t) if t.status.forceable() => plan_for(t),
+            Some(_) => Vec::new(),
+            // On a source row: every mirror it actually has. The source is stamped once, however
+            // many mirrors hang off it — its auto pass covers them all in one go.
+            None => {
+                let mut writes: Vec<ForceWrite> = Vec::new();
+                let mut touch: Option<ForceWrite> = None;
+                let mut untouch: Option<ForceWrite> = None;
+                for t in src.targets.iter().filter(|t| t.status.forceable()) {
+                    for w in plan_for(t) {
+                        match w {
+                            // The source is stamped once for the whole batch: its auto pass covers
+                            // every mirror at once, so repeating it per target would be noise.
+                            ForceWrite::TouchSource { .. } => touch = Some(w),
+                            ForceWrite::UnstampSource { .. } => untouch = Some(w),
+                            other => writes.push(other),
+                        }
+                    }
+                }
+                writes.extend(touch);
+                writes.extend(untouch);
+                writes
+            }
+        }
+    }
+
+    // How many mirrors the plan covers, for the confirmation line. The source stamp is not a mirror.
+    fn refl_force_count(&self) -> usize {
+        self.refl_force_writes()
+            .iter()
+            .filter(|w| {
+                !matches!(w, ForceWrite::TouchSource { .. } | ForceWrite::UnstampSource { .. })
+            })
+            .count()
+    }
+
+    fn open_reflector_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        if self.refl_force_writes().is_empty() {
+            // Never offer an action that cannot land. Say why instead.
+            let why = if self.refl_selected_orphan().is_some() {
+                st.refl_no_force_orphan
+            } else {
+                st.refl_no_force
+            };
+            self.clipboard_status = Some((std::time::Instant::now(), why.to_string()));
+            return;
+        }
+        let items = vec![ActionItem {
+            label: st.k_refl_force,
+            desc: st.desc_refl_force,
+            action: MenuAction::ReflForce,
+        }];
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_refl_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    // Run the plan, then refresh so the outcome shows without waiting on the 20s ticker. Reflector
+    // reacts to the source stamp within its own watch latency, so the first refresh can still show
+    // the old state; the ticker catches up.
+    fn refl_force(&mut self) {
+        let writes = self.refl_force_writes();
+        if writes.is_empty() { return; }
+        let n = self.refl_force_count();
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.reflector_state.clone();
+        tokio::spawn(async move {
+            let mut failed: Vec<String> = Vec::new();
+            for w in writes {
+                let label = match &w {
+                    ForceWrite::ClearMirror { namespace, name, .. }
+                    | ForceWrite::EmptyMirror { namespace, name, .. }
+                    | ForceWrite::TouchSource { namespace, name, .. }
+                    | ForceWrite::UnstampSource { namespace, name, .. } => {
+                        format!("{namespace}/{name}")
+                    }
+                };
+                if let Err(e) = apply_force(client.clone(), w).await {
+                    failed.push(format!("{label}: {e}"));
+                }
+            }
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((
+                    std::time::Instant::now(),
+                    if failed.is_empty() {
+                        format!("re-réflexion demandée sur {n} miroir(s)")
+                    } else {
+                        format!("échec sur {} miroir(s) : {}", failed.len(), failed.join(" ; "))
+                    },
+                ));
+            }
+            fetch_reflector(client, state).await;
+        });
+    }
 
     // Kyverno's admission denials, pulled from the event buffer the app already holds. They exist
     // nowhere else: the rejected resource was never created, so no PolicyReport describes it.
@@ -6176,6 +6662,7 @@ impl App {
             Some(MenuAction::Reconcile(scope)) => self.reconcile_selected(scope),
             Some(MenuAction::CertRenew) => self.certs_renew(),
             Some(MenuAction::CertAcmeRetry) => self.certs_acme_retry(),
+            Some(MenuAction::ReflForce) => self.refl_force(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
@@ -6689,6 +7176,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull) {
             app.refresh_kyverno_snapshot();
         }
+        if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
+            app.refresh_reflector_snapshot();
+            // The forced re-reflection reports through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
+        }
         // Follow re-reads the tail on the same ~3 s cadence as the Flux controller logs.
         if app.log_follow && app.last_log_follow_tick.elapsed() >= Duration::from_secs(3) {
             app.last_log_follow_tick = std::time::Instant::now();
@@ -6956,13 +7448,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_search();
         }
 
@@ -6985,12 +7477,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_edit_view();
         }
 
@@ -7003,12 +7495,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_delete_view();
         }
 
@@ -7497,6 +7989,39 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::CapacityFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::CapacityFull) => {}
 
+        (KeyCode::Up, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
+        (KeyCode::Down, _, Mode::Reflector) => app.move_refl_selection(1),
+        (KeyCode::PageUp, _, Mode::Reflector) => app.move_refl_selection(-10),
+        (KeyCode::PageDown, _, Mode::Reflector) => app.move_refl_selection(10),
+        (KeyCode::Char(' '), _, Mode::Reflector) => app.toggle_refl_node(),
+        (KeyCode::Char('g'), _, Mode::Reflector) => app.cycle_refl_world(),
+        (KeyCode::Char('f'), _, Mode::Reflector) => app.cycle_refl_filter(),
+        (KeyCode::Char('s'), _, Mode::Reflector) => app.refl_goto_source(),
+        (KeyCode::Char('r'), _, Mode::Reflector) => app.open_reflector_action_menu(),
+        (KeyCode::Enter, _, Mode::Reflector) => app.enter_reflector_full(),
+        (KeyCode::F(5), _, Mode::Reflector) => app.refresh_reflector(),
+        (KeyCode::Esc, _, Mode::Reflector) => app.exit_reflector_mode(),
+        (KeyCode::Char('n'), _, Mode::Reflector) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Reflector) => app.clear_namespace_filter(),
+        (KeyCode::Char('i'), _, Mode::Reflector) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::Reflector) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::Reflector) => {}
+
+        (KeyCode::Up, m, Mode::ReflectorFull) if !m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::ReflectorFull) if !m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::ReflectorFull) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::ReflectorFull) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(10),
+        (KeyCode::Enter, _, Mode::ReflectorFull) => app.exit_reflector_full(),
+        (KeyCode::Esc, _, Mode::ReflectorFull) => app.exit_reflector_full(),
+        (KeyCode::Char('g'), _, Mode::ReflectorFull) => app.refl_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::ReflectorFull) => app.refl_detail_scroll = usize::MAX / 2,
+        (KeyCode::Char('r'), _, Mode::ReflectorFull) => app.open_reflector_action_menu(),
+        (KeyCode::Char('i'), _, Mode::ReflectorFull) => app.enter_ai_panel(),
+        (KeyCode::Char('l'), _, Mode::ReflectorFull) => app.ai_language = app.ai_language.toggle(),
+        (_, _, Mode::ReflectorFull) => {}
+
         (KeyCode::Up, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
         (KeyCode::Left, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
@@ -7631,7 +8156,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -7662,11 +8187,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -7682,8 +8207,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -7708,6 +8233,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Secrets | Mode::SecretsFull => st.mode_secrets,
         Mode::Certs | Mode::CertsFull => st.mode_certs,
         Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
+        Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
         Mode::Storage | Mode::StorageFull => st.mode_storage,
@@ -7770,6 +8296,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             } else {
                 draw_kyverno_tree(f, app, ta);
             }
+        } else if draw_mode == Mode::Reflector {
+            draw_reflector_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Services {
@@ -7781,7 +8309,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -8149,6 +8677,34 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::StorageFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+        ],
+        Mode::Reflector => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.refl_world {
+                ReflWorld::Sources => st.k_refl_mirrors,
+                ReflWorld::Mirrors => st.k_refl_orphans,
+                ReflWorld::Orphans => st.k_refl_sources,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Espace ", kbg), Span::raw(format!(" {}   ", st.k_refl_fold)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_refl_filter, app.refl_filter.label())),
+                Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_refl_goto_source)),
+                Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_refl_force)),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::ReflectorFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
@@ -10781,6 +11337,91 @@ fn loss_word(loss: &CapLoss) -> &'static str {
     }
 }
 
+// Fold key of a source row. Also the uid suffix, so `s` can find a source by its identity alone.
+fn refl_source_key(src: &ReflSource) -> String {
+    format!("{}/{}", src.namespace, src.name)
+}
+
+fn refl_severity(level: Option<ReflHintLevel>) -> Severity {
+    match level {
+        Some(ReflHintLevel::Danger) => Severity::Warning,
+        Some(ReflHintLevel::Warn) => Severity::Warning,
+        _ => Severity::Normal,
+    }
+}
+
+// The synthetic records below are what gives the view `y`, `Ctrl-D` and the Related tab: they name a
+// real object, so the generic machinery can fetch and act on it. A target with no mirror still gets
+// a record — it names the object that *should* be there, which is what one wants to copy or create.
+fn synthetic_refl_source_record(src: &ReflSource) -> EventRecord {
+    let (synced, expected) = src.tally();
+    EventRecord {
+        uid: format!("refl|src|{}", refl_source_key(src)),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: refl_severity(src.worst()),
+        reason: "Source".to_string(),
+        api_version: "v1".to_string(),
+        kind: src.kind.label().to_string(),
+        namespace: src.namespace.clone(),
+        name: src.name.clone(),
+        message: format!(
+            "source · {} destination(s) auto · {}/{} à jour{}",
+            expected,
+            synced,
+            expected,
+            if src.scope_known { "" } else { " · portée indéterminée" },
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_refl_target_record(src: &ReflSource, t: &ReflTarget) -> EventRecord {
+    EventRecord {
+        uid: format!("refl|tgt|{}/{}|{}", src.namespace, src.name, t.namespace),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: refl_severity(t.worst()),
+        reason: t.status.label().to_string(),
+        api_version: "v1".to_string(),
+        kind: src.kind.label().to_string(),
+        namespace: t.namespace.clone(),
+        name: src.name.clone(),
+        message: format!(
+            "miroir de {}/{} · {}{}",
+            src.namespace,
+            src.name,
+            t.status.label(),
+            match &t.mirror {
+                Some(m) if !m.reflected_age.is_empty() =>
+                    format!(" · dernier passage il y a {}", m.reflected_age),
+                _ => String::new(),
+            },
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_refl_orphan_record(o: &ReflOrphan) -> EventRecord {
+    let (rns, rname) = o.props.reflects.clone().unwrap_or_default();
+    EventRecord {
+        uid: format!("refl|orph|{}/{}", o.namespace, o.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: refl_severity(o.worst()),
+        reason: "Orphelin".to_string(),
+        api_version: "v1".to_string(),
+        kind: o.kind.label().to_string(),
+        namespace: o.namespace.clone(),
+        name: o.name.clone(),
+        message: format!("reflects {rns}/{rname} · orphelin"),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 fn synthetic_storage_record(row: &StoRow) -> EventRecord {
     let now = k8s_openapi::jiff::Timestamp::now();
     let severity = |r: &StoRow| {
@@ -11271,6 +11912,463 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// --- Reflector view rendering ---------------------------------------------------------------------
+
+fn refl_hint_color(level: Option<ReflHintLevel>) -> Option<Color> {
+    match level? {
+        ReflHintLevel::Danger => Some(Color::Red),
+        ReflHintLevel::Warn => Some(Color::Rgb(255, 140, 0)),
+        ReflHintLevel::Info => None,
+    }
+}
+
+// The status cell, coloured by what the status costs: SYNC is fine, the waiting ones are questions,
+// and the three that reflector will never resolve on its own are red.
+fn refl_status_cell(status: TargetStatus) -> Cell<'static> {
+    let color = match status {
+        TargetStatus::Synced => Color::Green,
+        TargetStatus::Stale | TargetStatus::Pending | TargetStatus::Missing => Color::Yellow,
+        TargetStatus::Blocked | TargetStatus::Drifted => Color::Red,
+        TargetStatus::Manual => DIM,
+    };
+    Cell::from(status.label()).style(Style::default().fg(color))
+}
+
+// One shape for all three worlds, because the columns answer the same questions whichever object
+// owns the row: where it is, what it is, what state the copy is in, against which version, since
+// when. The last column is a fixed length, never `Min`, so the right border holds at every width.
+fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, n_src, n_mirror, n_problem, controller) = {
+        let s = app.reflector_state.lock().expect("reflector poisoned");
+        let (a, b, c) = s.summary();
+        (s.loading, s.error.clone(), a, b, c, s.controller_present)
+    };
+
+    let world = match app.refl_world {
+        ReflWorld::Sources => "sources",
+        ReflWorld::Mirrors => "miroirs",
+        ReflWorld::Orphans => "orphelins",
+    };
+    // The controller's absence belongs in the title: it explains every row at once, and it is the
+    // reason to open this view at all when nothing moves.
+    let ctrl = match controller {
+        Some(true) => String::new(),
+        Some(false) => " · CONTRÔLEUR ABSENT".to_string(),
+        None => " · contrôleur non vérifié".to_string(),
+    };
+    let title = if let Some(e) = &error {
+        format!("reflector (erreur: {e})")
+    } else if loading && app.refl_rows.is_empty() {
+        "reflector (chargement...)".to_string()
+    } else {
+        format!(
+            "reflector/{} ({} source · {} miroir · {} à voir){} · ns={} · [f] {}",
+            world, n_src, n_mirror, n_problem, ctrl, app.namespace_label, app.refl_filter.label(),
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("ROLE"),
+        Cell::from("STATE"), Cell::from("VERSION"), Cell::from("AGE"), Cell::from("ALERT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let blank = || Cell::from("");
+    // The first hint of a row, which is the one worth reading at a glance; the panel has them all.
+    let alert = |hints: &[crate::reflector::Hint]| match hints.first() {
+        Some(h) => Cell::from(h.text.clone())
+            .style(Style::default().fg(refl_hint_color(Some(h.level)).unwrap_or(DIM))),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
+    };
+
+    let rows: Vec<Row> = app
+        .refl_rows
+        .iter()
+        .map(|row| match row {
+            ReflRow::Source { idx, collapsed } => {
+                let Some(src) = app.refl_view_sources.get(*idx) else { return Row::new(vec![blank()]) };
+                let (synced, expected) = src.tally();
+                let name_style = match refl_hint_color(src.worst()) {
+                    Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                    None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                };
+                let marker = if *collapsed { "▸" } else { "▾" };
+                Row::new(vec![
+                    Cell::from(src.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(format!("{marker} {}", src.name)).style(name_style),
+                    Cell::from(src.kind.label()).style(Style::default().fg(DIM)),
+                    Cell::from("source").style(Style::default().fg(Color::Cyan)),
+                    // A source has no state of its own; what it has is a score.
+                    Cell::from(if src.scope_known {
+                        format!("{synced}/{expected}")
+                    } else {
+                        "?".to_string()
+                    }),
+                    Cell::from(refl_short_version(&src.resource_version)).style(Style::default().fg(DIM)),
+                    Cell::from(src.age.clone()).style(Style::default().fg(DIM)),
+                    alert(&src.hints),
+                ])
+            }
+            ReflRow::Target { src, target } => {
+                let Some(s) = app.refl_view_sources.get(*src) else { return Row::new(vec![blank()]) };
+                let Some(t) = s.targets.get(*target) else { return Row::new(vec![blank()]) };
+                // Indented only in the tree: in the flat Mirrors world there is no parent above.
+                let indent = if app.refl_world == ReflWorld::Sources { "    " } else { "" };
+                let name_style = match refl_hint_color(t.worst()) {
+                    Some(c) => Style::default().fg(c),
+                    None => Style::default(),
+                };
+                let version = match &t.mirror {
+                    Some(m) => refl_short_version(&m.reflected_version),
+                    None => "—".to_string(),
+                };
+                let age = match &t.mirror {
+                    Some(m) => m.age.clone(),
+                    None => "—".to_string(),
+                };
+                let role = match &t.mirror {
+                    Some(m) if m.auto => "miroir auto",
+                    Some(_) => "miroir",
+                    None if t.auto => "attendu",
+                    None => "—",
+                };
+                Row::new(vec![
+                    Cell::from(t.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(format!("{indent}{}", s.name)).style(name_style),
+                    Cell::from(s.kind.label()).style(Style::default().fg(DIM)),
+                    Cell::from(role).style(Style::default().fg(DIM)),
+                    refl_status_cell(t.status),
+                    Cell::from(version).style(Style::default().fg(DIM)),
+                    Cell::from(age).style(Style::default().fg(DIM)),
+                    alert(&t.hints),
+                ])
+            }
+            ReflRow::Orphan { idx } => {
+                let Some(o) = app.refl_view_orphans.get(*idx) else { return Row::new(vec![blank()]) };
+                let name_style = match refl_hint_color(o.worst()) {
+                    Some(c) => Style::default().fg(c),
+                    None => Style::default(),
+                };
+                Row::new(vec![
+                    Cell::from(o.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(o.name.clone()).style(name_style),
+                    Cell::from(o.kind.label()).style(Style::default().fg(DIM)),
+                    Cell::from("orphelin").style(Style::default().fg(Color::Red)),
+                    Cell::from("ORPHELIN").style(Style::default().fg(Color::Red)),
+                    Cell::from(refl_short_version(&o.mirror.reflected_version))
+                        .style(Style::default().fg(DIM)),
+                    Cell::from(o.age.clone()).style(Style::default().fg(DIM)),
+                    alert(&o.hints),
+                ])
+            }
+        })
+        .collect();
+
+    // Width is measured on the strings actually drawn — marker and indent included — or the column
+    // comes out two characters short and clips every source name.
+    let ns_values: Vec<String> = app
+        .refl_rows
+        .iter()
+        .map(|r| match r {
+            ReflRow::Source { idx, .. } => app
+                .refl_view_sources
+                .get(*idx)
+                .map(|s| s.namespace.clone())
+                .unwrap_or_default(),
+            ReflRow::Target { src, target } => app
+                .refl_view_sources
+                .get(*src)
+                .and_then(|s| s.targets.get(*target))
+                .map(|t| t.namespace.clone())
+                .unwrap_or_default(),
+            ReflRow::Orphan { idx } => app
+                .refl_view_orphans
+                .get(*idx)
+                .map(|o| o.namespace.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let indent = if app.refl_world == ReflWorld::Sources { "    " } else { "" };
+    let names: Vec<String> = app
+        .refl_rows
+        .iter()
+        .map(|r| match r {
+            ReflRow::Source { idx, .. } => app
+                .refl_view_sources
+                .get(*idx)
+                .map(|s| format!("▾ {}", s.name))
+                .unwrap_or_default(),
+            ReflRow::Target { src, .. } => app
+                .refl_view_sources
+                .get(*src)
+                .map(|s| format!("{indent}{}", s.name))
+                .unwrap_or_default(),
+            ReflRow::Orphan { idx } => app
+                .refl_view_orphans
+                .get(*idx)
+                .map(|o| o.name.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let ns_w = col_width(ns_values.iter().map(|s| s.as_str()), "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 36);
+    // The alert column takes what is left, as a percentage rather than `Min`: a `Min` last column
+    // eats the right border as soon as the terminal is narrower than the sum of the fixed widths.
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(9),
+        Constraint::Length(11), Constraint::Length(11), Constraint::Length(9),
+        Constraint::Length(5), Constraint::Percentage(100),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// resourceVersions are only ever compared, never read: the tail is enough to tell two apart.
+fn refl_short_version(v: &str) -> String {
+    if v.is_empty() {
+        return "—".to_string();
+    }
+    if v.chars().count() <= 8 {
+        return v.to_string();
+    }
+    let tail: String = v.chars().skip(v.chars().count() - 7).collect();
+    format!("…{tail}")
+}
+
+// The facts of the selected row, then what the rules make of them — the same shape as the storage
+// and cert-manager panels, so the three read alike. The annotations are shown verbatim: they are
+// the input to every verdict above, and a reader has to be able to check the reasoning.
+fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let cluster_hints = {
+        let s = app.reflector_state.lock().expect("reflector poisoned");
+        s.cluster_hints.clone()
+    };
+    let Some((title, mut lines)) = reflector_detail_lines(app, &cluster_hints) else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            " sélectionnez une source, un miroir ou un orphelin ",
+            Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" reflector "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.refl_detail_scroll > max_scroll {
+        app.refl_detail_scroll = max_scroll;
+    }
+    app.refl_detail_scroll = text_search_top(
+        app, Mode::ReflectorFull, &mut lines, visible, app.refl_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .scroll((app.refl_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn reflector_detail_lines(
+    app: &App,
+    cluster_hints: &[crate::reflector::Hint],
+) -> Option<(Line<'static>, Vec<Line<'static>>)> {
+    // Width chosen so the longest label ("allowed-namespaces", "créé par reflector" — 18 chars
+    // each) still leaves a gap before the value instead of running into it.
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<20}", k), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+    let banner = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    let sel = app.table_state.selected()?;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Assigned exactly once, by whichever arm matches: the row's own diagnosis.
+    let own_hints: Vec<crate::reflector::Hint>;
+
+    let title = match app.refl_rows.get(sel)? {
+        ReflRow::Source { idx, .. } => {
+            let src = app.refl_view_sources.get(*idx)?;
+            let (synced, expected) = src.tally();
+            lines.push(label("kind", src.kind.label().to_string()));
+            if !src.type_.is_empty() {
+                lines.push(label("type", src.type_.clone()));
+            }
+            lines.push(label("resourceVersion", dash(&src.resource_version)));
+            lines.push(label("provenance", src.provenance.label()));
+            lines.push(label("âge", src.age.clone()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Annotations".to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(label("allowed", if src.props.allowed { "true".into() } else { "false".to_string() }));
+            // An empty list is not an absence: at reflector it means "every namespace". Spell it out
+            // rather than printing a dash the reader would take for "nothing".
+            lines.push(label(
+                "allowed-namespaces",
+                if src.props.allowed_ns.is_empty() {
+                    "\"\" (tous les namespaces)".to_string()
+                } else {
+                    src.props.allowed_ns.clone()
+                },
+            ));
+            if !src.props.allowed_selector.is_empty() {
+                lines.push(label("allowed-selector", src.props.allowed_selector.clone()));
+            }
+            lines.push(label("auto-enabled", if src.props.auto_enabled { "true".into() } else { "false".to_string() }));
+            lines.push(label(
+                "auto-namespaces",
+                if src.props.auto_ns.is_empty() {
+                    "\"\" (tous les namespaces)".to_string()
+                } else {
+                    src.props.auto_ns.clone()
+                },
+            ));
+            if !src.props.auto_selector.is_empty() {
+                lines.push(label("auto-selector", src.props.auto_selector.clone()));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Portée résolue".to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            if !src.scope_known {
+                lines.push(label("destinations", "indéterminée (sélecteur illisible)".to_string()));
+            } else if src.targets.is_empty() {
+                lines.push(label("destinations", "aucun namespace ne correspond".to_string()));
+            } else {
+                lines.push(label("auto", format!("{synced}/{expected} à jour")));
+                for t in &src.targets {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<20}", ""), Style::default().fg(DIM)),
+                        // 12, not 10: "EN ATTENTE" is exactly 10 and would touch the namespace.
+                        Span::styled(
+                            format!("{:<12}", t.status.label()),
+                            Style::default().fg(refl_hint_color(t.worst()).unwrap_or(Color::Green)),
+                        ),
+                        Span::raw(t.namespace.clone()),
+                        Span::styled(
+                            if t.auto { "".to_string() } else { "  (hors portée auto)".to_string() },
+                            Style::default().fg(DIM),
+                        ),
+                    ]));
+                }
+            }
+            own_hints = src.hints.clone();
+            banner(format!(" source {} {}/{} ", src.kind.label(), src.namespace, src.name))
+        }
+        ReflRow::Target { src, target } => {
+            let s = app.refl_view_sources.get(*src)?;
+            let t = s.targets.get(*target)?;
+            lines.push(label("état", t.status.label().to_string()));
+            lines.push(label("source", format!("{}/{}", s.namespace, s.name)));
+            lines.push(label("kind", s.kind.label().to_string()));
+            lines.push(label(
+                "portée",
+                if t.auto { "automatique".to_string() } else { "à la main".to_string() },
+            ));
+            match &t.mirror {
+                Some(m) => {
+                    lines.push(label("créé par reflector", if m.auto { "oui".into() } else { "non (déclaré à la main)".to_string() }));
+                    lines.push(label("reflected-version", dash(&m.reflected_version)));
+                    lines.push(label("attendu", dash(&s.resource_version)));
+                    lines.push(label("reflected-at", dash(&m.reflected_at)));
+                    if !m.reflected_age.is_empty() {
+                        lines.push(label("dernier passage", format!("il y a {}", m.reflected_age)));
+                    }
+                    lines.push(label("provenance", m.provenance.label()));
+                    lines.push(label("âge", m.age.clone()));
+                    lines.push(label("clés", if m.keys.is_empty() { "—".to_string() } else { m.keys.join(", ") }));
+                }
+                None => {
+                    lines.push(label("objet", "absent de ce namespace".to_string()));
+                    if let Some(b) = &t.blocker {
+                        lines.push(label("occupé par", b.clone()));
+                    }
+                }
+            }
+            lines.push(label(
+                "réclamé par",
+                if t.consumers.is_empty() { "—".to_string() } else { t.consumers.join(", ") },
+            ));
+            own_hints = t.hints.clone();
+            banner(format!(" miroir {}/{} ", t.namespace, s.name))
+        }
+        ReflRow::Orphan { idx } => {
+            let o = app.refl_view_orphans.get(*idx)?;
+            let (rns, rname) = o.props.reflects.clone().unwrap_or_default();
+            lines.push(label("kind", o.kind.label().to_string()));
+            lines.push(label("reflects", format!("{rns}/{rname}")));
+            lines.push(label(
+                "créé par reflector",
+                if o.mirror.auto { "oui".into() } else { "non (déclaré à la main)".to_string() },
+            ));
+            lines.push(label("reflected-version", dash(&o.mirror.reflected_version)));
+            lines.push(label("reflected-at", dash(&o.mirror.reflected_at)));
+            if !o.mirror.reflected_age.is_empty() {
+                lines.push(label("dernier passage", format!("il y a {}", o.mirror.reflected_age)));
+            }
+            lines.push(label("provenance", o.provenance.label()));
+            lines.push(label("âge", o.age.clone()));
+            lines.push(label(
+                "réclamé par",
+                if o.consumers.is_empty() { "—".to_string() } else { o.consumers.join(", ") },
+            ));
+            own_hints = o.hints.clone();
+            banner(format!(" orphelin {}/{} ", o.namespace, o.name))
+        }
+    };
+
+    push_reflector_hints(&mut lines, "Diagnostic", &own_hints);
+    push_reflector_hints(&mut lines, "Cluster", cluster_hints);
+    Some((title, lines))
+}
+
+// A titled block of hints, wrapped and glyphed like the storage and cert-manager diagnostics so the
+// views read the same way. Nothing is drawn when there is nothing to say.
+fn push_reflector_hints(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    hints: &[crate::reflector::Hint],
+) {
+    if hints.is_empty() { return; }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    for h in hints {
+        let (glyph, color) = match h.level {
+            ReflHintLevel::Danger => ("✗", Color::Red),
+            ReflHintLevel::Warn => ("▲", Color::Rgb(255, 140, 0)),
+            ReflHintLevel::Info => ("·", DIM),
+        };
+        let mut first = true;
+        for w in wrap_words(&h.text, 76) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if first { format!("{glyph} ") } else { "  ".to_string() },
+                    Style::default().fg(color),
+                ),
+                Span::styled(w, Style::default().fg(color)),
+            ]));
+            first = false;
+        }
+    }
 }
 
 // --- Storage view rendering ---------------------------------------------------------------------
@@ -14844,6 +15942,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let is_kyverno_mode = matches!(view_mode(app), Mode::Kyverno | Mode::KyvernoFull);
     if is_kyverno_mode {
         draw_kyverno_detail(f, app, area);
+        return;
+    }
+    let is_reflector_mode = matches!(view_mode(app), Mode::Reflector | Mode::ReflectorFull);
+    if is_reflector_mode {
+        draw_reflector_detail(f, app, area);
         return;
     }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
