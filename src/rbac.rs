@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use k8s_openapi::api::rbac::v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule as K8sPolicyRule, Role, RoleBinding,
 };
+use crate::lang::{Strings, fill};
 use kube::api::{Api, DynamicObject, ListParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
@@ -329,6 +330,7 @@ pub fn classify(
     subjects: &[Subject],
     rules: &[PolicyRule],
     critical_ns: &[String],
+    st: &'static Strings,
 ) -> (Severity, Vec<Finding>) {
     let cluster = matches!(scope, Scope::ClusterWide);
     let mut findings: Vec<Finding> = Vec::new();
@@ -340,7 +342,7 @@ pub fn classify(
             push(
                 Severity::Critical,
                 "wildcard-all",
-                "verbs:* resources:* apiGroups:* — équivaut cluster-admin".into(),
+                st.rbac_wildcard_all.into(),
             );
         }
         if r.group("rbac.authorization.k8s.io")
@@ -366,42 +368,42 @@ pub fn classify(
             push(
                 Severity::High,
                 "pod-exec",
-                "exec/attach sur pods — exécution de code dans un pod".into(),
+                st.rbac_pod_exec.into(),
             );
         }
         if r.group("") && r.res("pods") && r.has_verb("create") {
             push(
                 Severity::High,
                 "pod-create",
-                "create pods — peut planifier un pod privilégié et voler son token SA".into(),
+                st.rbac_pod_create.into(),
             );
         }
         if r.group("") && r.res("secrets") && r.has_read() {
             push(
                 Severity::High,
                 "secrets-read",
-                "lecture des secrets — accès aux credentials".into(),
+                st.rbac_secrets_read.into(),
             );
         }
         if WORKLOADS.iter().any(|w| r.res(w)) && r.has_write() {
             push(
                 Severity::High,
                 "workload-write",
-                "écriture sur workloads — planifie indirectement des pods".into(),
+                st.rbac_workload_write.into(),
             );
         }
         if r.group("") && r.res("serviceaccounts/token") && r.has_verb("create") {
             push(
                 Severity::High,
                 "sa-token",
-                "create serviceaccounts/token — émission de jetons SA".into(),
+                st.rbac_sa_token.into(),
             );
         }
         if r.group("") && r.res("serviceaccounts") && r.has_write() {
             push(
                 Severity::High,
                 "sa-write",
-                "écriture sur serviceaccounts".into(),
+                st.rbac_sa_write.into(),
             );
         }
         // Cluster-scoped resources: only count when the binding is actually cluster-wide.
@@ -411,7 +413,7 @@ pub fn classify(
                 push(
                     Severity::High,
                     "csr-sign",
-                    "approbation de CSR — peut forger des certificats client".into(),
+                    st.rbac_csr_sign.into(),
                 );
             }
             if (r.res("mutatingwebhookconfigurations")
@@ -421,14 +423,14 @@ pub fn classify(
                 push(
                     Severity::High,
                     "webhook-write",
-                    "écriture sur les admission webhooks — interception/altération des requêtes".into(),
+                    st.rbac_webhook_write.into(),
                 );
             }
             if r.res("nodes") || r.res("nodes/proxy") {
                 push(
                     Severity::High,
                     "node-access",
-                    "accès aux nodes/proxy".into(),
+                    st.rbac_node_access.into(),
                 );
             }
         }
@@ -439,7 +441,7 @@ pub fn classify(
             push(
                 Severity::High,
                 "wildcard-verb",
-                "verbe * sur une ressource sensible".into(),
+                st.rbac_wildcard_verb.into(),
             );
         }
 
@@ -450,11 +452,11 @@ pub fn classify(
             push(
                 Severity::Medium,
                 "wide-read",
-                "lecture sur toutes les ressources".into(),
+                st.rbac_wide_read.into(),
             );
         }
         if r.has_write() {
-            push(Severity::Medium, "write", "écriture sur des ressources".into());
+            push(Severity::Medium, "write", st.rbac_write.into());
         }
     }
 
@@ -464,7 +466,7 @@ pub fn classify(
             push(
                 Severity::Critical,
                 "system-masters",
-                "sujet system:masters — bypass total de RBAC".into(),
+                st.rbac_system_masters.into(),
             );
         }
         if s.kind == "Group" && (s.name == "system:authenticated" || s.name == "system:unauthenticated")
@@ -472,14 +474,14 @@ pub fn classify(
             push(
                 Severity::High,
                 "subject-public",
-                format!("sujet {} — accordé à un public très large", s.name),
+                fill(st.rbac_subject_public, &[("name", &s.name)]),
             );
         }
         if s.kind == "ServiceAccount" && s.name == "default" {
             push(
                 Severity::Medium,
                 "default-sa",
-                "lié au ServiceAccount default — tout pod du ns hérite des droits".into(),
+                st.rbac_default_sa.into(),
             );
         }
     }
@@ -508,7 +510,7 @@ pub fn classify(
             push(
                 sev,
                 "critical-ns",
-                format!("namespace critique ({ns}) — escalade cluster probable"),
+                fill(st.rbac_critical_ns, &[("ns", ns)]),
             );
         }
     }
@@ -525,7 +527,7 @@ pub fn classify(
             push(
                 Severity::Info,
                 "inert-cluster-rules",
-                format!("règles cluster-scoped inertes dans ce ns : {}", inert.join(", ")),
+                fill(st.rbac_inert_cluster_rules, &[("list", &inert.join(", "))]),
             );
         }
     }
@@ -600,6 +602,7 @@ fn resolve_cluster_rules(
 }
 
 pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedRbac) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("rbac poisoned");
         s.loading = true;
@@ -703,9 +706,9 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
         let (rules, aggregated) = resolve_cluster_rules(&role_ref.name, &cr_index);
         let subjects = conv_subjects(crb.subjects.as_deref());
         let scope = Scope::ClusterWide;
-        let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns);
+        let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns, st);
         let provenance = detect_provenance(&crb.metadata);
-        push_gitops_finding(&provenance, severity, &mut findings);
+        push_gitops_finding(&provenance, severity, &mut findings, st);
         bindings.push(RbacBinding {
             scope,
             binding_kind: "ClusterRoleBinding".into(),
@@ -743,9 +746,9 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
         };
         let subjects = conv_subjects(rb.subjects.as_deref());
         let scope = Scope::Namespace(ns);
-        let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns);
+        let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns, st);
         let provenance = detect_provenance(&rb.metadata);
-        push_gitops_finding(&provenance, severity, &mut findings);
+        push_gitops_finding(&provenance, severity, &mut findings, st);
         bindings.push(RbacBinding {
             scope,
             binding_kind: "RoleBinding".into(),
@@ -791,12 +794,17 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
 
 // Flag a risky grant that lives outside GitOps (kubectl/unmanaged/owned): an audit blind spot.
 // Informational — it never raises severity, only surfaces a tag on already-risky bindings.
-fn push_gitops_finding(prov: &Provenance, severity: Severity, findings: &mut Vec<Finding>) {
+fn push_gitops_finding(
+    prov: &Provenance,
+    severity: Severity,
+    findings: &mut Vec<Finding>,
+    st: &'static Strings,
+) {
     if prov.out_of_gitops() && severity >= Severity::High {
         findings.push(Finding {
             sev: Severity::Info,
             tag: "out-of-gitops",
-            detail: format!("origine {} — grant hors GitOps, dérive non auditée", prov.label()),
+            detail: fill(st.rbac_out_of_gitops, &[("origin", &prov.label())]),
         });
     }
 }
@@ -926,6 +934,7 @@ pub fn critical_namespaces(extra: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::FR;
 
     fn rule(groups: &[&str], resources: &[&str], verbs: &[&str]) -> PolicyRule {
         PolicyRule {
@@ -945,12 +954,12 @@ mod tests {
     }
 
     fn classify_cluster(rules: &[PolicyRule]) -> Severity {
-        classify(&Scope::ClusterWide, &[sa("app", "x")], rules, &[]).0
+        classify(&Scope::ClusterWide, &[sa("app", "x")], rules, &[], &FR).0
     }
 
     fn classify_ns(ns: &str, rules: &[PolicyRule], crit: &[&str]) -> Severity {
         let crit: Vec<String> = crit.iter().map(|s| s.to_string()).collect();
-        classify(&Scope::Namespace(ns.into()), &[sa(ns, "x")], rules, &crit).0
+        classify(&Scope::Namespace(ns.into()), &[sa(ns, "x")], rules, &crit, &FR).0
     }
 
     #[test]
@@ -1010,13 +1019,13 @@ mod tests {
     #[test]
     fn public_group_floors_high() {
         let r = rule(&[""], &["configmaps"], &["get"]);
-        let s = classify(&Scope::Namespace("app".into()), &[group("system:authenticated")], &[r], &[]).0;
+        let s = classify(&Scope::Namespace("app".into()), &[group("system:authenticated")], &[r], &[], &FR).0;
         assert_eq!(s, Severity::High);
     }
 
     #[test]
     fn system_masters_is_critical() {
-        let s = classify(&Scope::ClusterWide, &[group("system:masters")], &[], &[]).0;
+        let s = classify(&Scope::ClusterWide, &[group("system:masters")], &[], &[], &FR).0;
         assert_eq!(s, Severity::Critical);
     }
 }

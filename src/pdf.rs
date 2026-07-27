@@ -36,6 +36,8 @@ const BRAND_FONT_MONO: &[&str] = &[
 const TEMPLATE: &str = r###"
 #let inp = sys.inputs
 #let brand = inp.brand
+// Every label of this template comes from `l`, built Rust-side from the active string table.
+#let l = inp.l10n
 
 #set document(title: inp.title, author: "kdt")
 #set page(
@@ -50,7 +52,7 @@ const TEMPLATE: &str = r###"
     #counter(page).display() / #counter(page).final().first()
   ]),
 )
-#set text(font: brand.font_sans, size: 10pt, lang: "fr", fill: rgb(brand.text_dark), hyphenate: false)
+#set text(font: brand.font_sans, size: 10pt, lang: inp.lang, fill: rgb(brand.text_dark), hyphenate: false)
 #set par(justify: false, leading: 0.55em, linebreaks: "simple")
 
 #show heading.where(level: 1): it => block(below: 0.6em)[
@@ -107,13 +109,13 @@ const TEMPLATE: &str = r###"
 #let render-ai(ai) = {
   if ai.error != "" {
     block(fill: rgb(brand.red_light_bg), stroke: 0.5pt + rgb(brand.red_border), inset: 10pt, radius: 4pt, width: 100%)[
-      #text(fill: rgb(brand.red_dark), weight: "bold")[Erreur :] #h(4pt) #ai.error
+      #text(fill: rgb(brand.red_dark), weight: "bold")[#l.error] #h(4pt) #ai.error
     ]
   } else if ai.blocks.len() == 0 {
-    text(fill: rgb("#888"))[(pas de réponse IA)]
+    text(fill: rgb("#888"))[#l.no_ai_answer]
   } else {
     if ai.model != "" {
-      text(fill: rgb("#666"), size: 8pt)[Modèle : ]
+      text(fill: rgb("#666"), size: 8pt)[#l.model]
       raw(ai.model, block: false)
       v(0.3em)
     }
@@ -213,11 +215,11 @@ const TEMPLATE: &str = r###"
         columns: (auto, 1fr),
         column-gutter: 1.5em,
         row-gutter: 0.6em,
-        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[Contexte],
+        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[#l.context],
         text(size: 11pt)[#inp.context],
-        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[Namespace],
+        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[#l.namespace],
         text(size: 11pt)[#inp.namespace],
-        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[Généré le],
+        text(fill: rgb(brand.red_dark), weight: "bold", size: 11pt)[#l.generated_on],
         text(size: 11pt)[#inp.generated_at],
       )
     ]
@@ -229,13 +231,13 @@ const TEMPLATE: &str = r###"
 #let summary = inp.summary
 #align(center)[
   #block(width: 70%, fill: rgb(brand.red_light_bg), stroke: 0.5pt + rgb(brand.red_border), inset: 14pt, radius: 4pt)[
-    #text(weight: "bold", fill: rgb(brand.red_dark), size: 11pt)[Contenu de l'extraction] \
+    #text(weight: "bold", fill: rgb(brand.red_dark), size: 11pt)[#l.contents] \
     #v(4pt)
     #if summary.has_diagnostic [
-      · diagnostic cluster (#summary.diag_total étapes) \
+      · #l.toc_diagnostic (#summary.diag_total #l.toc_steps) \
     ]
     #if summary.node_count > 0 [
-      · usage détaillé de #summary.node_count noeud(s) avec analyse IA \
+      · #l.toc_nodes #summary.node_count #l.toc_node_word \
     ]
   ]
 ]
@@ -243,7 +245,7 @@ const TEMPLATE: &str = r###"
 #align(bottom + center)[
   #v(1fr)
   #text(fill: rgb("#999"), size: 8pt)[
-    rapport généré automatiquement par #big-first("kdt", 9pt, 8pt, rgb("#999"))
+    #l.generated_by #big-first("kdt", 9pt, 8pt, rgb("#999"))
   ]
 ]
 
@@ -251,17 +253,17 @@ const TEMPLATE: &str = r###"
   #pagebreak()
   #let d = inp.diagnostic
   #let counts = d.counts
-  = Diagnostic cluster
+  = #l.diag_title
 
   #block(fill: rgb(brand.red_light_bg), stroke: 0.5pt + rgb(brand.red_border), inset: 8pt, radius: 4pt, width: 100%)[
-    #text(weight: "bold", fill: rgb(brand.red_dark))[Bilan] — #counts.total étapes : #h(0.4em)
+    #text(weight: "bold", fill: rgb(brand.red_dark))[#l.diag_summary] — #counts.total #l.toc_steps : #h(0.4em)
     #status-badge("ok") #h(2pt) #counts.ok #h(0.8em)
     #status-badge("info") #h(2pt) #counts.info #h(0.8em)
     #status-badge("warn") #h(2pt) #counts.warn #h(0.8em)
     #status-badge("err") #h(2pt) #counts.err
   ]
 
-  == Étapes
+  == #l.diag_steps
   #for step in d.steps [
     #block(above: 0.9em, below: 0.4em)[
       #status-badge(step.status) #h(6pt)
@@ -277,7 +279,7 @@ const TEMPLATE: &str = r###"
     ]
   ]
 
-  == Analyse IA
+  == #l.ai_analysis
   #render-ai(d.ai)
 ]
 
@@ -285,10 +287,10 @@ const TEMPLATE: &str = r###"
 
 #for node in inp.nodes [
   #pagebreak()
-  = Noeud : #raw(node.name, block: false)
+  = #l.node_title #raw(node.name, block: false)
 
     #text(fill: rgb("#666"), size: 9pt)[
-      allocatable cpu=*#node.alloc_cpu*, mem=*#node.alloc_mem*  ·  metrics-server : #if node.metrics_available [#text(fill: rgb("#1b5e20"))[disponible]] else [#text(fill: rgb("#bf6500"))[indisponible]]  ·  *#node.user_count* user · *#node.system_count* system
+      allocatable cpu=*#node.alloc_cpu*, mem=*#node.alloc_mem*  ·  #l.metrics_server #if node.metrics_available [#text(fill: rgb("#1b5e20"))[#l.available]] else [#text(fill: rgb("#bf6500"))[#l.unavailable]]  ·  *#node.user_count* user · *#node.system_count* system
     ]
 
     #v(0.4em)
@@ -297,12 +299,12 @@ const TEMPLATE: &str = r###"
       columns: (1fr, 1fr),
       gutter: 10pt,
       block(fill: rgb("#f1f8e9"), inset: 8pt, radius: 4pt, width: 100%)[
-        #text(weight: "bold")[User containers (#node.user_count)] \
+        #text(weight: "bold")[#l.user_containers (#node.user_count)] \
         cpu req=*#node.user_cpu_req* lim=*#node.user_cpu_lim* use=*#node.user_cpu_use* \
         mem req=*#node.user_mem_req* lim=*#node.user_mem_lim* use=*#node.user_mem_use*
       ],
       block(fill: rgb("#eceff1"), inset: 8pt, radius: 4pt, width: 100%)[
-        #text(weight: "bold")[System containers (#node.system_count)] \
+        #text(weight: "bold")[#l.system_containers (#node.system_count)] \
         cpu req=*#node.sys_cpu_req* use=*#node.sys_cpu_use* \
         mem req=*#node.sys_mem_req* use=*#node.sys_mem_use*
       ],
@@ -323,7 +325,7 @@ const TEMPLATE: &str = r###"
       radius: 3pt,
       width: 100%,
     )[
-      #text(weight: "bold", fill: rgb(brand.red_dark), size: 9pt)[Légende] \
+      #text(weight: "bold", fill: rgb(brand.red_dark), size: 9pt)[#l.legend] \
       #v(2pt)
       #grid(
         columns: (1fr, 1fr),
@@ -331,20 +333,20 @@ const TEMPLATE: &str = r###"
         row-gutter: 3pt,
         // Left: symbols
         block[
-          #text(size: 8pt, weight: "bold", fill: rgb(brand.text_dark))[Symboles dans les cellules] \
+          #text(size: 8pt, weight: "bold", fill: rgb(brand.text_dark))[#l.cell_symbols] \
           #text(size: 8pt)[
-            #text(fill: rgb(brand.red), weight: "bold")[▲] use ≥ limit (cpuMax / OOMrisk) \
-            #text(fill: rgb(brand.red), weight: "bold")[▼] sous-utilisé (use < 30 % de request) \
-            #text(fill: rgb(brand.red), weight: "bold")[↡] sous-utilisé extrême (use < 5 %) \
-            #text(fill: rgb(brand.red), weight: "bold")[»] limit » request (limit > 4× req) \
-            #text(fill: rgb(brand.red), weight: "bold")[—] valeur manquante (request ou limit non définie) \
-            #text(fill: rgb("#999"))[·] préfixe = conteneur système
+            #text(fill: rgb(brand.red), weight: "bold")[▲] #l.sym_at_limit \
+            #text(fill: rgb(brand.red), weight: "bold")[▼] #l.sym_under \
+            #text(fill: rgb(brand.red), weight: "bold")[↡] #l.sym_under_hard \
+            #text(fill: rgb(brand.red), weight: "bold")[»] #l.sym_limit_gap \
+            #text(fill: rgb(brand.red), weight: "bold")[—] #l.sym_missing \
+            #text(fill: rgb("#999"))[·] #l.sym_system
           ]
         ],
         // Right: color scale
         block[
-          #text(size: 8pt, weight: "bold", fill: rgb(brand.text_dark))[Surlignage rouge — impact sur le noeud] \
-          #text(size: 7.5pt, fill: rgb("#666"))[(% de l'allocatable du noeud occupé par la valeur)] \
+          #text(size: 8pt, weight: "bold", fill: rgb(brand.text_dark))[#l.heat_title] \
+          #text(size: 7.5pt, fill: rgb("#666"))[#l.heat_sub] \
           #v(2pt)
           #lvl-swatch(1, "2 – 6 %")  #h(6pt)
           #lvl-swatch(2, "6 – 12 %") #h(6pt)
@@ -353,7 +355,7 @@ const TEMPLATE: &str = r###"
           #lvl-swatch(4, "20 – 30 %") #h(6pt)
           #lvl-swatch(5, "≥ 30 %") \
           #v(2pt)
-          #text(size: 7.5pt, fill: rgb("#666"))[Plus le rouge est vif, plus la valeur consomme une part importante du noeud.]
+          #text(size: 7.5pt, fill: rgb("#666"))[#l.heat_note]
         ]
       )
     ]
@@ -400,7 +402,7 @@ const TEMPLATE: &str = r###"
 
     #v(0.6em)
 
-    == Analyse IA
+    == #l.ai_analysis
     #render-ai(node.ai)
 ]
 "###;
@@ -682,6 +684,46 @@ fn font_array(stack: &[&str]) -> Value {
     Value::Array(arr)
 }
 
+// Every French (or English) word of the template comes from here, so the report is written in the
+// same language as the UI that asked for it.
+fn build_l10n_dict(st: &'static crate::lang::Strings) -> Dict {
+    dict_from(&[
+        ("error", s(st.pdf_error)),
+        ("no_ai_answer", s(st.pdf_no_ai_answer)),
+        ("model", s(st.pdf_model)),
+        ("context", s(st.pdf_context)),
+        ("namespace", s(st.pdf_namespace)),
+        ("generated_on", s(st.pdf_generated_on)),
+        ("contents", s(st.pdf_contents)),
+        ("toc_diagnostic", s(st.pdf_toc_diagnostic)),
+        ("toc_steps", s(st.pdf_toc_steps)),
+        ("toc_nodes", s(st.pdf_toc_nodes)),
+        ("toc_node_word", s(st.pdf_toc_node_word)),
+        ("generated_by", s(st.pdf_generated_by)),
+        ("diag_title", s(st.pdf_diag_title)),
+        ("diag_summary", s(st.pdf_diag_summary)),
+        ("diag_steps", s(st.pdf_diag_steps)),
+        ("ai_analysis", s(st.pdf_ai_analysis)),
+        ("node_title", s(st.pdf_node_title)),
+        ("metrics_server", s(st.pdf_metrics_server)),
+        ("available", s(st.pdf_available)),
+        ("unavailable", s(st.pdf_unavailable)),
+        ("user_containers", s(st.pdf_user_containers)),
+        ("system_containers", s(st.pdf_system_containers)),
+        ("legend", s(st.pdf_legend)),
+        ("cell_symbols", s(st.pdf_cell_symbols)),
+        ("sym_at_limit", s(st.pdf_sym_at_limit)),
+        ("sym_under", s(st.pdf_sym_under)),
+        ("sym_under_hard", s(st.pdf_sym_under_hard)),
+        ("sym_limit_gap", s(st.pdf_sym_limit_gap)),
+        ("sym_missing", s(st.pdf_sym_missing)),
+        ("sym_system", s(st.pdf_sym_system)),
+        ("heat_title", s(st.pdf_heat_title)),
+        ("heat_sub", s(st.pdf_heat_sub)),
+        ("heat_note", s(st.pdf_heat_note)),
+    ])
+}
+
 fn build_brand_dict() -> Dict {
     dict_from(&[
         ("red", s(BRAND_RED.to_string())),
@@ -695,6 +737,7 @@ fn build_brand_dict() -> Dict {
 }
 
 fn build_inputs(report: &Report) -> Dict {
+    let st = crate::lang::active();
     let nodes_arr: Array = report
         .nodes
         .iter()
@@ -717,6 +760,8 @@ fn build_inputs(report: &Report) -> Dict {
         ("has_diagnostic", Value::Bool(report.diagnostic.is_some())),
         ("nodes", Value::Array(nodes_arr)),
         ("brand", Value::Dict(build_brand_dict())),
+        ("lang", s(st.pdf_lang_tag)),
+        ("l10n", Value::Dict(build_l10n_dict(st))),
     ];
     if let Some(d) = &report.diagnostic {
         pairs.push(("diagnostic", Value::Dict(build_diag_dict(d))));
@@ -963,18 +1008,25 @@ mod tests {
 
     #[test]
     fn smoke_export_produces_valid_pdf() {
-        let report = Report {
-            title: "Extraction complète".to_string(),
-            context: "test-ctx".to_string(),
-            namespace: "all".to_string(),
-            generated_at: "2026-05-09 12:00".to_string(),
-            diagnostic: Some(sample_diag()),
-            nodes: vec![sample_node(), sample_node()],
-        };
-        let path = std::env::temp_dir().join("kdt_pdf_typst_test.pdf");
-        export_to_pdf(&path, &report).expect("export");
-        let bytes = std::fs::read(&path).expect("read back");
-        assert!(bytes.starts_with(b"%PDF-"), "header");
-        assert!(bytes.windows(5).any(|w| w == b"%%EOF"), "trailer");
+        // Both languages: the template pulls every label from the active table, so a missing entry
+        // or a stale `#l.` reference is a Typst compile error, not a silently French page.
+        for lang in [crate::ai::AiLanguage::Fr, crate::ai::AiLanguage::En] {
+            crate::lang::set_active(lang);
+            let report = Report {
+                title: crate::lang::t(lang).extract_report_title.to_string(),
+                context: "test-ctx".to_string(),
+                namespace: "all".to_string(),
+                generated_at: "2026-05-09 12:00".to_string(),
+                diagnostic: Some(sample_diag()),
+                nodes: vec![sample_node(), sample_node()],
+            };
+            let path = std::env::temp_dir()
+                .join(format!("kdt_pdf_typst_test_{}.pdf", lang.code()));
+            export_to_pdf(&path, &report).expect("export");
+            let bytes = std::fs::read(&path).expect("read back");
+            assert!(bytes.starts_with(b"%PDF-"), "header");
+            assert!(bytes.windows(5).any(|w| w == b"%%EOF"), "trailer");
+        }
+        crate::lang::set_active(crate::ai::AiLanguage::Fr);
     }
 }

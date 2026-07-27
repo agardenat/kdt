@@ -672,7 +672,7 @@ async fn run_apply(client: &Client, remedy: &Remedy, target: &Target) -> Result<
                 .await?;
             api.delete(name, &DeleteParams::default())
                 .await
-                .map(|_| format!("{} supprimée", name))
+                .map(|_| crate::lang::fill(crate::lang::active().rp_deleted, &[("name", name)]))
                 .map_err(|e| e.to_string())
         }
         Remedy::RemoveFinalizers { api_version, kind, namespace, name, finalizers } => {
@@ -683,7 +683,17 @@ async fn run_apply(client: &Client, remedy: &Remedy, target: &Target) -> Result<
             let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
             api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
-                .map(|_| format!("{} finalizer(s) retiré(s) de {}", finalizers.len(), name))
+                .map(|_| {
+                    let st = crate::lang::active();
+                    crate::lang::fill(
+                        &st.plural(
+                            finalizers.len(),
+                            st.rp_finalizers_removed_one,
+                            st.rp_finalizers_removed_many,
+                        ),
+                        &[("name", name)],
+                    )
+                })
                 .map_err(|e| e.to_string())
         }
         Remedy::ResetFailures | Remedy::ForceUpgrade => {

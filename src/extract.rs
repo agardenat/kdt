@@ -102,7 +102,7 @@ pub async fn run_full_extract(
     if !update(&state, run_id, current, total_steps, st.progress_diag_ai) {
         return;
     }
-    let diag_prompt = build_prompt_diagnostic(&ctx_label, &ns_label, &diag_summary);
+    let diag_prompt = build_prompt_diagnostic(&ctx_label, &ns_label, &diag_summary, lang);
     let (diag_ai_content, diag_ai_error) = match query_ai_direct(&config, lang, &diag_prompt).await
     {
         Ok(c) => (c, None),
@@ -134,7 +134,7 @@ pub async fn run_full_extract(
             return;
         }
         let usage_text = format_node_usage_text(&snap);
-        let prompt = build_prompt_node(&ctx_label, name, &usage_text);
+        let prompt = build_prompt_node(&ctx_label, name, &usage_text, lang);
         let (ai_content, ai_error) = match query_ai_direct(&config, lang, &prompt).await {
             Ok(c) => (c, None),
             Err(e) => (String::new(), Some(e)),
@@ -200,10 +200,7 @@ pub async fn run_full_extract(
         ai_error: diag_ai_error,
     };
 
-    let report_title = match lang {
-        AiLanguage::Fr => "Extraction complète",
-        AiLanguage::En => "Full extraction",
-    };
+    let report_title = crate::lang::t(lang).extract_report_title;
     let report = pdf::Report {
         title: report_title.to_string(),
         context: ctx_label.clone(),
@@ -259,21 +256,22 @@ fn line_color_to_pdf(c: crate::events::LineColor) -> &'static str {
     }
 }
 
-fn build_prompt_diagnostic(ctx: &str, ns: &str, body: &str) -> String {
-    format!(
-        "Contexte: {ctx} (namespace courant: {ns})\n\nVoici un diagnostic cluster automatisé. Analyse-le et propose un résumé : état général, points d'attention, actions recommandées. Sois structuré (Diagnostic, Cause probable, Actions recommandées).\n\n----- Diagnostic -----\n{body}\n",
-        ctx = ctx, ns = ns, body = body,
+fn build_prompt_diagnostic(ctx: &str, ns: &str, body: &str, lang: AiLanguage) -> String {
+    crate::lang::fill(
+        crate::lang::t(lang).prompt_diagnostic,
+        &[("ctx", ctx), ("ns", ns), ("body", body)],
     )
 }
 
-fn build_prompt_node(ctx: &str, node: &str, body: &str) -> String {
-    format!(
-        "Contexte: {ctx}\nNoeud: {node}\n\nVoici un état d'utilisation des conteneurs sur ce noeud. Identifie les conteneurs problématiques (sur-provisionnés, à risque OOM, sans request/limit), les tendances, et propose des actions. Sois structuré (Diagnostic, Conteneurs prioritaires, Actions recommandées).\n\n----- Usage du noeud -----\n{body}\n",
-        ctx = ctx, node = node, body = body,
+fn build_prompt_node(ctx: &str, node: &str, body: &str, lang: AiLanguage) -> String {
+    crate::lang::fill(
+        crate::lang::t(lang).prompt_node_usage,
+        &[("ctx", ctx), ("node", node), ("body", body)],
     )
 }
 
 pub fn format_node_usage_text(s: &NodeUsageState) -> String {
+    let st = crate::lang::active();
     let mut body = String::new();
     body.push_str(&format!(
         "Node allocatable: cpu={}, memory={}\n",
@@ -303,14 +301,14 @@ pub fn format_node_usage_text(s: &NodeUsageState) -> String {
         format_memory_bytes(totals.s_mem_req),
         format_memory_bytes(totals.s_mem_use),
     ));
-    body.push_str("\nDétails par container avec problème :\n");
+    body.push_str(st.prompt_per_container_details);
     let mut printed = 0;
     for r in &s.rows {
         if !row_has_issue(r) {
             continue;
         }
         if printed >= 80 {
-            body.push_str("(... liste tronquée ...)\n");
+            body.push_str(st.prompt_list_truncated);
             break;
         }
         printed += 1;

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::apps::v1::ReplicaSet;
+use crate::lang::{Strings, fill};
 use k8s_openapi::api::core::v1::{Node, Pod, ResourceQuota, Taint, Toleration};
 use kube::api::{Api, ListParams};
 use kube::Client;
@@ -225,6 +226,7 @@ pub fn new_capacity_state() -> SharedCapacity {
 // ReplicaSets (to name a Deployment rather than its hash) and metrics degrade to "absent" so a
 // cluster that refuses one of them still gets every other finding.
 pub async fn fetch_capacity(client: Client, state: SharedCapacity) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("capacity poisoned");
         s.loading = true;
@@ -257,7 +259,7 @@ pub async fn fetch_capacity(client: Client, state: SharedCapacity) {
     let owners = replicaset_owners(replicasets.map(|l| l.items).unwrap_or_default());
 
     let metrics_available = !usage.is_empty();
-    let computed = analyse(&nodes, &pods, &quotas, &owners, &usage, metrics_available);
+    let computed = analyse(&nodes, &pods, &quotas, &owners, &usage, metrics_available, st);
 
     let mut s = state.lock().expect("capacity poisoned");
     s.loading = false;
@@ -309,19 +311,20 @@ pub fn analyse(
     rs_owners: &HashMap<String, (String, String)>,
     usage: &HashMap<(String, String), (i64, i64)>,
     metrics_available: bool,
+    st: &'static Strings,
 ) -> Analysis {
     let mut rooms = node_rooms(nodes, pods, usage, metrics_available);
     for room in &mut rooms {
         room.loss = simulate_loss(&room.name, nodes, pods);
-        room.hints = node_hints(room);
+        room.hints = node_hints(room, st);
     }
     rooms.sort_by(|a, b| {
         b.loss.homeless().cmp(&a.loss.homeless()).then(a.name.cmp(&b.name))
     });
 
-    let workloads = workload_sizing(pods, rs_owners, usage, metrics_available);
-    let quotas = quota_pressure(quotas);
-    let cluster_hints = cluster_hints(&rooms, &workloads, metrics_available);
+    let workloads = workload_sizing(pods, rs_owners, usage, metrics_available, st);
+    let quotas = quota_pressure(quotas, st);
+    let cluster_hints = cluster_hints(&rooms, &workloads, metrics_available, st);
 
     Analysis { nodes: rooms, workloads, quotas, cluster_hints }
 }
@@ -375,7 +378,7 @@ fn node_rooms(
         .collect()
 }
 
-fn node_hints(room: &NodeRoom) -> Vec<Hint> {
+fn node_hints(room: &NodeRoom, st: &'static Strings) -> Vec<Hint> {
     let mut out = Vec::new();
     match &room.loss {
         Loss::Homeless(pods) => {
@@ -384,84 +387,77 @@ fn node_hints(room: &NodeRoom) -> Vec<Hint> {
                 .take(4)
                 .map(|p| format!("{}/{}", p.namespace, p.name))
                 .collect();
-            out.push(danger(format!(
-                "si ce noeud tombe, {} pod(s) n'ont nulle part où aller : {}",
-                pods.len(),
-                names.join(", ")
+            out.push(danger(fill(
+                &st.plural(pods.len(), st.cap_loss_homeless_one, st.cap_loss_homeless_many),
+                &[("pods", &names.join(", "))],
             )));
         }
-        Loss::Tight => out.push(warn(
-            "si ce noeud tombe, tout se replace mais il ne reste presque plus rien ailleurs."
-                .to_string(),
-        )),
+        Loss::Tight => out.push(warn(st.cap_loss_tight.to_string())),
         Loss::Fits | Loss::Alone => {}
     }
     let cpu_pct = pct(room.req_cpu, room.alloc_cpu);
     let mem_pct = pct(room.req_mem, room.alloc_mem);
     if cpu_pct >= RESERVED_WARN_PCT {
-        out.push(warn(format!(
-            "CPU réservé à {}% ({} sur {}) : le scheduler n'a presque plus de place à donner.",
-            cpu_pct,
-            cpu_text(room.req_cpu),
-            cpu_text(room.alloc_cpu)
+        out.push(warn(fill(
+            st.cap_cpu_reserved,
+            &[
+                ("pct", &cpu_pct.to_string()),
+                ("used", &cpu_text(room.req_cpu)),
+                ("total", &cpu_text(room.alloc_cpu)),
+            ],
         )));
     }
     if mem_pct >= RESERVED_WARN_PCT {
-        out.push(warn(format!(
-            "mémoire réservée à {}% ({} sur {}) : le scheduler n'a presque plus de place à donner.",
-            mem_pct,
-            mem_text(room.req_mem),
-            mem_text(room.alloc_mem)
+        out.push(warn(fill(
+            st.cap_mem_reserved,
+            &[
+                ("pct", &mem_pct.to_string()),
+                ("used", &mem_text(room.req_mem)),
+                ("total", &mem_text(room.alloc_mem)),
+            ],
         )));
     }
     if let (Some(c), Some(m)) = (room.use_cpu, room.use_mem) {
         let uc = pct(c, room.alloc_cpu);
         let um = pct(m, room.alloc_mem);
         if uc >= USED_WARN_PCT {
-            out.push(warn(format!(
-                "CPU réellement utilisé à {}% de l'allocatable : ce n'est plus une réservation, c'est du plein.",
-                uc
-            )));
+            out.push(warn(fill(st.cap_cpu_used, &[("pct", &uc.to_string())])));
         }
         if um >= USED_WARN_PCT {
-            out.push(warn(format!(
-                "mémoire réellement utilisée à {}% de l'allocatable : la pression mémoire évince avant d'avertir.",
-                um
-            )));
+            out.push(warn(fill(st.cap_mem_used, &[("pct", &um.to_string())])));
         }
     }
     // Over-commit is not a fault — it is how clusters are run — but the ratio is worth knowing
     // when the node is also close to full on the measured side.
     if room.alloc_cpu > 0 && room.lim_cpu > room.alloc_cpu {
-        out.push(info(format!(
-            "limites CPU à {}% de l'allocatable : sur-engagement assumé, mais tout le monde ne peut pas tirer en même temps.",
-            pct(room.lim_cpu, room.alloc_cpu)
+        out.push(info(fill(
+            st.cap_cpu_overcommit,
+            &[("pct", &pct(room.lim_cpu, room.alloc_cpu).to_string())],
         )));
     }
     if room.alloc_mem > 0 && room.lim_mem > room.alloc_mem {
-        out.push(info(format!(
-            "limites mémoire à {}% de l'allocatable : la mémoire ne se partage pas comme le CPU, l'OOM killer arbitrera.",
-            pct(room.lim_mem, room.alloc_mem)
+        out.push(info(fill(
+            st.cap_mem_overcommit,
+            &[("pct", &pct(room.lim_mem, room.alloc_mem).to_string())],
         )));
     }
     if room.pod_capacity > 0 {
         let p = pct(room.pods as i64, room.pod_capacity);
         if p >= RESERVED_WARN_PCT {
-            out.push(warn(format!(
-                "{} pods sur {} possibles : la limite se prend avant le CPU et la mémoire.",
-                room.pods, room.pod_capacity
+            out.push(warn(fill(
+                st.cap_pod_slots,
+                &[
+                    ("used", &room.pods.to_string()),
+                    ("total", &room.pod_capacity.to_string()),
+                ],
             )));
         }
     }
     if !room.schedulable {
-        out.push(info(
-            "cordonné : sa place ne compte pas pour le reste du cluster.".to_string(),
-        ));
+        out.push(info(st.cap_node_cordoned.to_string()));
     }
     if !room.ready {
-        out.push(warn(
-            "NotReady : ce que ce noeud héberge est déjà en sursis.".to_string(),
-        ));
+        out.push(warn(st.cap_node_not_ready.to_string()));
     }
     out.sort_by_key(|h| std::cmp::Reverse(h.level));
     out
@@ -688,6 +684,7 @@ fn workload_sizing(
     rs_owners: &HashMap<String, (String, String)>,
     usage: &HashMap<(String, String), (i64, i64)>,
     metrics_available: bool,
+    st: &'static Strings,
 ) -> Vec<WorkloadSizing> {
     let mut by_owner: BTreeMap<(String, String, String), WorkloadSizing> = BTreeMap::new();
     for p in pods {
@@ -743,7 +740,7 @@ fn workload_sizing(
 
     let mut out: Vec<WorkloadSizing> = by_owner.into_values().collect();
     for w in &mut out {
-        w.hints = sizing_hints(w);
+        w.hints = sizing_hints(w, st);
     }
     // Most to answer for first: the rows with findings, worst level first.
     out.sort_by(|a, b| {
@@ -755,60 +752,62 @@ fn workload_sizing(
     out
 }
 
-fn sizing_hints(w: &WorkloadSizing) -> Vec<Hint> {
+fn sizing_hints(w: &WorkloadSizing, st: &'static Strings) -> Vec<Hint> {
     let mut out = Vec::new();
     if w.no_cpu_request || w.no_mem_request {
-        let what = match (w.no_cpu_request, w.no_mem_request) {
-            (true, true) => "CPU ni mémoire",
-            (true, false) => "CPU",
-            _ => "mémoire",
-        };
+        // Spelled out once per case rather than pasted together from a fragment: which resource is
+        // missing changes the article and the elision in French, and the word order in English.
+        //
         // No request means the scheduler places the pod as if it were free, and the kubelet evicts
         // it first when the node runs short. Both halves matter, hence Warn and not Info.
-        out.push(warn(format!(
-            "pas de requests {} : invisible au scheduler, qui le place comme s'il ne coûtait rien — et premier évincé quand le noeud manque.",
-            what
-        )));
+        out.push(warn(
+            match (w.no_cpu_request, w.no_mem_request) {
+                (true, true) => st.cap_no_request_both,
+                (true, false) => st.cap_no_request_cpu,
+                _ => st.cap_no_request_mem,
+            }
+            .to_string(),
+        ));
     }
     if w.qos == Qos::BestEffort {
-        out.push(warn(
-            "QoS BestEffort : premier de la file des évictions, avant tous les autres.".to_string(),
-        ));
+        out.push(warn(st.cap_besteffort.to_string()));
     }
     if let (Some(cu), Some(mu)) = (w.cpu_use, w.mem_use) {
         if oversized(w.cpu_req, cu, OVERSIZED_MIN_CPU) {
-            out.push(info(format!(
-                "réserve {} de CPU pour en utiliser {} : {} dorment, réservés à personne d'autre.",
-                cpu_text(w.cpu_req),
-                cpu_text(cu),
-                cpu_text(w.cpu_req - cu)
+            out.push(info(fill(
+                st.cap_oversized_cpu,
+                &[
+                    ("req", &cpu_text(w.cpu_req)),
+                    ("used", &cpu_text(cu)),
+                    ("idle", &cpu_text(w.cpu_req - cu)),
+                ],
             )));
         }
         if oversized(w.mem_req, mu, OVERSIZED_MIN_MEM) {
-            out.push(info(format!(
-                "réserve {} de mémoire pour en utiliser {} : {} dorment, réservés à personne d'autre.",
-                mem_text(w.mem_req),
-                mem_text(mu),
-                mem_text(w.mem_req - mu)
+            out.push(info(fill(
+                st.cap_oversized_mem,
+                &[
+                    ("req", &mem_text(w.mem_req)),
+                    ("used", &mem_text(mu)),
+                    ("idle", &mem_text(w.mem_req - mu)),
+                ],
             )));
         }
         if w.cpu_lim > 0 && pct(cu, w.cpu_lim) >= NEAR_LIMIT_PCT {
-            out.push(warn(format!(
-                "à {}% de sa propre limite CPU : au plafond, le noyau l'étrangle (throttling) sans que rien ne redémarre.",
-                pct(cu, w.cpu_lim)
+            out.push(warn(fill(
+                st.cap_near_cpu_limit,
+                &[("pct", &pct(cu, w.cpu_lim).to_string())],
             )));
         }
         if w.mem_lim > 0 && pct(mu, w.mem_lim) >= NEAR_LIMIT_PCT {
-            out.push(danger(format!(
-                "à {}% de sa propre limite mémoire : au plafond c'est un OOMKill, pas un ralentissement.",
-                pct(mu, w.mem_lim)
+            out.push(danger(fill(
+                st.cap_near_mem_limit,
+                &[("pct", &pct(mu, w.mem_lim).to_string())],
             )));
         }
     }
     if w.no_mem_limit {
-        out.push(info(
-            "pas de limite mémoire : rien ne l'empêche de prendre celle du noeud entier.".to_string(),
-        ));
+        out.push(info(st.cap_no_mem_limit.to_string()));
     }
     out.sort_by_key(|h| std::cmp::Reverse(h.level));
     out
@@ -818,7 +817,7 @@ fn oversized(req: i64, used: i64, floor: i64) -> bool {
     req > floor && used * OVERSIZED_FACTOR < req
 }
 
-fn quota_pressure(quotas: &[ResourceQuota]) -> Vec<QuotaPressure> {
+fn quota_pressure(quotas: &[ResourceQuota], st: &'static Strings) -> Vec<QuotaPressure> {
     let mut out: Vec<QuotaPressure> = quotas
         .iter()
         .map(|q| {
@@ -845,17 +844,23 @@ fn quota_pressure(quotas: &[ResourceQuota]) -> Vec<QuotaPressure> {
             let mut hints = Vec::new();
             for i in &items {
                 if i.pct() >= 100 {
-                    hints.push(danger(format!(
-                        "{} au plafond ({} / {}) : la prochaine création est refusée.",
-                        i.resource, i.used_text, i.hard_text
+                    hints.push(danger(fill(
+                        st.cap_quota_full,
+                        &[
+                            ("resource", &i.resource),
+                            ("used", &i.used_text),
+                            ("hard", &i.hard_text),
+                        ],
                     )));
                 } else if i.pct() >= QUOTA_WARN_PCT {
-                    hints.push(warn(format!(
-                        "{} à {}% ({} / {}) : il reste peu avant le refus.",
-                        i.resource,
-                        i.pct(),
-                        i.used_text,
-                        i.hard_text
+                    hints.push(warn(fill(
+                        st.cap_quota_near,
+                        &[
+                            ("resource", &i.resource),
+                            ("pct", &i.pct().to_string()),
+                            ("used", &i.used_text),
+                            ("hard", &i.hard_text),
+                        ],
                     )));
                 }
             }
@@ -870,23 +875,24 @@ fn cluster_hints(
     nodes: &[NodeRoom],
     workloads: &[WorkloadSizing],
     metrics_available: bool,
+    st: &'static Strings,
 ) -> Vec<Hint> {
     let mut out = Vec::new();
     if !metrics_available {
         // Said once, at the top: without it, half this view is requests-only, and a reader has to
         // know that rather than wonder why the usage columns are empty.
-        out.push(info(
-            "metrics-server absent : l'écart entre ce qui est réservé et ce qui est utilisé n'est pas calculable, seules les requests sont montrées."
-                .to_string(),
-        ));
+        out.push(info(st.cap_no_metrics.to_string()));
     }
     let worst = nodes.iter().max_by_key(|n| n.loss.homeless());
     if let Some(n) = worst {
         if n.loss.homeless() > 0 {
-            out.push(danger(format!(
-                "perdre {} laisserait {} pod(s) sans nulle part où aller.",
-                n.name,
-                n.loss.homeless()
+            out.push(danger(fill(
+                &st.plural(
+                    n.loss.homeless(),
+                    st.cap_worst_loss_one,
+                    st.cap_worst_loss_many,
+                ),
+                &[("name", &n.name)],
             )));
         }
     }
@@ -895,16 +901,18 @@ fn cluster_hints(
         .filter(|w| w.no_cpu_request || w.no_mem_request)
         .count();
     if no_request > 0 {
-        out.push(warn(format!(
-            "{} workload(s) sans requests : ils faussent tous les calculs de cette vue, à commencer par la place restante.",
-            no_request
+        out.push(warn(st.plural(
+            no_request,
+            st.cap_no_request_total_one,
+            st.cap_no_request_total_many,
         )));
     }
     let schedulable = nodes.iter().filter(|n| n.ready && n.schedulable).count();
     if schedulable <= 1 {
-        out.push(info(format!(
-            "{} noeud ordonnançable : il n'y a pas de « ailleurs » où replacer quoi que ce soit.",
-            schedulable
+        out.push(info(st.plural(
+            schedulable,
+            st.cap_few_schedulable_one,
+            st.cap_few_schedulable_many,
         )));
     }
     out.sort_by_key(|h| std::cmp::Reverse(h.level));
@@ -1075,6 +1083,7 @@ pub fn mem_text(v: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::{FR, reads_as};
     use serde_json::json;
 
     fn pod(v: serde_json::Value) -> Pod {
@@ -1282,12 +1291,12 @@ mod tests {
             "apps/web-6d9c".to_string(),
             ("Deployment".to_string(), "web".to_string()),
         );
-        let rows = workload_sizing(&[p], &owners, &HashMap::new(), false);
+        let rows = workload_sizing(&[p], &owners, &HashMap::new(), false, &FR);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].kind.as_str(), rows[0].name.as_str()), ("Deployment", "web"));
         assert_eq!(rows[0].qos, Qos::BestEffort);
-        assert!(rows[0].hints.iter().any(|h| h.text.contains("pas de requests CPU ni mémoire")));
-        assert!(rows[0].hints.iter().any(|h| h.text.contains("BestEffort")));
+        assert!(rows[0].hints.iter().any(|h| h.text == FR.cap_no_request_both));
+        assert!(rows[0].hints.iter().any(|h| h.text == FR.cap_besteffort));
     }
 
     #[test]
@@ -1296,25 +1305,25 @@ mod tests {
         let big = sized_pod("apps", "hog", "n1", "2", "4Gi");
         let mut usage = HashMap::new();
         usage.insert(("apps".to_string(), "hog".to_string()), (100, 100 * 1024 * 1024));
-        let rows = workload_sizing(&[big], &HashMap::new(), &usage, true);
-        assert!(rows[0].hints.iter().any(|h| h.text.contains("de CPU pour en utiliser")));
-        assert!(rows[0].hints.iter().any(|h| h.text.contains("de mémoire pour en utiliser")));
+        let rows = workload_sizing(&[big], &HashMap::new(), &usage, true, &FR);
+        assert!(rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_oversized_cpu)));
+        assert!(rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_oversized_mem)));
 
         // A 50m sidecar using 1m is 50x over and nobody cares: below the floor, nothing is said.
         let small = sized_pod("apps", "sidecar", "n1", "50m", "16Mi");
         let mut usage = HashMap::new();
         usage.insert(("apps".to_string(), "sidecar".to_string()), (1, 1024 * 1024));
-        let rows = workload_sizing(&[small], &HashMap::new(), &usage, true);
-        assert!(!rows[0].hints.iter().any(|h| h.text.contains("pour en utiliser")));
+        let rows = workload_sizing(&[small], &HashMap::new(), &usage, true, &FR);
+        assert!(!rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_oversized_cpu)));
     }
 
     #[test]
     fn without_metrics_no_rule_reads_an_absent_figure_as_a_zero() {
         let p = sized_pod("apps", "web", "n1", "2", "4Gi");
-        let rows = workload_sizing(&[p], &HashMap::new(), &HashMap::new(), false);
+        let rows = workload_sizing(&[p], &HashMap::new(), &HashMap::new(), false, &FR);
         assert_eq!(rows[0].cpu_use, None);
-        assert!(!rows[0].hints.iter().any(|h| h.text.contains("pour en utiliser")));
-        assert!(!rows[0].hints.iter().any(|h| h.text.contains("de sa propre limite")));
+        assert!(!rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_oversized_cpu)));
+        assert!(!rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_near_cpu_limit)));
     }
 
     #[test]
@@ -1332,17 +1341,17 @@ mod tests {
             ("apps".to_string(), "tight".to_string()),
             (980, 1000 * 1024 * 1024),
         );
-        let rows = workload_sizing(&[p], &HashMap::new(), &usage, true);
+        let rows = workload_sizing(&[p], &HashMap::new(), &usage, true, &FR);
         let mem = rows[0]
             .hints
             .iter()
-            .find(|h| h.text.contains("limite mémoire"))
+            .find(|h| reads_as(&h.text, FR.cap_near_mem_limit))
             .expect("near-limit-mem");
         assert_eq!(mem.level, HintLevel::Danger);
         let cpu = rows[0]
             .hints
             .iter()
-            .find(|h| h.text.contains("limite CPU"))
+            .find(|h| reads_as(&h.text, FR.cap_near_cpu_limit))
             .expect("near-limit-cpu");
         assert_eq!(cpu.level, HintLevel::Warn);
     }
@@ -1358,7 +1367,7 @@ mod tests {
             },
         }))
         .expect("quota fixture");
-        let rows = quota_pressure(&[q]);
+        let rows = quota_pressure(&[q], &FR);
         assert_eq!(rows.len(), 1);
         let pods = rows[0].items.iter().find(|i| i.resource == "pods").expect("pods");
         assert_eq!((pods.used, pods.hard, pods.pct()), (10, 10, 100));
@@ -1371,7 +1380,7 @@ mod tests {
             .expect("cpu");
         assert_eq!(cpu.pct(), 95);
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Danger));
-        assert!(rows[0].hints.iter().any(|h| h.text.starts_with("requests.cpu à 95%")));
+        assert!(rows[0].hints.iter().any(|h| reads_as(&h.text, FR.cap_quota_near)));
     }
 
     #[test]
@@ -1380,8 +1389,8 @@ mod tests {
         let pods = vec![sized_pod("apps", "hog", "n1", "3800m", "1Gi")];
         let rooms = node_rooms(&[n], &pods, &HashMap::new(), false);
         assert_eq!(pct(rooms[0].req_cpu, rooms[0].alloc_cpu), 95);
-        let hints = node_hints(&rooms[0]);
-        assert!(hints.iter().any(|h| h.text.starts_with("CPU réservé à 95%")));
-        assert!(!hints.iter().any(|h| h.text.starts_with("mémoire réservée")));
+        let hints = node_hints(&rooms[0], &FR);
+        assert!(hints.iter().any(|h| reads_as(&h.text, FR.cap_cpu_reserved)));
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cap_mem_reserved)));
     }
 }

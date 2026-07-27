@@ -104,7 +104,16 @@ async fn main() -> Result<()> {
 
     let args = cli::Args::parse();
 
-    // Caractérisation du terminal : ne demande aucun cluster.
+    // Resolved here rather than in the TUI: `--probe-glyphs` prints and exits without ever building
+    // an App, and it still has to print in the user's language.
+    let file_config = config::load();
+    lang::set_active(
+        config::initial_language(&file_config)
+            .or_else(config::system_language)
+            .unwrap_or(ai::AiLanguage::Fr),
+    );
+
+    // Terminal characterisation: asks no cluster for anything.
     if args.probe_glyphs {
         glyphs::print_report()?;
         return Ok(());
@@ -121,7 +130,6 @@ async fn main() -> Result<()> {
     let watcher = events::spawn_watcher(client.clone(), ns, buffer.clone(), args.buffer_size);
 
     let ai_state = ai::new_ai_state();
-    let file_config = config::load();
     let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
     ui::run(app).await
 }

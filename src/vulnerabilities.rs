@@ -187,7 +187,7 @@ pub async fn fetch_vulnerabilities(client: Client, server_version: Option<String
         Err(TrivyError::NotInstalled) => {
             s.available = false;
             s.components.clear();
-            s.error = Some("Trivy Operator non installé (VulnerabilityReport introuvable)".into());
+            s.error = Some(crate::lang::active().vuln_no_trivy.into());
         }
         Err(TrivyError::Api(e)) => {
             s.available = true;
@@ -369,7 +369,7 @@ async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
     };
 
     let Some((minor, patch)) = parse_minor_patch(server_version) else {
-        risk.note = Some("version serveur non interprétable".into());
+        risk.note = Some(crate::lang::active().vuln_bad_server_version.into());
         return risk;
     };
 
@@ -382,7 +382,7 @@ async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
             }
             risk.latest_patch = Some(latest);
         }
-        None => risk.note = Some("réseau indisponible (cible de patch non résolue)".into()),
+        None => risk.note = Some(crate::lang::active().vuln_network_down.into()),
     }
 
     // Support window: EOL when more than the latest 3 minors behind current stable.
@@ -395,7 +395,7 @@ async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
     match http_json(K8S_CVE_FEED).await {
         Some(feed) => risk.cves = parse_k8s_feed(&feed),
         None => {
-            let n = "feed CVE k8s indisponible (réseau)".to_string();
+            let n = crate::lang::active().vuln_feed_down.to_string();
             risk.note = Some(match risk.note.take() {
                 Some(prev) => format!("{prev} · {n}"),
                 None => n,

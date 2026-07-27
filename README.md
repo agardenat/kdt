@@ -117,7 +117,7 @@ défilement live est actif.
 | `D` | Diagnostic cluster |
 | `X` | Extraction complète (PDF) |
 | `i` | Panneau IA |
-| `l` | Bascule langue IA (FR/EN) |
+| `l` | Bascule la langue de l'interface (FR/EN), et la retient |
 | `m` | Fournisseur IA suivant |
 | `←` / `→` / `Home` | Scroll horizontal |
 | `q` / `Ctrl-C` | Quitter |
@@ -660,7 +660,7 @@ la prochaine création. Le détail les liste tous.
 | `i` / `Esc` / `q` | Fermer |
 | `↑/↓`, `PgUp/PgDn`, `g`/`G` | Scroll |
 | `c` | Copier le contenu |
-| `l` | Bascule langue |
+| `l` | Bascule la langue (relance la requête dans la nouvelle langue) |
 
 La réponse du modèle est reçue en streaming (SSE, format OpenAI `chat/completions`) : le texte apparaît progressivement à mesure qu'il est généré, sans attendre la fin de la réponse. Relancer une analyse (`i`) pendant qu'une autre streame interrompt proprement la précédente.
 
@@ -681,7 +681,24 @@ Fichier JSON optionnel chargé depuis (par ordre de priorité) :
 }
 ```
 
-`language` accepte `fr`/`french`/`français` ou `en`/`english`/`anglais`.
+### Langue
+
+Toute l'interface est bilingue : titres de panneaux, libellés, diagnostics, rapports PDF et
+prompts envoyés au modèle. La langue est choisie dans cet ordre :
+
+1. la clé `language` du fichier de configuration — `fr`/`french`/`français` ou `en`/`english`/`anglais` ;
+2. la locale du système (`LC_ALL`, `LC_MESSAGES`, `LANG`, `LANGUAGE`) : `fr*` donne le français,
+   toute autre locale donne l'anglais, `C`/`POSIX` ne compte pas ;
+3. le français par défaut.
+
+`l` bascule la langue à chaud, y compris à l'intérieur d'une vue : les diagnostics déjà affichés
+sont recalculés dans la nouvelle langue. Le choix est réécrit dans le fichier de configuration, donc
+il survit au redémarrage — seule la clé `language` est modifiée, le reste du fichier (clés d'API
+comprises) et ses permissions sont laissés tels quels.
+
+Le jargon Kubernetes reste en anglais des deux côtés : `pod`, `node`, `workload`, `namespace`,
+`taint`, `requests`/`limits`, `scheduler`, `drain`… Les en-têtes de colonnes suivent `kubectl` et ne
+sont pas traduits non plus.
 
 ### Plusieurs fournisseurs IA
 
@@ -1015,7 +1032,7 @@ habituels, qui traitent déjà PVC et PV comme de la donnée persistante.
 | `enrich.rs` | Récupération du contexte lié à un évènement |
 | `ai.rs` | Client API compatible OpenAI |
 | `pdf.rs` | Génération PDF via Typst |
-| `lang.rs` | Chaînes FR/EN |
+| `lang.rs` | Table de chaînes FR/EN de toute l'interface |
 | `config.rs` | Chargement du fichier de configuration |
 | `clip.rs` | Copie presse-papier OSC 52 |
 

@@ -562,7 +562,7 @@ pub async fn fetch_kyverno(client: Client, state: SharedKyverno) {
     s.violations = violations;
     s.health = health;
     s.error = if !installed {
-        Some("CRD Kyverno introuvables (Kyverno n'est pas installé sur ce cluster ?)".into())
+        Some(crate::lang::active().ky_crds_missing.to_string())
     } else if s.policies.is_empty() && !errors.is_empty() {
         Some(errors.join(" · "))
     } else {

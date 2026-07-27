@@ -14,6 +14,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Event as K8sEvent, Namespace, Node, PersistentVolume, Pod};
+use crate::lang::{active, fill};
 use kube::api::{DynamicObject, ListParams, LogParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Api, Client};
@@ -159,9 +160,9 @@ async fn check_api_health(client: &Client, state: &SharedDiagnostic, run_id: u64
                 _ => LineColor::Err,
             },
             if status == DiagStatus::Ok {
-                format!("réponse: {}", snippet.trim())
+                fill(active().diag_response, &[("body", snippet.trim())])
             } else {
-                format!("erreur: {}", snippet.trim())
+                fill(active().diag_error, &[("e", snippet.trim())])
             },
         ));
         finish_step(state, run_id, idx, status, lines);
@@ -172,7 +173,7 @@ async fn check_cluster_version(client: &Client, state: &SharedDiagnostic, run_id
     let Some(idx) = push_step(
         state,
         run_id,
-        "Version cluster",
+        active().diag_step_version,
         "kubectl get --raw='/version'",
     ) else {
         return;
@@ -197,7 +198,7 @@ async fn check_cluster_version(client: &Client, state: &SharedDiagnostic, run_id
             DiagStatus::Ok
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -253,7 +254,10 @@ async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 if n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false) {
                     unschedulable += 1;
                     any_issue = true;
-                    lines.push((LineColor::Warn, format!("{}: cordonné (unschedulable)", name)));
+                    lines.push((
+                        LineColor::Warn,
+                        fill(active().diag_node_cordoned, &[("name", &name)]),
+                    ));
                 }
             }
             for p in &pressure {
@@ -287,7 +291,7 @@ async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -298,7 +302,7 @@ async fn check_system_namespaces(client: &Client, state: &SharedDiagnostic, run_
     let Some(idx) = push_step(
         state,
         run_id,
-        "Namespaces système présents",
+        active().diag_step_system_ns,
         "kubectl get ns",
     ) else {
         return;
@@ -340,19 +344,19 @@ async fn check_system_namespaces(client: &Client, state: &SharedDiagnostic, run_
             let found: Vec<&&str> = candidates.iter().filter(|c| names.contains(**c)).collect();
             lines.push((
                 LineColor::Info,
-                format!("namespaces totaux: {}", names.len()),
+                fill(active().diag_ns_total, &[("n", &names.len().to_string())]),
             ));
             lines.push((
                 LineColor::Plain,
-                format!(
-                    "détectés: {}",
-                    found.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                fill(
+                    active().diag_ns_found,
+                    &[("list", &found.iter().map(|s| **s).collect::<Vec<_>>().join(", "))],
                 ),
             ));
             DiagStatus::Info
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -405,14 +409,19 @@ async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_i
             high_restarts.sort_by_key(|(_, r)| std::cmp::Reverse(*r));
             high_restarts.truncate(5);
             for (n, r) in &high_restarts {
-                lines.push((LineColor::Warn, format!("{} : restarts={}", n, r)));
+                lines.push((
+                    LineColor::Warn,
+                    fill(active().diag_restarts, &[("name", n), ("n", &r.to_string())]),
+                ));
             }
-            let summary = format!(
-                "{} pods, notReady={}, crashloop={}, top-restarts={}",
-                total,
-                not_ready,
-                crashloop,
-                high_restarts.len()
+            let summary = fill(
+                active().diag_pods_summary,
+                &[
+                    ("total", &total.to_string()),
+                    ("notready", &not_ready.to_string()),
+                    ("crashloop", &crashloop.to_string()),
+                    ("restarts", &high_restarts.len().to_string()),
+                ],
             );
             let head = if not_ready > 0 || crashloop > 0 {
                 LineColor::Warn
@@ -429,7 +438,7 @@ async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_i
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -440,7 +449,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let Some(idx) = push_step(
         state,
         run_id,
-        "DNS cluster (CoreDNS)",
+        active().diag_step_dns,
         "kubectl -n kube-system get pods -l k8s-app=kube-dns",
     ) else {
         return;
@@ -453,7 +462,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             if list.items.is_empty() {
                 lines.push((
                     LineColor::Warn,
-                    "aucun pod label k8s-app=kube-dns trouvé".into(),
+                    active().diag_no_coredns.into(),
                 ));
                 DiagStatus::Warn
             } else {
@@ -477,7 +486,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                     } else {
                         LineColor::Warn
                     },
-                    format!("{}/{} pods CoreDNS prêts", ready, total),
+                    fill(active().diag_coredns_ready, &[("ready", &ready.to_string()), ("total", &total.to_string())]),
                 ));
                 if ready == total {
                     DiagStatus::Ok
@@ -487,7 +496,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -539,7 +548,7 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let status = if !found_any {
         lines.push((
             LineColor::Info,
-            "aucun CNI commun détecté via labels (peut être managé hors cluster)".into(),
+            active().diag_no_cni.into(),
         ));
         DiagStatus::Info
     } else {
@@ -551,7 +560,7 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
             lines.push((
                 if ok { LineColor::Ok } else { LineColor::Warn },
-                format!("{}: {}/{} pods prêts", k, ready, total),
+                fill(active().diag_cni_ready, &[("name", k), ("ready", &ready.to_string()), ("total", &total.to_string())]),
             ));
         }
         if all_ok {
@@ -603,9 +612,9 @@ async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, ru
                     } else {
                         LineColor::Ok
                     },
-                    format!(
-                        "{} webhooks de validation, dont {} en fail-close (impact sur cluster si KO)",
-                        total, fail_close
+                    fill(
+                        active().diag_validating_webhooks,
+                        &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
                     ),
                 ),
             );
@@ -616,7 +625,7 @@ async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, ru
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -663,9 +672,9 @@ async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_
                     } else {
                         LineColor::Ok
                     },
-                    format!(
-                        "{} webhooks mutants, dont {} en fail-close",
-                        total, fail_close
+                    fill(
+                        active().diag_mutating_webhooks,
+                        &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
                     ),
                 ),
             );
@@ -676,7 +685,7 @@ async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -712,7 +721,7 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let Some(idx) = push_step(
         state,
         run_id,
-        "Rancher (local ou cluster importé)",
+        active().diag_step_rancher,
         "kubectl -n cattle-system get deploy,pods",
     ) else {
         return;
@@ -725,7 +734,7 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     if !cattle_present && !fleet_present && !fleet_local_present {
         lines.push((
             LineColor::Info,
-            "aucun namespace cattle-* — cluster non lié à rancher".into(),
+            active().diag_no_cattle.into(),
         ));
         finish_step(state, run_id, idx, DiagStatus::Info, lines);
         return;
@@ -744,16 +753,17 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let local_total = local_pods.as_ref().map(|l| l.items.len()).unwrap_or(0);
     let agent_total = agent_pods.as_ref().map(|l| l.items.len()).unwrap_or(0);
 
+    let st = active();
     let kind = if local_total > 0 {
-        "rancher local (server installé sur ce cluster)"
+        st.diag_rancher_local
     } else if agent_total > 0 {
-        "cluster importé (piloté par rancher externe)"
+        st.diag_rancher_imported
     } else if fleet_local_present {
-        "cluster local fleet (sans server rancher dans cattle-system)"
+        st.diag_rancher_fleet
     } else {
-        "cattle-* présent mais ni server rancher ni cattle-cluster-agent"
+        st.diag_rancher_neither
     };
-    lines.push((LineColor::Info, format!("type détecté: {}", kind)));
+    lines.push((LineColor::Info, fill(st.diag_rancher_kind, &[("kind", kind)])));
 
     let count_ready = |pods: &kube::core::ObjectList<Pod>| -> usize {
         pods.items
@@ -776,7 +786,10 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 } else {
                     LineColor::Warn
                 },
-                format!("rancher server pods: {}/{} prêts", ready, list.items.len()),
+                fill(
+                    st.diag_rancher_server_ready,
+                    &[("ready", &ready.to_string()), ("total", &list.items.len().to_string())],
+                ),
             ));
         }
     }
@@ -789,10 +802,9 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 } else {
                     LineColor::Warn
                 },
-                format!(
-                    "cattle-cluster-agent: {}/{} prêts",
-                    ready,
-                    list.items.len()
+                fill(
+                    st.diag_agent_ready,
+                    &[("ready", &ready.to_string()), ("total", &list.items.len().to_string())],
                 ),
             ));
         }
@@ -819,7 +831,7 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     };
 
     if let Some(url) = &server_url {
-        let label = if local_total > 0 { "server-url" } else { "URL upstream rancher (CATTLE_SERVER)" };
+        let label = if local_total > 0 { "server-url" } else { st.diag_upstream_url };
         lines.push((LineColor::Info, format!("{}: {}", label, url)));
     }
 
@@ -830,7 +842,7 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     } else {
         lines.push((
             LineColor::Info,
-            "ni server rancher ni cattle-cluster-agent — rien à analyser".into(),
+            st.diag_nothing_to_analyse.into(),
         ));
         DiagStatus::Info
     };
@@ -845,7 +857,7 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     let list = match pods.list(&ListParams::default().labels("app=cattle-cluster-agent")).await {
         Ok(l) => l.items,
         Err(e) => {
-            lines.push((LineColor::Err, format!("liste pods agent: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_list_agent_pods, &[("e", &e.to_string())])));
             return DiagStatus::Err;
         }
     };
@@ -858,18 +870,21 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     }) {
         Some(p) => p,
         None => {
-            lines.push((LineColor::Warn, "aucun pod cattle-cluster-agent en Running".into()));
+            lines.push((LineColor::Warn, active().diag_no_agent_running.into()));
             return DiagStatus::Warn;
         }
     };
     let pod_name = pod.metadata.name.clone().unwrap_or_default();
-    lines.push((LineColor::Dim, format!("logs lus sur pod: {}", pod_name)));
+    lines.push((LineColor::Dim, fill(active().diag_logs_from_pod, &[("name", &pod_name)])));
 
     let lp = LogParams { tail_lines: Some(200), ..Default::default() };
     let text = match pods.logs(&pod_name, &lp).await {
         Ok(t) => t,
         Err(e) => {
-            lines.push((LineColor::Err, format!("kubectl logs {} échoue: {}", pod_name, e)));
+            lines.push((
+                LineColor::Err,
+                fill(active().diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
+            ));
             return DiagStatus::Err;
         }
     };
@@ -920,9 +935,12 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     };
 
     if tunnel_ok && dns_failures.is_empty() && tls_failures.is_empty() && connect_failures.len() <= 1 {
-        lines.push((LineColor::Ok, "tunnel cattle-cluster-agent → rancher: établi".into()));
+        lines.push((LineColor::Ok, active().diag_tunnel_ok.into()));
         if let Some(l) = last_relevant {
-            lines.push((LineColor::Dim, format!("  dernière trace utile: {}", truncate(&l, 200))));
+            lines.push((
+                LineColor::Dim,
+                fill(active().diag_last_trace, &[("line", &truncate(&l, 200))]),
+            ));
         }
         return DiagStatus::Ok;
     }
@@ -935,12 +953,13 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
         worst = DiagStatus::Err;
     }
 
-    push_some(lines, "DNS échec", &dns_failures, LineColor::Err);
-    push_some(lines, "TLS échec", &tls_failures, LineColor::Err);
-    push_some(lines, "websocket échec", &connect_failures, LineColor::Err);
-    push_some(lines, "autres erreurs", &other_errors, LineColor::Warn);
+    let st = active();
+    push_some(lines, st.diag_dns_failures, &dns_failures, LineColor::Err);
+    push_some(lines, st.diag_tls_failures, &tls_failures, LineColor::Err);
+    push_some(lines, st.diag_ws_failures, &connect_failures, LineColor::Err);
+    push_some(lines, st.diag_other_errors, &other_errors, LineColor::Warn);
     if !tunnel_ok && dns_failures.is_empty() && tls_failures.is_empty() && connect_failures.is_empty() && other_errors.is_empty() {
-        lines.push((LineColor::Warn, "aucun marqueur clair de tunnel établi dans les 200 dernières lignes".into()));
+        lines.push((LineColor::Warn, st.diag_no_tunnel_marker.into()));
     }
     worst
 }
@@ -950,7 +969,7 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
     let list = match pods.list(&ListParams::default().labels("app=rancher")).await {
         Ok(l) => l.items,
         Err(e) => {
-            lines.push((LineColor::Err, format!("liste pods rancher: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_list_rancher_pods, &[("e", &e.to_string())])));
             return DiagStatus::Err;
         }
     };
@@ -959,18 +978,21 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
     }) {
         Some(p) => p,
         None => {
-            lines.push((LineColor::Warn, "aucun pod rancher en Running".into()));
+            lines.push((LineColor::Warn, active().diag_no_rancher_running.into()));
             return DiagStatus::Warn;
         }
     };
     let pod_name = pod.metadata.name.clone().unwrap_or_default();
-    lines.push((LineColor::Dim, format!("logs lus sur pod: {}", pod_name)));
+    lines.push((LineColor::Dim, fill(active().diag_logs_from_pod, &[("name", &pod_name)])));
 
     let lp = LogParams { tail_lines: Some(150), ..Default::default() };
     let text = match pods.logs(&pod_name, &lp).await {
         Ok(t) => t,
         Err(e) => {
-            lines.push((LineColor::Err, format!("kubectl logs {} échoue: {}", pod_name, e)));
+            lines.push((
+                LineColor::Err,
+                fill(active().diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
+            ));
             return DiagStatus::Err;
         }
     };
@@ -989,17 +1011,20 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
         }
     }
     if serving_ok && errors.len() <= 2 {
-        lines.push((LineColor::Ok, "rancher serveur opérationnel (logs récents)".into()));
+        lines.push((LineColor::Ok, active().diag_rancher_serving.into()));
         return DiagStatus::Ok;
     }
     if !errors.is_empty() {
-        lines.push((LineColor::Warn, format!("erreurs récentes dans les logs rancher ({})", errors.len())));
+        lines.push((
+            LineColor::Warn,
+            fill(active().diag_rancher_errors, &[("n", &errors.len().to_string())]),
+        ));
         for e in errors.iter().take(3) {
             lines.push((LineColor::Dim, format!("  {}", truncate(e, 200))));
         }
     }
     if !serving_ok {
-        lines.push((LineColor::Warn, "aucun marqueur de démarrage rancher trouvé dans les logs".into()));
+        lines.push((LineColor::Warn, active().diag_no_rancher_start.into()));
     }
     DiagStatus::Warn
 }
@@ -1050,7 +1075,7 @@ async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u
     let Some(idx) = push_step(
         state,
         run_id,
-        "Pods en erreur (cluster)",
+        active().diag_step_failing_pods,
         "kubectl get pods -A",
     ) else {
         return;
@@ -1101,7 +1126,7 @@ async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u
             oom.dedup();
             lines.push((
                 LineColor::Info,
-                format!("{} pods total cluster", total),
+                fill(active().diag_pods_total, &[("n", &total.to_string())]),
             ));
             push_problem_list(&mut lines, "CrashLoopBackOff", &crashloop, LineColor::Err);
             push_problem_list(&mut lines, "ImagePullBackOff", &imagepull, LineColor::Err);
@@ -1116,7 +1141,7 @@ async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -1132,7 +1157,10 @@ fn push_problem_list(lines: &mut Vec<(LineColor, String)>, label: &str, items: &
         lines.push((LineColor::Dim, format!("  - {}", it)));
     }
     if items.len() > 8 {
-        lines.push((LineColor::Dim, format!("  ... ({} de plus)", items.len() - 8)));
+        lines.push((
+            LineColor::Dim,
+            fill(active().diag_more_items, &[("n", &(items.len() - 8).to_string())]),
+        ));
     }
 }
 
@@ -1167,7 +1195,13 @@ async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run
             } else {
                 LineColor::Ok
             };
-            lines.push((head, format!("{} PV: {}", list.items.len(), summary)));
+            lines.push((
+                head,
+                fill(
+                    active().diag_pv_summary,
+                    &[("n", &list.items.len().to_string()), ("summary", &summary)],
+                ),
+            ));
             for f in &failed {
                 lines.push((LineColor::Err, format!("Failed: {}", f)));
             }
@@ -1178,7 +1212,7 @@ async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -1189,7 +1223,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
     let Some(idx) = push_step(
         state,
         run_id,
-        "Évènements warning récents",
+        active().diag_step_warnings,
         "kubectl get events -A --field-selector type=Warning",
     ) else {
         return;
@@ -1213,7 +1247,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
                 } else {
                     LineColor::Warn
                 },
-                format!("{} évènements Warning visibles dans la fenêtre serveur", total),
+                fill(active().diag_warning_count, &[("n", &total.to_string())]),
             ));
             let mut sorted: Vec<(String, usize)> = by_reason.into_iter().collect();
             sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -1227,7 +1261,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, format!("erreur: {}", e)));
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -1237,9 +1271,12 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
 // Flatten the diagnostic steps into a plain-text block suitable for the AI prompt or clipboard.
 pub fn format_diagnostic_for_ai(state: &DiagnosticState) -> String {
     let mut out = String::new();
-    out.push_str("Diagnostic cluster automatisé:\n");
+    out.push_str(active().diag_ai_header);
     if let Some(ms) = state.elapsed_ms {
-        out.push_str(&format!("durée: {} ms, {} étapes\n", ms, state.steps.len()));
+        out.push_str(&fill(
+            active().diag_ai_duration,
+            &[("ms", &ms.to_string()), ("n", &state.steps.len().to_string())],
+        ));
     }
     for s in &state.steps {
         out.push_str(&format!(

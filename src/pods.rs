@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::apps::v1::ReplicaSet;
 use k8s_openapi::api::core::v1::Pod;
+use crate::lang::{active, fill};
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
@@ -386,19 +387,19 @@ async fn resolve_ar(
             return Ok(ar);
         }
     }
-    Err(format!("{} introuvable sur le cluster", kind))
+    Err(fill(active().pods_kind_not_found, &[("kind", kind)]))
 }
 
 async fn workload_api(client: &Client, owner: &OwnerRef) -> Result<Api<DynamicObject>, String> {
     let (group, versions) = workload_group(&owner.kind)
-        .ok_or_else(|| format!("type non géré : {}", owner.kind))?;
+        .ok_or_else(|| fill(active().pods_kind_unsupported, &[("kind", &owner.kind)]))?;
     let ar = resolve_ar(client, group, versions, &owner.kind).await?;
     Ok(Api::namespaced_with(client.clone(), &owner.namespace, &ar))
 }
 
 async fn patch_replicas(client: &Client, owner: &OwnerRef, replicas: i32) -> Result<(), String> {
     if matches!(owner.kind.as_str(), "DaemonSet" | "Job") {
-        return Err(format!("scale non supporté pour {}", owner.kind));
+        return Err(fill(active().pods_scale_unsupported, &[("kind", &owner.kind)]));
     }
     let api = workload_api(client, owner).await?;
     let patch = serde_json::json!({ "spec": { "replicas": replicas } });
@@ -424,7 +425,7 @@ pub async fn run_force_recycle(client: Client, owner: OwnerRef, replicas: i32, s
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             match patch_replicas(&client, &owner, replicas).await {
                 Ok(()) => format!("↻ recycle {}/{} (0 → {})", owner.kind, owner.name, replicas),
-                Err(e) => format!("✗ recycle (remontée) : {}", e),
+                Err(e) => fill(active().pods_recycle_failed, &[("e", &e)]),
             }
         }
         Err(e) => format!("✗ recycle (descente) : {}", e),
@@ -443,7 +444,7 @@ pub async fn run_restart(client: Client, owner: OwnerRef, status: SharedReconcil
 
 async fn patch_restart(client: &Client, owner: &OwnerRef) -> Result<(), String> {
     if !matches!(owner.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet") {
-        return Err(format!("restart non supporté pour {}", owner.kind));
+        return Err(fill(active().pods_restart_unsupported, &[("kind", &owner.kind)]));
     }
     let api = workload_api(client, owner).await?;
     let now = chrono::Utc::now().to_rfc3339();

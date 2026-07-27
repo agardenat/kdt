@@ -233,7 +233,13 @@ fn build_secret_info(
                 Ok(c) => (Some(c), None),
                 Err(e) => (None, Some(e)),
             },
-            None => (None, Some(format!("clé {CRT_KEY} absente"))),
+            None => (
+                None,
+                Some(crate::lang::fill(
+                    crate::lang::active().sec_crt_key_missing,
+                    &[("key", CRT_KEY)],
+                )),
+            ),
         }
     } else {
         (None, None)

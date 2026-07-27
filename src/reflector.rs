@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
+use crate::lang::{Strings, fill};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -351,15 +352,17 @@ pub enum TargetStatus {
 }
 
 impl TargetStatus {
-    pub fn label(&self) -> &'static str {
+    // Takes the table rather than reading the active language itself: this label also lands in a
+    // table cell, and the whole view has to be drawn from one and the same language.
+    pub fn label(&self, st: &'static Strings) -> &'static str {
         match self {
-            TargetStatus::Synced => "SYNC",
-            TargetStatus::Stale => "PÉRIMÉ",
-            TargetStatus::Drifted => "DIVERGENT",
-            TargetStatus::Pending => "EN ATTENTE",
-            TargetStatus::Missing => "ABSENT",
-            TargetStatus::Blocked => "BLOQUÉ",
-            TargetStatus::Manual => "À LA MAIN",
+            TargetStatus::Synced => st.refl_st_synced,
+            TargetStatus::Stale => st.refl_st_stale,
+            TargetStatus::Drifted => st.refl_st_drifted,
+            TargetStatus::Pending => st.refl_st_pending,
+            TargetStatus::Missing => st.refl_st_missing,
+            TargetStatus::Blocked => st.refl_st_blocked,
+            TargetStatus::Manual => st.refl_st_manual,
         }
     }
 
@@ -526,6 +529,7 @@ pub struct NsInfo {
 pub type ConsumerMap = HashMap<(String, ReflKind, String), Vec<String>>;
 
 pub async fn fetch_reflector(client: Client, state: SharedReflector) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("reflector poisoned");
         s.loading = true;
@@ -604,16 +608,12 @@ pub async fn fetch_reflector(client: Client, state: SharedReflector) {
         Err(_) => None,
     };
 
-    let mut diagnosed = diagnose(objects, &namespaces, &consumers, consumers_known);
+    let mut diagnosed = diagnose(objects, &namespaces, &consumers, consumers_known, st);
     diagnosed.controller_present = controller_present;
     if controller_present == Some(false) && !diagnosed.sources.is_empty() {
-        diagnosed.cluster_hints.push(danger(
-            "aucun déploiement reflector dans le cluster : les annotations ci-dessous ne seront honorées par personne.".to_string(),
-        ));
+        diagnosed.cluster_hints.push(danger(st.refl_no_controller.to_string()));
     } else if controller_present.is_none() {
-        diagnosed.cluster_hints.push(info(
-            "déploiements illisibles : impossible de confirmer que le contrôleur reflector tourne.".to_string(),
-        ));
+        diagnosed.cluster_hints.push(info(st.refl_controller_unknown.to_string()));
     }
 
     let mut s = state.lock().expect("reflector poisoned");
@@ -790,6 +790,7 @@ pub fn diagnose(
     namespaces: &[NsInfo],
     consumers: &ConsumerMap,
     consumers_known: bool,
+    st: &'static Strings,
 ) -> Diagnosed {
     // Cluster-wide index: reflector's own `OnResourceWithNameList` looks objects up by name across
     // every namespace, so the conflict test has to see the whole cluster too.
@@ -809,7 +810,7 @@ pub fn diagnose(
     let mut claimed: HashSet<(ReflKind, String, String)> = HashSet::new();
 
     for obj in &source_objs {
-        let src = diagnose_source(obj, namespaces, &by_id, consumers, consumers_known);
+        let src = diagnose_source(obj, namespaces, &by_id, consumers, consumers_known, st);
         for t in &src.targets {
             if t.mirror.is_some() {
                 claimed.insert((src.kind, t.namespace.clone(), src.name.clone()));
@@ -825,14 +826,14 @@ pub fn diagnose(
         if claimed.contains(&key) {
             continue;
         }
-        orphans.push(diagnose_orphan(obj, &source_ids, &by_id, consumers));
+        orphans.push(diagnose_orphan(obj, &source_ids, &by_id, consumers, st));
     }
 
     let mut cluster_hints = Vec::new();
     // Pods elsewhere waiting on a name that some source publishes, in a namespace that source does
     // not reach: the ImagePullBackOff whose cause is three namespaces away.
     if consumers_known {
-        cluster_hints.extend(stranded_consumers(&sources, &by_id, consumers));
+        cluster_hints.extend(stranded_consumers(&sources, &by_id, consumers, st));
     }
 
     sources.sort_by(|a, b| {
@@ -863,6 +864,7 @@ fn diagnose_source(
     by_id: &HashMap<(ReflKind, String, String), &ReflObject>,
     consumers: &ConsumerMap,
     consumers_known: bool,
+    st: &'static Strings,
 ) -> ReflSource {
     let p = &obj.props;
     let allowed_sel = parse_selector(&p.allowed_selector);
@@ -873,11 +875,12 @@ fn diagnose_source(
     let mut targets: Vec<ReflTarget> = Vec::new();
 
     if !scope_known {
-        hints.push(danger(format!(
-            "sélecteur de namespaces illisible ({}) : reflector le fait échouer en fermé — il ne réfléchit nulle part par ce chemin. Tant qu'il n'est pas corrigé, kdt ne se prononce pas sur les destinations.",
-            if allowed_sel.is_none() { A_ALLOWED_SEL } else { A_AUTO_SEL }
-                .trim_start_matches(PREFIX)
-                .trim_start_matches('/')
+        let annotation = if allowed_sel.is_none() { A_ALLOWED_SEL } else { A_AUTO_SEL }
+            .trim_start_matches(PREFIX)
+            .trim_start_matches('/');
+        hints.push(danger(fill(
+            st.refl_bad_selector,
+            &[("annotation", annotation)],
         )));
     }
 
@@ -892,7 +895,7 @@ fn diagnose_source(
                 continue;
             }
             let auto = p.auto_enabled && match_scope(&p.auto_ns, auto_sel, ns);
-            targets.push(build_target(obj, ns, auto, by_id, consumers, consumers_known));
+            targets.push(build_target(obj, ns, auto, by_id, consumers, consumers_known, st));
         }
         targets.sort_by(|a, b| a.namespace.cmp(&b.namespace));
 
@@ -901,11 +904,9 @@ fn diagnose_source(
         // annotation gives no hint of it.
         let unmatched = unmatched_patterns(&p.auto_ns, namespaces);
         if !unmatched.is_empty() && p.auto_enabled {
-            hints.push(info(format!(
-                "{} de reflection-auto-namespaces {} aucun namespace existant : {}. Un miroir y apparaîtra à leur création.",
-                if unmatched.len() > 1 { "plusieurs motifs" } else { "un motif" },
-                if unmatched.len() > 1 { "ne désignent" } else { "ne désigne" },
-                unmatched.join(", ")
+            hints.push(info(fill(
+                &st.plural(unmatched.len(), st.refl_unmatched_one, st.refl_unmatched_many),
+                &[("list", &unmatched.join(", "))],
             )));
         }
     }
@@ -913,21 +914,21 @@ fn diagnose_source(
     // Scope-shape rules. These read the annotations only, so they hold even when a selector failed
     // to parse.
     if p.allowed && p.allowed_ns.is_empty() && p.allowed_selector.is_empty() {
-        hints.push(danger(format!(
-            "reflection-allowed sans reflection-allowed-namespaces : chez reflector une liste vide vaut « tous les namespaces ». {} du cluster peuvent en tirer une copie, kube-system et flux-system compris.",
-            plural(namespaces.len().saturating_sub(1), "namespace")
+        hints.push(danger(st.plural(
+            namespaces.len().saturating_sub(1),
+            st.refl_allowed_everywhere_one,
+            st.refl_allowed_everywhere_many,
         )));
     }
     if p.auto_enabled && p.auto_ns.is_empty() && p.auto_selector.is_empty() {
-        hints.push(danger(format!(
-            "reflection-auto-enabled sans reflection-auto-namespaces : reflector crée d'office un miroir dans {} du cluster.",
-            plural(namespaces.len().saturating_sub(1), "namespace")
+        hints.push(danger(st.plural(
+            namespaces.len().saturating_sub(1),
+            st.refl_auto_everywhere_one,
+            st.refl_auto_everywhere_many,
         )));
     }
     if !p.auto_ns.is_empty() && !p.auto_enabled {
-        hints.push(warn(
-            "reflection-auto-namespaces est renseigné mais reflection-auto-enabled est absent : la liste est décorative, aucun miroir ne sera créé.".to_string(),
-        ));
+        hints.push(warn(st.refl_auto_list_decorative.to_string()));
     }
 
     // A mirror declared by hand in a namespace that is allowed but outside the automatic scope gets
@@ -939,9 +940,9 @@ fn diagnose_source(
             .map(|t| t.namespace.clone())
             .collect();
         if !doomed.is_empty() {
-            hints.push(danger(format!(
-                "miroir déclaré à la main hors de la portée auto ({}) : la passe automatique supprime tout miroir de cette source dont le namespace n'est pas dans reflection-auto-namespaces, y compris ceux qu'on n'a pas créés.",
-                doomed.join(", ")
+            hints.push(danger(fill(
+                st.refl_manual_doomed,
+                &[("namespaces", &doomed.join(", "))],
             )));
         }
     }
@@ -991,6 +992,7 @@ fn build_target(
     by_id: &HashMap<(ReflKind, String, String), &ReflObject>,
     consumers: &ConsumerMap,
     consumers_known: bool,
+    st: &'static Strings,
 ) -> ReflTarget {
     let here = by_id.get(&(src.kind, ns.name.clone(), src.name.clone())).copied();
     let waiting = consumers
@@ -1031,7 +1033,10 @@ fn build_target(
             }
             // The name is taken — by a mirror of something else, or by an unrelated object.
             Some((rns, rname)) => {
-                blocker = Some(format!("miroir de {rns}/{rname}"));
+                blocker = Some(fill(
+                    st.refl_blocker_mirror_of,
+                    &[("ns", rns), ("name", rname)],
+                ));
                 TargetStatus::Blocked
             }
             None => {
@@ -1049,27 +1054,30 @@ fn build_target(
 
     match status {
         TargetStatus::Blocked => {
-            hints.push(danger(format!(
-                "le nom est déjà pris par {} : reflector saute ce namespace, sans le dire et définitivement. Le miroir n'apparaîtra qu'une fois cet objet retiré.",
-                blocker.clone().unwrap_or_else(|| "un autre objet".to_string())
-            )));
+            let who = blocker
+                .clone()
+                .unwrap_or_else(|| st.refl_blocker_unknown.to_string());
+            hints.push(danger(fill(st.refl_blocked, &[("blocker", &who)])));
         }
         TargetStatus::Drifted => {
-            hints.push(danger(
-                "le contenu diffère de la source alors que la version enregistrée dit « à jour » : ce miroir a été modifié à la main. Reflector ne compare que les versions — il ne le corrigera jamais tout seul.".to_string(),
-            ));
+            hints.push(danger(st.refl_drifted.to_string()));
         }
         TargetStatus::Stale => {
             let age = mirror
                 .as_ref()
                 .map(|m| m.reflected_age.clone())
                 .filter(|a| !a.is_empty())
-                .map(|a| format!(", dernier passage il y a {a}"))
+                .map(|a| fill(st.refl_stale_age, &[("age", &a)]))
                 .unwrap_or_default();
-            hints.push(warn(format!(
-                "version enregistrée {} contre {} sur la source{age}.",
-                short_version(&mirror.as_ref().map(|m| m.reflected_version.clone()).unwrap_or_default()),
-                short_version(&src.resource_version),
+            let recorded =
+                mirror.as_ref().map(|m| m.reflected_version.clone()).unwrap_or_default();
+            hints.push(warn(fill(
+                st.refl_stale,
+                &[
+                    ("mirror", &short_version(&recorded)),
+                    ("source", &short_version(&src.resource_version)),
+                    ("age", &age),
+                ],
             )));
         }
         TargetStatus::Pending => {
@@ -1078,31 +1086,21 @@ fn build_target(
                 .as_ref()
                 .map(|m| m.reflected_age.clone())
                 .filter(|a| !a.is_empty())
-                .map(|a| format!(" (il y a {a})"))
+                .map(|a| fill(st.refl_pending_age, &[("age", &a)]))
                 .unwrap_or_default();
             hints.push(match (passed, content_matches) {
                 // Reflector has been here and the copy is right; only its bookkeeping is blank. It
                 // will re-send at the next event on the source, so this is untidy, not broken.
-                (true, true) => info(format!(
-                    "reflector est passé{age} et le contenu correspond à la source, mais il n'a enregistré aucune version. Le miroir est utilisable ; il sera repoussé au prochain événement sur la source.",
-                )),
-                (true, false) => warn(format!(
-                    "reflector est passé{age} sans enregistrer de version, et le contenu diffère de la source : la copie n'est pas à jour.",
-                )),
-                _ => warn(
-                    "l'annotation reflects est posée mais rien n'a encore été réfléchi : reflector n'est pas passé, ou la source ne permet pas ce namespace.".to_string(),
-                ),
+                (true, true) => info(fill(st.refl_pending_matches, &[("age", &age)])),
+                (true, false) => warn(fill(st.refl_pending_differs, &[("age", &age)])),
+                _ => warn(st.refl_pending_never.to_string()),
             });
         }
         TargetStatus::Missing => {
-            hints.push(warn(
-                "dans la portée automatique et pourtant absent : reflector n'est pas encore passé, ou n'a pas le droit d'écrire ici.".to_string(),
-            ));
+            hints.push(warn(st.refl_missing.to_string()));
         }
         TargetStatus::Manual => {
-            hints.push(info(
-                "autorisé mais hors de la portée automatique : aucun miroir n'apparaîtra ici tant qu'on n'en déclare pas un avec l'annotation reflects.".to_string(),
-            ));
+            hints.push(info(st.refl_manual.to_string()));
         }
         TargetStatus::Synced => {}
     }
@@ -1112,12 +1110,9 @@ fn build_target(
         && !waiting.is_empty()
         && matches!(status, TargetStatus::Missing | TargetStatus::Blocked | TargetStatus::Manual)
     {
-        hints.push(danger(format!(
-            "{} {} ce nom ici et ne le {} pas : {}.",
-            plural(waiting.len(), "objet"),
-            if waiting.len() > 1 { "réclament" } else { "réclame" },
-            if waiting.len() > 1 { "trouvent" } else { "trouve" },
-            waiting.join(", ")
+        hints.push(danger(fill(
+            &st.plural(waiting.len(), st.refl_waiting_one, st.refl_waiting_many),
+            &[("list", &waiting.join(", "))],
         )));
     }
 
@@ -1167,19 +1162,12 @@ fn short_version(v: &str) -> String {
     format!("…{}", &v[v.len() - 7..])
 }
 
-fn plural(n: usize, word: &str) -> String {
-    if n > 1 {
-        format!("{n} {word}s")
-    } else {
-        format!("{n} {word}")
-    }
-}
-
 fn diagnose_orphan(
     obj: &ReflObject,
     source_ids: &HashSet<(ReflKind, String, String)>,
     by_id: &HashMap<(ReflKind, String, String), &ReflObject>,
     consumers: &ConsumerMap,
+    st: &'static Strings,
 ) -> ReflOrphan {
     let (rns, rname) = obj.props.reflects.clone().unwrap_or_default();
     let key = (obj.kind, rns.clone(), rname.clone());
@@ -1189,36 +1177,39 @@ fn diagnose_orphan(
         // An auto mirror in this state gets deleted the next time reflector looks at it; a manual
         // one simply stops being updated. Both are worth a red line, for different reasons.
         if obj.props.auto_reflects {
-            hints.push(danger(format!(
-                "la source {rns}/{rname} n'existe plus : reflector supprimera ce miroir à son prochain passage."
+            hints.push(danger(fill(
+                st.refl_orphan_source_gone_auto,
+                &[("ns", &rns), ("name", &rname)],
             )));
         } else {
-            hints.push(danger(format!(
-                "la source {rns}/{rname} est introuvable : le contenu est figé au dernier passage et ne sera plus jamais mis à jour."
+            hints.push(danger(fill(
+                st.refl_orphan_source_gone_manual,
+                &[("ns", &rns), ("name", &rname)],
             )));
         }
     } else if !source_ids.contains(&key) {
-        hints.push(danger(format!(
-            "{rns}/{rname} existe mais ne porte pas reflection-allowed : ce n'est plus une source. Le contenu est figé."
+        hints.push(danger(fill(
+            st.refl_orphan_not_a_source,
+            &[("ns", &rns), ("name", &rname)],
         )));
     } else {
         // The source exists and is a source, yet this mirror was not attached to any of its targets
         // — the only way that happens is a namespace the source no longer permits.
         if obj.props.auto_reflects {
-            hints.push(danger(format!(
-                "{rns}/{rname} ne permet plus ce namespace : reflector supprimera ce miroir à son prochain passage."
+            hints.push(danger(fill(
+                st.refl_orphan_out_of_scope_auto,
+                &[("ns", &rns), ("name", &rname)],
             )));
         } else {
-            hints.push(danger(format!(
-                "{rns}/{rname} ne permet plus ce namespace : reflector refuse de le mettre à jour, le contenu est figé."
+            hints.push(danger(fill(
+                st.refl_orphan_out_of_scope_manual,
+                &[("ns", &rns), ("name", &rname)],
             )));
         }
     }
 
     if obj.props.allowed {
-        hints.push(warn(
-            "cet objet porte à la fois reflects et reflection-allowed : reflector le traite comme un miroir, jamais comme une source. La chaîne s'arrête ici.".to_string(),
-        ));
+        hints.push(warn(st.refl_orphan_both_annotations.to_string()));
     }
 
     let waiting = consumers
@@ -1246,6 +1237,7 @@ fn stranded_consumers(
     sources: &[ReflSource],
     by_id: &HashMap<(ReflKind, String, String), &ReflObject>,
     consumers: &ConsumerMap,
+    st: &'static Strings,
 ) -> Vec<Hint> {
     let mut out = Vec::new();
     for src in sources {
@@ -1266,14 +1258,14 @@ fn stranded_consumers(
         }
         if !stranded.is_empty() {
             stranded.sort();
-            out.push(danger(format!(
-                "{} {} est réclamé dans {} hors de la portée de {}/{} et n'y existe pas : {}.",
-                src.kind.label(),
-                src.name,
-                plural(stranded.len(), "namespace"),
-                src.namespace,
-                src.name,
-                stranded.join(", ")
+            out.push(danger(fill(
+                &st.plural(stranded.len(), st.refl_stranded_one, st.refl_stranded_many),
+                &[
+                    ("kind", src.kind.label()),
+                    ("name", &src.name),
+                    ("ns", &src.namespace),
+                    ("list", &stranded.join(", ")),
+                ],
             )));
         }
     }
@@ -1398,6 +1390,7 @@ pub async fn apply_force(client: Client, write: ForceWrite) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::FR;
 
     fn ns(name: &str) -> NsInfo {
         NsInfo { name: name.to_string(), labels: BTreeMap::new() }
@@ -1532,7 +1525,7 @@ mod tests {
         // `Allowed` gates everything upstream.
         let src = obj(ReflKind::Secret, "kube-system", "registry-pull", "100", source_props("qpool", "qpool,historik"));
         let namespaces = vec![ns("kube-system"), ns("qpool"), ns("historik")];
-        let d = diagnose(vec![src], &namespaces, &HashMap::new(), true);
+        let d = diagnose(vec![src], &namespaces, &HashMap::new(), true, &FR);
         let targets: Vec<&str> = d.sources[0].targets.iter().map(|t| t.namespace.as_str()).collect();
         assert_eq!(targets, vec!["qpool"]);
     }
@@ -1541,7 +1534,7 @@ mod tests {
     fn the_source_namespace_is_never_its_own_target() {
         let src = obj(ReflKind::Secret, "qpool", "s", "100", source_props("", ""));
         let namespaces = vec![ns("qpool"), ns("historik")];
-        let d = diagnose(vec![src], &namespaces, &HashMap::new(), true);
+        let d = diagnose(vec![src], &namespaces, &HashMap::new(), true, &FR);
         let targets: Vec<&str> = d.sources[0].targets.iter().map(|t| t.namespace.as_str()).collect();
         assert_eq!(targets, vec!["historik"]);
     }
@@ -1550,7 +1543,7 @@ mod tests {
     fn auto_disabled_leaves_targets_manual() {
         let props = MirroringProps { allowed: true, allowed_ns: "qpool".to_string(), ..Default::default() };
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", props);
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert!(!t.auto);
         assert_eq!(t.status, TargetStatus::Manual);
@@ -1563,7 +1556,7 @@ mod tests {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool", "qpool"));
         let mut mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("kube-system", "s", "100"));
         mirror.fingerprint = 42; // same payload as the source
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.sources[0].targets[0].status, TargetStatus::Synced);
         assert!(d.orphans.is_empty());
     }
@@ -1572,7 +1565,7 @@ mod tests {
     fn an_older_recorded_version_is_stale() {
         let src = obj(ReflKind::Secret, "kube-system", "s", "200", source_props("qpool", "qpool"));
         let mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("kube-system", "s", "100"));
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.sources[0].targets[0].status, TargetStatus::Stale);
     }
 
@@ -1582,7 +1575,7 @@ mod tests {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool", "qpool"));
         let mut mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("kube-system", "s", "100"));
         mirror.fingerprint = 999;
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.status, TargetStatus::Drifted);
         assert_eq!(t.worst(), Some(HintLevel::Danger));
@@ -1593,7 +1586,7 @@ mod tests {
         // The migration case: the app still ships its own copy, so reflector skips the namespace.
         let src = obj(ReflKind::Secret, "kube-system", "registry-pull", "100", source_props("qpool", "qpool"));
         let squatter = obj(ReflKind::Secret, "qpool", "registry-pull", "7", MirroringProps::default());
-        let d = diagnose(vec![src, squatter], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, squatter], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.status, TargetStatus::Blocked);
         assert_eq!(t.worst(), Some(HintLevel::Danger));
@@ -1604,14 +1597,14 @@ mod tests {
     fn a_mirror_of_another_source_also_blocks() {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool", "qpool"));
         let other = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("elsewhere", "s", "1"));
-        let d = diagnose(vec![src, other], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, other], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.sources[0].targets[0].status, TargetStatus::Blocked);
     }
 
     #[test]
     fn a_namespace_in_scope_with_nothing_in_it_is_missing() {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool", "qpool"));
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.status, TargetStatus::Missing);
         assert!(!t.status.forceable(), "il n'y a rien à forcer sans miroir");
@@ -1627,7 +1620,7 @@ mod tests {
             ("qpool".to_string(), ReflKind::Secret, "registry-pull".to_string()),
             vec!["Pod/web-1".to_string()],
         );
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &consumers, true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &consumers, true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.worst(), Some(HintLevel::Danger));
         assert!(t.hints.iter().any(|h| h.text.contains("Pod/web-1")));
@@ -1636,7 +1629,7 @@ mod tests {
     #[test]
     fn consumers_stay_silent_when_pods_could_not_be_listed() {
         let src = obj(ReflKind::Secret, "kube-system", "registry-pull", "100", source_props("qpool", "qpool"));
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), false);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), false, &FR);
         let t = &d.sources[0].targets[0];
         // Still missing, but nothing is claimed about who is waiting for it.
         assert_eq!(t.status, TargetStatus::Missing);
@@ -1656,6 +1649,7 @@ mod tests {
             &[ns("kube-system"), ns("qpool"), ns("tablet")],
             &consumers,
             true,
+            &FR,
         );
         assert!(d.cluster_hints.iter().any(|h| h.text.contains("tablet") && h.level == HintLevel::Danger));
     }
@@ -1665,7 +1659,7 @@ mod tests {
     #[test]
     fn a_mirror_without_a_source_is_an_orphan() {
         let mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("gone", "s", "1"));
-        let d = diagnose(vec![mirror], &[ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![mirror], &[ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.orphans.len(), 1);
         assert_eq!(d.orphans[0].worst(), Some(HintLevel::Danger));
     }
@@ -1674,7 +1668,7 @@ mod tests {
     fn a_mirror_whose_source_lost_its_annotation_is_an_orphan() {
         let ex_source = obj(ReflKind::Secret, "kube-system", "s", "100", MirroringProps::default());
         let mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("kube-system", "s", "100"));
-        let d = diagnose(vec![ex_source, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![ex_source, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.orphans.len(), 1);
         assert!(d.orphans[0].hints[0].text.contains("reflection-allowed"));
     }
@@ -1688,6 +1682,7 @@ mod tests {
             &[ns("kube-system"), ns("qpool"), ns("historik")],
             &HashMap::new(),
             true,
+            &FR,
         );
         assert_eq!(d.orphans.len(), 1);
         assert!(d.orphans[0].hints[0].text.contains("ne permet plus"));
@@ -1698,10 +1693,10 @@ mod tests {
         let mut props = mirror_props("kube-system", "s", "100");
         props.allowed = true;
         let both = obj(ReflKind::Secret, "qpool", "s", "7", props);
-        let d = diagnose(vec![both], &[ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![both], &[ns("qpool")], &HashMap::new(), true, &FR);
         assert!(d.sources.is_empty(), "reflector branche sur reflects avant reflection-allowed");
         assert_eq!(d.orphans.len(), 1);
-        assert!(d.orphans.iter().any(|o| o.hints.iter().any(|h| h.text.contains("La chaîne s'arrête ici"))));
+        assert!(d.orphans.iter().any(|o| o.hints.iter().any(|h| h.text == FR.refl_orphan_both_annotations)));
     }
 
     // --- scope-shape rules ---
@@ -1710,7 +1705,7 @@ mod tests {
     fn an_empty_allowed_list_is_flagged_as_cluster_wide() {
         let props = MirroringProps { allowed: true, ..Default::default() };
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", props);
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert!(d.sources[0]
             .hints
             .iter()
@@ -1726,8 +1721,8 @@ mod tests {
             ..Default::default()
         };
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", props);
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
-        assert!(d.sources[0].hints.iter().any(|h| h.text.contains("décorative")));
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
+        assert!(d.sources[0].hints.iter().any(|h| h.text == FR.refl_auto_list_decorative));
     }
 
     #[test]
@@ -1745,6 +1740,7 @@ mod tests {
             &[ns("kube-system"), ns("qpool"), ns("historik")],
             &HashMap::new(),
             true,
+            &FR,
         );
         assert!(d.sources[0]
             .hints
@@ -1755,7 +1751,7 @@ mod tests {
     #[test]
     fn a_pattern_matching_no_namespace_is_reported() {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool,tablet", "qpool,tablet"));
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert!(d.sources[0].hints.iter().any(|h| h.text.contains("tablet")));
     }
 
@@ -1767,7 +1763,7 @@ mod tests {
             ..Default::default()
         };
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", props);
-        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert!(!d.sources[0].scope_known);
         assert!(d.sources[0].targets.is_empty(), "aucune destination inventée");
     }
@@ -1855,7 +1851,7 @@ mod tests {
         let mut props = mirror_props("kube-system", "s", "");
         props.reflected_at = "2026-07-27T14:12:32.4166782+00:00".to_string();
         let mirror = obj(ReflKind::Secret, "qpool", "s", "7", props);
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.status, TargetStatus::Pending);
         assert_eq!(t.worst(), Some(HintLevel::Info), "ne pas crier au loup sur un miroir correct");
@@ -1869,7 +1865,7 @@ mod tests {
         props.reflected_at = "2026-07-27T14:12:32.4166782+00:00".to_string();
         let mut mirror = obj(ReflKind::Secret, "qpool", "s", "7", props);
         mirror.fingerprint = 999;
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         assert_eq!(d.sources[0].targets[0].worst(), Some(HintLevel::Warn));
     }
 
@@ -1877,10 +1873,10 @@ mod tests {
     fn a_blank_version_and_no_pass_at_all_stays_a_warning() {
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", source_props("qpool", "qpool"));
         let mirror = obj(ReflKind::Secret, "qpool", "s", "7", mirror_props("kube-system", "s", ""));
-        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true);
+        let d = diagnose(vec![src, mirror], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
         let t = &d.sources[0].targets[0];
         assert_eq!(t.worst(), Some(HintLevel::Warn));
-        assert!(t.hints[0].text.contains("rien n'a encore été réfléchi"));
+        assert!(t.hints[0].text == FR.refl_pending_never);
     }
 
     #[test]

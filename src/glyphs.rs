@@ -59,13 +59,16 @@ pub fn measure(glyphs: &str) -> std::io::Result<Vec<Measure>> {
     result
 }
 
-/// Rapport lisible : `kdt --probe-glyphs`, à lancer dans le terminal que l'on veut caractériser.
+/// Readable report: `kdt --probe-glyphs`, to be run in the terminal one wants to characterise.
 pub fn print_report() -> std::io::Result<()> {
+    let st = crate::lang::active();
     let measures = measure(UI_GLYPHS)?;
-    println!("largeur des glyphes de kdt, mesurée par le terminal (CPR)\n");
-    println!("  glyphe  code      mesurée   supposée");
+    println!("{}\n", st.glyph_report_title);
+    // The header and the "off" flag are padded to the same width in both languages: this report is
+    // a hand-aligned ASCII table, and a shorter word would shear the columns.
+    println!("{}", st.glyph_header);
     for m in &measures {
-        let flag = if m.agrees() { "" } else { "   <-- ÉCART" };
+        let flag = if m.agrees() { "" } else { st.glyph_off_flag };
         println!(
             "    {}     U+{:04X}     {}         {}{}",
             m.ch, m.ch as u32, m.measured, m.assumed, flag
@@ -74,15 +77,28 @@ pub fn print_report() -> std::io::Result<()> {
     let off: Vec<&Measure> = measures.iter().filter(|m| !m.agrees()).collect();
     println!();
     if off.is_empty() {
-        println!("Aucun écart : le terminal et kdt comptent les mêmes cellules.");
+        println!("{}", st.glyph_all_agree);
     } else {
+        let list = off
+            .iter()
+            .map(|m| {
+                crate::lang::fill(
+                    st.glyph_off_detail,
+                    &[
+                        ("ch", &m.ch.to_string()),
+                        ("measured", &m.measured.to_string()),
+                        ("assumed", &m.assumed.to_string()),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "{} glyphe(s) en écart : {}",
-            off.len(),
-            off.iter()
-                .map(|m| format!("{} (mesuré {}, supposé {})", m.ch, m.measured, m.assumed))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "{}",
+            crate::lang::fill(
+                &st.plural(off.len(), st.glyph_off_one, st.glyph_off_many),
+                &[("list", &list)],
+            )
         );
     }
     Ok(())

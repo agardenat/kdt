@@ -629,10 +629,12 @@ async fn drain(
         (s.waiting.len(), s.failed.len())
     };
     if failed > 0 {
-        return Err(format!("{} pod(s) en échec", failed));
+        let st = crate::lang::active();
+        return Err(st.plural(failed, st.node_failed_pods_one, st.node_failed_pods_many));
     }
     if left > 0 {
-        return Err(format!("{} pod(s) retenus par un PDB", left));
+        let st = crate::lang::active();
+        return Err(st.plural(left, st.node_pdb_held_one, st.node_pdb_held_many));
     }
     Ok(())
 }

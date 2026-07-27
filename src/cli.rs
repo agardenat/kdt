@@ -17,7 +17,7 @@ pub struct Args {
     #[arg(long, default_value_t = 5000)]
     pub buffer_size: usize,
 
-    /// Mesure la largeur réelle des glyphes de l'interface dans ce terminal, puis quitte.
+    /// Measure the real width of the UI glyphs in this terminal, then exit.
     #[arg(long)]
     pub probe_glyphs: bool,
 }

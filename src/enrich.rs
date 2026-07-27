@@ -11,6 +11,7 @@ use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, Servic
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding, Subject};
 use k8s_openapi::api::storage::v1::StorageClass;
+use crate::lang::active;
 use kube::api::{DynamicObject, ListParams};
 use kube::core::GroupVersionKind;
 use kube::discovery::{self, Scope};
@@ -76,45 +77,46 @@ pub async fn gather_extra_context_with_progress<F>(
 where
     F: Fn(&str, usize),
 {
+    let st = active();
     let mut sections = Vec::new();
 
-    progress("Recherche de policies Kyverno...", sections.len());
+    progress(st.enr_kyverno, sections.len());
     sections.extend(kyverno_context(client, rec).await);
 
-    progress("Analyse des liaisons RBAC (RoleBindings, ClusterRoleBindings)...", sections.len());
+    progress(st.enr_rbac, sections.len());
     sections.extend(rbac_context(client, rec).await);
 
-    progress("Recherche d'objets cert-manager (Certificate, Issuer)...", sections.len());
+    progress(st.enr_certmanager, sections.len());
     sections.extend(cert_manager_context(client, rec).await);
 
-    progress("Recherche d'objets Velero (Backup, BackupStorageLocation)...", sections.len());
+    progress(st.enr_velero, sections.len());
     sections.extend(velero_context(client, rec).await);
 
-    progress("Recherche de l'Ingress et de l'IngressClass...", sections.len());
+    progress(st.enr_ingress, sections.len());
     sections.extend(ingress_context(client, rec).await);
 
-    progress("Recherche d'objets Rancher (cattle.io)...", sections.len());
+    progress(st.enr_rancher, sections.len());
     sections.extend(rancher_context(client, rec).await);
 
-    progress("Recherche d'objets Datadog (DatadogAgent)...", sections.len());
+    progress(st.enr_datadog, sections.len());
     sections.extend(datadog_context(client, rec).await);
 
-    progress("Recherche du stockage (PVC, PV, StorageClass)...", sections.len());
+    progress(st.enr_storage, sections.len());
     sections.extend(storage_context(client, rec).await);
 
-    progress("Recherche d'objets Argo CD (Application, AppProject)...", sections.len());
+    progress(st.enr_argocd, sections.len());
     sections.extend(argocd_context(client, rec).await);
 
-    progress("Recherche d'objets Flux CD (Kustomization, HelmRelease, sources)...", sections.len());
+    progress(st.enr_fluxcd, sections.len());
     sections.extend(fluxcd_context(client, rec).await);
 
-    progress("Application des hints outils...", sections.len());
+    progress(st.enr_tool_hints, sections.len());
     sections.extend(tool_hints(rec));
 
     for s in sections.iter_mut() {
         if s.1.len() > MAX_SECTION_CHARS {
             s.1.truncate(MAX_SECTION_CHARS);
-            s.1.push_str("\n... (tronqué)");
+            s.1.push_str(active().enr_truncated);
         }
     }
     sections
@@ -214,7 +216,7 @@ async fn rbac_context(client: &Client, rec: &EventRecord) -> Vec<(String, String
     } else {
         out.push((
             format!("[rbac] ServiceAccount {}/{}", sa_ns, sa_name),
-            "(introuvable)".to_string(),
+            active().enr_not_found.to_string(),
         ));
     }
 
@@ -590,6 +592,7 @@ async fn fluxcd_context(client: &Client, rec: &EventRecord) -> Vec<(String, Stri
 // Static troubleshooting hints injected when an event matches a known tool (fluent-bit, datadog…),
 // giving the model curated background it might otherwise lack.
 fn tool_hints(rec: &EventRecord) -> Vec<(String, String)> {
+    let st = active();
     let mut hints = Vec::new();
     let comp = rec.component.to_lowercase();
     let ns = rec.namespace.to_lowercase();
@@ -599,25 +602,25 @@ fn tool_hints(rec: &EventRecord) -> Vec<(String, String)> {
     if probe("fluent-bit") || probe("fluentbit") {
         hints.push((
             "[hint] fluent-bit".to_string(),
-            "Pistes typiques: parser/multiline mal défini, output buffer plein (mem_buf_limit), TLS/CA invalide, écriture vers backend (Loki/ES/Datadog/CloudWatch), filter Kubernetes (échec API), index template (ES). Vérifier: ConfigMap fluent-bit.conf et CR ClusterFilter/ClusterOutput/ClusterParser, RBAC du SA fluent-bit (events,pods,namespaces RO cluster-wide).".to_string(),
+            st.enr_hint_fluentbit.to_string(),
         ));
     }
     if probe("datadog") {
         hints.push((
             "[hint] datadog".to_string(),
-            "Pistes: API key invalide (DD_API_KEY), kubelet auth (TLS, bearer token), conflit port dogstatsd/statsd, autodiscovery (annotations ad.datadoghq.com/<container>.{check_names,init_configs,instances}), accès kube-state-metrics, Cluster Agent injoignable, leader election. Vérifier le DatadogAgent CR (operator) ou le DaemonSet datadog-agent et son ServiceAccount.".to_string(),
+            st.enr_hint_datadog.to_string(),
         ));
     }
     if probe("reflector") {
         hints.push((
             "[hint] reflector (emberstack)".to_string(),
-            "Annotations source: reflector.v1.k8s.emberstack.com/{reflection-allowed=true, reflection-allowed-namespaces=<csv|regex>, reflection-auto-enabled=true, reflection-auto-namespaces=<csv|regex>}. Annotations destinations (auto-créées): reflects=true, reflects-from=<ns>/<name>. Vérifier le ClusterRole du reflector (lecture Secrets/ConfigMaps cluster-wide) et que la source porte les annotations adéquates.".to_string(),
+            st.enr_hint_reflector.to_string(),
         ));
     }
     if probe("airflow") {
         hints.push((
             "[hint] airflow".to_string(),
-            "Pour KubernetesExecutor / KubernetesPodOperator: vérifier les labels du pod (dag_id, task_id, run_id, try_number) et la config airflow.cfg (kubernetes_executor.*). Erreurs typiques: image worker introuvable, pull secret manquant, ressources insuffisantes (request CPU/mem > capacité), volumes manquants (logs PVC airflow-logs, dags PVC), webserver/scheduler injoignable, RBAC du SA airflow-worker (create/get/watch pods + pods/log dans le ns d'exécution), secrets backend (DB metadata) injoignable.".to_string(),
+            st.enr_hint_airflow.to_string(),
         ));
     }
 

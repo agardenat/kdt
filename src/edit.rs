@@ -504,7 +504,7 @@ pub fn remove_temp(path: &Path) {
 pub fn parse(text: &str) -> Result<Value, String> {
     let value: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     if !value.is_object() {
-        return Err("le document n'est pas un objet YAML".to_string());
+        return Err(crate::lang::active().edit_not_an_object.to_string());
     }
     Ok(value)
 }

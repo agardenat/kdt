@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use crate::lang::{Strings, fill};
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
@@ -230,6 +231,7 @@ pub fn new_certs_state() -> SharedCerts {
 // not deployed" from "deployed but nothing issued yet", and `acme_installed` keeps a CA-only cluster
 // from being reported as broken.
 pub async fn fetch_certs(client: Client, state: SharedCerts) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("certs poisoned");
         s.loading = true;
@@ -261,7 +263,7 @@ pub async fn fetch_certs(client: Client, state: SharedCerts) {
             Ok(list) => {
                 let api_version = format!("{}/{}", group, version);
                 for obj in &list.items {
-                    if let Some(r) = parse_cm(obj, kind, &api_version) {
+                    if let Some(r) = parse_cm(obj, kind, &api_version, st) {
                         resources.push(r);
                     }
                 }
@@ -278,7 +280,7 @@ pub async fn fetch_certs(client: Client, state: SharedCerts) {
     s.acme_installed = acme_installed;
     s.resources = resources;
     s.error = if !installed {
-        Some("CRD cert-manager introuvables (cert-manager n'est pas installé sur ce cluster ?)".into())
+        Some(st.cert_crds_missing.to_string())
     } else if s.resources.is_empty() && !errors.is_empty() {
         Some(errors.join(" · "))
     } else {
@@ -286,14 +288,19 @@ pub async fn fetch_certs(client: Client, state: SharedCerts) {
     };
 }
 
-fn parse_cm(obj: &DynamicObject, kind: &str, api_version: &str) -> Option<CmResource> {
+fn parse_cm(
+    obj: &DynamicObject,
+    kind: &str,
+    api_version: &str,
+    st: &'static Strings,
+) -> Option<CmResource> {
     let cm_kind = CmKind::from_str(kind)?;
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
     let name = obj.metadata.name.clone().unwrap_or_default();
     let spec = obj.data.get("spec");
     let status = obj.data.get("status");
 
-    let (ready, message) = parse_ready(cm_kind, status);
+    let (ready, message) = parse_ready(cm_kind, status, st);
 
     let owner = obj.metadata.owner_references.as_deref().and_then(lineage_owner);
 
@@ -428,7 +435,11 @@ fn lineage_owner(refs: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerRe
 // Issuers, Certificates and CertificateRequests use `status.conditions`. Orders and Challenges use a
 // bare `status.state` string and have no conditions at all — reading conditions alone would leave
 // every ACME object Unknown.
-fn parse_ready(kind: CmKind, status: Option<&serde_json::Value>) -> (CmReady, String) {
+fn parse_ready(
+    kind: CmKind,
+    status: Option<&serde_json::Value>,
+    st: &'static Strings,
+) -> (CmReady, String) {
     match kind {
         CmKind::Order | CmKind::Challenge => {
             let state = status
@@ -442,7 +453,7 @@ fn parse_ready(kind: CmKind, status: Option<&serde_json::Value>) -> (CmReady, St
                 .unwrap_or_default();
             let ready = acme_state_ready(state);
             let msg = match (state.is_empty(), reason.is_empty()) {
-                (true, true) => "(pas encore d'état)".to_string(),
+                (true, true) => st.cert_no_state.to_string(),
                 (false, true) => state.to_string(),
                 (true, false) => reason,
                 (false, false) => format!("{state}: {reason}"),
@@ -452,7 +463,10 @@ fn parse_ready(kind: CmKind, status: Option<&serde_json::Value>) -> (CmReady, St
         CmKind::CertificateRequest => {
             // A denied or malformed request never reaches a Ready=False condition, so those two
             // conditions have to be checked before falling back to Ready.
-            for (ty, label) in [("Denied", "refusée"), ("InvalidRequest", "requête invalide")] {
+            for (ty, label) in [
+                ("Denied", st.cert_denied),
+                ("InvalidRequest", st.cert_invalid_request),
+            ] {
                 if let Some(c) = condition(status, ty) {
                     if c.0 == "True" {
                         let m = join_reason(&c.1, &c.2);
@@ -461,36 +475,37 @@ fn parse_ready(kind: CmKind, status: Option<&serde_json::Value>) -> (CmReady, St
                 }
             }
             match condition(status, "Ready") {
-                Some((st, reason, msg)) => cond_to_ready(&st, &reason, &msg),
+                Some((state, reason, msg)) => cond_to_ready(&state, &reason, &msg),
                 // Approval is a distinct gate: an unapproved request sits with no Ready condition at
                 // all, which is pending rather than unknown.
                 None if condition(status, "Approved").is_none() => (
                     CmReady::InProgress,
-                    "en attente d'approbation".to_string(),
+                    st.cert_awaiting_approval.to_string(),
                 ),
-                None => (CmReady::Unknown, "(pas de condition Ready)".to_string()),
+                None => (CmReady::Unknown, st.cert_no_ready_condition.to_string()),
             }
         }
         CmKind::Certificate => {
             // Issuing=True means a renewal is under way; it must not read as a failure even while
             // Ready is False (the previous certificate is usually still valid and in use).
-            let issuing = matches!(condition(status, "Issuing"), Some((st, _, _)) if st == "True");
+            let issuing =
+                matches!(condition(status, "Issuing"), Some((state, _, _)) if state == "True");
             match condition(status, "Ready") {
-                Some((st, reason, msg)) => {
-                    let (r, m) = cond_to_ready(&st, &reason, &msg);
+                Some((state, reason, msg)) => {
+                    let (r, m) = cond_to_ready(&state, &reason, &msg);
                     if issuing && r != CmReady::Ready {
-                        (CmReady::InProgress, if m.is_empty() { "émission en cours".into() } else { m })
+                        (CmReady::InProgress, if m.is_empty() { st.cert_issuing.to_string() } else { m })
                     } else {
                         (r, m)
                     }
                 }
-                None if issuing => (CmReady::InProgress, "émission en cours".to_string()),
-                None => (CmReady::Unknown, "(pas de condition Ready)".to_string()),
+                None if issuing => (CmReady::InProgress, st.cert_issuing.to_string()),
+                None => (CmReady::Unknown, st.cert_no_ready_condition.to_string()),
             }
         }
         CmKind::Issuer | CmKind::ClusterIssuer => match condition(status, "Ready") {
-            Some((st, reason, msg)) => cond_to_ready(&st, &reason, &msg),
-            None => (CmReady::Unknown, "(pas de condition Ready)".to_string()),
+            Some((state, reason, msg)) => cond_to_ready(&state, &reason, &msg),
+            None => (CmReady::Unknown, st.cert_no_ready_condition.to_string()),
         },
     }
 }
@@ -782,6 +797,7 @@ pub fn chain_hints(
     idx: usize,
     resources: &[CmResource],
     secret: Option<&SecretFacts>,
+    st: &'static Strings,
 ) -> Vec<Hint> {
     let mut out: Vec<Hint> = Vec::new();
     let warn = |t: String| Hint { level: HintLevel::Warn, text: t };
@@ -800,31 +816,38 @@ pub fn chain_hints(
                         && c.type_ == "dns-01"
                         && r.age_secs > DNS_PROPAGATION_GRACE_SECS
                     {
-                        out.push(warn(format!(
-                            "propagation DNS lente ({} min) : vérifier le TXT _acme-challenge.{}",
-                            r.age_secs / 60,
-                            c.dns_name
+                        out.push(warn(fill(
+                            st.cert_dns_slow,
+                            &[
+                                ("min", &(r.age_secs / 60).to_string()),
+                                ("dns", &c.dns_name),
+                            ],
                         )));
                     }
                     if r.ready == CmReady::InProgress && c.type_ == "http-01" && !c.presented {
-                        out.push(warn(format!(
-                            "challenge http-01 non présenté pour {} : le solveur n'est pas joignable (Ingress/NetworkPolicy ?)",
-                            c.dns_name
+                        out.push(warn(fill(
+                            st.cert_http01_not_presented,
+                            &[("dns", &c.dns_name)],
                         )));
                     }
                 }
             }
             // 3. An invalid Order carries the authorization failure that explains everything above it.
             CmKind::Order if r.ready == CmReady::Failed => {
-                out.push(danger(format!("Order {} en échec : {}", r.name, r.message)));
+                out.push(danger(fill(
+                    st.cert_order_failed,
+                    &[("name", &r.name), ("message", &r.message)],
+                )));
             }
             // 7. A broken issuer dooms every issuance under it — worth saying once, loudly.
             CmKind::Issuer | CmKind::ClusterIssuer if r.ready != CmReady::Ready => {
-                out.push(danger(format!(
-                    "{} {} n'est pas prêt : toutes les émissions sous cet émetteur échoueront ({})",
-                    r.kind.as_str(),
-                    r.name,
-                    r.message
+                out.push(danger(fill(
+                    st.cert_issuer_not_ready,
+                    &[
+                        ("kind", r.kind.as_str()),
+                        ("name", &r.name),
+                        ("message", &r.message),
+                    ],
                 )));
             }
             _ => {}
@@ -833,9 +856,7 @@ pub fn chain_hints(
 
     // 2. Rate limit: checked over the whole chain, and it overrides the advice to retry.
     if is_rate_limited(idx, resources) {
-        out.push(danger(
-            "rate limit ACME atteint — ne pas relancer, attendre la fenêtre (5 certificats dupliqués/semaine chez Let's Encrypt)".to_string(),
-        ));
+        out.push(danger(st.cert_rate_limited.to_string()));
     }
 
     if let Some(cert_idx) = owning_certificate(idx, resources) {
@@ -844,9 +865,9 @@ pub fn chain_hints(
         // 4. Renewal due but nothing in flight means the controller is not reacting.
         if let Some(rt) = &cert.renewal_time {
             if is_past_rfc3339(rt) && in_flight_request(cert_idx, resources).is_none() {
-                out.push(warn(format!(
-                    "renouvellement en retard (prévu le {}) sans CertificateRequest en cours : le contrôleur ne réagit pas",
-                    &rt[..rt.len().min(10)]
+                out.push(warn(fill(
+                    st.cert_renewal_late,
+                    &[("date", &rt[..rt.len().min(10)])],
                 )));
             }
         }
@@ -855,23 +876,27 @@ pub fn chain_hints(
             // 5. Ready with no Secret is the one case where the certificate is useless despite
             //    looking healthy.
             if !facts.found {
-                out.push(danger(format!(
-                    "Secret {}/{} absent alors que le Certificate existe",
-                    cert.namespace, sn
+                out.push(danger(fill(
+                    st.cert_secret_missing,
+                    &[("ns", &cert.namespace), ("name", sn)],
                 )));
             } else if let (Some(sd), Some(cd)) = (facts.days_remaining, cert.days_remaining) {
                 // 6. A Secret that disagrees with the Certificate means consumers are serving an
                 //    older certificate than the control plane believes.
                 if (sd - cd).abs() > 1 {
-                    out.push(warn(format!(
-                        "Secret désynchronisé : il expire dans {sd} j, le Certificate annonce {cd} j"
+                    out.push(warn(fill(
+                        st.cert_secret_desynced,
+                        &[("secret", &sd.to_string()), ("cert", &cd.to_string())],
                     )));
                 }
             }
             if facts.found && facts.ingress_refs == 0 && cert.ready == CmReady::Ready {
                 out.push(Hint {
                     level: HintLevel::Info,
-                    text: format!("aucun Ingress ne référence {}/{}", cert.namespace, sn),
+                    text: fill(
+                        st.cert_no_ingress_ref,
+                        &[("ns", &cert.namespace), ("name", sn)],
+                    ),
                 });
             }
         }
@@ -896,9 +921,10 @@ pub async fn renew(
     name: String,
     status: SharedReconcile,
 ) {
-    let msg = match run_renew(&client, &api_version, &namespace, &name).await {
+    let st = crate::lang::active();
+    let msg = match run_renew(&client, &api_version, &namespace, &name, st).await {
         Ok(m) => m,
-        Err(e) => format!("✗ renew : {}", e),
+        Err(e) => fill(st.cert_renew_failed, &[("e", &e)]),
     };
     if let Ok(mut s) = status.lock() {
         *s = Some((std::time::Instant::now(), msg));
@@ -910,6 +936,7 @@ async fn run_renew(
     api_version: &str,
     namespace: &str,
     name: &str,
+    st: &'static Strings,
 ) -> Result<String, String> {
     let version = api_version.split_once('/').map(|(_, v)| v).unwrap_or("v1");
     let ar = resolve_ar(client, CM_GROUP, &[version], "Certificate").await?;
@@ -925,6 +952,8 @@ async fn run_renew(
         "type": "Issuing",
         "status": "True",
         "reason": "ManuallyTriggered",
+        // Written onto the Kubernetes object, not shown in the UI: it stays in one language so a
+        // reader of `kubectl describe` sees the same text whatever kdt was set to.
         "message": "Renouvellement déclenché manuellement depuis kdt",
         "lastTransitionTime": now,
     });
@@ -946,7 +975,7 @@ async fn run_renew(
     api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(|e| format!("Certificate/{} : {}", name, e))?;
-    Ok(format!("✓ renouvellement demandé : Certificate/{}", name))
+    Ok(fill(st.cert_renew_ok, &[("name", name)]))
 }
 
 // Restarts a stuck ACME cycle by deleting the in-flight CertificateRequest. Deleting the Challenge
@@ -959,9 +988,10 @@ pub async fn retry_acme(
     name: String,
     status: SharedReconcile,
 ) {
-    let msg = match run_retry_acme(&client, &api_version, &namespace, &name).await {
+    let st = crate::lang::active();
+    let msg = match run_retry_acme(&client, &api_version, &namespace, &name, st).await {
         Ok(m) => m,
-        Err(e) => format!("✗ relance ACME : {}", e),
+        Err(e) => fill(st.cert_acme_retry_failed, &[("e", &e)]),
     };
     if let Ok(mut s) = status.lock() {
         *s = Some((std::time::Instant::now(), msg));
@@ -973,6 +1003,7 @@ async fn run_retry_acme(
     api_version: &str,
     namespace: &str,
     name: &str,
+    st: &'static Strings,
 ) -> Result<String, String> {
     let version = api_version.split_once('/').map(|(_, v)| v).unwrap_or("v1");
     let ar = resolve_ar(client, CM_GROUP, &[version], "CertificateRequest").await?;
@@ -980,10 +1011,7 @@ async fn run_retry_acme(
     api.delete(name, &kube::api::DeleteParams::default())
         .await
         .map_err(|e| format!("CertificateRequest/{} : {}", name, e))?;
-    Ok(format!(
-        "✓ cycle ACME relancé : CertificateRequest/{} supprimée (Order et Challenges en cascade)",
-        name
-    ))
+    Ok(fill(st.cert_acme_retry_ok, &[("name", name)]))
 }
 
 async fn resolve_ar(
@@ -1011,6 +1039,7 @@ async fn resolve_ar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::{FR, reads_as};
 
     fn res(kind: CmKind, ns: &str, name: &str) -> CmResource {
         CmResource {
@@ -1187,13 +1216,13 @@ mod tests {
         // The trap: Orders and Challenges have no conditions at all. A conditions-only parser would
         // report every one of them as Unknown.
         let st = serde_json::json!({ "state": "pending", "reason": "waiting for DNS" });
-        assert_eq!(parse_ready(CmKind::Order, Some(&st)).0, CmReady::InProgress);
+        assert_eq!(parse_ready(CmKind::Order, Some(&st), &FR).0, CmReady::InProgress);
         let st = serde_json::json!({ "state": "invalid", "reason": "NXDOMAIN" });
-        let (r, m) = parse_ready(CmKind::Challenge, Some(&st));
+        let (r, m) = parse_ready(CmKind::Challenge, Some(&st), &FR);
         assert_eq!(r, CmReady::Failed);
         assert_eq!(m, "invalid: NXDOMAIN");
         let st = serde_json::json!({ "state": "valid" });
-        assert_eq!(parse_ready(CmKind::Order, Some(&st)).0, CmReady::Ready);
+        assert_eq!(parse_ready(CmKind::Order, Some(&st), &FR).0, CmReady::Ready);
     }
 
     #[test]
@@ -1202,17 +1231,17 @@ mod tests {
             { "type": "Ready", "status": "False", "reason": "DoesNotExist", "message": "issuing" },
             { "type": "Issuing", "status": "True", "reason": "Renewing" },
         ]});
-        assert_eq!(parse_ready(CmKind::Certificate, Some(&st)).0, CmReady::InProgress);
+        assert_eq!(parse_ready(CmKind::Certificate, Some(&st), &FR).0, CmReady::InProgress);
 
         let st = serde_json::json!({ "conditions": [
             { "type": "Ready", "status": "False", "reason": "Failed", "message": "order errored" },
         ]});
-        assert_eq!(parse_ready(CmKind::Certificate, Some(&st)).0, CmReady::Failed);
+        assert_eq!(parse_ready(CmKind::Certificate, Some(&st), &FR).0, CmReady::Failed);
 
         let st = serde_json::json!({ "conditions": [
             { "type": "Ready", "status": "True", "reason": "Ready", "message": "up to date" },
         ]});
-        assert_eq!(parse_ready(CmKind::Certificate, Some(&st)).0, CmReady::Ready);
+        assert_eq!(parse_ready(CmKind::Certificate, Some(&st), &FR).0, CmReady::Ready);
     }
 
     #[test]
@@ -1221,14 +1250,14 @@ mod tests {
             { "type": "Ready", "status": "False", "reason": "Pending", "message": "waiting" },
             { "type": "Denied", "status": "True", "reason": "Denied", "message": "policy refuse" },
         ]});
-        let (r, m) = parse_ready(CmKind::CertificateRequest, Some(&st));
+        let (r, m) = parse_ready(CmKind::CertificateRequest, Some(&st), &FR);
         assert_eq!(r, CmReady::Failed);
         assert_eq!(m, "Denied: policy refuse");
 
         // Not yet approved: no Ready condition at all, which is pending rather than unknown.
         let st = serde_json::json!({ "conditions": [] });
         assert_eq!(
-            parse_ready(CmKind::CertificateRequest, Some(&st)).0,
+            parse_ready(CmKind::CertificateRequest, Some(&st), &FR).0,
             CmReady::InProgress
         );
     }
@@ -1273,10 +1302,10 @@ mod tests {
         });
 
         all[4].age_secs = 60;
-        assert!(chain_hints(4, &all, None).is_empty());
+        assert!(chain_hints(4, &all, None, &FR).is_empty());
 
         all[4].age_secs = 1_800;
-        let hints = chain_hints(4, &all, None);
+        let hints = chain_hints(4, &all, None, &FR);
         assert!(hints.iter().any(|h| h.text.contains("_acme-challenge.grafana.exemple.fr")));
     }
 
@@ -1284,18 +1313,18 @@ mod tests {
     fn missing_and_desynced_secrets_are_reported() {
         let all = full_chain();
         let missing = SecretFacts { found: false, days_remaining: None, ingress_refs: 0 };
-        let hints = chain_hints(1, &all, Some(&missing));
-        assert!(hints.iter().any(|h| h.text.contains("absent") && h.level == HintLevel::Danger));
+        let hints = chain_hints(1, &all, Some(&missing), &FR);
+        assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_missing) && h.level == HintLevel::Danger));
 
         let mut synced = full_chain();
         synced[1].days_remaining = Some(60);
         let facts = SecretFacts { found: true, days_remaining: Some(12), ingress_refs: 1 };
-        let hints = chain_hints(1, &synced, Some(&facts));
-        assert!(hints.iter().any(|h| h.text.contains("désynchronisé")));
+        let hints = chain_hints(1, &synced, Some(&facts), &FR);
+        assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_desynced)));
 
         let facts = SecretFacts { found: true, days_remaining: Some(60), ingress_refs: 1 };
-        let hints = chain_hints(1, &synced, Some(&facts));
-        assert!(!hints.iter().any(|h| h.text.contains("désynchronisé")));
+        let hints = chain_hints(1, &synced, Some(&facts), &FR);
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_desynced)));
     }
 
     #[test]
@@ -1303,7 +1332,7 @@ mod tests {
         let mut all = full_chain();
         all[0].ready = CmReady::Failed;
         all[0].message = "ACME account registration failed".into();
-        let hints = chain_hints(4, &all, None);
+        let hints = chain_hints(4, &all, None, &FR);
         assert!(hints
             .iter()
             .any(|h| h.text.contains("letsencrypt") && h.level == HintLevel::Danger));

@@ -137,6 +137,7 @@ use crate::kyverno::{
     KyPolicy, KyReady, KyResult, KyViolation, SharedKyverno,
 };
 use crate::lang;
+use crate::lang::Strings;
 use crate::pdf;
 use crate::pods::{
     fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, PodResource,
@@ -1019,7 +1020,13 @@ impl App {
         file_config: FileConfig,
         kube_context: Option<String>,
     ) -> Self {
-        let initial_lang = config::initial_language(&file_config).unwrap_or(AiLanguage::Fr);
+        // The config file wins over the locale: it is an explicit choice, and it is also where the
+        // `l` key writes what the user picked.
+        let initial_lang = config::initial_language(&file_config)
+            .or_else(config::system_language)
+            .unwrap_or(AiLanguage::Fr);
+        // Published for the background fetch tasks, which build their sentences off the UI thread.
+        lang::set_active(initial_lang);
         let ai_providers = resolve_providers(&file_config);
         let ai_provider_idx = default_provider_index(&file_config, &ai_providers);
         Self {
@@ -1450,7 +1457,7 @@ impl App {
         if self.log_opts.previous {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "suivi impossible sur un run précédent (terminé)".to_string(),
+                lang::t(self.ai_language).msg_no_previous_follow.to_string(),
             ));
             return;
         }
@@ -1544,7 +1551,7 @@ impl App {
     fn current_ai_config(&self) -> Result<AiConfig, String> {
         match self.ai_providers.get(self.ai_provider_idx) {
             Some(p) => AiConfig::from_resolved(p),
-            None => Err("aucun fournisseur IA configuré".to_string()),
+            None => Err(lang::t(self.ai_language).msg_no_ai_provider.to_string()),
         }
     }
 
@@ -1558,9 +1565,15 @@ impl App {
     fn cycle_ai_provider(&mut self) {
         let msg = if self.ai_providers.len() > 1 {
             self.ai_provider_idx = (self.ai_provider_idx + 1) % self.ai_providers.len();
-            format!("IA: {}", self.ai_provider_name())
+            lang::fill(
+                lang::t(self.ai_language).ai_provider_switched,
+                &[("name", self.ai_provider_name())],
+            )
         } else {
-            format!("IA: {} (seul fournisseur)", self.ai_provider_name())
+            lang::fill(
+                lang::t(self.ai_language).ai_provider_only_one,
+                &[("name", self.ai_provider_name())],
+            )
         };
         self.clipboard_status = Some((std::time::Instant::now(), msg));
     }
@@ -1659,7 +1672,7 @@ impl App {
             s.content.clear();
             s.error = None;
             s.prompt_preview.clear();
-            s.stage = "Préparation...".to_string();
+            s.stage = lang::t(self.ai_language).msg_preparing.to_string();
             s.started_at = Some(std::time::Instant::now());
             s.sections_count = 0;
             s.model = model;
@@ -1851,7 +1864,7 @@ impl App {
 
     fn copy_text(&mut self, text: String) {
         if text.trim().is_empty() {
-            self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
+            self.clipboard_status = Some((std::time::Instant::now(), lang::t(self.ai_language).msg_nothing_to_copy.to_string()));
             return;
         }
         let n_lines = text.lines().count();
@@ -1860,11 +1873,14 @@ impl App {
             Ok(()) => {
                 self.clipboard_status = Some((
                     std::time::Instant::now(),
-                    format!("{} lignes ({} caractères) copiés", n_lines, n_bytes),
+                    lang::fill(
+                        lang::t(self.ai_language).msg_copied,
+                        &[("lines", &n_lines.to_string()), ("chars", &n_bytes.to_string())],
+                    ),
                 ));
             }
             Err(e) => {
-                self.clipboard_status = Some((std::time::Instant::now(), format!("copie KO: {}", e)));
+                self.clipboard_status = Some((std::time::Instant::now(), lang::fill(lang::t(self.ai_language).msg_copy_failed, &[("e", &e)])));
             }
         }
     }
@@ -1930,7 +1946,7 @@ impl App {
         let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "yaml : aucun objet sélectionné".to_string(),
+                lang::t(self.ai_language).msg_yaml_no_object.to_string(),
             ));
             return;
         };
@@ -2802,9 +2818,24 @@ impl App {
         }
     }
 
-    // Re-run the fetch backing whichever view is on screen.
+    // `l`: switch the UI language. The diagnostic views build their sentences when the data is
+    // fetched, not when it is drawn, so the view has to be re-fetched for the new language to reach
+    // the hints already on screen.
+    fn toggle_language(&mut self) {
+        self.ai_language = self.ai_language.toggle();
+        lang::set_active(self.ai_language);
+        config::save_language(self.ai_language);
+        self.refresh_current_view();
+        if self.mode == Mode::AiPanel {
+            // The answer itself was written in the old language: ask again.
+            self.enter_ai_panel();
+        }
+    }
+
+    // Re-run the fetch backing whichever view is on screen. Resolved through `view_mode` so an open
+    // overlay (AI panel, palette, search prompt) refreshes the view underneath it.
     fn refresh_current_view(&self) {
-        match self.mode {
+        match view_mode(self) {
             Mode::Nodes | Mode::NodesFull => self.refresh_nodes(),
             Mode::Flux | Mode::FluxFull => self.refresh_flux(),
             Mode::Pods | Mode::PodsFull => self.schedule_pods_refresh(800),
@@ -2884,7 +2915,7 @@ impl App {
             kind: "Diagnostic".to_string(),
             namespace: String::new(),
             name: self.context_label.clone(),
-            message: "Diagnostic cluster automatisé".to_string(),
+            message: lang::t(self.ai_language).msg_diagnostic_record.to_string(),
             component: "kdt".to_string(),
             host: String::new(),
             count: 1,
@@ -3573,7 +3604,7 @@ impl App {
         let Some((uid, api_version, kind, ns, name)) = self.selected_kustomization() else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "inventaire : sélectionnez un Kustomization".to_string(),
+                lang::t(self.ai_language).msg_inventory_pick_ks.to_string(),
             ));
             return;
         };
@@ -3659,13 +3690,16 @@ impl App {
         let Some((api_version, kind, ns, name)) = target else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucune ressource sélectionnée".to_string(),
+                lang::t(self.ai_language).msg_no_resource_selected.to_string(),
             ));
             return;
         };
         self.clipboard_status = Some((
             std::time::Instant::now(),
-            format!("↻ reconcile demandé : {}/{}…", kind, name),
+            lang::fill(
+                lang::t(self.ai_language).msg_reconcile_requested,
+                &[("kind", &kind), ("name", &name)],
+            ),
         ));
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
@@ -3702,7 +3736,7 @@ impl App {
         else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucune ressource sélectionnée".to_string(),
+                lang::t(self.ai_language).msg_no_resource_selected.to_string(),
             ));
             return;
         };
@@ -4549,7 +4583,10 @@ impl App {
             other => {
                 self.clipboard_status = Some((
                     std::time::Instant::now(),
-                    format!("origine {} : non navigable", other.label()),
+                    lang::fill(
+                        lang::t(self.ai_language).msg_origin_not_navigable,
+                        &[("origin", &other.label())],
+                    ),
                 ));
                 return;
             }
@@ -5088,7 +5125,7 @@ impl App {
         let Some((ns, name)) = target else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucun Secret produit par cette chaîne".to_string(),
+                lang::t(self.ai_language).msg_no_secret_in_chain.to_string(),
             ));
             return;
         };
@@ -5105,7 +5142,10 @@ impl App {
         } else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("secret {}/{} pas encore chargé", ns, name),
+                lang::fill(
+                    lang::t(self.ai_language).msg_secret_not_loaded,
+                    &[("ns", &ns), ("name", &name)],
+                ),
             ));
         }
     }
@@ -5597,13 +5637,14 @@ impl App {
             orphans.retain(|o| o.worst().is_some_and(|l| l >= ReflHintLevel::Warn));
         }
 
+        let st = lang::t(self.ai_language);
         let mut rows: Vec<ReflRow> = Vec::new();
         let mut recs: Vec<EventRecord> = Vec::new();
         match self.refl_world {
             ReflWorld::Sources => {
                 for (i, src) in sources.iter().enumerate() {
                     let collapsed = self.refl_collapsed.contains(&refl_source_key(src));
-                    recs.push(synthetic_refl_source_record(src));
+                    recs.push(synthetic_refl_source_record(src, st));
                     rows.push(ReflRow::Source { idx: i, collapsed });
                     if collapsed { continue; }
                     for (j, t) in src.targets.iter().enumerate() {
@@ -5613,7 +5654,7 @@ impl App {
                         {
                             continue;
                         }
-                        recs.push(synthetic_refl_target_record(src, t));
+                        recs.push(synthetic_refl_target_record(src, t, st));
                         rows.push(ReflRow::Target { src: i, target: j });
                     }
                 }
@@ -5623,7 +5664,7 @@ impl App {
                 for (i, src) in sources.iter().enumerate() {
                     for (j, t) in src.targets.iter().enumerate() {
                         if t.mirror.is_none() { continue; }
-                        recs.push(synthetic_refl_target_record(src, t));
+                        recs.push(synthetic_refl_target_record(src, t, st));
                         rows.push(ReflRow::Target { src: i, target: j });
                     }
                 }
@@ -5874,6 +5915,7 @@ impl App {
         let writes = self.refl_force_writes();
         if writes.is_empty() { return; }
         let n = self.refl_force_count();
+        let st = lang::t(self.ai_language);
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
         let state = self.reflector_state.clone();
@@ -5897,9 +5939,16 @@ impl App {
                 *s = Some((
                     std::time::Instant::now(),
                     if failed.is_empty() {
-                        format!("re-réflexion demandée sur {n} miroir(s)")
+                        st.plural(n, st.msg_refl_forced_one, st.msg_refl_forced_many)
                     } else {
-                        format!("échec sur {} miroir(s) : {}", failed.len(), failed.join(" ; "))
+                        lang::fill(
+                            &st.plural(
+                                failed.len(),
+                                st.msg_refl_force_failed_one,
+                                st.msg_refl_force_failed_many,
+                            ),
+                            &[("list", &failed.join(" ; "))],
+                        )
                     },
                 ));
             }
@@ -5957,7 +6006,7 @@ impl App {
             drop(s);
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucun objet cert-manager sélectionné".to_string(),
+                lang::t(self.ai_language).msg_no_cert_object.to_string(),
             ));
             return;
         };
@@ -5965,7 +6014,7 @@ impl App {
             drop(s);
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucun Certificate dans cette chaîne".to_string(),
+                lang::t(self.ai_language).msg_no_cert_in_chain.to_string(),
             ));
             return;
         };
@@ -6026,7 +6075,7 @@ impl App {
         let Some((api_version, namespace, name)) = target else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "relance refusée : rate limit ACME atteint (ou aucune requête en cours)".to_string(),
+                lang::t(self.ai_language).msg_acme_retry_refused.to_string(),
             ));
             return;
         };
@@ -6045,11 +6094,14 @@ impl App {
     fn open_secrets_copy_menu(&mut self) {
         let Some(s) = self.secret_selected() else { return; };
         if s.data.is_empty() {
-            self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
+            self.clipboard_status = Some((std::time::Instant::now(), lang::t(self.ai_language).msg_nothing_to_copy.to_string()));
             return;
         }
         self.secrets_copy_menu = Some(SecretsCopyMenu {
-            title: format!("copier — {}/{}", s.namespace, s.name),
+            title: lang::fill(
+                lang::t(self.ai_language).msg_copy_picker_title,
+                &[("ns", &s.namespace), ("name", &s.name)],
+            ),
             keys: s.data_keys.clone(),
             cursor: 0,
         });
@@ -6089,7 +6141,10 @@ impl App {
                 self.copy_text(text);
             }
             None => {
-                self.clipboard_status = Some((std::time::Instant::now(), "clé introuvable".to_string()));
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    lang::t(self.ai_language).msg_key_not_found.to_string(),
+                ));
             }
         }
     }
@@ -6185,11 +6240,14 @@ impl App {
         let Some(cm) = self.configmap_selected() else { return; };
         let keys = cm.keys();
         if keys.is_empty() {
-            self.clipboard_status = Some((std::time::Instant::now(), "rien à copier".to_string()));
+            self.clipboard_status = Some((std::time::Instant::now(), lang::t(self.ai_language).msg_nothing_to_copy.to_string()));
             return;
         }
         self.configmaps_copy_menu = Some(ConfigmapsCopyMenu {
-            title: format!("copier — {}/{}", cm.namespace, cm.name),
+            title: lang::fill(
+                lang::t(self.ai_language).msg_copy_picker_title,
+                &[("ns", &cm.namespace), ("name", &cm.name)],
+            ),
             keys,
             cursor: 0,
         });
@@ -6424,7 +6482,10 @@ impl App {
         let Some(cur) = w.replicas else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("scale non supporté pour {}", w.kind),
+                lang::fill(
+                    lang::t(self.ai_language).pods_scale_unsupported,
+                    &[("kind", &w.kind)],
+                ),
             ));
             return;
         };
@@ -6441,7 +6502,10 @@ impl App {
         if w.replicas.is_none() {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("scale non supporté pour {}", w.kind),
+                lang::fill(
+                    lang::t(self.ai_language).pods_scale_unsupported,
+                    &[("kind", &w.kind)],
+                ),
             ));
             return;
         }
@@ -6457,7 +6521,10 @@ impl App {
         if w.replicas.is_none() {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("scale non supporté pour {}", w.kind),
+                lang::fill(
+                    lang::t(self.ai_language).pods_scale_unsupported,
+                    &[("kind", &w.kind)],
+                ),
             ));
             return;
         }
@@ -6474,7 +6541,10 @@ impl App {
         if w.replicas.is_none() {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("scale non supporté pour {}", w.kind),
+                lang::fill(
+                    lang::t(self.ai_language).pods_scale_unsupported,
+                    &[("kind", &w.kind)],
+                ),
             ));
             return;
         }
@@ -6538,7 +6608,7 @@ impl App {
     fn pods_scale_hint(&mut self) {
         self.clipboard_status = Some((
             std::time::Instant::now(),
-            "scale/restart : sélectionnez un workload (ou un de ses pods)".to_string(),
+            lang::t(self.ai_language).msg_scale_pick_workload.to_string(),
         ));
     }
 
@@ -6846,9 +6916,15 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let target = k.latest_patch.clone().unwrap_or_else(|| "?".to_string());
-                let message = format!(
-                    "Kubernetes control-plane\nversion serveur={}\ncible (dernier patch mineure)={}\nretard de patch={}\nEOL={}\nCVEs récentes (feed officiel, non filtrées par version):\n{}",
-                    k.server_version, target, k.behind, k.eol, cve_lines,
+                let message = lang::fill(
+                    lang::t(self.ai_language).rec_k8s_cve,
+                    &[
+                        ("version", &k.server_version),
+                        ("target", &target),
+                        ("behind", &k.behind.to_string()),
+                        ("eol", &k.eol.to_string()),
+                        ("cves", &cve_lines),
+                    ],
                 );
                 Some(EventRecord {
                     uid: format!("vuln|k8s|{}", k.server_version),
@@ -6873,42 +6949,56 @@ impl App {
     // and chain/issuer problems.
     fn synthetic_secrets_record(&self) -> Option<EventRecord> {
         let s = self.secret_selected()?;
-        let mut msg = format!(
-            "secret={}/{}\ntype={}\nclés={}\norigine={}",
-            s.namespace,
-            s.name,
-            s.type_,
-            if s.data_keys.is_empty() { "—".to_string() } else { s.data_keys.join(", ") },
-            s.provenance.label(),
+        let st = lang::t(self.ai_language);
+        let keys = s.data_keys.join(", ");
+        let mut msg = lang::fill(
+            st.rec_secret,
+            &[
+                ("ns", &s.namespace),
+                ("name", &s.name),
+                ("type", &s.type_),
+                ("keys", if s.data_keys.is_empty() { "—" } else { &keys }),
+                ("origin", &s.provenance.label()),
+            ],
         );
         if !s.ingress_refs.is_empty() {
-            msg.push_str(&format!("\ningress consommateurs={}", s.ingress_refs.join(", ")));
+            msg.push_str(&lang::fill(
+                st.rec_secret_ingress,
+                &[("list", &s.ingress_refs.join(", "))],
+            ));
         }
         if let Some(cm) = &s.cert_manager {
             msg.push_str(&format!("\ncert-manager Certificate={cm}"));
         }
         if let Some(c) = &s.tls {
-            msg.push_str(&format!(
-                "\n--- certificat TLS ---\nsubject CN={}\nissuer CN={}\nauto-signé={}\nCA={}\nSAN={}\nvalidité={} → {} ({} jours restants)\nclé={}\nserial={}",
-                c.subject_cn,
-                c.issuer_cn,
-                c.self_signed,
-                c.is_ca,
-                if c.sans.is_empty() { "—".to_string() } else { c.sans.join(", ") },
-                c.not_before,
-                c.not_after,
-                c.days_remaining,
-                c.key_algo,
-                c.serial,
+            let sans = c.sans.join(", ");
+            msg.push_str(&lang::fill(
+                st.rec_secret_tls,
+                &[
+                    ("subject", &c.subject_cn),
+                    ("issuer", &c.issuer_cn),
+                    ("selfsigned", &c.self_signed.to_string()),
+                    ("ca", &c.is_ca.to_string()),
+                    ("san", if c.sans.is_empty() { "—" } else { &sans }),
+                    ("from", &c.not_before),
+                    ("to", &c.not_after),
+                    ("days", &c.days_remaining.to_string()),
+                    ("key", &c.key_algo),
+                    ("serial", &c.serial),
+                ],
             ));
             if let Some(ca) = &c.ca_bundle {
-                msg.push_str(&format!(
-                    "\nCA bundle: CN={} expire {} ({} jours)",
-                    ca.subject_cn, ca.not_after, ca.days_remaining,
+                msg.push_str(&lang::fill(
+                    st.rec_ca_bundle,
+                    &[
+                        ("cn", &ca.subject_cn),
+                        ("date", &ca.not_after),
+                        ("days", &ca.days_remaining.to_string()),
+                    ],
                 ));
             }
         } else if let Some(e) = &s.tls_error {
-            msg.push_str(&format!("\ncertificat TLS illisible: {e}"));
+            msg.push_str(&lang::fill(st.rec_tls_unreadable, &[("e", e)]));
         }
         let reason = match s.tls.as_ref().map(|c| c.expiry) {
             Some(Expiry::Expired) => "SECRET/TLS-EXPIRED",
@@ -6940,13 +7030,15 @@ impl App {
     // the model can explain what the configuration does or spot misconfigurations.
     fn synthetic_configmaps_record(&self) -> Option<EventRecord> {
         let cm = self.configmap_selected()?;
-        let mut msg = format!(
-            "configmap={}/{}\norigine={}\nclés texte={} · clés binaires={}",
-            cm.namespace,
-            cm.name,
-            cm.provenance.label(),
-            cm.data.len(),
-            cm.binary_keys.len(),
+        let mut msg = lang::fill(
+            lang::t(self.ai_language).rec_configmap,
+            &[
+                ("ns", &cm.namespace),
+                ("name", &cm.name),
+                ("origin", &cm.provenance.label()),
+                ("text", &cm.data.len().to_string()),
+                ("binary", &cm.binary_keys.len().to_string()),
+            ],
         );
         for (k, v) in &cm.data {
             let val: String = v.chars().take(2000).collect();
@@ -6974,9 +7066,12 @@ impl App {
     fn synthetic_node_record(&self) -> Option<EventRecord> {
         let n = self.selected_node()?;
         let abnormal = if n.abnormal.is_empty() {
-            "aucune condition anormale".to_string()
+            lang::t(self.ai_language).msg_no_abnormal_condition.to_string()
         } else {
-            format!("conditions anormales: {}", n.abnormal.join(", "))
+            lang::fill(
+                lang::t(self.ai_language).msg_abnormal_conditions,
+                &[("list", &n.abnormal.join(", "))],
+            )
         };
         Some(EventRecord {
             uid: format!("node-{}", n.name),
@@ -7037,14 +7132,14 @@ impl App {
         let Some(ns) = ns else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "aucun namespace sur l'élément sélectionné".to_string(),
+                lang::t(self.ai_language).msg_no_namespace_on_row.to_string(),
             ));
             return;
         };
         if self.namespace_label == ns {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                format!("déjà filtré sur {}", ns),
+                lang::fill(lang::t(self.ai_language).msg_already_filtered, &[("ns", &ns)]),
             ));
             return;
         }
@@ -7070,7 +7165,7 @@ impl App {
         if self.namespace_label == "all" {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                "déjà sur tous les namespaces".to_string(),
+                lang::t(self.ai_language).msg_already_all_namespaces.to_string(),
             ));
             return;
         }
@@ -7511,6 +7606,12 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('m'), _, Mode::NsPicker) => {}
         (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
 
+        // Language toggle, available from every view. The prompt modes never get here (the arms
+        // above feed every character to the query being typed); these three swallow `l` instead of
+        // switching language, as they always have.
+        (KeyCode::Char('l'), _, Mode::NsPicker | Mode::Extract | Mode::FluxLogs) => {}
+        (KeyCode::Char('l'), _, _) => app.toggle_language(),
+
         (KeyCode::Up, _, Mode::NsPicker) => {
             if app.ns_cursor > 0 { app.ns_cursor -= 1; }
         }
@@ -7531,10 +7632,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::PageDown, _, Mode::AiPanel) => app.ai_scroll = app.ai_scroll.saturating_add(10),
         (KeyCode::Char('g'), _, Mode::AiPanel) => app.ai_scroll = 0,
         (KeyCode::Char('G'), _, Mode::AiPanel) => app.ai_scroll = usize::MAX / 2,
-        (KeyCode::Char('l'), _, Mode::AiPanel) => {
-            app.ai_language = app.ai_language.toggle();
-            app.enter_ai_panel();
-        }
         (KeyCode::Char('p' | 'P'), _, Mode::AiPanel) if app.return_mode == Mode::Diagnostic => {
             app.export_diagnostic_pdf(true);
         }
@@ -7564,7 +7661,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::DetailFull) => app.exit_detail_full(),
         (KeyCode::Esc, _, Mode::DetailFull) => app.exit_detail_full(),
         (KeyCode::Char('i'), _, Mode::DetailFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::DetailFull) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('g'), _, Mode::DetailFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::DetailFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('s'), _, Mode::DetailFull) => app.scroll_frozen = !app.scroll_frozen,
@@ -7581,7 +7677,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Esc, _, Mode::Nodes) => app.exit_nodes_mode(),
         (KeyCode::Char('r'), _, Mode::Nodes) => app.refresh_nodes(),
         (KeyCode::Char('i'), _, Mode::Nodes) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Nodes) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('N'), _, Mode::Nodes) => app.exit_nodes_mode(),
         (KeyCode::Char('u'), _, Mode::Nodes) => app.enter_node_usage(),
         (KeyCode::Char('o'), _, Mode::Nodes | Mode::NodesFull) => app.open_node_ops_menu(),
@@ -7597,7 +7692,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::NodeUsage) => app.node_usage_scroll = usize::MAX / 2,
         (KeyCode::Char('r'), _, Mode::NodeUsage) => app.refresh_node_usage(),
         (KeyCode::Char('i'), _, Mode::NodeUsage) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::NodeUsage) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('s'), _, Mode::NodeUsage) => {
             app.node_usage_sort = app.node_usage_sort.next();
             app.node_usage_scroll = 0;
@@ -7624,7 +7718,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::NodesFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::NodesFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('i'), _, Mode::NodesFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::NodesFull) => app.ai_language = app.ai_language.toggle(),
 
         (KeyCode::Up, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
@@ -7653,7 +7746,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::Flux) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Flux) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Flux) => app.scroll_detail_bottom(),
-        (KeyCode::Char('l'), _, Mode::Flux) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Flux) => {}
 
         (KeyCode::Up, m, Mode::FluxFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -7678,7 +7770,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('z'), _, Mode::FluxFull) => app.toggle_suspend(),
         (KeyCode::Char('L'), _, Mode::FluxFull) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::FluxFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::FluxFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::FluxFull) => {}
 
         (KeyCode::Up, _, Mode::FluxLogs) => app.scroll_detail(1),
@@ -7710,7 +7801,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::Pods) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
-        (KeyCode::Char('l'), _, Mode::Pods) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('t'), _, Mode::Pods) => app.toggle_pods_workloads(),
         (_, _, Mode::Pods) => {}
 
@@ -7732,7 +7822,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::PodsFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::PodsFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('i'), _, Mode::PodsFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::PodsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::PodsFull) => {}
 
         (KeyCode::Up, m, Mode::Rbac) if m.contains(KeyModifiers::SHIFT) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(1),
@@ -7747,7 +7836,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Rbac) => app.refresh_rbac(),
         (KeyCode::Esc, _, Mode::Rbac) => app.exit_rbac_mode(),
         (KeyCode::Char('i'), _, Mode::Rbac) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Rbac) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Rbac) => {}
 
         (KeyCode::Up, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(1),
@@ -7758,7 +7846,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::RbacFull) => app.exit_rbac_full(),
         (KeyCode::Esc, _, Mode::RbacFull) => app.exit_rbac_full(),
         (KeyCode::Char('i'), _, Mode::RbacFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::RbacFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::RbacFull) => {}
 
         (KeyCode::Up, m, Mode::Vuln) if m.contains(KeyModifiers::SHIFT) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
@@ -7772,7 +7859,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Vuln) => app.refresh_vulnerabilities(),
         (KeyCode::Esc, _, Mode::Vuln) => app.exit_vuln_mode(),
         (KeyCode::Char('i'), _, Mode::Vuln) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Vuln) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Vuln) => {}
 
         (KeyCode::Up, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
@@ -7783,7 +7869,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::VulnFull) => app.exit_vuln_full(),
         (KeyCode::Esc, _, Mode::VulnFull) => app.exit_vuln_full(),
         (KeyCode::Char('i'), _, Mode::VulnFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::VulnFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::VulnFull) => {}
 
         (KeyCode::Up, m, Mode::Secrets) if m.contains(KeyModifiers::SHIFT) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
@@ -7802,7 +7887,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Secrets) => app.refresh_secrets(),
         (KeyCode::Esc, _, Mode::Secrets) => app.exit_secrets_mode(),
         (KeyCode::Char('i'), _, Mode::Secrets) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Secrets) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Secrets) => {}
 
         (KeyCode::Up, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
@@ -7816,7 +7900,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::SecretsFull) => app.exit_secrets_full(),
         (KeyCode::Esc, _, Mode::SecretsFull) => app.exit_secrets_full(),
         (KeyCode::Char('i'), _, Mode::SecretsFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::SecretsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::SecretsFull) => {}
 
         (KeyCode::Up, m, Mode::Certs) if m.contains(KeyModifiers::SHIFT) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
@@ -7834,7 +7917,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Certs) => app.refresh_certs(),
         (KeyCode::Esc, _, Mode::Certs) => app.exit_certs_mode(),
         (KeyCode::Char('i'), _, Mode::Certs) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Certs) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Certs) => {}
 
         (KeyCode::Up, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
@@ -7847,7 +7929,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::CertsFull) => app.exit_certs_full(),
         (KeyCode::Esc, _, Mode::CertsFull) => app.exit_certs_full(),
         (KeyCode::Char('i'), _, Mode::CertsFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::CertsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::CertsFull) => {}
 
         (KeyCode::Up, m, Mode::Kyverno) if m.contains(KeyModifiers::SHIFT) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_sub(1),
@@ -7863,7 +7944,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Kyverno) => app.refresh_kyverno(),
         (KeyCode::Esc, _, Mode::Kyverno) => app.exit_kyverno_mode(),
         (KeyCode::Char('i'), _, Mode::Kyverno) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Kyverno) => app.ai_language = app.ai_language.toggle(),
         // Catch-all: without it the global keys (`q`, the horizontal scroll) leak into this view.
         (_, _, Mode::Kyverno) => {}
 
@@ -7875,7 +7955,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
         (KeyCode::Esc, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
         (KeyCode::Char('i'), _, Mode::KyvernoFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::KyvernoFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::KyvernoFull) => {}
 
         (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
@@ -7891,7 +7970,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Configmaps) => app.refresh_configmaps(),
         (KeyCode::Esc, _, Mode::Configmaps) => app.exit_configmaps_mode(),
         (KeyCode::Char('i'), _, Mode::Configmaps) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Configmaps) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Configmaps) => {}
 
         (KeyCode::Up, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
@@ -7905,7 +7983,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::ConfigmapsFull) => app.exit_configmaps_full(),
         (KeyCode::Esc, _, Mode::ConfigmapsFull) => app.exit_configmaps_full(),
         (KeyCode::Char('i'), _, Mode::ConfigmapsFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::ConfigmapsFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ConfigmapsFull) => {}
 
         (KeyCode::Up, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -7926,7 +8003,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::Services) => app.cycle_network_world(),
         (KeyCode::F(5), _, Mode::Services) => app.refresh_network(),
         (KeyCode::Char('i'), _, Mode::Services) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Services) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Services) => {}
 
         (KeyCode::Up, m, Mode::ServicesFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -7947,7 +8023,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::ServicesFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::ServicesFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('i'), _, Mode::ServicesFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::ServicesFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ServicesFull) => {}
 
         (KeyCode::Up, m, Mode::Capacity) if m.contains(KeyModifiers::SHIFT) => {
@@ -7966,7 +8041,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('f'), _, Mode::Capacity) => app.cycle_capacity_filter(),
         (KeyCode::F(5), _, Mode::Capacity) => app.refresh_capacity(),
         (KeyCode::Char('i'), _, Mode::Capacity) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Capacity) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Capacity) => {}
 
         (KeyCode::Up, m, Mode::CapacityFull) if !m.contains(KeyModifiers::SHIFT) => {
@@ -7986,7 +8060,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::CapacityFull) => app.exit_capacity_full(),
         (KeyCode::Esc, _, Mode::CapacityFull) => app.exit_capacity_full(),
         (KeyCode::Char('i'), _, Mode::CapacityFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::CapacityFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::CapacityFull) => {}
 
         (KeyCode::Up, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
@@ -8006,7 +8079,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('n'), _, Mode::Reflector) => app.filter_ns_to_selected(),
         (KeyCode::Char('0'), _, Mode::Reflector) => app.clear_namespace_filter(),
         (KeyCode::Char('i'), _, Mode::Reflector) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Reflector) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Reflector) => {}
 
         (KeyCode::Up, m, Mode::ReflectorFull) if !m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
@@ -8019,7 +8091,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::ReflectorFull) => app.refl_detail_scroll = usize::MAX / 2,
         (KeyCode::Char('r'), _, Mode::ReflectorFull) => app.open_reflector_action_menu(),
         (KeyCode::Char('i'), _, Mode::ReflectorFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::ReflectorFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::ReflectorFull) => {}
 
         (KeyCode::Up, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -8041,7 +8112,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('f'), _, Mode::Storage) => app.cycle_storage_filter(),
         (KeyCode::F(5), _, Mode::Storage) => app.refresh_storage(),
         (KeyCode::Char('i'), _, Mode::Storage) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Storage) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::Storage) => {}
 
         (KeyCode::Up, m, Mode::StorageFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -8062,7 +8132,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::StorageFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::StorageFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('i'), _, Mode::StorageFull) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::StorageFull) => app.ai_language = app.ai_language.toggle(),
         (_, _, Mode::StorageFull) => {}
 
         (KeyCode::Left, m, _) if !m.contains(KeyModifiers::SHIFT) => {
@@ -8093,7 +8162,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::Diagnostic) => app.diagnostic_scroll = usize::MAX / 2,
         (KeyCode::Char('r'), _, Mode::Diagnostic) => app.refresh_diagnostic(),
         (KeyCode::Char('i'), _, Mode::Diagnostic) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Diagnostic) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Char('p' | 'P'), _, Mode::Diagnostic) => app.export_diagnostic_pdf(false),
         (KeyCode::Char('c'), _, Mode::Diagnostic) => app.copy_current_view(),
         (_, _, Mode::Diagnostic) => {}
@@ -8114,7 +8182,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('N'), _, Mode::Selection) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('N'), _, Mode::DetailFull) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('i'), _, Mode::Selection) => app.enter_ai_panel(),
-        (KeyCode::Char('l'), _, Mode::Selection) => app.ai_language = app.ai_language.toggle(),
         (KeyCode::Enter, _, Mode::Selection) => app.enter_detail_full(),
         (KeyCode::Up, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
@@ -9484,7 +9551,7 @@ fn drain_reason_text(st: &lang::Strings, reason: &NodeReason) -> String {
         NodeReason::ControlPlane => st.dr_control_plane.to_string(),
         NodeReason::AlreadyCordoned => st.dr_already_cordoned.to_string(),
         NodeReason::NotReady => st.dr_not_ready.to_string(),
-        NodeReason::DaemonSetPods { count } => st.dr_daemonsets.replace("{n}", &count.to_string()),
+        NodeReason::DaemonSetPods { count } => st.plural(*count, st.dr_daemonsets_one, st.dr_daemonsets_many),
     }
 }
 
@@ -9520,11 +9587,11 @@ fn draw_node_op_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         let to_evict = s.to_evict();
         let skipped = s.candidates.len() - to_evict;
-        let mut plan = st.drain_plan.replace("{n}", &to_evict.to_string());
+        let mut plan = st.plural(to_evict, st.drain_plan_one, st.drain_plan_many);
         if skipped > 0 {
             plan.push_str(&format!(
                 " · {}",
-                st.drain_plan_skipped.replace("{n}", &skipped.to_string())
+                st.plural(skipped, st.drain_plan_skipped_one, st.drain_plan_skipped_many)
             ));
         }
         lines.push(Line::from(Span::styled(plan, Style::default().fg(Color::Cyan))));
@@ -9896,7 +9963,7 @@ fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ choisir · Enter copier (déchiffré) · Esc annuler",
+            lang::t(app.ai_language).hint_secret_copy_picker,
             Style::default().fg(DIM),
         ))),
         chunks[1],
@@ -10303,9 +10370,16 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ];
         let user_count = rows.iter().filter(|r| !r.is_system).count();
         let sys_count = rows.iter().filter(|r| r.is_system).count();
-        let title = format!(
-            " {} user + {} system (·) · {} req-manquant · {} sur-provisionné · {} lim-excessif · {} à-la-limite ",
-            user_count, sys_count, missing_req, over_req, excessive_lim, at_limit,
+        let title = lang::fill(
+            lang::t(app.ai_language).node_usage_title,
+            &[
+                ("user", &user_count.to_string()),
+                ("system", &sys_count.to_string()),
+                ("missing", &missing_req.to_string()),
+                ("over", &over_req.to_string()),
+                ("excess", &excessive_lim.to_string()),
+                ("atlimit", &at_limit.to_string()),
+            ],
         );
         let table = Table::new(body_rows, widths)
             .header(header_row)
@@ -10330,7 +10404,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st_f.k_refresh)),
         Span::styled(" s ", kbg), Span::raw(format!(" {}:{}   ", st_f.k_sort, app.node_usage_sort.label())),
         Span::styled(" p ", kbg), Span::raw(format!(" {}   ", st_f.k_pdf)),
-        Span::styled(" c ", kbg), Span::raw(" copier   "),
+        Span::styled(" c ", kbg), Span::raw(st_f.k_copy_word),
         Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st_f.k_ai)),
         Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st_f.k_lang, app.ai_language.label())),
     ];
@@ -10344,6 +10418,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc_mem: i64) -> Vec<Line<'static>> {
     use crate::events::{format_cpu_milli, format_memory_bytes};
+    let st = lang::active();
     let (mut u_cr, mut u_cl, mut u_cu) = (0_i64, 0_i64, 0_i64);
     let (mut u_mr, mut u_ml, mut u_mu) = (0_i64, 0_i64, 0_i64);
     let (mut s_cr, mut s_cl, mut s_cu) = (0_i64, 0_i64, 0_i64);
@@ -10419,9 +10494,15 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
             Span::styled(format!("{:<6}", "WASTE"), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("(req-use) ", Style::default().fg(DIM)),
             Span::raw("cpu="), Span::styled(format_cpu_milli(cpu_waste), Style::default().fg(Color::Yellow)),
-            Span::styled(format!(" ({}% non utilisé)  ", waste_cpu_pct), Style::default().fg(if waste_cpu_pct > 50 { Color::Yellow } else { DIM })),
+            Span::styled(
+                format!("{}  ", lang::fill(st.node_usage_waste, &[("pct", &waste_cpu_pct.to_string())])),
+                Style::default().fg(if waste_cpu_pct > 50 { Color::Yellow } else { DIM }),
+            ),
             Span::raw("mem="), Span::styled(format_memory_bytes(mem_waste), Style::default().fg(Color::Yellow)),
-            Span::styled(format!(" ({}% non utilisé)", waste_mem_pct), Style::default().fg(if waste_mem_pct > 50 { Color::Yellow } else { DIM })),
+            Span::styled(
+                lang::fill(st.node_usage_waste, &[("pct", &waste_mem_pct.to_string())]),
+                Style::default().fg(if waste_mem_pct > 50 { Color::Yellow } else { DIM }),
+            ),
         ]),
     ]
 }
@@ -10684,7 +10765,7 @@ fn draw_diagnostic_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_relaunch)),
         Span::styled(" p ", kbg), Span::raw(format!(" {}   ", st.k_pdf)),
-        Span::styled(" c ", kbg), Span::raw(" copier   "),
+        Span::styled(" c ", kbg), Span::raw(st.k_copy_word),
         Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_send_to_ai)),
         Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
     ];
@@ -10744,7 +10825,7 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else if loading && content.is_empty() {
         (loading_lines(&stage, started_at, sections_count, &model, app.ai_language), Color::Yellow)
     } else if content.is_empty() {
-        (vec![Line::from("(réponse vide)")], DIM)
+        (vec![Line::from(lang::t(app.ai_language).ai_empty_answer)], DIM)
     } else {
         (render_markdown_lines(&content, popup_width.saturating_sub(2) as usize), Color::Cyan)
     };
@@ -11018,7 +11099,10 @@ fn synthetic_rule_record(p: &KyPolicy, rule: &str) -> EventRecord {
         uid: format!("kyrule|{}|{}", p.uid(), rule),
         reason: "Rule".to_string(),
         severity: Severity::Normal,
-        message: format!("{} · règle {}", p.name, rule),
+        message: lang::fill(
+            lang::active().rec_rule,
+            &[("policy", &p.name), ("rule", rule)],
+        ),
         ..synthetic_policy_record(p)
     }
 }
@@ -11263,14 +11347,19 @@ fn synthetic_capacity_record(row: &CapRow) -> EventRecord {
             kind: "Node".to_string(),
             namespace: String::new(),
             name: n.name.clone(),
-            message: format!(
-                "réservé cpu {}/{} mem {}/{} · {} pods · {}",
-                cap::cpu_text(n.req_cpu),
-                cap::cpu_text(n.alloc_cpu),
-                cap::mem_text(n.req_mem),
-                cap::mem_text(n.alloc_mem),
-                n.pods,
-                n.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
+            message: lang::fill(
+                lang::active().rec_node_capacity,
+                &[
+                    ("cpureq", &cap::cpu_text(n.req_cpu)),
+                    ("cpualloc", &cap::cpu_text(n.alloc_cpu)),
+                    ("memreq", &cap::mem_text(n.req_mem)),
+                    ("memalloc", &cap::mem_text(n.alloc_mem)),
+                    ("pods", &n.pods.to_string()),
+                    (
+                        "loss",
+                        &n.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
+                    ),
+                ],
             ),
             component: String::new(),
             host: n.name.clone(),
@@ -11329,11 +11418,12 @@ fn workload_api_version(kind: &str) -> &'static str {
 }
 
 fn loss_word(loss: &CapLoss) -> &'static str {
+    let st = lang::active();
     match loss {
-        CapLoss::Alone => "SeulNoeud",
-        CapLoss::Fits => "Absorbable",
-        CapLoss::Tight => "Juste",
-        CapLoss::Homeless(_) => "SansPlace",
+        CapLoss::Alone => st.cap_loss_word_alone,
+        CapLoss::Fits => st.cap_loss_word_fits,
+        CapLoss::Tight => st.cap_loss_word_tight,
+        CapLoss::Homeless(_) => st.cap_loss_word_homeless,
     }
 }
 
@@ -11353,7 +11443,7 @@ fn refl_severity(level: Option<ReflHintLevel>) -> Severity {
 // The synthetic records below are what gives the view `y`, `Ctrl-D` and the Related tab: they name a
 // real object, so the generic machinery can fetch and act on it. A target with no mirror still gets
 // a record — it names the object that *should* be there, which is what one wants to copy or create.
-fn synthetic_refl_source_record(src: &ReflSource) -> EventRecord {
+fn synthetic_refl_source_record(src: &ReflSource, st: &'static Strings) -> EventRecord {
     let (synced, expected) = src.tally();
     EventRecord {
         uid: format!("refl|src|{}", refl_source_key(src)),
@@ -11364,12 +11454,13 @@ fn synthetic_refl_source_record(src: &ReflSource) -> EventRecord {
         kind: src.kind.label().to_string(),
         namespace: src.namespace.clone(),
         name: src.name.clone(),
-        message: format!(
-            "source · {} destination(s) auto · {}/{} à jour{}",
-            expected,
-            synced,
-            expected,
-            if src.scope_known { "" } else { " · portée indéterminée" },
+        message: lang::fill(
+            &st.plural(expected, st.refl_rec_source_one, st.refl_rec_source_many),
+            &[
+                ("synced", &synced.to_string()),
+                ("expected", &expected.to_string()),
+                ("scope", if src.scope_known { "" } else { st.refl_rec_scope_unknown }),
+            ],
         ),
         component: String::new(),
         host: String::new(),
@@ -11377,26 +11468,36 @@ fn synthetic_refl_source_record(src: &ReflSource) -> EventRecord {
     }
 }
 
-fn synthetic_refl_target_record(src: &ReflSource, t: &ReflTarget) -> EventRecord {
+fn synthetic_refl_target_record(
+    src: &ReflSource,
+    t: &ReflTarget,
+    st: &'static Strings,
+) -> EventRecord {
     EventRecord {
         uid: format!("refl|tgt|{}/{}|{}", src.namespace, src.name, t.namespace),
         time: k8s_openapi::jiff::Timestamp::now(),
         severity: refl_severity(t.worst()),
-        reason: t.status.label().to_string(),
+        reason: t.status.label(st).to_string(),
         api_version: "v1".to_string(),
         kind: src.kind.label().to_string(),
         namespace: t.namespace.clone(),
         name: src.name.clone(),
-        message: format!(
-            "miroir de {}/{} · {}{}",
-            src.namespace,
-            src.name,
-            t.status.label(),
-            match &t.mirror {
-                Some(m) if !m.reflected_age.is_empty() =>
-                    format!(" · dernier passage il y a {}", m.reflected_age),
-                _ => String::new(),
-            },
+        message: lang::fill(
+            st.refl_rec_mirror,
+            &[
+                ("ns", &src.namespace),
+                ("name", &src.name),
+                ("status", t.status.label(st)),
+                (
+                    "age",
+                    &match &t.mirror {
+                        Some(m) if !m.reflected_age.is_empty() => {
+                            lang::fill(st.refl_rec_last_pass, &[("age", &m.reflected_age)])
+                        }
+                        _ => String::new(),
+                    },
+                ),
+            ],
         ),
         component: String::new(),
         host: String::new(),
@@ -11410,7 +11511,7 @@ fn synthetic_refl_orphan_record(o: &ReflOrphan) -> EventRecord {
         uid: format!("refl|orph|{}/{}", o.namespace, o.name),
         time: k8s_openapi::jiff::Timestamp::now(),
         severity: refl_severity(o.worst()),
-        reason: "Orphelin".to_string(),
+        reason: lang::active().rec_orphan.to_string(),
         api_version: "v1".to_string(),
         kind: o.kind.label().to_string(),
         namespace: o.namespace.clone(),
@@ -11428,27 +11529,32 @@ fn synthetic_storage_record(row: &StoRow) -> EventRecord {
         if r.has_problem() { Severity::Warning } else { Severity::Normal }
     };
     match row {
-        StoRow::Claim(c) => EventRecord {
-            uid: format!("sto|{}", c.uid),
-            time: now,
-            severity: severity(row),
-            reason: c.phase.clone(),
-            api_version: "v1".to_string(),
-            kind: "PersistentVolumeClaim".to_string(),
-            namespace: c.namespace.clone(),
-            name: c.name.clone(),
-            message: format!(
-                "{} {} class={} pv={} monté par {}",
-                if c.capacity.is_empty() { c.requested.clone() } else { c.capacity.clone() },
-                c.access_modes,
-                c.storage_class.clone().unwrap_or_else(|| "—".to_string()),
-                c.volume_name.clone().unwrap_or_else(|| "—".to_string()),
-                if c.mounted_by.is_empty() { "—".to_string() } else { c.mounted_by.join(",") },
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
+        StoRow::Claim(c) => {
+            let mounts = c.mounted_by.join(",");
+            EventRecord {
+                uid: format!("sto|{}", c.uid),
+                time: now,
+                severity: severity(row),
+                reason: c.phase.clone(),
+                api_version: "v1".to_string(),
+                kind: "PersistentVolumeClaim".to_string(),
+                namespace: c.namespace.clone(),
+                name: c.name.clone(),
+                message: lang::fill(
+                    lang::active().rec_pvc,
+                    &[
+                        ("size", if c.capacity.is_empty() { &c.requested } else { &c.capacity }),
+                        ("modes", &c.access_modes),
+                        ("class", c.storage_class.as_deref().unwrap_or("—")),
+                        ("pv", c.volume_name.as_deref().unwrap_or("—")),
+                        ("mounts", if c.mounted_by.is_empty() { "—" } else { &mounts }),
+                    ],
+                ),
+                component: String::new(),
+                host: String::new(),
+                count: 1,
+            }
+        }
         StoRow::Volume(v) => EventRecord {
             uid: format!("sto|{}", v.uid),
             time: now,
@@ -11926,20 +12032,21 @@ fn refl_hint_color(level: Option<ReflHintLevel>) -> Option<Color> {
 
 // The status cell, coloured by what the status costs: SYNC is fine, the waiting ones are questions,
 // and the three that reflector will never resolve on its own are red.
-fn refl_status_cell(status: TargetStatus) -> Cell<'static> {
+fn refl_status_cell(status: TargetStatus, st: &'static Strings) -> Cell<'static> {
     let color = match status {
         TargetStatus::Synced => Color::Green,
         TargetStatus::Stale | TargetStatus::Pending | TargetStatus::Missing => Color::Yellow,
         TargetStatus::Blocked | TargetStatus::Drifted => Color::Red,
         TargetStatus::Manual => DIM,
     };
-    Cell::from(status.label()).style(Style::default().fg(color))
+    Cell::from(status.label(st)).style(Style::default().fg(color))
 }
 
 // One shape for all three worlds, because the columns answer the same questions whichever object
 // owns the row: where it is, what it is, what state the copy is in, against which version, since
 // when. The last column is a fixed length, never `Min`, so the right border holds at every width.
 fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
     let (loading, error, n_src, n_mirror, n_problem, controller) = {
         let s = app.reflector_state.lock().expect("reflector poisoned");
         let (a, b, c) = s.summary();
@@ -11947,25 +12054,33 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let world = match app.refl_world {
-        ReflWorld::Sources => "sources",
-        ReflWorld::Mirrors => "miroirs",
-        ReflWorld::Orphans => "orphelins",
+        ReflWorld::Sources => st.refl_world_sources,
+        ReflWorld::Mirrors => st.refl_world_mirrors,
+        ReflWorld::Orphans => st.refl_world_orphans,
     };
     // The controller's absence belongs in the title: it explains every row at once, and it is the
     // reason to open this view at all when nothing moves.
     let ctrl = match controller {
-        Some(true) => String::new(),
-        Some(false) => " · CONTRÔLEUR ABSENT".to_string(),
-        None => " · contrôleur non vérifié".to_string(),
+        Some(true) => "",
+        Some(false) => st.refl_ctrl_absent,
+        None => st.refl_ctrl_unknown,
     };
     let title = if let Some(e) = &error {
-        format!("reflector (erreur: {e})")
+        lang::fill(st.ui_title_error, &[("view", "reflector"), ("e", e)])
     } else if loading && app.refl_rows.is_empty() {
-        "reflector (chargement...)".to_string()
+        lang::fill(st.ui_title_loading, &[("view", "reflector")])
     } else {
-        format!(
-            "reflector/{} ({} source · {} miroir · {} à voir){} · ns={} · [f] {}",
-            world, n_src, n_mirror, n_problem, ctrl, app.namespace_label, app.refl_filter.label(),
+        lang::fill(
+            st.refl_title,
+            &[
+                ("world", world),
+                ("sources", &n_src.to_string()),
+                ("mirrors", &n_mirror.to_string()),
+                ("problems", &n_problem.to_string()),
+                ("ctrl", ctrl),
+                ("ns", &app.namespace_label),
+                ("filter", app.refl_filter.label()),
+            ],
         )
     };
 
@@ -12029,9 +12144,9 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     None => "—".to_string(),
                 };
                 let role = match &t.mirror {
-                    Some(m) if m.auto => "miroir auto",
-                    Some(_) => "miroir",
-                    None if t.auto => "attendu",
+                    Some(m) if m.auto => st.refl_role_auto,
+                    Some(_) => st.refl_role_manual,
+                    None if t.auto => st.refl_role_expected,
                     None => "—",
                 };
                 Row::new(vec![
@@ -12039,7 +12154,7 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{indent}{}", s.name)).style(name_style),
                     Cell::from(s.kind.label()).style(Style::default().fg(DIM)),
                     Cell::from(role).style(Style::default().fg(DIM)),
-                    refl_status_cell(t.status),
+                    refl_status_cell(t.status, st),
                     Cell::from(version).style(Style::default().fg(DIM)),
                     Cell::from(age).style(Style::default().fg(DIM)),
                     alert(&t.hints),
@@ -12056,7 +12171,7 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(o.name.clone()).style(name_style),
                     Cell::from(o.kind.label()).style(Style::default().fg(DIM)),
                     Cell::from("orphelin").style(Style::default().fg(Color::Red)),
-                    Cell::from("ORPHELIN").style(Style::default().fg(Color::Red)),
+                    Cell::from("ORPHAN").style(Style::default().fg(Color::Red)),
                     Cell::from(refl_short_version(&o.mirror.reflected_version))
                         .style(Style::default().fg(DIM)),
                     Cell::from(o.age.clone()).style(Style::default().fg(DIM)),
@@ -12152,7 +12267,7 @@ fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
     let Some((title, mut lines)) = reflector_detail_lines(app, &cluster_hints) else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez une source, un miroir ou un orphelin ",
+            lang::t(app.ai_language).refl_empty_select,
             Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" reflector "));
@@ -12178,6 +12293,7 @@ fn reflector_detail_lines(
     app: &App,
     cluster_hints: &[crate::reflector::Hint],
 ) -> Option<(Line<'static>, Vec<Line<'static>>)> {
+    let st = lang::t(app.ai_language);
     // Width chosen so the longest label ("allowed-namespaces", "créé par reflector" — 18 chars
     // each) still leaves a gap before the value instead of running into it.
     let label = |k: &str, v: String| {
@@ -12208,11 +12324,11 @@ fn reflector_detail_lines(
                 lines.push(label("type", src.type_.clone()));
             }
             lines.push(label("resourceVersion", dash(&src.resource_version)));
-            lines.push(label("provenance", src.provenance.label()));
-            lines.push(label("âge", src.age.clone()));
+            lines.push(label(st.lbl_provenance, src.provenance.label()));
+            lines.push(label(st.lbl_age, src.age.clone()));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Annotations".to_string(),
+                st.lbl_annotations.to_string(),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )));
             lines.push(label("allowed", if src.props.allowed { "true".into() } else { "false".to_string() }));
@@ -12221,7 +12337,7 @@ fn reflector_detail_lines(
             lines.push(label(
                 "allowed-namespaces",
                 if src.props.allowed_ns.is_empty() {
-                    "\"\" (tous les namespaces)".to_string()
+                    st.refl_all_namespaces.to_string()
                 } else {
                     src.props.allowed_ns.clone()
                 },
@@ -12233,7 +12349,7 @@ fn reflector_detail_lines(
             lines.push(label(
                 "auto-namespaces",
                 if src.props.auto_ns.is_empty() {
-                    "\"\" (tous les namespaces)".to_string()
+                    st.refl_all_namespaces.to_string()
                 } else {
                     src.props.auto_ns.clone()
                 },
@@ -12243,70 +12359,95 @@ fn reflector_detail_lines(
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Portée résolue".to_string(),
+                st.refl_scope_title.to_string(),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )));
             if !src.scope_known {
-                lines.push(label("destinations", "indéterminée (sélecteur illisible)".to_string()));
+                lines.push(label(st.refl_lbl_destinations, st.refl_dest_unknown.to_string()));
             } else if src.targets.is_empty() {
-                lines.push(label("destinations", "aucun namespace ne correspond".to_string()));
+                lines.push(label(st.refl_lbl_destinations, st.refl_dest_none.to_string()));
             } else {
-                lines.push(label("auto", format!("{synced}/{expected} à jour")));
+                lines.push(label(
+                    "auto",
+                    lang::fill(
+                        st.refl_dest_uptodate,
+                        &[
+                            ("synced", &synced.to_string()),
+                            ("expected", &expected.to_string()),
+                        ],
+                    ),
+                ));
                 for t in &src.targets {
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {:<20}", ""), Style::default().fg(DIM)),
                         // 12, not 10: "EN ATTENTE" is exactly 10 and would touch the namespace.
                         Span::styled(
-                            format!("{:<12}", t.status.label()),
+                            format!("{:<12}", t.status.label(st)),
                             Style::default().fg(refl_hint_color(t.worst()).unwrap_or(Color::Green)),
                         ),
                         Span::raw(t.namespace.clone()),
                         Span::styled(
-                            if t.auto { "".to_string() } else { "  (hors portée auto)".to_string() },
+                            if t.auto { "" } else { st.refl_out_of_auto },
                             Style::default().fg(DIM),
                         ),
                     ]));
                 }
             }
             own_hints = src.hints.clone();
-            banner(format!(" source {} {}/{} ", src.kind.label(), src.namespace, src.name))
+            banner(lang::fill(
+                st.refl_banner_source,
+                &[
+                    ("kind", src.kind.label()),
+                    ("ns", &src.namespace),
+                    ("name", &src.name),
+                ],
+            ))
         }
         ReflRow::Target { src, target } => {
             let s = app.refl_view_sources.get(*src)?;
             let t = s.targets.get(*target)?;
-            lines.push(label("état", t.status.label().to_string()));
+            lines.push(label(st.lbl_state, t.status.label(st).to_string()));
             lines.push(label("source", format!("{}/{}", s.namespace, s.name)));
             lines.push(label("kind", s.kind.label().to_string()));
             lines.push(label(
-                "portée",
-                if t.auto { "automatique".to_string() } else { "à la main".to_string() },
+                st.lbl_scope,
+                if t.auto { st.refl_scope_auto } else { st.refl_scope_manual }.to_string(),
             ));
             match &t.mirror {
                 Some(m) => {
-                    lines.push(label("créé par reflector", if m.auto { "oui".into() } else { "non (déclaré à la main)".to_string() }));
+                    lines.push(label(
+                        st.refl_lbl_created_by,
+                        if m.auto { st.lbl_yes } else { st.refl_created_manual }.to_string(),
+                    ));
                     lines.push(label("reflected-version", dash(&m.reflected_version)));
-                    lines.push(label("attendu", dash(&s.resource_version)));
+                    lines.push(label(st.lbl_expected, dash(&s.resource_version)));
                     lines.push(label("reflected-at", dash(&m.reflected_at)));
                     if !m.reflected_age.is_empty() {
-                        lines.push(label("dernier passage", format!("il y a {}", m.reflected_age)));
+                        lines.push(label(
+                            st.refl_lbl_last_pass,
+                            lang::fill(st.refl_ago, &[("age", &m.reflected_age)]),
+                        ));
                     }
-                    lines.push(label("provenance", m.provenance.label()));
-                    lines.push(label("âge", m.age.clone()));
-                    lines.push(label("clés", if m.keys.is_empty() { "—".to_string() } else { m.keys.join(", ") }));
+                    lines.push(label(st.lbl_provenance, m.provenance.label()));
+                    lines.push(label(st.lbl_age, m.age.clone()));
+                    lines.push(label(st.lbl_keys, if m.keys.is_empty() { "—".to_string() } else { m.keys.join(", ") }));
                 }
                 None => {
-                    lines.push(label("objet", "absent de ce namespace".to_string()));
+                    lines.push(label(st.lbl_object, st.refl_object_absent.to_string()));
                     if let Some(b) = &t.blocker {
-                        lines.push(label("occupé par", b.clone()));
+                        lines.push(label(st.refl_lbl_occupied, b.clone()));
                     }
                 }
             }
             lines.push(label(
-                "réclamé par",
+                st.refl_lbl_claimed_by,
                 if t.consumers.is_empty() { "—".to_string() } else { t.consumers.join(", ") },
             ));
             own_hints = t.hints.clone();
-            banner(format!(" miroir {}/{} ", t.namespace, s.name))
+            banner(lang::fill(
+                st.refl_banner_mirror,
+                &[("ns", &t.namespace), ("name", &s.name)],
+            ))
         }
         ReflRow::Orphan { idx } => {
             let o = app.refl_view_orphans.get(*idx)?;
@@ -12314,27 +12455,33 @@ fn reflector_detail_lines(
             lines.push(label("kind", o.kind.label().to_string()));
             lines.push(label("reflects", format!("{rns}/{rname}")));
             lines.push(label(
-                "créé par reflector",
-                if o.mirror.auto { "oui".into() } else { "non (déclaré à la main)".to_string() },
+                st.refl_lbl_created_by,
+                if o.mirror.auto { st.lbl_yes } else { st.refl_created_manual }.to_string(),
             ));
             lines.push(label("reflected-version", dash(&o.mirror.reflected_version)));
             lines.push(label("reflected-at", dash(&o.mirror.reflected_at)));
             if !o.mirror.reflected_age.is_empty() {
-                lines.push(label("dernier passage", format!("il y a {}", o.mirror.reflected_age)));
+                lines.push(label(
+                    st.refl_lbl_last_pass,
+                    lang::fill(st.refl_ago, &[("age", &o.mirror.reflected_age)]),
+                ));
             }
-            lines.push(label("provenance", o.provenance.label()));
-            lines.push(label("âge", o.age.clone()));
+            lines.push(label(st.lbl_provenance, o.provenance.label()));
+            lines.push(label(st.lbl_age, o.age.clone()));
             lines.push(label(
-                "réclamé par",
+                st.refl_lbl_claimed_by,
                 if o.consumers.is_empty() { "—".to_string() } else { o.consumers.join(", ") },
             ));
             own_hints = o.hints.clone();
-            banner(format!(" orphelin {}/{} ", o.namespace, o.name))
+            banner(lang::fill(
+                st.refl_banner_orphan,
+                &[("ns", &o.namespace), ("name", &o.name)],
+            ))
         }
     };
 
-    push_reflector_hints(&mut lines, "Diagnostic", &own_hints);
-    push_reflector_hints(&mut lines, "Cluster", cluster_hints);
+    push_reflector_hints(&mut lines, st.lbl_diagnostic, &own_hints);
+    push_reflector_hints(&mut lines, st.lbl_cluster, cluster_hints);
     Some((title, lines))
 }
 
@@ -12694,9 +12841,10 @@ fn provenance_color(p: &crate::rbac::Provenance) -> Color {
 
 // Detail panel (split top / full screen): selected binding's findings, then its resolved rules.
 fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
     let Some(b) = app.rbac_selected() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un binding ", Style::default().fg(DIM),
+            lang::t(app.ai_language).rbac_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" rbac "));
         f.render_widget(p, area);
@@ -12722,7 +12870,7 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         lines.push(label("via", format!("ClusterRole rabattu sur {}", b.scope.label())));
     }
     if b.aggregated {
-        lines.push(label("aggregated", "règles composées par agrégation".to_string()));
+        lines.push(label("aggregated", st.rbac_aggregated.to_string()));
     }
     lines.push(Line::from(vec![
         Span::styled(format!("{:<10}", "origin"), Style::default().fg(DIM)),
@@ -12738,7 +12886,7 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("FINDINGS", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
     if b.findings.is_empty() {
-        lines.push(Line::from(Span::styled("  read-only / sans risque détecté", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(st.rbac_read_only, Style::default().fg(DIM))));
     }
     for fd in &b.findings {
         lines.push(rbac_finding_line(fd));
@@ -12747,7 +12895,7 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("RULES", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
     if b.rules.is_empty() {
-        lines.push(Line::from(Span::styled("  (aucune règle résolue)", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(st.rbac_no_rule, Style::default().fg(DIM))));
     }
     for r in &b.rules {
         let mut spans = vec![
@@ -12804,6 +12952,7 @@ fn vuln_sev_color(s: VulnSev) -> Color {
 // Image vulnerability table: the k8s control-plane risk first (when known), then one row per scanned
 // image, sorted by max severity. Severity floor filters the image rows (`f`).
 fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
     let (loading, error, available, total, counts) = {
         let s = app.vuln_state.lock().expect("vuln poisoned");
         (s.loading, s.error.clone(), s.available, s.components.len(), s.counts())
@@ -12815,16 +12964,23 @@ fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let title = if !available {
         // Trivy Operator absent: light fallback showing only the Kubernetes version risk.
-        "vuln · k8s seul (Trivy Operator absent → pas de scan d'images)".to_string()
+        st.vuln_k8s_only.to_string()
     } else if let Some(e) = &error {
-        format!("vuln (erreur: {})", e)
+        lang::fill(st.ui_title_error, &[("view", st.vuln_view), ("e", e)])
     } else if loading && total == 0 {
-        "vuln (chargement...)".to_string()
+        lang::fill(st.ui_title_loading, &[("view", st.vuln_view)])
     } else {
         let (c, h, m, l) = counts;
-        format!(
-            "vuln ({} images · crit{} high{} med{} low{}) · min={}",
-            total, c, h, m, l, app.vuln_min_sev.label(),
+        lang::fill(
+            st.vuln_title,
+            &[
+                ("total", &total.to_string()),
+                ("crit", &c.to_string()),
+                ("high", &h.to_string()),
+                ("med", &m.to_string()),
+                ("low", &l.to_string()),
+                ("min", app.vuln_min_sev.label()),
+            ],
         )
     };
 
@@ -12929,7 +13085,7 @@ fn short_image(image: &str) -> String {
 fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(row) = app.vuln_selected() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un composant ", Style::default().fg(DIM),
+            lang::t(app.ai_language).vuln_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" vuln "));
         f.render_widget(p, area);
@@ -12954,6 +13110,7 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let title = Line::from(Span::styled(
         format!(" {} : {} ", short_image(&c.image), c.version),
         Style::default().fg(Color::Black).bg(vuln_sev_color(c.max_sev)).add_modifier(Modifier::BOLD),
@@ -12971,7 +13128,10 @@ fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
         "counts",
         format!("crit {} · high {} · med {} · low {} · total {}", c.critical, c.high, c.medium, c.low, c.total()),
     ));
-    lines.push(label("fixables", format!("{} CVE corrigibles par mise à jour", c.fixable)));
+    lines.push(label(
+            "fixables",
+            lang::fill(st.vuln_fixable, &[("n", &c.fixable.to_string())]),
+        ));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "CVEs", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
@@ -12986,6 +13146,7 @@ fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
 }
 
 fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let title = Line::from(Span::styled(
         format!(" Kubernetes {} ", k.server_version),
         Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -13005,13 +13166,16 @@ fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
         ])),
         (Some(v), false) => lines.push(Line::from(vec![
             Span::styled(format!("{:<14}", "cible patch"), Style::default().fg(DIM)),
-            Span::styled(format!("✓ à jour ({})", v), Style::default().fg(Color::Green)),
+            Span::styled(
+                    lang::fill(st.vuln_up_to_date, &[("version", v)]),
+                    Style::default().fg(Color::Green),
+                ),
         ])),
-        (None, _) => lines.push(label("cible patch", "non résolue".to_string())),
+        (None, _) => lines.push(label("cible patch", st.vuln_target_unresolved.to_string())),
     }
     if k.eol {
         lines.push(Line::from(Span::styled(
-            "  ▲ version hors fenêtre de support (EOL)",
+            st.vuln_eol,
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
@@ -13020,7 +13184,7 @@ fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "CVEs récentes (feed officiel k8s, non filtrées par version)",
+        st.vuln_recent_cves,
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
     )));
     if k.cves.is_empty() {
@@ -13069,10 +13233,14 @@ fn expiry_color(e: Expiry) -> Color {
 
 // Human-readable "EXPIRY" cell: the date plus the signed days remaining (or "expiré").
 fn expiry_text(c: &crate::secrets::TlsCert) -> String {
+    let st = lang::active();
     if c.days_remaining < 0 {
-        format!("{} (expiré)", c.not_after)
+        lang::fill(st.sec_expired, &[("date", &c.not_after)])
     } else {
-        format!("{} ({}j)", c.not_after, c.days_remaining)
+        lang::fill(
+            st.sec_expiry_days,
+            &[("date", &c.not_after), ("n", &c.days_remaining.to_string())],
+        )
     }
 }
 
@@ -13088,6 +13256,7 @@ fn secret_type_short(t: &str) -> String {
 // Secrets table: every secret in scope (filtered by `f`), TLS certs about to expire pinned on top with
 // a coloured EXPIRY cell. Non-TLS rows leave EXPIRY blank.
 fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
     let (loading, error, cm_present, summary) = {
         let s = app.secrets_state.lock().expect("secrets poisoned");
         (s.loading, s.error.clone(), s.cert_manager_present, s.summary())
@@ -13104,9 +13273,16 @@ fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         "secrets (chargement...)".to_string()
     } else {
         let cm = if cm_present { " · cert-manager ✓" } else { "" };
-        format!(
-            "secrets ({} · tls{} expirés{} <30j{}){} · filtre={}",
-            total, tls, expired, expiring, cm, app.secrets_filter.label(),
+        lang::fill(
+            st.sec_title,
+            &[
+                ("total", &total.to_string()),
+                ("tls", &tls.to_string()),
+                ("expired", &expired.to_string()),
+                ("expiring", &expiring.to_string()),
+                ("cm", cm),
+                ("filter", app.secrets_filter.label()),
+            ],
         )
     };
 
@@ -13164,7 +13340,7 @@ fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn draw_secrets_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(s) = app.secret_selected() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un secret ", Style::default().fg(DIM),
+            lang::t(app.ai_language).sec_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" secrets "));
         f.render_widget(p, area);
@@ -13186,6 +13362,7 @@ fn draw_secrets_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let (title_bg, title_txt) = match (&s.tls, s.is_tls()) {
         (Some(c), _) => (expiry_color(c.expiry), format!(" {}/{} : TLS ", s.namespace, s.name)),
         (None, true) => (Color::Red, format!(" {}/{} : TLS illisible ", s.namespace, s.name)),
@@ -13204,38 +13381,44 @@ fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, 
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(label("type", s.type_.clone()));
-    lines.push(label("origine", s.provenance.label()));
+    lines.push(label(st.lbl_origin, s.provenance.label()));
     lines.push(label(
-        "clés",
+        st.sec_lbl_keys,
         if s.data_keys.is_empty() { "—".to_string() } else { s.data_keys.join(", ") },
     ));
-    lines.push(label("âge", s.age.clone()));
+    lines.push(label(st.lbl_age, s.age.clone()));
 
     if let Some(c) = &s.tls {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Certificat", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            st.sec_certificate, Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )));
         lines.push(label("subject CN", c.subject_cn.clone()));
         let issuer = if c.self_signed {
-            format!("{} (auto-signé)", c.issuer_cn)
+            lang::fill(st.sec_self_signed, &[("issuer", &c.issuer_cn)])
         } else {
             c.issuer_cn.clone()
         };
         lines.push(label("issuer (CA)", issuer));
         if c.is_ca {
-            lines.push(label("contrainte", "certificat de CA (CA:TRUE)".to_string()));
+            lines.push(label(st.sec_lbl_constraint, st.sec_ca_true.to_string()));
         }
-        lines.push(label("clé", c.key_algo.clone()));
+        lines.push(label(st.sec_lbl_key, c.key_algo.clone()));
         lines.push(label("serial", c.serial.clone()));
-        lines.push(label("émis le", c.not_before.clone()));
+        lines.push(label(st.sec_lbl_issued_on, c.not_before.clone()));
         let exp = if c.days_remaining < 0 {
-            format!("{} — EXPIRÉ depuis {} j", c.not_after, -c.days_remaining)
+            lang::fill(
+                st.sec_expired_since,
+                &[("date", &c.not_after), ("n", &(-c.days_remaining).to_string())],
+            )
         } else {
-            format!("{} — {} jours restants", c.not_after, c.days_remaining)
+            lang::fill(
+                st.sec_days_left,
+                &[("date", &c.not_after), ("n", &c.days_remaining.to_string())],
+            )
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", "expire le"), Style::default().fg(DIM)),
+            Span::styled(format!("{:<14}", st.sec_lbl_expires_on), Style::default().fg(DIM)),
             Span::styled(exp, Style::default().fg(expiry_color(c.expiry)).add_modifier(Modifier::BOLD)),
         ]));
         if let Some(ca) = &c.ca_bundle {
@@ -13267,14 +13450,14 @@ fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, 
     // Consumers / issuer — the "Related" section folded into the detail panel.
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Consommateurs / émetteur",
+        st.sec_consumers,
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
     )));
     if let Some(cm) = &s.cert_manager {
         lines.push(label("cert-manager", format!("Certificate {cm}")));
     }
     if s.ingress_refs.is_empty() {
-        lines.push(Line::from(Span::styled("  aucun Ingress référençant ce secret", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(st.sec_no_ingress_ref, Style::default().fg(DIM))));
     } else {
         for ing in &s.ingress_refs {
             lines.push(Line::from(vec![
@@ -13288,8 +13471,8 @@ fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, 
     if reveal != SecretReveal::Hidden {
         lines.push(Line::from(""));
         let (heading, color) = match reveal {
-            SecretReveal::Base64 => ("Contenu (base64)", Color::Magenta),
-            SecretReveal::Decoded => ("Contenu (déchiffré)", Color::Red),
+            SecretReveal::Base64 => (st.sec_content_b64, Color::Magenta),
+            SecretReveal::Decoded => (st.sec_content_decoded, Color::Red),
             SecretReveal::Hidden => unreachable!(),
         };
         lines.push(Line::from(Span::styled(
@@ -13377,26 +13560,36 @@ fn cert_target(r: &CmResource) -> String {
 // Counts are taken from the rows actually on screen, so a filter that hides everything cannot leave
 // the title claiming eight certificates over an empty table.
 fn certs_panel_title(app: &App, tree: bool, rows: &[CmResource]) -> String {
+    let st = lang::t(app.ai_language);
     let (loading, error, acme_installed) = {
         let s = app.certs_state.lock().expect("certs poisoned");
         (s.loading, s.error.clone(), s.acme_installed)
     };
-    let kind = if tree { "certs arbre" } else { "certs" };
+    let kind = if tree { st.cert_view_tree } else { st.cert_view_certs };
     if let Some(e) = &error {
-        return format!("{} (erreur: {})", kind, e);
+        return lang::fill(st.ui_title_error, &[("view", kind), ("e", e)]);
     }
     if loading && rows.is_empty() {
-        return format!("{} (chargement...)", kind);
+        return lang::fill(st.ui_title_loading, &[("view", kind)]);
     }
     let (total, ready, failed, flight, expiring) = CertState {
         resources: rows.to_vec(),
         ..Default::default()
     }
     .counts();
-    let acme = if acme_installed { "" } else { " · sans ACME" };
-    format!(
-        "{} ({} certificats · ✓{} ✗{} ↻{} · {} expirent <30j{}) · filtre={}",
-        kind, total, ready, failed, flight, expiring, acme, app.certs_filter.label()
+    let acme = if acme_installed { "" } else { st.cert_no_acme };
+    lang::fill(
+        st.cert_title,
+        &[
+            ("view", kind),
+            ("total", &total.to_string()),
+            ("ready", &ready.to_string()),
+            ("failed", &failed.to_string()),
+            ("flight", &flight.to_string()),
+            ("expiring", &expiring.to_string()),
+            ("acme", acme),
+            ("filter", app.certs_filter.label()),
+        ],
     )
 }
 
@@ -13407,12 +13600,12 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = certs_panel_title(app, true, &resources);
 
     let header_row = Row::new(vec![
-        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("CIBLE"),
+        Cell::from("RESOURCE"), Cell::from("READY"), Cell::from("TARGET"),
         Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("MESSAGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // First pass sizes the RESSOURCE column, which the MESSAGE wrap width depends on.
+    // First pass sizes the RESOURCE column, which the MESSAGE wrap width depends on.
     let labels: Vec<String> = app
         .certs_tree_view
         .iter()
@@ -13436,7 +13629,7 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
-        .max("RESSOURCE".chars().count());
+        .max("RESOURCE".chars().count());
     let name_col = (name_w as u16).clamp(28, 72);
     let selected = app.table_state.selected();
     // Six columns, so five inter-column gaps — and `highlight_symbol("> ")` takes two more cells off
@@ -13496,10 +13689,11 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         .get(&(namespace.clone(), name.clone()))
                         .copied()
                         .unwrap_or((None, 0));
+                    let st = lang::t(app.ai_language);
                     let consumers = match ingress {
-                        0 => "aucun ingress".to_string(),
-                        1 => "←1 ingress".to_string(),
-                        n => format!("←{n} ingress"),
+                        0 => st.cert_ingress_none_short.to_string(),
+                        1 => st.cert_ingress_one_short.to_string(),
+                        n => lang::fill(st.cert_ingress_many_short, &[("n", &n.to_string())]),
                     };
                     Row::new(vec![
                         Cell::from(label).style(Style::default().fg(Color::Magenta)),
@@ -13536,7 +13730,7 @@ fn draw_certs_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("KIND"), Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
-        Cell::from("CIBLE"), Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("MESSAGE"),
+        Cell::from("TARGET"), Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("MESSAGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
@@ -13580,6 +13774,7 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let sel = app.table_state.selected();
     let is_secret_row = matches!(sel.and_then(|i| app.certs_tree_view.get(i)), Some(CertRow::Secret { .. }));
 
+    let st = lang::t(app.ai_language);
     let resources = app.cert_rows();
     // A Secret leaf has no cert-manager object of its own; show the chain of the Certificate above it.
     let idx = match app.cert_selected_idx(&resources) {
@@ -13596,7 +13791,7 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let Some(idx) = idx else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un objet cert-manager ", Style::default().fg(DIM),
+            st.cert_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" cert-manager "));
         f.render_widget(p, area);
@@ -13604,7 +13799,7 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let facts = cert_secret_facts(app, &resources, idx);
-    let (title, mut lines) = cert_chain_lines(idx, &resources, facts.as_ref());
+    let (title, mut lines) = cert_chain_lines(idx, &resources, facts.as_ref(), st);
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
@@ -13637,34 +13832,37 @@ fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         )
     };
     let src = &app.cap_rows;
+    let st = lang::t(app.ai_language);
     let (world, next) = match app.cap_world {
-        CapWorld::Nodes => ("noeuds", "workloads"),
-        CapWorld::Workloads => ("workloads", "quotas"),
-        CapWorld::Quotas => ("quotas", "noeuds"),
+        CapWorld::Nodes => (st.cap_world_nodes, st.cap_world_workloads),
+        CapWorld::Workloads => (st.cap_world_workloads, st.cap_world_quotas),
+        CapWorld::Quotas => (st.cap_world_quotas, st.cap_world_nodes),
     };
     let title = if let Some(e) = &error {
-        format!("capacité (erreur: {})", e)
+        lang::fill(st.ui_title_error, &[("view", st.cap_view), ("e", e)])
     } else if loading && src.is_empty() {
-        "capacité (chargement...)".to_string()
+        lang::fill(st.ui_title_loading, &[("view", st.cap_view)])
     } else {
-        format!(
-            "capacité/{} ({} noeuds · {} workloads · {} quotas){} · [g] {} · [f] {}",
-            world,
-            n_nodes,
-            n_wl,
-            n_q,
-            if metrics { "" } else { " · sans metrics-server" },
-            next,
-            app.cap_filter.label(),
+        lang::fill(
+            st.cap_title,
+            &[
+                ("world", world),
+                ("nodes", &n_nodes.to_string()),
+                ("workloads", &n_wl.to_string()),
+                ("quotas", &n_q.to_string()),
+                ("metrics", if metrics { "" } else { st.cap_no_metrics_suffix }),
+                ("next", next),
+                ("filter", app.cap_filter.label()),
+            ],
         )
     };
 
     let (header_row, widths) = match app.cap_world {
         CapWorld::Nodes => (
             Row::new(vec![
-                Cell::from("NODE"), Cell::from("CPU RÉSERVÉ"), Cell::from("MEM RÉSERVÉE"),
-                Cell::from("CPU UTIL."), Cell::from("MEM UTIL."), Cell::from("PODS"),
-                Cell::from("SI PERDU"),
+                Cell::from("NODE"), Cell::from("CPU RESERVED"), Cell::from("MEM RESERVED"),
+                Cell::from("CPU USED"), Cell::from("MEM USED"), Cell::from("PODS"),
+                Cell::from("IF LOST"),
             ]),
             vec![
                 Constraint::Min(20), Constraint::Length(18), Constraint::Length(18),
@@ -13675,8 +13873,8 @@ fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         CapWorld::Workloads => (
             Row::new(vec![
                 Cell::from("NAMESPACE"), Cell::from("KIND"), Cell::from("NAME"), Cell::from("PODS"),
-                Cell::from("CPU REQ→UTIL."), Cell::from("MEM REQ→UTIL."), Cell::from("QOS"),
-                Cell::from("CONSTAT"),
+                Cell::from("CPU REQ→USED"), Cell::from("MEM REQ→USED"), Cell::from("QOS"),
+                Cell::from("FINDING"),
             ]),
             vec![
                 Constraint::Length(18), Constraint::Length(12), Constraint::Min(18),
@@ -13686,8 +13884,8 @@ fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ),
         CapWorld::Quotas => (
             Row::new(vec![
-                Cell::from("NAMESPACE"), Cell::from("QUOTA"), Cell::from("RESSOURCE"),
-                Cell::from("UTILISÉ"), Cell::from("PLAFOND"), Cell::from("%"),
+                Cell::from("NAMESPACE"), Cell::from("QUOTA"), Cell::from("RESOURCE"),
+                Cell::from("USED"), Cell::from("LIMIT"), Cell::from("%"),
             ]),
             vec![
                 Constraint::Length(24), Constraint::Min(18), Constraint::Min(22),
@@ -13708,6 +13906,7 @@ fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn cap_row_cells(row: &CapRow) -> Row<'static> {
+    let st = lang::active();
     let flag = sto_hint_color(row.hints());
     let name_style = match flag {
         Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -13717,12 +13916,17 @@ fn cap_row_cells(row: &CapRow) -> Row<'static> {
     match row {
         CapRow::Node(n) => {
             let (loss_text, loss_color) = match &n.loss {
-                CapLoss::Alone => ("seul noeud".to_string(), DIM),
-                CapLoss::Fits => ("absorbé ailleurs".to_string(), Color::Green),
-                CapLoss::Tight => ("absorbé, il ne reste rien".to_string(), Color::Rgb(255, 140, 0)),
-                CapLoss::Homeless(v) => {
-                    (format!("{} pod(s) sans place", v.len()), Color::Red)
-                }
+                CapLoss::Alone => (st.cap_loss_alone_short.to_string(), DIM),
+                CapLoss::Fits => (st.cap_loss_fits_short.to_string(), Color::Green),
+                CapLoss::Tight => (st.cap_loss_tight_short.to_string(), Color::Rgb(255, 140, 0)),
+                CapLoss::Homeless(v) => (
+                    st.plural(
+                        v.len(),
+                        st.cap_loss_homeless_one_short,
+                        st.cap_loss_homeless_many_short,
+                    ),
+                    Color::Red,
+                ),
             };
             Row::new(vec![
                 Cell::from(n.name.clone()).style(name_style),
@@ -13826,12 +14030,13 @@ fn first_sentence(text: &str) -> String {
 // Capacity detail: the numbers behind the row, then the findings as sentences — and, on a node, the
 // pods that would have nowhere to go, which is the answer this whole view exists for.
 fn draw_capacity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
     let Some(row) = app.capacity_selected().cloned() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un noeud, un workload ou un quota ",
+            st.cap_empty_select,
             Style::default().fg(DIM),
         )))
-        .block(Block::default().borders(Borders::ALL).title(" capacité "));
+        .block(Block::default().borders(Borders::ALL).title(lang::t(app.ai_language).frame_capacity));
         f.render_widget(p, area);
         return;
     };
@@ -13864,6 +14069,7 @@ fn capacity_detail_lines(
     cluster_hints: &[crate::storage::Hint],
     width: usize,
 ) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let label = |k: &str, v: String| {
         Line::from(vec![
             Span::styled(format!("  {:<18}", k), Style::default().fg(DIM)),
@@ -13875,84 +14081,105 @@ fn capacity_detail_lines(
         CapRow::Node(n) => {
             lines.push(label(
                 "CPU",
-                format!(
-                    "réservé {} · limites {} · allocatable {}",
-                    cap::cpu_text(n.req_cpu),
-                    cap::cpu_text(n.lim_cpu),
-                    cap::cpu_text(n.alloc_cpu)
+                lang::fill(
+                    st.cap_node_cpu,
+                    &[
+                        ("req", &cap::cpu_text(n.req_cpu)),
+                        ("lim", &cap::cpu_text(n.lim_cpu)),
+                        ("alloc", &cap::cpu_text(n.alloc_cpu)),
+                    ],
                 ),
             ));
             lines.push(label(
-                "mémoire",
-                format!(
-                    "réservée {} · limites {} · allocatable {}",
-                    cap::mem_text(n.req_mem),
-                    cap::mem_text(n.lim_mem),
-                    cap::mem_text(n.alloc_mem)
+                st.cap_lbl_memory,
+                lang::fill(
+                    st.cap_node_mem,
+                    &[
+                        ("req", &cap::mem_text(n.req_mem)),
+                        ("lim", &cap::mem_text(n.lim_mem)),
+                        ("alloc", &cap::mem_text(n.alloc_mem)),
+                    ],
                 ),
             ));
             match (n.use_cpu, n.use_mem) {
                 (Some(c), Some(m)) => lines.push(label(
-                    "utilisé",
-                    format!("cpu {} · mem {}", cap::cpu_text(c), cap::mem_text(m)),
+                    st.cap_lbl_used,
+                    lang::fill(
+                        st.cap_used_value,
+                        &[("cpu", &cap::cpu_text(c)), ("mem", &cap::mem_text(m))],
+                    ),
                 )),
-                _ => lines.push(label("utilisé", "— (metrics-server absent)".to_string())),
+                _ => lines.push(label(st.cap_lbl_used, st.cap_no_metrics_value.to_string())),
             }
             lines.push(label(
                 "pods",
                 if n.pod_capacity > 0 {
-                    format!("{} sur {} possibles", n.pods, n.pod_capacity)
+                    lang::fill(
+                        st.cap_pods_of,
+                        &[("n", &n.pods.to_string()), ("total", &n.pod_capacity.to_string())],
+                    )
                 } else {
                     n.pods.to_string()
                 },
             ));
             lines.push(label(
-                "état",
-                format!(
-                    "{} · {}",
-                    if n.ready { "Ready" } else { "NotReady" },
-                    if n.schedulable { "ordonnançable" } else { "cordonné" }
+                st.lbl_state,
+                lang::fill(
+                    st.cap_node_state,
+                    &[
+                        ("ready", if n.ready { "Ready" } else { "NotReady" }),
+                        (
+                            "schedulable",
+                            if n.schedulable { st.cap_schedulable } else { st.cap_cordoned },
+                        ),
+                    ],
                 ),
             ));
             lines.push(Line::from(""));
             match &n.loss {
                 CapLoss::Alone => lines.push(Line::from(Span::styled(
-                    "  Seul noeud ordonnançable : il n'y a pas d'ailleurs à simuler.",
+                    st.cap_alone_note,
                     Style::default().fg(DIM),
                 ))),
                 CapLoss::Fits => lines.push(Line::from(Span::styled(
-                    "  Si ce noeud tombe : tout se replace ailleurs, avec de la marge.",
+                    st.cap_fits_note,
                     Style::default().fg(Color::Green),
                 ))),
                 CapLoss::Tight => lines.push(Line::from(Span::styled(
-                    "  Si ce noeud tombe : tout se replace, mais il ne restera presque rien.",
+                    st.cap_tight_note,
                     Style::default().fg(Color::Rgb(255, 140, 0)),
                 ))),
                 CapLoss::Homeless(pods) => {
                     lines.push(Line::from(Span::styled(
-                        format!("  Si ce noeud tombe : {} pod(s) sans place —", pods.len()),
+                        st.plural(
+                            pods.len(),
+                            st.cap_homeless_note_one,
+                            st.cap_homeless_note_many,
+                        ),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     )));
                     for p in pods {
                         let why = match p.why {
-                            CapHomeless::NoRoom => "aucun noeud restant n'a la place",
-                            CapHomeless::Taints => "aucun noeud restant dont il tolère les taints",
-                            CapHomeless::Selector => "aucun noeud restant ne satisfait son sélecteur",
+                            CapHomeless::NoRoom => st.cap_why_no_room,
+                            CapHomeless::Taints => st.cap_why_taints,
+                            CapHomeless::Selector => st.cap_why_selector,
                         };
                         lines.push(Line::from(Span::styled(
-                            format!(
-                                "    {}/{}  (cpu {} · mem {})  {}",
-                                p.namespace,
-                                p.name,
-                                cap::cpu_text(p.cpu),
-                                cap::mem_text(p.mem),
-                                why
+                            lang::fill(
+                                st.cap_homeless_pod,
+                                &[
+                                    ("ns", &p.namespace),
+                                    ("name", &p.name),
+                                    ("cpu", &cap::cpu_text(p.cpu)),
+                                    ("mem", &cap::mem_text(p.mem)),
+                                    ("why", why),
+                                ],
                             ),
                             Style::default().fg(Color::Red),
                         )));
                     }
                     for chunk in wrap_text(
-                        "Simulation en first-fit sur les requests : elle tient compte des taints et des sélecteurs, pas des affinités souples. Le vrai scheduler ne fera pas mieux.",
+                        st.cap_simulation_note,
                         width.saturating_sub(4).max(20),
                     ) {
                         lines.push(Line::from(Span::styled(
@@ -13963,7 +14190,7 @@ fn capacity_detail_lines(
                 }
             }
             Line::from(Span::styled(
-                format!(" Noeud {} ", n.name),
+                lang::fill(st.cap_banner_node, &[("name", &n.name)]),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))
         }
@@ -13973,32 +14200,40 @@ fn capacity_detail_lines(
             lines.push(label(
                 "CPU",
                 match w.cpu_use {
-                    Some(u) => format!(
-                        "requests {} · limites {} · utilisé {}",
-                        cap::cpu_text(w.cpu_req),
-                        cap::cpu_text(w.cpu_lim),
-                        cap::cpu_text(u)
+                    Some(u) => lang::fill(
+                        st.cap_workload_res,
+                        &[
+                            ("req", &cap::cpu_text(w.cpu_req)),
+                            ("lim", &cap::cpu_text(w.cpu_lim)),
+                            ("used", &cap::cpu_text(u)),
+                        ],
                     ),
-                    None => format!(
-                        "requests {} · limites {}",
-                        cap::cpu_text(w.cpu_req),
-                        cap::cpu_text(w.cpu_lim)
+                    None => lang::fill(
+                        st.cap_workload_res_nouse,
+                        &[
+                            ("req", &cap::cpu_text(w.cpu_req)),
+                            ("lim", &cap::cpu_text(w.cpu_lim)),
+                        ],
                     ),
                 },
             ));
             lines.push(label(
-                "mémoire",
+                st.cap_lbl_memory,
                 match w.mem_use {
-                    Some(u) => format!(
-                        "requests {} · limites {} · utilisé {}",
-                        cap::mem_text(w.mem_req),
-                        cap::mem_text(w.mem_lim),
-                        cap::mem_text(u)
+                    Some(u) => lang::fill(
+                        st.cap_workload_res,
+                        &[
+                            ("req", &cap::mem_text(w.mem_req)),
+                            ("lim", &cap::mem_text(w.mem_lim)),
+                            ("used", &cap::mem_text(u)),
+                        ],
                     ),
-                    None => format!(
-                        "requests {} · limites {}",
-                        cap::mem_text(w.mem_req),
-                        cap::mem_text(w.mem_lim)
+                    None => lang::fill(
+                        st.cap_workload_res_nouse,
+                        &[
+                            ("req", &cap::mem_text(w.mem_req)),
+                            ("lim", &cap::mem_text(w.mem_lim)),
+                        ],
                     ),
                 },
             ));
@@ -14063,7 +14298,7 @@ fn hint_lines(hints: &[crate::storage::Hint], width: usize) -> Vec<Line<'static>
 fn draw_storage_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(row) = app.storage_selected().cloned() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez un PVC, un PV ou une StorageClass ", Style::default().fg(DIM),
+            lang::t(app.ai_language).sto_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" stockage "));
         f.render_widget(p, area);
@@ -14094,6 +14329,7 @@ fn storage_detail_lines(
     row: &StoRow,
     cluster_hints: &[crate::storage::Hint],
 ) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let label = |k: &str, v: String| {
         Line::from(vec![
             Span::styled(format!("  {:<16}", k), Style::default().fg(DIM)),
@@ -14106,26 +14342,26 @@ fn storage_detail_lines(
     let title = match row {
         StoRow::Claim(c) => {
             lines.push(label("phase", c.phase.clone()));
-            lines.push(label("demandé", dash(&c.requested)));
-            lines.push(label("obtenu", dash(&c.capacity)));
+            lines.push(label(st.sto_lbl_requested, dash(&c.requested)));
+            lines.push(label(st.sto_lbl_obtained, dash(&c.capacity)));
             lines.push(label("accessModes", dash(&c.access_modes)));
             lines.push(label(
                 "storageClass",
                 match c.storage_class.as_deref() {
                     // The empty string is a decision, not an absence: it is worth spelling out.
-                    Some("") => "\"\" (provisionnement dynamique refusé)".to_string(),
+                    Some("") => st.sto_class_refused.to_string(),
                     Some(name) => name.to_string(),
-                    None => "— (classe par défaut)".to_string(),
+                    None => st.sto_class_default.to_string(),
                 },
             ));
-            lines.push(label("volume", dash(c.volume_name.as_deref().unwrap_or(""))));
-            lines.push(label("âge", c.age.clone()));
+            lines.push(label(st.sto_lbl_volume, dash(c.volume_name.as_deref().unwrap_or(""))));
+            lines.push(label(st.lbl_age, c.age.clone()));
             let mounted = if c.mounted_by.is_empty() {
-                "aucun pod".to_string()
+                st.sto_no_pod.to_string()
             } else {
                 c.mounted_by.join(", ")
             };
-            lines.push(label("monté par", mounted));
+            lines.push(label(st.sto_lbl_mounted_by, mounted));
             Line::from(Span::styled(
                 format!(" PVC {}/{} ", c.namespace, c.name),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -14133,14 +14369,14 @@ fn storage_detail_lines(
         }
         StoRow::Volume(v) => {
             lines.push(label("phase", v.phase.clone()));
-            lines.push(label("capacité", dash(&v.capacity)));
+            lines.push(label(st.sto_lbl_capacity, dash(&v.capacity)));
             lines.push(label("accessModes", dash(&v.access_modes)));
             lines.push(label("reclaimPolicy", v.reclaim_policy.clone()));
             lines.push(label("storageClass", dash(&v.storage_class)));
             lines.push(label("claimRef", dash(v.claim.as_deref().unwrap_or(""))));
             lines.push(label("backend", dash(&v.source)));
             lines.push(label("nodeAffinity", dash(&v.node_affinity)));
-            lines.push(label("âge", v.age.clone()));
+            lines.push(label(st.lbl_age, v.age.clone()));
             Line::from(Span::styled(
                 format!(" PV {} ", v.name),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -14150,9 +14386,15 @@ fn storage_detail_lines(
             lines.push(label("provisioner", dash(&c.provisioner)));
             lines.push(label("reclaimPolicy", c.reclaim_policy.clone()));
             lines.push(label("bindingMode", c.binding_mode.clone()));
-            lines.push(label("expansion", if c.allow_expansion { "oui".into() } else { "non".to_string() }));
-            lines.push(label("par défaut", if c.is_default { "oui".into() } else { "non".to_string() }));
-            lines.push(label("âge", c.age.clone()));
+            lines.push(label(
+                st.sto_lbl_expansion,
+                if c.allow_expansion { st.lbl_yes } else { st.lbl_no }.to_string(),
+            ));
+            lines.push(label(
+                st.sto_lbl_default,
+                if c.is_default { st.lbl_yes } else { st.lbl_no }.to_string(),
+            ));
+            lines.push(label(st.lbl_age, c.age.clone()));
             Line::from(Span::styled(
                 format!(" StorageClass {} ", c.name),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -14222,6 +14464,7 @@ fn cert_chain_lines(
     idx: usize,
     resources: &[CmResource],
     secret: Option<&SecretFacts>,
+    st: &'static Strings,
 ) -> (Line<'static>, Vec<Line<'static>>) {
     let sel = &resources[idx];
     let (_, sel_color) = cert_ready_cell(sel.ready);
@@ -14240,7 +14483,7 @@ fn cert_chain_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
-        "Chaîne", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        st.cert_chain_title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
     )));
 
     // Ancestors indent by their position in the path; descendants by their depth *below* the
@@ -14294,7 +14537,7 @@ fn cert_chain_lines(
                 .filter(|&(c, _)| resources[c].kind == CmKind::Certificate)
                 .count();
             lines.push(Line::from(Span::styled(
-                format!("    {signed} certificats émis sous cet émetteur (détail dans l'arbre)"),
+                lang::fill(st.cert_signed_summary, &[("n", &signed.to_string())]),
                 Style::default().fg(DIM),
             )));
         }
@@ -14314,12 +14557,12 @@ fn cert_chain_lines(
         if let Some(sn) = &cert.secret_name {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Secret produit", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                st.cert_secret_produced, Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )));
             match secret {
                 Some(f) if f.found => {
                     let exp = match f.days_remaining {
-                        Some(d) => format!(" · expire dans {d} j"),
+                        Some(d) => lang::fill(st.cert_expires_in, &[("n", &d.to_string())]),
                         None => String::new(),
                     };
                     lines.push(Line::from(vec![
@@ -14331,14 +14574,17 @@ fn cert_chain_lines(
                         Span::styled(exp, Style::default().fg(DIM)),
                     ]));
                     let consumers = match f.ingress_refs {
-                        0 => "  aucun Ingress ne le référence".to_string(),
-                        1 => "  ← 1 Ingress le référence".to_string(),
-                        n => format!("  ← {n} Ingress le référencent"),
+                        0 => st.cert_ingress_none.to_string(),
+                        1 => st.cert_ingress_one.to_string(),
+                        n => lang::fill(st.cert_ingress_many, &[("n", &n.to_string())]),
                     };
                     lines.push(Line::from(Span::styled(consumers, Style::default().fg(DIM))));
                 }
                 Some(_) => lines.push(Line::from(Span::styled(
-                    format!("  → Secret {}/{} : absent", cert.namespace, sn),
+                    lang::fill(
+                        st.cert_secret_absent,
+                        &[("ns", &cert.namespace), ("name", sn)],
+                    ),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ))),
                 None => lines.push(Line::from(Span::styled(
@@ -14348,18 +14594,18 @@ fn cert_chain_lines(
             }
         }
         if let Some(rt) = &cert.renewal_time {
-            lines.push(label("renouvellement", rt[..rt.len().min(10)].to_string()));
+            lines.push(label(st.cert_lbl_renewal, rt[..rt.len().min(10)].to_string()));
         }
         if let Some(na) = &cert.not_after {
-            lines.push(label("expire le", na[..na.len().min(10)].to_string()));
+            lines.push(label(st.cert_lbl_expires, na[..na.len().min(10)].to_string()));
         }
     }
 
-    let hints = chain_hints(idx, resources, secret);
+    let hints = chain_hints(idx, resources, secret, st);
     if !hints.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Diagnostic", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            st.lbl_diagnostic, Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )));
         for h in hints {
             let (glyph, color) = match h.level {
@@ -14482,12 +14728,12 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = kyverno_panel_title(app);
 
     let header_row = Row::new(vec![
-        Cell::from("RESSOURCE"), Cell::from("ACTION"), Cell::from("ÉTAT"),
-        Cell::from("PORTÉE"), Cell::from("DÉTAIL"),
+        Cell::from("RESOURCE"), Cell::from("ACTION"), Cell::from("STATE"),
+        Cell::from("SCOPE"), Cell::from("DETAIL"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // First pass sizes the RESSOURCE column, which the DÉTAIL wrap width depends on.
+    // First pass sizes the RESOURCE column, which the DETAIL wrap width depends on.
     let labels: Vec<String> = app
         .ky_rows
         .iter()
@@ -14530,7 +14776,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
-        .max("RESSOURCE".chars().count());
+        .max("RESOURCE".chars().count());
     let name_col = (name_w as u16).clamp(30, 64);
     let selected = app.table_state.selected();
     // Five columns, so four inter-column gaps — and `highlight_symbol("> ")` takes two more cells
@@ -14602,7 +14848,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         return Row::new(vec![Cell::from(label)]);
                     };
                     let rules = if e.rules.is_empty() {
-                        "toutes les règles".to_string()
+                        lang::t(app.ai_language).ky_all_rules.to_string()
                     } else {
                         e.rules.join(", ")
                     };
@@ -14639,7 +14885,7 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
     let title = kyverno_panel_title(app);
 
     let header_row = Row::new(vec![
-        Cell::from("RESSOURCE"), Cell::from("RÉSULTAT"), Cell::from("POLICY / RÈGLE"),
+        Cell::from("RESOURCE"), Cell::from("RESULT"), Cell::from("POLICY / RULE"),
         Cell::from("MESSAGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
@@ -14680,7 +14926,7 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
-        .max("RESSOURCE".chars().count());
+        .max("RESOURCE".chars().count());
     let name_col = (name_w as u16).clamp(30, 64);
     let selected = app.table_state.selected();
     // Four columns, so three gaps, plus the two cells of `highlight_symbol` and one of margin.
@@ -14828,7 +15074,7 @@ fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
         }
         None => lines.push(Line::from(Span::styled(
-            " sélectionnez une policy ",
+            lang::t(app.ai_language).ky_empty_select,
             Style::default().fg(DIM),
         ))),
     }
@@ -14849,6 +15095,7 @@ fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // webhook counts are the load-bearing part: every controller can be green while no policy is
 // intercepting a thing, and nothing else on the cluster says so.
 fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
+    let st = lang::t(app.ai_language);
     let (health, cel, reports) = {
         let s = app.kyverno_state.lock().expect("kyverno poisoned");
         (s.health.clone(), s.cel_installed, s.health.reports)
@@ -14858,7 +15105,7 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
     let (badge, badge_color) = if health.controllers.is_empty() {
         (" kyverno ", Color::DarkGray)
     } else if !ok {
-        (" kyverno dégradé ", Color::Red)
+        (st.ky_degraded, Color::Red)
     } else if health.silently_inactive() {
         (" kyverno inactif ", Color::Yellow)
     } else {
@@ -14878,7 +15125,7 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
     ];
     if health.controllers.is_empty() {
         spans.push(Span::styled(
-            "  contrôleurs introuvables dans le namespace kyverno",
+            st.ky_no_controllers,
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -14914,7 +15161,7 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
     }
     if health.silently_inactive() {
         second.push(Span::styled(
-            "  ·  aucun webhook enregistré : rien n'est intercepté",
+            st.ky_no_webhook,
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -14945,6 +15192,7 @@ fn ky_policy_lines(
     denials: &[(String, String, String)],
     width: usize,
 ) -> Vec<Line<'static>> {
+    let st = lang::active();
     let mut out: Vec<Line<'static>> = Vec::new();
 
     let header = if p.namespace.is_empty() {
@@ -14969,7 +15217,7 @@ fn ky_policy_lines(
     // A policy that cannot evaluate is protecting nothing, whatever its rules say. That goes first.
     if p.ready == KyReady::NotReady {
         out.push(Line::from(""));
-        for l in wrap_words(&format!("non-Ready : {}", p.ready_message), width) {
+        for l in wrap_words(&lang::fill(st.ky_not_ready, &[("message", &p.ready_message)]), width) {
             out.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Red))));
         }
     }
@@ -14979,20 +15227,20 @@ fn ky_policy_lines(
     out.push(field("action", p.action.label().to_string()));
     out.push(field(
         "admission",
-        if p.admission { "oui".into() } else { "non (scan de fond seulement)".to_string() },
+        if p.admission { st.lbl_yes.into() } else { st.ky_background_only.to_string() },
     ));
     out.push(field(
         "background",
         if p.background {
-            "oui".to_string()
+            st.lbl_yes.to_string()
         } else {
-            "non (les objets existants ne sont pas scannés)".to_string()
+            st.ky_no_background.to_string()
         },
     ));
     if let Some(s) = &p.schedule {
         out.push(field("schedule", s.clone()));
     }
-    out.push(field("âge", p.age.clone()));
+    out.push(field(st.lbl_age, p.age.clone()));
     for o in &p.overrides {
         // Without this the ACTION column lies on every cluster phasing Enforce in namespace by
         // namespace.
@@ -15004,7 +15252,7 @@ fn ky_policy_lines(
 
     if !p.rules.is_empty() {
         out.push(Line::from(""));
-        out.push(section("règles"));
+        out.push(section(st.ky_sec_rules));
         for r in &p.rules {
             let mut spans = vec![
                 Span::styled(format!("  {}", r.name), Style::default().add_modifier(Modifier::BOLD)),
@@ -15028,7 +15276,7 @@ fn ky_policy_lines(
             }
             out.push(Line::from(spans));
             out.push(Line::from(Span::styled(
-                format!("      s'applique à {}", r.match_summary),
+                lang::fill(st.ky_applies_to_line, &[("summary", &r.match_summary)]),
                 Style::default().fg(Color::Cyan),
             )));
             for l in wrap_words(&r.message, width.saturating_sub(6)) {
@@ -15050,7 +15298,7 @@ fn ky_policy_lines(
             ]));
             if !e.rules.is_empty() {
                 out.push(Line::from(Span::styled(
-                    format!("      pour les règles {}", e.rules.join(", ")),
+                    lang::fill(st.ky_for_rules, &[("list", &e.rules.join(", "))]),
                     Style::default().fg(DIM),
                 )));
             }
@@ -15061,7 +15309,7 @@ fn ky_policy_lines(
     // events know.
     if !violations.is_empty() {
         out.push(Line::from(""));
-        out.push(section("ressources en échec"));
+        out.push(section(st.ky_sec_failing));
         for v in violations.iter().take(12) {
             out.push(Line::from(vec![
                 Span::styled(
@@ -15081,10 +15329,10 @@ fn ky_policy_lines(
     }
 
     out.push(Line::from(""));
-    out.push(section("refus d'admission récents"));
+    out.push(section(st.ky_sec_denials));
     if denials.is_empty() {
         out.push(Line::from(Span::styled(
-            "  aucun dans le tampon d'events",
+            st.ky_no_denial,
             Style::default().fg(DIM),
         )));
     } else {
@@ -15106,6 +15354,7 @@ fn ky_violation_lines(
     policy: Option<&KyPolicy>,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let st = lang::active();
     let mut out: Vec<Line<'static>> = Vec::new();
     let color = ky_result_color(v.result);
     out.push(Line::from(Span::styled(
@@ -15125,10 +15374,10 @@ fn ky_violation_lines(
         out.push(field("category", v.category.clone()));
     }
     if !v.process.is_empty() {
-        out.push(field("origine", v.process.clone()));
+        out.push(field(st.lbl_origin, v.process.clone()));
     }
     if !v.age.is_empty() {
-        out.push(field("évalué", format!("il y a {}", v.age)));
+        out.push(field(st.ky_lbl_evaluated, lang::fill(st.refl_ago, &[("age", &v.age)])));
     }
 
     out.push(Line::from(""));
@@ -15142,7 +15391,7 @@ fn ky_violation_lines(
     if v.result == KyResult::Error {
         out.push(Line::from(""));
         for l in wrap_words(
-            "La règle n'a pas pu s'évaluer : c'est la policy qui est en cause, pas la ressource.",
+            st.ky_error_note,
             width.saturating_sub(2),
         ) {
             out.push(Line::from(Span::styled(
@@ -15155,8 +15404,8 @@ fn ky_violation_lines(
     if let Some(p) = policy {
         if let Some(r) = p.rules.iter().find(|r| r.name == v.rule) {
             out.push(Line::from(""));
-            out.push(section("la règle"));
-            out.push(field("s'applique à", r.match_summary.clone()));
+            out.push(section(st.ky_sec_the_rule));
+            out.push(field(st.ky_applies_to, r.match_summary.clone()));
             out.push(field("action", r.action.label().to_string()));
             for l in wrap_words(&r.message, width.saturating_sub(4)) {
                 out.push(Line::from(Span::styled(
@@ -15169,21 +15418,22 @@ fn ky_violation_lines(
 
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
-        "  h : re-déclencher l'admission sur cette ressource (Kyverno la réévalue)",
+        st.ky_retrigger_hint,
         Style::default().fg(Color::Cyan),
     )));
     out
 }
 
 fn ky_namespace_lines(ns: &str, counts: &KyCounts) -> Vec<Line<'static>> {
+    let st = lang::active();
     vec![
         Line::from(Span::styled(
             format!(" namespace {} ", ns_label(ns)),
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        field("erreurs", counts.error.to_string()),
-        field("échecs", counts.fail.to_string()),
+        field(st.ky_lbl_errors, counts.error.to_string()),
+        field(st.ky_lbl_failures, counts.fail.to_string()),
         field("warnings", counts.warn.to_string()),
     ]
 }
@@ -15195,6 +15445,7 @@ fn ky_resource_lines(
     violations: &[KyViolation],
     width: usize,
 ) -> Vec<Line<'static>> {
+    let st = lang::active();
     let mut out = vec![
         Line::from(Span::styled(
             format!(" {} {} ", kind, name),
@@ -15203,7 +15454,7 @@ fn ky_resource_lines(
         Line::from(""),
         field("namespace", ns_label(ns).to_string()),
         Line::from(""),
-        section("policies violées"),
+        section(st.ky_sec_violated),
     ];
     for v in violations {
         out.push(Line::from(vec![
@@ -15219,7 +15470,7 @@ fn ky_resource_lines(
     }
     out.push(Line::from(""));
     out.push(Line::from(Span::styled(
-        "  h : re-déclencher l'admission sur cette ressource",
+        st.ky_retrigger_hint_short,
         Style::default().fg(Color::Cyan),
     )));
     out
@@ -15285,7 +15536,7 @@ fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn draw_configmaps_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(cm) = app.configmap_selected() else {
         let p = Paragraph::new(Line::from(Span::styled(
-            " sélectionnez une configmap ", Style::default().fg(DIM),
+            lang::t(app.ai_language).cm_empty_select, Style::default().fg(DIM),
         )))
         .block(Block::default().borders(Borders::ALL).title(" configmaps "));
         f.render_widget(p, area);
@@ -15307,6 +15558,7 @@ fn draw_configmaps_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn configmap_detail_lines(cm: &ConfigMapInfo) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
     let title = Line::from(Span::styled(
         format!(" {}/{} ", cm.namespace, cm.name),
         Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -15318,11 +15570,19 @@ fn configmap_detail_lines(cm: &ConfigMapInfo) -> (Line<'static>, Vec<Line<'stati
             Span::raw(v),
         ])
     };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(label("origine", cm.provenance.label()));
-    lines.push(label("clés", format!("{} texte · {} binaire", cm.data.len(), cm.binary_keys.len())));
-    lines.push(label("taille", human_size(cm.total_bytes)));
-    lines.push(label("âge", cm.age.clone()));
+    let mut lines: Vec<Line<'static>> = vec![label(st.lbl_origin, cm.provenance.label())];
+    lines.push(label(
+        st.cm_lbl_keys,
+        lang::fill(
+            st.cm_keys_value,
+            &[
+                ("text", &cm.data.len().to_string()),
+                ("binary", &cm.binary_keys.len().to_string()),
+            ],
+        ),
+    ));
+    lines.push(label(st.cm_lbl_size, human_size(cm.total_bytes)));
+    lines.push(label(st.lbl_age, cm.age.clone()));
 
     for (k, v) in &cm.data {
         lines.push(Line::from(""));
@@ -15337,7 +15597,7 @@ fn configmap_detail_lines(cm: &ConfigMapInfo) -> (Line<'static>, Vec<Line<'stati
     if !cm.binary_keys.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Clés binaires (binaryData)",
+            st.cm_binary_keys,
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )));
         for k in &cm.binary_keys {
@@ -15454,19 +15714,23 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         (s.resources.clone(), s.error.clone())
     };
 
+    let st = lang::t(app.ai_language);
     let title = if let Some(e) = &error {
-        format!("flux arbre (erreur: {})", e)
+        lang::fill(st.ui_title_error, &[("view", st.flux_tree_view), ("e", e)])
     } else {
-        format!("flux arbre ({} nœuds)", app.flux_tree_view.len())
+        lang::fill(
+            st.flux_tree_title,
+            &[("n", &app.flux_tree_view.len().to_string())],
+        )
     };
 
     let header_row = Row::new(vec![
-        Cell::from("RESSOURCE"), Cell::from("READY"), Cell::from("REVISION"),
+        Cell::from("RESOURCE"), Cell::from("READY"), Cell::from("REVISION"),
         Cell::from("AGE"), Cell::from("MESSAGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // First pass: build every (indented) label so the RESSOURCE column can be sized before the rows
+    // First pass: build every (indented) label so the RESOURCE column can be sized before the rows
     // are constructed — the MESSAGE width (needed to wrap the focused row) depends on that column.
     let labels: Vec<String> = app
         .flux_tree_view
@@ -15502,7 +15766,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
-        .max("RESSOURCE".chars().count());
+        .max("RESOURCE".chars().count());
     let name_col = (name_w as u16).clamp(24, 80);
     let selected = app.table_state.selected();
     // Five columns, four gaps, plus `highlight_symbol("> ")` and the one-cell margin — same reason
@@ -15777,11 +16041,13 @@ fn loading_lines(
 
     let st = lang::t(lang);
     let stage_text = if stage.is_empty() { st.lbl_preparation.to_string() } else { stage.to_string() };
-    let (elapsed_label, resources_label, model_label, lang_label, hint) = match lang {
-        AiLanguage::Fr => ("◔ écoulé : ", "● ressources collectées : ", "» modèle : ", "    langue : ", "    (les requêtes longues peuvent prendre 30-60s sur de gros prompts)"),
-        AiLanguage::En => ("◔ elapsed: ",  "● resources collected: ",   "» model: ",   "    language: ", "    (long requests may take 30-60s for large prompts)"),
-    };
-    let _ = st;
+    let (elapsed_label, resources_label, model_label, lang_label, hint) = (
+        st.ai_elapsed,
+        st.ai_resources,
+        st.ai_model,
+        st.ai_lang,
+        st.ai_slow_hint,
+    );
 
     vec![
         Line::from(""),
@@ -16304,7 +16570,7 @@ fn draw_flux_logs(f: &mut ratatui::Frame, app: &mut App) -> usize {
     f.render_widget(p, layout[1]);
 
     let footer = Paragraph::new(Line::from(Span::styled(
-        " ↑↓ / PgUp / PgDn défil · g/G haut/bas · Esc retour ".to_string(),
+        lang::t(app.ai_language).logs_footer,
         Style::default().fg(DIM),
     )));
     f.render_widget(footer, layout[2]);
@@ -16319,7 +16585,14 @@ fn colorize_log_line(l: &str) -> Line<'static> {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     }
-    if l.starts_with("(aucun log)") || l.starts_with("(échec récupération logs") {
+    let st = lang::active();
+    // The log-fetch failure carries the container name, so only its fixed head can be matched.
+    let fetch_failed_head = st
+        .ev_log_fetch_failed
+        .split('{')
+        .next()
+        .unwrap_or(st.ev_log_fetch_failed);
+    if l.starts_with(st.ev_no_log) || l.starts_with(fetch_failed_head) {
         return Line::from(Span::styled(l.to_string(), Style::default().fg(DIM)));
     }
     let bytes = l.as_bytes();
@@ -16371,6 +16644,7 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn related_lines(app: &App) -> Vec<Line<'static>> {
+    let st = lang::t(app.ai_language);
     let Some(idx) = app.table_state.selected() else { return Vec::new(); };
     let Some(rec) = app.snapshot.get(idx) else { return Vec::new(); };
     let target_ns = rec.namespace.clone();
@@ -16405,7 +16679,7 @@ fn related_lines(app: &App) -> Vec<Line<'static>> {
 
     if !event_lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "── Événements ──",
+            st.rel_events_header,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
         lines.extend(event_lines);
@@ -16419,15 +16693,15 @@ fn related_lines(app: &App) -> Vec<Line<'static>> {
     if loading || !sections.is_empty() || error.is_some() {
         if !lines.is_empty() { lines.push(Line::from("")); }
         lines.push(Line::from(Span::styled(
-            "── Ressources contextuelles ──",
+            st.rel_context_header,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
         if let Some(e) = error {
             lines.push(Line::from(Span::styled(e, Style::default().fg(Color::Red))));
         } else if loading && sections.is_empty() {
-            lines.push(Line::from(Span::styled("(récupération...)", Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(st.rel_fetching, Style::default().fg(Color::Yellow))));
         } else if sections.is_empty() {
-            lines.push(Line::from(Span::styled("(aucune ressource détectée pour ce type d'événement)", Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(st.rel_none, Style::default().fg(DIM))));
         } else {
             for (title, body) in sections.iter() {
                 lines.push(Line::from(""));
@@ -16835,6 +17109,7 @@ fn slice_from(s: &str, n: usize) -> String {
 // Format a node's usage as a (title, body) prompt section: totals plus per-container detail,
 // limited to containers with an issue and capped at 80 rows.
 fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, String) {
+    let st = lang::active();
     use crate::events::{format_cpu_milli, format_memory_bytes};
     let mut body = String::new();
     body.push_str(&format!("Node allocatable: cpu={}, memory={}\n",
@@ -16868,14 +17143,18 @@ fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, Strin
         format_cpu_milli(user_cpu_req), format_cpu_milli(user_cpu_lim), format_cpu_milli(user_cpu_use),
         format_memory_bytes(user_mem_req), format_memory_bytes(user_mem_lim), format_memory_bytes(user_mem_use),
     ));
-    body.push_str(&format!(
-        "System containers ({}, hors influence directe utilisateur): cpu req={} use={}, mem req={} use={}\n",
-        sys_n,
-        format_cpu_milli(sys_cpu_req), format_cpu_milli(sys_cpu_use),
-        format_memory_bytes(sys_mem_req), format_memory_bytes(sys_mem_use),
+    body.push_str(&lang::fill(
+        st.prompt_sys_containers,
+        &[
+            ("n", &sys_n.to_string()),
+            ("creq", &format_cpu_milli(sys_cpu_req)),
+            ("cuse", &format_cpu_milli(sys_cpu_use)),
+            ("mreq", &format_memory_bytes(sys_mem_req)),
+            ("muse", &format_memory_bytes(sys_mem_use)),
+        ],
     ));
 
-    body.push_str("\nDétails par container (USER d'abord, system préfixé `[sys]`, focus sur ceux avec problème) :\n");
+    body.push_str(st.prompt_per_container_details_full);
     let mut printed = 0;
     for r in &s.rows {
         let cpu_at_limit = matches!((r.cpu_use, r.cpu_lim), (Some(u), Some(l)) if l > 0 && u >= l);
@@ -16887,7 +17166,7 @@ fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, Strin
         let has_issue = cpu_at_limit || mem_at_limit || cpu_under || mem_under || cpu_over_lim || mem_over_lim
             || r.cpu_req.is_none() || r.mem_req.is_none() || r.mem_lim.is_none();
         if !has_issue { continue; }
-        if printed >= 80 { body.push_str("(... liste tronquée ...)\n"); break; }
+        if printed >= 80 { body.push_str(st.prompt_list_truncated); break; }
         printed += 1;
         let mut tags = Vec::new();
         if r.cpu_req.is_none() { tags.push("noCpuReq"); }
@@ -16910,7 +17189,7 @@ fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, Strin
             tags.join(","),
         ));
     }
-    body.push_str("\nNote: les pods `[sys]` (CSI drivers, defender, addons CNI/cloud, monitoring système) ne sont pas modifiables par l'utilisateur final ; concentrer le diagnostic et les recommandations sur les pods USER.\n");
+    body.push_str(st.prompt_sys_note);
     ("Node usage (per-container avec issues)".to_string(), body)
 }
 
@@ -16955,14 +17234,15 @@ fn cap_chars_tail(s: String, max: usize) -> String {
     if s.len() <= max { return s; }
     let mut start = s.len() - max;
     while start < s.len() && !s.is_char_boundary(start) { start += 1; }
-    format!("... (tronqué)\n{}", &s[start..])
+    lang::fill(lang::active().prompt_truncated, &[("body", &s[start..])])
 }
 
 fn capture_logs_text(state: &SharedLog) -> String {
+    let st = lang::active();
     let s = state.lock().expect("log state poisoned");
-    if let Some(e) = &s.error { return format!("(indisponible: {})", e); }
-    if s.loading && s.lines.is_empty() { return "(en cours de chargement)".to_string(); }
-    if s.lines.is_empty() { return "(aucun log)".to_string(); }
+    if let Some(e) = &s.error { return lang::fill(st.cap_unavailable, &[("e", e)]); }
+    if s.loading && s.lines.is_empty() { return st.cap_loading.to_string(); }
+    if s.lines.is_empty() { return st.cap_no_log.to_string(); }
     let n = s.lines.len();
     let start = n.saturating_sub(200);
     let collapsed = collapse_repeats(s.lines[start..].iter().map(|l| l.as_str()));
@@ -16970,10 +17250,11 @@ fn capture_logs_text(state: &SharedLog) -> String {
 }
 
 fn capture_status_text(state: &SharedStatus) -> String {
+    let st = lang::active();
     let s = state.lock().expect("status state poisoned");
-    if let Some(e) = &s.error { return format!("(indisponible: {})", e); }
-    if s.loading && s.lines.is_empty() { return "(en cours de chargement)".to_string(); }
-    if s.lines.is_empty() { return "(aucun status)".to_string(); }
+    if let Some(e) = &s.error { return lang::fill(st.cap_unavailable, &[("e", e)]); }
+    if s.loading && s.lines.is_empty() { return st.cap_loading.to_string(); }
+    if s.lines.is_empty() { return st.cap_no_status.to_string(); }
     let collapsed = collapse_repeats(s.lines.iter().map(|(_, t)| t.as_str()));
     cap_chars_tail(collapsed.join("\n"), MAX_STATUS_CHARS)
 }
@@ -17020,7 +17301,7 @@ fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
         related.drain(0..drop);
     }
     if related.is_empty() {
-        "(aucun)".to_string()
+        lang::active().cap_no_related.to_string()
     } else {
         related.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
     }
@@ -17043,7 +17324,8 @@ fn prompt_char_budget(context_window: Option<usize>) -> Option<usize> {
 // in the list) when the budget is exhausted and noting how many were omitted. At least the first
 // (highest-priority) section is always included even if it alone exceeds the budget.
 fn build_extra_block(extra: &[(String, String)], budget: Option<usize>) -> String {
-    if extra.is_empty() { return "(aucun)".to_string(); }
+    let st = lang::active();
+    if extra.is_empty() { return st.prompt_none.to_string(); }
     let mut out = String::new();
     let mut omitted = 0;
     for (i, (title, body)) in extra.iter().enumerate() {
@@ -17058,8 +17340,10 @@ fn build_extra_block(extra: &[(String, String)], budget: Option<usize>) -> Strin
         out.push_str(&section);
     }
     if omitted > 0 {
-        out.push_str(&format!(
-            "\n\n... ({omitted} section(s) contextuelle(s) omise(s) — budget de contexte atteint)"
+        out.push_str(&st.plural(
+            omitted,
+            st.prompt_sections_omitted_one,
+            st.prompt_sections_omitted_many,
         ));
     }
     out
@@ -17337,7 +17621,7 @@ mod footer_tests {
             key("e"), lbl("erreurs"),
             footer_sep(),
             key("↑↓"), lbl("navigation"),
-            key("Shift+↑↓"), lbl("défilement détail"),
+            key("Shift+↑↓"), lbl(lang::FR.help_detail_scroll),
             key("s"), lbl("figer"),
             footer_sep(),
             key("Enter"), lbl("zoom"),

@@ -57,6 +57,10 @@ impl AiLanguage {
     pub fn toggle(self) -> Self {
         match self { Self::Fr => Self::En, Self::En => Self::Fr }
     }
+    // Value written to the config file, and the tag Typst uses for hyphenation.
+    pub fn code(self) -> &'static str {
+        match self { Self::Fr => "fr", Self::En => "en" }
+    }
     fn system_prompt(self) -> &'static str {
         match self {
             Self::Fr => "Tu es un expert Kubernetes. On te fournit un événement Kubernetes ainsi que le statut de l'objet impliqué, ses logs récents, les autres événements liés, et des ressources contextuelles attachées (policies, RBAC, ingress, sources flux/argo, PV/PVC, etc.). Identifie la cause racine la plus probable et propose des actions correctives concrètes. Sois concis et structuré : Diagnostic, Cause probable, Actions recommandées.\n\nRÈGLES STRICTES de format :\n1. CHAQUE action recommandée DOIT être accompagnée de la commande exacte à exécuter (kubectl, helm, etc.) dans un bloc de code triple-backtick avec langage `sh`. Aucune recommandation sans commande associée.\n2. Les commandes longues DOIVENT être formatées sur plusieurs lignes en utilisant `\\` en fin de ligne pour permettre le copier-coller, en gardant chaque ligne sous ~100 caractères.\n3. Pour des inspections, fournis aussi la commande de vérification (kubectl describe, get -o yaml, logs, etc.).\n4. Les commandes inline courtes (noms de ressources, flags) restent en backticks simples.\n\nRéponds en français.",
@@ -147,11 +151,15 @@ pub struct AiConfig {
 
 impl AiConfig {
     pub fn from_resolved(p: &AiProviderResolved) -> Result<Self, String> {
-        let api_key = p.api_key.clone().ok_or_else(|| format!(
-            "Clé API absente pour le fournisseur '{}' (env OPENAI_API_KEY ou {})",
-            p.name,
-            crate::config::config_path_display(),
-        ))?;
+        let api_key = p.api_key.clone().ok_or_else(|| {
+            crate::lang::fill(
+                crate::lang::active().ai_no_api_key,
+                &[
+                    ("provider", &p.name),
+                    ("env", &crate::config::config_path_display()),
+                ],
+            )
+        })?;
         Ok(Self {
             base_url: p.base_url.clone(),
             api_key,
@@ -254,7 +262,7 @@ async fn stream_completion(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("requête: {}", e))?;
+        .map_err(|e| crate::lang::fill(crate::lang::active().ai_request, &[("e", &e.to_string())]))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -298,7 +306,11 @@ async fn stream_completion(
 // Stream a chat completion into the shared UI state. Every state write is guarded by `current_key`
 // so a superseded request silently drops its result instead of clobbering a newer one.
 pub async fn query_ai(config: AiConfig, prompt: String, lang: AiLanguage, key: String, state: SharedAi) {
-    update_stage(&state, &key, format!("Envoi de la requête à {}...", config.model));
+    update_stage(
+        &state,
+        &key,
+        crate::lang::fill(crate::lang::t(lang).ai_sending, &[("provider", &config.model)]),
+    );
 
     // Append each delta to the panel content; the render loop (polled every 250ms) shows it live.
     let on_delta = |raw: &str| {

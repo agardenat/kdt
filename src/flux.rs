@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::lang::{Strings, fill};
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
@@ -267,6 +268,7 @@ const CANDIDATES: &[(&str, &[&str], &str)] = &[
 // List every Flux resource kind present on the cluster. `found_crd` distinguishes "Flux not
 // installed" from "installed but empty/errored" for a clearer message in the UI.
 pub async fn fetch_flux(client: Client, state: SharedFlux) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("flux poisoned");
         s.loading = true;
@@ -293,7 +295,7 @@ pub async fn fetch_flux(client: Client, state: SharedFlux) {
             Ok(list) => {
                 let api_version = format!("{}/{}", group, version);
                 for obj in &list.items {
-                    resources.push(parse_flux(obj, kind, &api_version));
+                    resources.push(parse_flux(obj, kind, &api_version, st));
                 }
             }
             Err(e) => errors.push(format!("{}: {}", kind, e)),
@@ -309,7 +311,7 @@ pub async fn fetch_flux(client: Client, state: SharedFlux) {
     // rows (an RBAC-denied kind is the common case), and a silently incomplete inventory is exactly
     // what makes someone conclude a resource does not exist when it merely could not be read.
     s.error = if !found_crd {
-        Some("Flux CRDs introuvables (Flux n'est pas installé sur ce cluster ?)".into())
+        Some(st.flux_crds_missing.to_string())
     } else if !errors.is_empty() {
         Some(errors.join(" · "))
     } else {
@@ -317,7 +319,12 @@ pub async fn fetch_flux(client: Client, state: SharedFlux) {
     };
 }
 
-fn parse_flux(obj: &DynamicObject, kind: &str, api_version: &str) -> FluxResource {
+fn parse_flux(
+    obj: &DynamicObject,
+    kind: &str,
+    api_version: &str,
+    st: &'static Strings,
+) -> FluxResource {
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
     let name = obj.metadata.name.clone().unwrap_or_default();
     let suspended = obj
@@ -378,13 +385,13 @@ fn parse_flux(obj: &DynamicObject, kind: &str, api_version: &str) -> FluxResourc
             (r, combined)
         }
         None if reconciling_cond => (FluxReady::Reconciling, "Reconciling".to_string()),
-        None => (FluxReady::Unknown, "(pas de condition Ready)".to_string()),
+        None => (FluxReady::Unknown, st.flux_no_ready_condition.to_string()),
     };
 
     // An OCI HelmRepository is a static reference (no reconciliation, no Ready condition): surface it
     // as N/A instead of a misleading "Unknown".
     let (ready, message) = if ready == FluxReady::Unknown && is_oci_helm_repository(obj, kind) {
-        (FluxReady::NotApplicable, "OCI (référence statique, pas de réconciliation)".to_string())
+        (FluxReady::NotApplicable, st.flux_oci_static.to_string())
     } else {
         (ready, message)
     };
@@ -523,9 +530,10 @@ pub async fn reconcile(
     name: String,
     status: SharedReconcile,
 ) {
-    let msg = match run_reconcile(&client, scope, &api_version, &kind, &ns, &name).await {
+    let st = crate::lang::active();
+    let msg = match run_reconcile(&client, scope, &api_version, &kind, &ns, &name, st).await {
         Ok(m) => m,
-        Err(e) => format!("✗ reconcile : {}", e),
+        Err(e) => fill(st.flux_reconcile_failed, &[("e", &e)]),
     };
     if let Ok(mut s) = status.lock() {
         *s = Some((Instant::now(), msg));
@@ -542,7 +550,7 @@ pub async fn reconcile_once(
     ns: &str,
     name: &str,
 ) -> Result<String, String> {
-    run_reconcile(client, scope, api_version, kind, ns, name).await
+    run_reconcile(client, scope, api_version, kind, ns, name, crate::lang::active()).await
 }
 
 // Suspend then immediately resume: the older way of making a controller drop the state it has got
@@ -556,12 +564,16 @@ pub async fn suspend_cycle(
     ns: &str,
     name: &str,
 ) -> Result<String, String> {
+    let st = crate::lang::active();
     let suspended = run_set_suspend(client, api_version, kind, ns, name, true).await;
     let resumed = run_set_suspend(client, api_version, kind, ns, name, false).await;
     match (suspended, resumed) {
-        (Ok(()), Ok(())) => Ok(format!("cycle suspend/resume effectué : {}/{}", kind, name)),
-        (_, Err(e)) => Err(format!("resume échoué, {}/{} reste suspendu : {}", kind, name, e)),
-        (Err(e), Ok(())) => Err(format!("suspend échoué : {}", e)),
+        (Ok(()), Ok(())) => Ok(fill(st.flux_cycle_ok, &[("kind", kind), ("name", name)])),
+        (_, Err(e)) => Err(fill(
+            st.flux_resume_failed,
+            &[("kind", kind), ("name", name), ("e", &e)],
+        )),
+        (Err(e), Ok(())) => Err(fill(st.flux_suspend_failed, &[("e", &e)])),
     }
 }
 
@@ -572,22 +584,23 @@ async fn run_reconcile(
     kind: &str,
     ns: &str,
     name: &str,
+    st: &'static Strings,
 ) -> Result<String, String> {
     match scope {
         ReconcileScope::Resource => {
             let (group, version) = split_api_version(api_version)?;
             let obj = get_obj(client, group, &[version], kind, ns, name).await?;
             if is_suspended(&obj) {
-                return Err(format!("{}/{} est suspendu", kind, name));
+                return Err(fill(st.flux_suspended, &[("kind", kind), ("name", name)]));
             }
             annotate_reconcile(client, group, &[version], kind, ns, name).await?;
-            Ok(format!("✓ reconcile demandé : {}/{}", kind, name))
+            Ok(fill(st.flux_reconcile_ok, &[("kind", kind), ("name", name)]))
         }
         ReconcileScope::WithSource => {
             let (group, version) = split_api_version(api_version)?;
             let obj = get_obj(client, group, &[version], kind, ns, name).await?;
             if is_suspended(&obj) {
-                return Err(format!("{}/{} est suspendu", kind, name));
+                return Err(fill(st.flux_suspended, &[("kind", kind), ("name", name)]));
             }
             // A source resource (GitRepository, OCIRepository…) has no sourceRef: just reconcile it.
             match source_ref(&obj, ns) {
@@ -597,49 +610,60 @@ async fn run_reconcile(
                     // old revision — the confusing half-success this refusal exists to prevent.
                     let src = get_obj(client, SOURCE_GROUP, SOURCE_VERSIONS, &skind, &sns, &sname).await?;
                     if is_suspended(&src) {
-                        return Err(format!("source {}/{} est suspendue", skind, sname));
+                        return Err(fill(
+                            st.flux_source_suspended,
+                            &[("kind", &skind), ("name", &sname)],
+                        ));
                     }
                     annotate_reconcile(client, SOURCE_GROUP, SOURCE_VERSIONS, &skind, &sns, &sname).await?;
                     annotate_reconcile(client, group, &[version], kind, ns, name).await?;
-                    Ok(format!("✓ reconcile {}/{} + source {}/{}", kind, name, skind, sname))
+                    Ok(fill(
+                        st.flux_reconcile_with_source,
+                        &[
+                            ("kind", kind),
+                            ("name", name),
+                            ("skind", &skind),
+                            ("sname", &sname),
+                        ],
+                    ))
                 }
                 None => {
                     annotate_reconcile(client, group, &[version], kind, ns, name).await?;
-                    Ok(format!("✓ reconcile demandé : {}/{}", kind, name))
+                    Ok(fill(st.flux_reconcile_ok, &[("kind", kind), ("name", name)]))
                 }
             }
         }
         ReconcileScope::RootSync => {
             let obj = get_obj(client, SOURCE_GROUP, SOURCE_VERSIONS, "GitRepository", "flux-system", "flux-system")
                 .await
-                .map_err(|_| "GitRepository flux-system/flux-system introuvable".to_string())?;
+                .map_err(|_| st.flux_root_missing.to_string())?;
             if is_suspended(&obj) {
-                return Err("GitRepository flux-system est suspendue".to_string());
+                return Err(st.flux_root_suspended.to_string());
             }
             annotate_reconcile(client, SOURCE_GROUP, SOURCE_VERSIONS, "GitRepository", "flux-system", "flux-system").await?;
-            Ok("✓ sync racine demandé : GitRepository/flux-system".to_string())
+            Ok(st.flux_root_sync_ok.to_string())
         }
         // Force and Reset only mean something to helm-controller. Refusing elsewhere rather than
         // writing an annotation nobody reads keeps the toast honest: a "✓" has to mean the
         // controller was actually asked something, not that a patch happened to succeed.
         ReconcileScope::Force | ReconcileScope::Reset => {
             if kind != "HelmRelease" {
-                return Err(format!(
-                    "{} : réservé aux HelmRelease (annotation ignorée ailleurs)",
-                    kind
-                ));
+                return Err(fill(st.flux_helmrelease_only, &[("kind", kind)]));
             }
             let (group, version) = split_api_version(api_version)?;
             let obj = get_obj(client, group, &[version], kind, ns, name).await?;
             if is_suspended(&obj) {
-                return Err(format!("{}/{} est suspendu", kind, name));
+                return Err(fill(st.flux_suspended, &[("kind", kind), ("name", name)]));
             }
             let (extra, label) = match scope {
-                ReconcileScope::Force => (FORCE_ANNOTATION, "upgrade forcé"),
-                _ => (RESET_ANNOTATION, "compteurs d'échec remis à zéro"),
+                ReconcileScope::Force => (FORCE_ANNOTATION, st.flux_force_label),
+                _ => (RESET_ANNOTATION, st.flux_reset_label),
             };
             annotate_reconcile_with(client, group, &[version], kind, ns, name, &[extra]).await?;
-            Ok(format!("✓ {} : {}/{}", label, kind, name))
+            Ok(fill(
+                st.flux_action_ok,
+                &[("action", label), ("kind", kind), ("name", name)],
+            ))
         }
     }
 }
@@ -647,7 +671,12 @@ async fn run_reconcile(
 fn split_api_version(api_version: &str) -> Result<(&str, &str), String> {
     api_version
         .split_once('/')
-        .ok_or_else(|| format!("apiVersion invalide : {}", api_version))
+        .ok_or_else(|| {
+            fill(
+                crate::lang::active().flux_bad_api_version,
+                &[("v", api_version)],
+            )
+        })
 }
 
 fn is_suspended(obj: &DynamicObject) -> bool {
@@ -759,7 +788,7 @@ async fn resolve_ar(
             return Ok(ar);
         }
     }
-    Err(format!("{} introuvable sur le cluster", kind))
+    Err(fill(crate::lang::active().flux_kind_not_found, &[("kind", kind)]))
 }
 
 // One object owned by a Kustomization (from status.inventory), with its live readiness.
@@ -924,7 +953,7 @@ async fn fetch_item_status(
         }
         Err(_) => {
             item.ready = Some(false);
-            item.msg = "introuvable".to_string();
+            item.msg = crate::lang::active().flux_item_not_found.to_string();
         }
     }
     item
@@ -1056,10 +1085,11 @@ pub async fn toggle_suspend(
     name: String,
     status: SharedReconcile,
 ) {
+    let st = crate::lang::active();
     let msg = match run_toggle_suspend(&client, &api_version, &kind, &ns, &name).await {
-        Ok(true) => format!("■ suspendu : {}/{}", kind, name),
-        Ok(false) => format!("► repris : {}/{}", kind, name),
-        Err(e) => format!("✗ suspend : {}", e),
+        Ok(true) => fill(st.flux_suspended_ok, &[("kind", &kind), ("name", &name)]),
+        Ok(false) => fill(st.flux_resumed_ok, &[("kind", &kind), ("name", &name)]),
+        Err(e) => fill(st.flux_toggle_failed, &[("e", &e)]),
     };
     if let Ok(mut s) = status.lock() {
         *s = Some((Instant::now(), msg));

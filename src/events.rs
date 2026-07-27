@@ -2,6 +2,7 @@
 //! object status, namespaces, nodes, and per-node resource usage. Each fetcher writes into a
 //! shared, mutex-guarded state struct that the UI polls.
 
+use crate::lang::fill;
 use kube::api::DynamicObject;
 use kube::core::GroupVersionKind;
 use kube::discovery::{self, Scope};
@@ -206,6 +207,7 @@ pub struct PodLogs {
 // headers are added only when more than one is shown. Failures (get/logs) are embedded as lines
 // rather than aborting, so aggregating across several pods never drops the others.
 async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> PodLogs {
+    let st = crate::lang::active();
     let all: Vec<(String, bool)> = match api.get(pod).await {
         Ok(p) => {
             let mut names = Vec::new();
@@ -223,7 +225,7 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
         }
         Err(e) => {
             return PodLogs {
-                lines: vec![format!("(échec récupération du pod {}: {})", pod, e)],
+                lines: vec![fill(st.ev_pod_fetch_failed, &[("pod", pod), ("e", &e.to_string())])],
                 containers: Vec::new(),
             }
         }
@@ -232,7 +234,7 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
     let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
     if all.is_empty() {
         return PodLogs {
-            lines: vec!["aucun container trouvé sur ce pod".to_string()],
+            lines: vec![st.ev_no_container.to_string()],
             containers: names,
         };
     }
@@ -245,9 +247,9 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
     };
     if containers.is_empty() {
         return PodLogs {
-            lines: vec![format!(
-                "(ce pod n'a pas de container « {} »)",
-                opts.container.as_deref().unwrap_or(""),
+            lines: vec![fill(
+                st.ev_no_such_container,
+                &[("name", opts.container.as_deref().unwrap_or(""))],
             )],
             containers: names,
         };
@@ -278,9 +280,9 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
                 }
                 if count == 0 {
                     out.push(if opts.previous {
-                        "(aucun log — ce container n'a pas de run précédent)".to_string()
+                        st.ev_no_log_previous.to_string()
                     } else {
-                        "(aucun log)".to_string()
+                        st.ev_no_log.to_string()
                     });
                 }
             }
@@ -289,9 +291,9 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
                 // has not restarted, not a failure worth showing as one.
                 let msg = e.to_string();
                 if opts.previous && msg.contains("not found") {
-                    out.push(format!("({}: pas de run précédent)", cname));
+                    out.push(fill(st.ev_no_previous_run, &[("name", cname)]));
                 } else {
-                    out.push(format!("(échec récupération logs de {}: {})", cname, msg));
+                    out.push(fill(st.ev_log_fetch_failed, &[("name", cname), ("e", &msg)]));
                 }
             }
         }
@@ -340,7 +342,7 @@ pub async fn fetch_workload_logs(
         if s.current_key.as_deref() != Some(&key) { return; }
         s.loading = false;
         s.lines.clear();
-        s.error = Some("aucun pod en cours pour ce workload".to_string());
+        s.error = Some(crate::lang::active().ev_no_running_pod.to_string());
         return;
     }
 
@@ -386,7 +388,7 @@ pub async fn fetch_flux_logs(
             if s.current_key.as_deref() != Some(&key) { return; }
             s.loading = false;
             s.lines.clear();
-            s.error = Some(format!("flux-system introuvable: {}", e));
+            s.error = Some(fill(crate::lang::active().ev_flux_system_missing, &[("e", &e.to_string())]));
             return;
         }
     };
@@ -413,7 +415,7 @@ pub async fn fetch_flux_logs(
     if s.current_key.as_deref() != Some(&key) { return; }
     s.loading = false;
     s.error = if lines.is_empty() {
-        Some("(aucune ligne de log correspondante)".to_string())
+        Some(crate::lang::active().ev_no_matching_line.to_string())
     } else {
         None
     };
@@ -574,6 +576,7 @@ async fn fetch_dynamic(
 }
 
 fn format_dynamic_status(obj: &DynamicObject, kind: &str) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
     let mut out: Vec<(LineColor, String)> = Vec::new();
     let ns = obj.metadata.namespace.as_deref().unwrap_or("");
     let name = obj.metadata.name.as_deref().unwrap_or("?");
@@ -665,7 +668,7 @@ fn format_dynamic_status(obj: &DynamicObject, kind: &str) -> Vec<(LineColor, Str
     }
 
     if out.len() <= 2 {
-        out.push((LineColor::Warn, "No status fields exposed".into()));
+        out.push((LineColor::Warn, st.ev_no_status_fields.into()));
     }
     out
 }
@@ -729,6 +732,7 @@ pub async fn fetch_namespaces(client: Client, state: SharedNsList) {
 }
 
 fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
     let mut out: Vec<(LineColor, String)> = Vec::new();
     let meta = &pod.metadata;
     let spec = pod.spec.as_ref();
@@ -821,7 +825,7 @@ fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
                             "    last: Terminated ({}, exit={}){}",
                             t.reason.as_deref().unwrap_or(""),
                             t.exit_code,
-                            if oom { "  ▲ OOMKILLED précédemment" } else { "" },
+                            if oom { st.ev_oomkilled_before } else { "" },
                         )));
                     }
                 }
@@ -845,10 +849,13 @@ fn format_pod_status(pod: &Pod) -> Vec<(LineColor, String)> {
         let oom_count = count_oom(s);
         if oom_count > 0 {
             out.push((LineColor::Plain, String::new()));
-            out.push((LineColor::Err, format!("▲ OOMKilled détecté sur {} container(s)", oom_count)));
+            out.push((
+                LineColor::Err,
+                st.plural(oom_count, st.ev_oomkilled_count_one, st.ev_oomkilled_count_many),
+            ));
         }
     } else {
-        out.push((LineColor::Warn, "No status available".into()));
+        out.push((LineColor::Warn, st.ev_no_status.into()));
     }
 
     if let Some(spec) = spec {
@@ -901,6 +908,7 @@ fn format_resource_map(m: Option<&BTreeMap<String, Quantity>>) -> String {
 }
 
 pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
     let mut out: Vec<(LineColor, String)> = Vec::new();
     let meta = &node.metadata;
     out.push((LineColor::Info, format!("Node {}", meta.name.as_deref().unwrap_or("?"))));
@@ -1000,7 +1008,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
             }
         }
     } else {
-        out.push((LineColor::Warn, "No status available".into()));
+        out.push((LineColor::Warn, st.ev_no_status.into()));
     }
     out
 }
@@ -1105,6 +1113,7 @@ fn node_summary(n: &Node) -> NodeSummary {
 }
 
 pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
     let mut entries: Vec<(Option<Timestamp>, String)> = Vec::new();
     for p in pods {
         let ns = p.metadata.namespace.as_deref().unwrap_or("");
@@ -1160,13 +1169,16 @@ pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
     out.push((LineColor::Plain, String::new()));
     out.push((
         LineColor::Err,
-        format!("▲ Récents OOMKilled sur ce noeud ({}) :", entries.len()),
+        fill(st.ev_node_recent_ooms, &[("n", &entries.len().to_string())]),
     ));
     for (_, line) in entries.iter().take(10) {
         out.push((LineColor::Err, line.clone()));
     }
     if entries.len() > 10 {
-        out.push((LineColor::Dim, format!("  ... ({} de plus)", entries.len() - 10)));
+        out.push((
+            LineColor::Dim,
+            fill(st.ev_more_entries, &[("n", &(entries.len() - 10).to_string())]),
+        ));
     }
     out
 }
@@ -1174,6 +1186,7 @@ pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
 // Sum container requests/limits across active pods on a node and express them as a percentage of
 // the node's allocatable capacity (reservation for requests, over-commit for limits).
 pub fn format_node_reserved(pods: &[Pod], node: &Node) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
     let mut out: Vec<(LineColor, String)> = Vec::new();
     let mut cpu_req = 0_i64; let mut cpu_lim = 0_i64;
     let mut mem_req = 0_i64; let mut mem_lim = 0_i64;
@@ -1206,10 +1219,13 @@ pub fn format_node_reserved(pods: &[Pod], node: &Node) -> Vec<(LineColor, String
     let alloc_mem = node.status.as_ref().and_then(|s| s.allocatable.as_ref())
         .and_then(|m| m.get("memory")).and_then(|q| parse_quantity_memory_bytes(&q.0)).unwrap_or(0);
     out.push((LineColor::Plain, String::new()));
-    out.push((LineColor::Info, format!(
-        "Réservé par les pods (somme des requests/limits sur {} pods actifs / {} total ; le ratio est sur l'allocatable du noeud) :",
-        active, total,
-    )));
+    out.push((
+        LineColor::Info,
+        fill(
+            st.ev_node_reserved,
+            &[("active", &active.to_string()), ("total", &total.to_string())],
+        ),
+    ));
     out.push((color_for_pct(pct(cpu_req, alloc_cpu)), format!("  cpu  requests sum : {:>10}  /  allocatable {:<10} ({}% reserved)",
         format_cpu_milli(cpu_req), format_cpu_milli(alloc_cpu), pct(cpu_req, alloc_cpu))));
     out.push((color_for_pct(pct(cpu_lim, alloc_cpu)), format!("  cpu  limits   sum : {:>10}  /  allocatable {:<10} ({}% over-commit)",
@@ -1371,7 +1387,7 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
             let mut s = state.lock().expect("node usage poisoned");
             if s.current_node.as_deref() != Some(&node_name) { return; }
             s.loading = false;
-            s.error = Some(format!("liste des pods: {}", e));
+            s.error = Some(fill(crate::lang::active().ev_list_pods_failed, &[("e", &e.to_string())]));
             return;
         }
     };

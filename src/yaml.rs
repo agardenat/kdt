@@ -119,7 +119,12 @@ async fn load_object(
 }
 
 pub fn to_yaml(value: &Value) -> String {
-    serde_yaml::to_string(value).unwrap_or_else(|e| format!("sérialisation YAML impossible : {e}"))
+    serde_yaml::to_string(value).unwrap_or_else(|e| {
+        crate::lang::fill(
+            crate::lang::active().yaml_serialize_failed,
+            &[("e", &e.to_string())],
+        )
+    })
 }
 
 // Metadata fields the apiserver owns: none of them survive a re-apply.

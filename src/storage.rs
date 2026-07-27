@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use crate::lang::{Strings, fill};
 use k8s_openapi::api::core::v1::{
     Event as K8sEvent, PersistentVolume, PersistentVolumeClaim, Pod,
 };
@@ -150,6 +151,7 @@ pub fn volume_in_class(pv: &PvResource, sc: &ScResource) -> bool {
 // enrichment — a role that cannot read PVs or pods degrades the diagnosis instead of blanking the
 // screen, and each rule that depends on missing data stays quiet rather than guessing.
 pub async fn fetch_storage(client: Client, namespace: Option<String>, state: SharedStorage) {
+    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("storage poisoned");
         s.loading = true;
@@ -181,7 +183,7 @@ pub async fn fetch_storage(client: Client, namespace: Option<String>, state: Sha
         HashMap::new()
     };
 
-    let snap = diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events);
+    let snap = diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events, st);
 
     let mut s = state.lock().expect("storage poisoned");
     s.loading = false;
@@ -529,6 +531,7 @@ pub fn diagnose(
     mounts: &HashMap<(String, String), Vec<String>>,
     mounts_known: bool,
     events: &HashMap<(String, String), String>,
+    st: &'static Strings,
 ) -> Diagnosed {
     let by_class: HashMap<&str, &ScResource> =
         classes.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -552,18 +555,17 @@ pub fn diagnose(
             "Released" => {
                 released_bytes += parse_bytes(&pv.capacity).unwrap_or(0);
                 let claim = pv.claim.clone().unwrap_or_else(|| "?".to_string());
-                hints.push(warn(format!(
-                    "Released : le PVC {} n'existe plus. {} restent réservés et aucun nouveau PVC ne pourra s'y lier tant que le claimRef n'est pas effacé.",
-                    claim, pv.capacity
+                hints.push(warn(fill(
+                    st.sto_pv_released,
+                    &[("claim", &claim), ("size", &pv.capacity)],
                 )));
             }
-            "Failed" => hints.push(danger(format!(
-                "Failed : le recyclage ou la suppression du volume a échoué. {} sont bloqués et le provisioner ne réessaiera pas.",
-                pv.capacity
-            ))),
-            "Available" => hints.push(info(format!(
-                "libre : {} en {} attendent un PVC qui les réclame.",
-                pv.capacity, pv.access_modes
+            "Failed" => {
+                hints.push(danger(fill(st.sto_pv_failed, &[("size", &pv.capacity)])))
+            }
+            "Available" => hints.push(info(fill(
+                st.sto_pv_available,
+                &[("size", &pv.capacity), ("modes", &pv.access_modes)],
             ))),
             "Bound" => {
                 if let Some(claim) = &pv.claim {
@@ -572,25 +574,23 @@ pub fn diagnose(
                         && !known_claims.contains(claim)
                         && !claim.starts_with('/')
                     {
-                        hints.push(info(format!(
-                            "lié à {} — ce PVC n'est pas dans le périmètre affiché (autre namespace ?).",
-                            claim
-                        )));
+                        hints.push(info(fill(st.sto_pv_out_of_scope, &[("claim", claim)])));
                     }
                 }
             }
             _ => {}
         }
         if pv.reclaim_policy == "Delete" && pv.phase == "Bound" {
-            hints.push(warn(format!(
-                "reclaimPolicy Delete : supprimer le PVC {} détruit le volume et les données avec.",
-                pv.claim.clone().unwrap_or_else(|| "lié".to_string())
-            )));
+            let claim = pv
+                .claim
+                .clone()
+                .unwrap_or_else(|| st.sto_pv_claim_unnamed.to_string());
+            hints.push(warn(fill(st.sto_pv_reclaim_delete, &[("claim", &claim)])));
         }
         if !pv.node_affinity.is_empty() {
-            hints.push(info(format!(
-                "épinglé par nodeAffinity ({}) : seul un pod planifié là peut le monter.",
-                pv.node_affinity
+            hints.push(info(fill(
+                st.sto_pv_node_affinity,
+                &[("affinity", &pv.node_affinity)],
             )));
         }
         hints.sort_by_key(|h| std::cmp::Reverse(h.level));
@@ -604,21 +604,19 @@ pub fn diagnose(
         let mut hints = Vec::new();
 
         match pvc.phase.as_str() {
-            "Pending" => hints.extend(pending_hints(pvc, &by_class, &defaults, &pvs, events)),
-            "Lost" => hints.push(danger(
-                "Lost : le PV auquel ce PVC était lié a disparu. Les données ne sont plus accessibles par ce claim.".to_string(),
-            )),
+            "Pending" => {
+                hints.extend(pending_hints(pvc, &by_class, &defaults, &pvs, events, st))
+            }
+            "Lost" => hints.push(danger(st.sto_pvc_lost.to_string())),
             "Bound" => {
                 if mounts_known && pvc.mounted_by.is_empty() {
-                    hints.push(warn(format!(
-                        "aucun pod ne le monte : {} sont provisionnés et inutilisés (workload à zéro, ou reste d'une migration ?).",
-                        if pvc.capacity.is_empty() { pvc.requested.clone() } else { pvc.capacity.clone() }
-                    )));
+                    let size = if pvc.capacity.is_empty() { &pvc.requested } else { &pvc.capacity };
+                    hints.push(warn(fill(st.sto_pvc_unmounted, &[("size", size)])));
                 }
                 if pvc.access_modes.contains("RWO") && pvc.mounted_by.len() > 1 {
-                    hints.push(warn(format!(
-                        "RWO monté par {} pods : ils doivent tous tenir sur le même nœud, sinon les suivants resteront en ContainerCreating.",
-                        pvc.mounted_by.len()
+                    hints.push(warn(fill(
+                        st.sto_pvc_rwo_shared,
+                        &[("n", &pvc.mounted_by.len().to_string())],
                     )));
                 }
                 // The reclaim policy that decides the fate of the data lives on the PV, not here —
@@ -629,9 +627,9 @@ pub fn diagnose(
                     .and_then(|n| pvs.iter().find(|p| &p.name == n))
                 {
                     if pv.reclaim_policy == "Delete" {
-                        hints.push(warn(format!(
-                            "reclaimPolicy Delete sur {} : supprimer ce PVC détruit le volume et les données.",
-                            pv.name
+                        hints.push(warn(fill(
+                            st.sto_pvc_reclaim_delete,
+                            &[("pv", &pv.name)],
                         )));
                     }
                 }
@@ -645,24 +643,19 @@ pub fn diagnose(
     // --- Classes and cluster-level findings ---
     let mut cluster_hints = Vec::new();
     if classes.is_empty() {
-        cluster_hints.push(warn(
-            "aucune StorageClass : rien ne sera provisionné dynamiquement, chaque PV doit être créé à la main.".to_string(),
-        ));
+        cluster_hints.push(warn(st.sto_no_class.to_string()));
     } else if defaults.is_empty() {
-        cluster_hints.push(warn(
-            "aucune StorageClass par défaut : tout PVC qui n'en nomme pas une explicitement restera Pending.".to_string(),
-        ));
+        cluster_hints.push(warn(st.sto_no_default_class.to_string()));
     } else if defaults.len() > 1 {
-        cluster_hints.push(danger(format!(
-            "{} StorageClass par défaut ({}) : la classe qu'obtient un PVC sans classe nommée n'est pas déterminée.",
-            defaults.len(),
-            defaults.join(", ")
+        cluster_hints.push(danger(fill(
+            st.sto_many_default_classes,
+            &[("n", &defaults.len().to_string()), ("list", &defaults.join(", "))],
         )));
     }
     if released_bytes > 0 {
-        cluster_hints.push(warn(format!(
-            "{} en PV Released : de la donnée conservée pour des PVC qui n'existent plus.",
-            crate::events::format_memory_bytes(released_bytes)
+        cluster_hints.push(warn(fill(
+            st.sto_released_total,
+            &[("size", &crate::events::format_memory_bytes(released_bytes))],
         )));
     }
 
@@ -678,26 +671,22 @@ pub fn diagnose(
     for sc in &mut classes {
         let mut hints = Vec::new();
         if defaults.len() > 1 && sc.is_default {
-            hints.push(danger(format!(
-                "l'une des {} classes marquées par défaut : un PVC sans classe peut tomber sur l'une ou l'autre.",
-                defaults.len()
+            hints.push(danger(fill(
+                st.sto_class_one_of_defaults,
+                &[("n", &defaults.len().to_string())],
             )));
         }
         if sc.reclaim_policy == "Delete" {
-            hints.push(info(
-                "reclaimPolicy Delete : les volumes de cette classe sont détruits avec leur PVC.".to_string(),
-            ));
+            hints.push(info(st.sto_class_reclaim_delete.to_string()));
         }
         if !sc.allow_expansion {
-            hints.push(info(
-                "allowVolumeExpansion à false : agrandir un PVC de cette classe impose de recréer le volume et de recopier les données.".to_string(),
-            ));
+            hints.push(info(st.sto_class_no_expansion.to_string()));
         }
         if sc.provisioner == NO_PROVISIONER {
             let n = claims_per_class.get(sc.name.as_str()).copied().unwrap_or(0);
-            hints.push(info(format!(
-                "pas de provisioner : les {} PVC de cette classe ne se lieront qu'à des PV créés à la main.",
-                n
+            hints.push(info(fill(
+                st.sto_class_no_provisioner,
+                &[("n", &n.to_string())],
             )));
         }
         hints.sort_by_key(|h| std::cmp::Reverse(h.level));
@@ -716,37 +705,34 @@ fn pending_hints(
     defaults: &[String],
     pvs: &[PvResource],
     events: &HashMap<(String, String), String>,
+    st: &'static Strings,
 ) -> Vec<Hint> {
     let mut out = Vec::new();
     // The provisioner's own words come first when it left any: they beat every inference below.
     if let Some(msg) = events.get(&(pvc.namespace.clone(), pvc.name.clone())) {
-        out.push(danger(format!("le provisioner a échoué : {}", msg.trim())));
+        out.push(danger(fill(
+            st.sto_pending_provisioner_failed,
+            &[("msg", msg.trim())],
+        )));
     }
 
     // Which class this claim will actually be provisioned by: the one it names, or the default.
     let effective = match pvc.storage_class.as_deref() {
         Some("") => {
-            out.push(danger(
-                "storageClassName vide : le provisionnement dynamique est explicitement refusé, ce PVC attend un PV créé à la main qui lui corresponde.".to_string(),
-            ));
+            out.push(danger(st.sto_pending_empty_class.to_string()));
             None
         }
         Some(name) => match by_class.get(name) {
             Some(sc) => Some(*sc),
             None => {
-                out.push(danger(format!(
-                    "StorageClass « {} » introuvable : ce PVC ne sera jamais provisionné tant que la classe n'existe pas.",
-                    name
-                )));
+                out.push(danger(fill(st.sto_pending_class_missing, &[("name", name)])));
                 None
             }
         },
         None => match defaults.first().and_then(|d| by_class.get(d.as_str())) {
             Some(sc) => Some(*sc),
             None => {
-                out.push(danger(
-                    "aucune classe nommée et aucune StorageClass par défaut sur le cluster : personne n'est chargé de provisionner ce volume.".to_string(),
-                ));
+                out.push(danger(st.sto_pending_no_class_at_all.to_string()));
                 None
             }
         },
@@ -754,10 +740,7 @@ fn pending_hints(
 
     if let Some(sc) = effective {
         if sc.binding_mode == "WaitForFirstConsumer" && out.is_empty() {
-            out.push(info(format!(
-                "la classe {} est en WaitForFirstConsumer : c'est un pod qui déclenchera la liaison, ce Pending est normal tant qu'aucun ne le monte.",
-                sc.name
-            )));
+            out.push(info(fill(st.sto_pending_wffc, &[("name", &sc.name)])));
         }
         if sc.provisioner == NO_PROVISIONER {
             let want = parse_bytes(&pvc.requested);
@@ -770,14 +753,14 @@ fn pending_hints(
                 })
                 .count();
             let text = if candidates == 0 {
-                format!(
-                    "la classe {} n'a pas de provisioner et aucun PV Available d'au moins {} ne lui appartient : il faut en créer un.",
-                    sc.name, pvc.requested
+                fill(
+                    st.sto_pending_no_candidate,
+                    &[("name", &sc.name), ("size", &pvc.requested)],
                 )
             } else {
-                format!(
-                    "la classe {} n'a pas de provisioner ; {} PV Available pourraient convenir — la liaison dépend alors des accessModes et de la nodeAffinity.",
-                    sc.name, candidates
+                fill(
+                    st.sto_pending_candidates,
+                    &[("name", &sc.name), ("n", &candidates.to_string())],
                 )
             };
             out.push(if candidates == 0 { danger(text) } else { warn(text) });
@@ -785,10 +768,7 @@ fn pending_hints(
     }
 
     if out.is_empty() {
-        out.push(warn(format!(
-            "Pending depuis {} sans cause déclarée : ni évènement de provisionnement, ni classe manquante. Regarder les logs du provisioner.",
-            pvc.age
-        )));
+        out.push(warn(fill(st.sto_pending_unexplained, &[("age", &pvc.age)])));
     }
     out
 }
@@ -796,6 +776,7 @@ fn pending_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::{FR, reads_as};
 
     fn sc(name: &str, provisioner: &str, binding: &str, default: bool) -> ScResource {
         ScResource {
@@ -850,21 +831,21 @@ mod tests {
         pvs: Vec<PvResource>,
         classes: Vec<ScResource>,
     ) -> Diagnosed {
-        diagnose(pvcs, pvs, classes, &HashMap::new(), true, &HashMap::new())
+        diagnose(pvcs, pvs, classes, &HashMap::new(), true, &HashMap::new(), &FR)
     }
 
     #[test]
     fn missing_class_explains_pending() {
         let d = run(vec![pvc("data", "Pending", Some("fast"))], vec![], vec![sc("slow", "csi", "Immediate", true)]);
-        assert!(d.pvcs[0].hints.iter().any(|h| h.text.contains("introuvable")));
+        assert!(d.pvcs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pending_class_missing)));
         assert_eq!(d.pvcs[0].hints[0].level, HintLevel::Danger);
     }
 
     #[test]
     fn no_default_class_explains_pending_without_class() {
         let d = run(vec![pvc("data", "Pending", None)], vec![], vec![sc("slow", "csi", "Immediate", false)]);
-        assert!(d.pvcs[0].hints.iter().any(|h| h.text.contains("aucune StorageClass par défaut")));
-        assert!(d.cluster_hints.iter().any(|h| h.text.contains("aucune StorageClass par défaut")));
+        assert!(d.pvcs[0].hints.iter().any(|h| h.text == FR.sto_pending_no_class_at_all));
+        assert!(d.cluster_hints.iter().any(|h| h.text == FR.sto_no_default_class));
     }
 
     #[test]
@@ -875,7 +856,7 @@ mod tests {
             vec![sc("local", "csi", "WaitForFirstConsumer", true)],
         );
         assert_eq!(d.pvcs[0].hints[0].level, HintLevel::Info);
-        assert!(d.pvcs[0].hints[0].text.contains("WaitForFirstConsumer"));
+        assert!(reads_as(&d.pvcs[0].hints[0].text, FR.sto_pending_wffc));
     }
 
     #[test]
@@ -883,21 +864,21 @@ mod tests {
         let classes = vec![sc("manual", NO_PROVISIONER, "Immediate", false)];
         // Nothing available: there is a volume to create.
         let d = run(vec![pvc("data", "Pending", Some("manual"))], vec![], classes.clone());
-        assert!(d.pvcs[0].hints.iter().any(|h| h.text.contains("il faut en créer un")));
+        assert!(d.pvcs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pending_no_candidate)));
         // A big enough Available volume exists: the claim is not doomed, only unmatched.
         let d = run(
             vec![pvc("data", "Pending", Some("manual"))],
             vec![pv("vol", "Available", "manual", "20Gi")],
             classes.clone(),
         );
-        assert!(d.pvcs[0].hints.iter().any(|h| h.text.contains("pourraient convenir")));
+        assert!(d.pvcs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pending_candidates)));
         // Too small to satisfy the request: back to "create one".
         let d = run(
             vec![pvc("data", "Pending", Some("manual"))],
             vec![pv("vol", "Available", "manual", "1Gi")],
             classes,
         );
-        assert!(d.pvcs[0].hints.iter().any(|h| h.text.contains("il faut en créer un")));
+        assert!(d.pvcs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pending_no_candidate)));
     }
 
     #[test]
@@ -906,8 +887,8 @@ mod tests {
         v.claim = Some("gone/data".to_string());
         let d = run(vec![], vec![v], vec![sc("manual", NO_PROVISIONER, "Immediate", true)]);
         assert_eq!(d.released_bytes, 20 * 1024 * 1024 * 1024);
-        assert!(d.pvs[0].hints.iter().any(|h| h.text.contains("Released")));
-        assert!(d.cluster_hints.iter().any(|h| h.text.contains("Released")));
+        assert!(d.pvs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pv_released)));
+        assert!(d.cluster_hints.iter().any(|h| reads_as(&h.text, FR.sto_released_total)));
     }
 
     #[test]
@@ -915,8 +896,9 @@ mod tests {
         let bound = pvc("data", "Bound", Some("slow"));
         let classes = vec![sc("slow", "csi", "Immediate", true)];
         let known = run(vec![bound.clone()], vec![], classes.clone());
-        assert!(known.pvcs[0].hints.iter().any(|h| h.text.contains("aucun pod ne le monte")));
-        let unknown = diagnose(vec![bound], vec![], classes, &HashMap::new(), false, &HashMap::new());
+        assert!(known.pvcs[0].hints.iter().any(|h| reads_as(&h.text, FR.sto_pvc_unmounted)));
+        let unknown =
+            diagnose(vec![bound], vec![], classes, &HashMap::new(), false, &HashMap::new(), &FR);
         assert!(unknown.pvcs[0].hints.is_empty());
     }
 
