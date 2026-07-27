@@ -421,8 +421,13 @@ Helm déjà en cours, tentatives épuisées, dépendance non prête, CRD absente
 namespace en cours de suppression), puis il **confirme chaque piste contre le cluster** — une erreur
 qui nomme un webhook ne prouve pas que ce webhook soit cassé. Seuls les constats confirmés sont
 affichés, et seuls eux portent des actions. Quand le message ne donne aucune piste, un balayage des
-configurations d'admission cherche l'orphelin en `failurePolicy: Fail` — la seule panne qui casse
-les applies sans jamais se nommer dans l'objet qu'elle casse.
+configurations d'admission cherche les orphelines — dont celle en `failurePolicy: Fail`, la seule
+panne qui casse les applies sans jamais se nommer dans l'objet qu'elle casse.
+
+Ces résidus-là sont annoncés pour ce qu'ils sont : le panneau écrit **« rien ne bloque cette
+ressource, résidus trouvés sur le cluster, sans effet ici »** et les marque d'une puce neutre. Une
+configuration en `Ignore`, ou vidée de ses webhooks, est de la poussière, pas un blocage — et un
+panneau intitulé « déblocage » qui les listerait sans le dire laisserait croire le contraire.
 
 | Constat | Action proposée |
 |---|---|
@@ -434,9 +439,11 @@ les applies sans jamais se nommer dans l'objet qu'elle casse.
 | Dépendance non prête, CRD absente, champ immuable, refus d'admission | *Constat seul* : rien à automatiser |
 
 Les deux actions irréversibles — supprimer une configuration d'admission, retirer des finalizers —
-passent par la confirmation stricte : il faut **retaper le nom** de l'objet. Les autres demandent
-deux fois `Ctrl-R`. Dans tous les cas `Entrée` **annule** : refuser est la réponse par défaut, donc
-la touche réflexe n'est jamais celle qui détruit. Un état de release Helm est lu dans les *labels*
+passent par la confirmation stricte : il faut **retaper le nom** de l'objet. Le champ de saisie
+s'ouvre dès que le remède est sélectionné, avec le nom attendu rappelé à côté : demander un nom sans
+montrer où le taper, ni lequel, n'est pas une instruction qu'on peut suivre. Les autres remèdes
+demandent deux fois `Ctrl-R`. Dans tous les cas `Entrée` **annule** : refuser est la réponse par
+défaut, donc la touche réflexe n'est jamais celle qui détruit. Un état de release Helm est lu dans les *labels*
 du secret `sh.helm.release.v1.*`, sans décompresser quoi que ce soit.
 
 #### Logs Flux (`L` ou `:flux-logs`)

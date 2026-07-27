@@ -2112,12 +2112,33 @@ impl App {
             return;
         }
         if let Some(v) = self.repair_view.as_mut() {
-            if v.typed.is_some() || v.armed {
-                v.armed = false;
-                v.typed = None;
-            }
+            v.armed = false;
+            v.typed = None;
             let cur = v.cursor.min(len - 1) as i32;
             v.cursor = (cur + delta).rem_euclid(len as i32) as usize;
+        }
+        self.sync_strict_buffer();
+    }
+
+    // Keeps the name buffer in step with what is highlighted: a move that has to be typed through
+    // shows its field as soon as it is selected. Opening that field behind an extra keypress made
+    // the panel ask for a name while offering nowhere to put it — an invisible step nothing
+    // announced, and picking the move is already the acknowledgement the step stood for.
+    fn sync_strict_buffer(&mut self) {
+        let strict = {
+            let choices = self.repair_choices();
+            self.repair_view.as_ref().and_then(|v| {
+                choices
+                    .get(v.cursor.min(choices.len().saturating_sub(1)))
+                    .map(|(_, r)| r.level() == crate::delete::Level::Danger)
+            })
+        };
+        if let Some(v) = self.repair_view.as_mut() {
+            match strict {
+                Some(true) if v.typed.is_none() => v.typed = Some(String::new()),
+                Some(true) => {}
+                _ => v.typed = None,
+            }
         }
     }
 
@@ -2139,15 +2160,11 @@ impl App {
         };
         if remedy.level() == crate::delete::Level::Danger {
             let expected = remedy.confirm_target();
+            // The field is already open (see `sync_strict_buffer`), so this chord is the answer, not
+            // a step towards it. A mismatch keeps waiting: that is an unfinished answer, not an error.
             match v.typed.as_ref() {
-                // The first chord acknowledges the warning and opens the name prompt.
-                None => {
-                    v.typed = Some(String::new());
-                    return;
-                }
-                // A mismatch just keeps waiting: it is not an error, it is an unfinished answer.
-                Some(buf) if buf.trim() != expected => return,
-                Some(_) => {}
+                Some(buf) if buf.trim() == expected => {}
+                _ => return,
             }
         } else if !v.armed {
             v.armed = true;
@@ -2199,6 +2216,9 @@ impl App {
     // `refreshed` latch keeps the poll from re-firing on every tick while the panel stays open on
     // its result — the user still has to read it before closing.
     fn poll_repair(&mut self) {
+        // The findings arrive asynchronously, so this is also where the name field catches up with
+        // the move the cursor landed on when the probe published its results.
+        self.sync_strict_buffer();
         let succeeded = {
             let s = self.repair_state.lock().expect("repair state poisoned");
             matches!(s.done, Some(Ok(_)))
@@ -8738,11 +8758,23 @@ fn draw_repair_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Green),
         )));
     } else {
+        // Said before the list, not after: the panel is called "unblock", so an unqualified list of
+        // leftovers reads as "these are what is stopping you" when none of them is.
+        if s.swept {
+            lines.push(Line::from(Span::styled(
+                st.repair_swept,
+                Style::default().fg(Color::Green),
+            )));
+            lines.push(Line::from(""));
+        }
         for (i, b) in s.blockers.iter().enumerate() {
-            let (marker, color) = match b.level() {
-                DelLevel::Danger => ("✗ ", Color::Red),
-                DelLevel::Warn => ("▲ ", Color::Yellow),
-                DelLevel::Info => ("· ", DIM),
+            // A finding that is only a leftover keeps a neutral marker whatever its own severity:
+            // the severity says how bad the object is, not whether it is in this resource's way.
+            let (marker, color) = match (s.swept, b.level()) {
+                (true, _) => ("· ", DIM),
+                (false, DelLevel::Danger) => ("✗ ", Color::Red),
+                (false, DelLevel::Warn) => ("▲ ", Color::Yellow),
+                (false, DelLevel::Info) => ("· ", DIM),
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(color)),
@@ -8812,7 +8844,23 @@ fn draw_repair_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         (None, false) if s.loading => (String::new(), DIM),
         (None, false) if selected_remedy.is_none() => (String::new(), DIM),
         (None, false) => match v.typed.as_ref() {
-            Some(buf) => (st.repair_strict_prompt.replace("{d}", buf), Color::Red),
+            // The expected name is spelled out while the buffer does not match it: "type the name"
+            // is not an instruction anyone can follow when the panel lists several objects and says
+            // nothing about which of them the prompt is waiting for.
+            Some(buf) => {
+                let expected = selected_remedy
+                    .as_ref()
+                    .map(|r| r.confirm_target())
+                    .unwrap_or_default();
+                let mut p = st.repair_strict_prompt.replace("{d}", buf);
+                if buf.trim() != expected {
+                    p.push_str(&format!(
+                        "  ({})",
+                        st.repair_strict_mismatch.replace("{name}", &expected)
+                    ));
+                }
+                (p, Color::Red)
+            }
             None if strict => (st.repair_strict_hint.to_string(), Color::Red),
             None if v.armed => (st.repair_arm_prompt.to_string(), Color::Yellow),
             None => (st.repair_pick_prompt.to_string(), Color::Yellow),

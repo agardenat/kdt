@@ -228,6 +228,11 @@ pub struct RepairState {
     // list and a failed scan look the same on screen otherwise.
     pub error: Option<String>,
     pub blockers: Vec<Blocker>,
+    // True when the findings come from the cluster-wide sweep rather than from the controller's own
+    // message — meaning nothing here is proven to block the diagnosed resource. Worth stating: a
+    // panel called "unblock" that lists leftovers reads as "these are stopping you", and a
+    // fail-open webhook or an empty configuration is untidiness, not a blockage.
+    pub swept: bool,
     pub applying: bool,
     pub done: Option<Result<String, String>>,
 }
@@ -343,18 +348,21 @@ pub async fn probe(client: Client, target: Target, key: String, state: SharedRep
     }
     s.loading = false;
     match result {
-        Ok(blockers) => {
+        Ok((blockers, swept)) => {
             s.blockers = blockers;
+            s.swept = swept;
             s.error = None;
         }
         Err(e) => {
             s.blockers.clear();
+            s.swept = false;
             s.error = Some(e);
         }
     }
 }
 
-async fn run_probe(client: &Client, target: &Target) -> Result<Vec<Blocker>, String> {
+// Returns the findings and whether they came from the sweep (nothing implicated this resource).
+async fn run_probe(client: &Client, target: &Target) -> Result<(Vec<Blocker>, bool), String> {
     let suspicions = classify(&target.message);
     let mut out: Vec<Blocker> = Vec::new();
 
@@ -404,18 +412,21 @@ async fn run_probe(client: &Client, target: &Target) -> Result<Vec<Blocker>, Str
 
     // With no lead in the message there is nothing to confirm, so the webhook sweep runs as a last
     // resort: a fail-closed orphan is the one cluster-wide fault that breaks applies without ever
-    // naming itself in the object it breaks.
+    // naming itself in the object it breaks. Everything it finds is reported, not just what is
+    // already breaking — the sweep only ever returns configurations whose service is genuinely
+    // dead, so it cannot be noisy, and "nothing is blocking this, but the cluster still carries
+    // these leftovers" is the honest answer to someone who asked what was wrong.
+    // Anything found before this point was implicated by the resource's own state or message.
+    let implicated = !out.is_empty();
+    let mut swept = false;
     if suspicions.is_empty() && !scanned_webhooks {
-        out.extend(
-            webhook_blockers(client)
-                .await?
-                .into_iter()
-                .filter(|b| b.level() == Level::Danger),
-        );
+        let found = webhook_blockers(client).await?;
+        swept = !implicated && !found.is_empty();
+        out.extend(found);
     }
 
     out.sort_by_key(|b| std::cmp::Reverse(b.level()));
-    Ok(out)
+    Ok((out, swept))
 }
 
 // One webhook of a configuration, flattened: which Service backs it (absent for a URL-addressed
