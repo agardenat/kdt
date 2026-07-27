@@ -32,6 +32,9 @@ use crate::delete::{
     new_delete_state, preflight, run_delete, GitOpsTool, Level as DelLevel, Reason as DelReason,
     SharedDelete,
 };
+use crate::repair::{
+    Blocker as RpBlocker, Remedy as RpRemedy, WebhookFault as RpFault,
+};
 use crate::diagnostic::{
     format_diagnostic_for_ai, new_diagnostic_state, run_diagnostic, DiagStatus, DiagnosticStep,
     SharedDiagnostic,
@@ -41,7 +44,7 @@ use crate::clip;
 use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
 use crate::flux::{
     build_flux_tree, controller_for_kind, fetch_flux, fetch_inventory, flux_tree_uid, new_flux_state,
-    new_inventory_state, new_reconcile_status, reconcile, set_suspend, FlatTreeNode, FluxReady,
+    new_inventory_state, new_reconcile_status, reconcile, toggle_suspend, FlatTreeNode, FluxReady,
     FluxResource, InventoryItem, ReconcileScope, SharedFlux, SharedInventory, SharedReconcile,
     ALL_CONTROLLERS,
 };
@@ -178,6 +181,23 @@ struct DeleteView {
     armed: bool,
     typed: Option<String>,
     // Set once the successful deletion has triggered a refresh of the underlying view.
+    refreshed: bool,
+}
+
+// The `Ctrl-R` overlay: what is blocking the selected Flux resource, and which counter-move is
+// about to be played. The findings and the outcome live in `App::repair_state`, written by the
+// background probe. Unlike the delete and drain panels this one first has to *choose* — a blockage
+// often offers several moves — so a cursor runs over the flattened list of remedies before the
+// confirmation begins. From there it is the same two paths, and the same default: no.
+struct RepairView {
+    target: crate::repair::Target,
+    key: String,
+    // Index into the flattened (blocker, remedy) list. Blockers with nothing to offer are shown as
+    // findings but never land under the cursor.
+    cursor: usize,
+    armed: bool,
+    typed: Option<String>,
+    // Set once a successful repair has triggered a refresh of the underlying view.
     refreshed: bool,
 }
 
@@ -900,6 +920,9 @@ pub struct App {
     // Delete overlay (Ctrl-D): `None` when closed. Guard-rails and outcome sit in `delete_state`.
     delete_view: Option<DeleteView>,
     delete_state: SharedDelete,
+    // Repair overlay (Ctrl-R): `None` when closed. Findings and outcome sit in `repair_state`.
+    repair_view: Option<RepairView>,
+    repair_state: crate::repair::SharedRepair,
     // Edit overlay (`e`): `None` when closed. Document, guard-rails and outcome sit in `edit_state`.
     edit_view: Option<EditView>,
     edit_state: SharedEdit,
@@ -1095,6 +1118,8 @@ impl App {
             yaml_neat: true,
             delete_view: None,
             delete_state: new_delete_state(),
+            repair_view: None,
+            repair_state: crate::repair::new_repair_state(),
             edit_view: None,
             edit_state: new_edit_state(),
             pending_editor: None,
@@ -2015,6 +2040,178 @@ impl App {
     fn delete_backspace(&mut self) {
         if let Some(buf) = self.delete_view.as_mut().and_then(|v| v.typed.as_mut()) {
             buf.pop();
+        }
+    }
+
+    // Ctrl-R in the Flux view: ask what is holding the selected resource back. The controller's own
+    // failure message is handed to the probe as the starting lead — it is the only place the cause
+    // is ever named, even when the thing to repair lives in another namespace entirely.
+    fn open_repair_view(&mut self) {
+        let Some((api_version, kind, namespace, name)) = self.current_object_ref() else {
+            let st = lang::t(self.ai_language);
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.delete_no_object.to_string()));
+            return;
+        };
+        let message = {
+            let s = self.flux_state.lock().expect("flux poisoned");
+            s.resources
+                .iter()
+                .find(|r| r.kind == kind && r.namespace == namespace && r.name == name)
+                .map(|r| r.message.clone())
+                .unwrap_or_default()
+        };
+        let key = format!("repair|{}|{}/{}", kind, namespace, name);
+        let target = crate::repair::Target {
+            api_version,
+            kind,
+            namespace,
+            name,
+            message,
+        };
+        self.repair_view = Some(RepairView {
+            target: target.clone(),
+            key: key.clone(),
+            cursor: 0,
+            armed: false,
+            typed: None,
+            refreshed: false,
+        });
+        {
+            let mut s = self.repair_state.lock().expect("repair state poisoned");
+            *s = crate::repair::RepairState {
+                key: key.clone(),
+                loading: true,
+                ..Default::default()
+            };
+        }
+        let client = self.client.clone();
+        let state = self.repair_state.clone();
+        tokio::spawn(async move {
+            crate::repair::probe(client, target, key, state).await;
+        });
+    }
+
+    // The blockers flattened into the moves actually on offer, in panel order. A finding with no
+    // remedy is still displayed — knowing why something is stuck has value even when kdt cannot
+    // undo it — but it is skipped here so the cursor only ever rests on something actionable.
+    fn repair_choices(&self) -> Vec<(usize, crate::repair::Remedy)> {
+        let s = self.repair_state.lock().expect("repair state poisoned");
+        s.blockers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| b.remedies().into_iter().map(move |r| (i, r)))
+            .collect()
+    }
+
+    // Moving the cursor resets the confirmation: the arming the user did was for the previous move,
+    // and carrying it over would let a second keypress fire something they never agreed to.
+    fn repair_move(&mut self, delta: i32) {
+        let len = self.repair_choices().len();
+        if len == 0 {
+            return;
+        }
+        if let Some(v) = self.repair_view.as_mut() {
+            if v.typed.is_some() || v.armed {
+                v.armed = false;
+                v.typed = None;
+            }
+            let cur = v.cursor.min(len - 1) as i32;
+            v.cursor = (cur + delta).rem_euclid(len as i32) as usize;
+        }
+    }
+
+    // Ctrl-R again: one step down the confirmation path for the highlighted move — arm, open the
+    // type-the-name prompt, or play it. A no-op while the probe is still running. Only this chord
+    // advances: the panel refuses by default, so Enter cancels like Esc.
+    fn repair_confirm(&mut self) {
+        let (loading, busy) = {
+            let s = self.repair_state.lock().expect("repair state poisoned");
+            (s.loading, s.applying || s.done.is_some())
+        };
+        if loading || busy {
+            return;
+        }
+        let choices = self.repair_choices();
+        let Some(v) = self.repair_view.as_mut() else { return };
+        let Some((_, remedy)) = choices.get(v.cursor.min(choices.len().saturating_sub(1))) else {
+            return;
+        };
+        if remedy.level() == crate::delete::Level::Danger {
+            let expected = remedy.confirm_target();
+            match v.typed.as_ref() {
+                // The first chord acknowledges the warning and opens the name prompt.
+                None => {
+                    v.typed = Some(String::new());
+                    return;
+                }
+                // A mismatch just keeps waiting: it is not an error, it is an unfinished answer.
+                Some(buf) if buf.trim() != expected => return,
+                Some(_) => {}
+            }
+        } else if !v.armed {
+            v.armed = true;
+            return;
+        }
+        self.spawn_repair();
+    }
+
+    fn spawn_repair(&mut self) {
+        let choices = self.repair_choices();
+        let Some(v) = self.repair_view.as_ref() else { return };
+        let Some((_, remedy)) = choices.get(v.cursor.min(choices.len().saturating_sub(1))).cloned()
+        else {
+            return;
+        };
+        let (target, key) = (v.target.clone(), v.key.clone());
+        {
+            let mut s = self.repair_state.lock().expect("repair state poisoned");
+            s.applying = true;
+            s.done = None;
+        }
+        let client = self.client.clone();
+        let state = self.repair_state.clone();
+        tokio::spawn(async move {
+            crate::repair::apply(client, remedy, target, key, state).await;
+        });
+    }
+
+    // Esc and Enter: cancel outright, whatever step the gesture has reached.
+    fn repair_cancel(&mut self) {
+        self.repair_view = None;
+    }
+
+    fn repair_input(&mut self, c: char) {
+        if let Some(buf) = self.repair_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            if buf.len() < 253 {
+                buf.push(c);
+            }
+        }
+    }
+
+    fn repair_backspace(&mut self) {
+        if let Some(buf) = self.repair_view.as_mut().and_then(|v| v.typed.as_mut()) {
+            buf.pop();
+        }
+    }
+
+    // A repair that landed changes what the view underneath is showing, so refresh it once. The
+    // `refreshed` latch keeps the poll from re-firing on every tick while the panel stays open on
+    // its result — the user still has to read it before closing.
+    fn poll_repair(&mut self) {
+        let succeeded = {
+            let s = self.repair_state.lock().expect("repair state poisoned");
+            matches!(s.done, Some(Ok(_)))
+        };
+        if !succeeded {
+            return;
+        }
+        let needs = self.repair_view.as_ref().is_some_and(|v| !v.refreshed);
+        if needs {
+            if let Some(v) = self.repair_view.as_mut() {
+                v.refreshed = true;
+            }
+            self.refresh_flux();
         }
     }
 
@@ -3406,30 +3603,19 @@ impl App {
             ));
             return;
         };
-        let currently_suspended = {
-            let s = self.flux_state.lock().expect("flux poisoned");
-            s.resources
-                .iter()
-                .find(|r| r.kind == rec.kind && r.namespace == rec.namespace && r.name == rec.name)
-                .map(|r| r.suspended)
-                .unwrap_or(false)
-        };
-        let suspend = !currently_suspended;
+        // The direction is decided from the live object, not from this snapshot: it can be a full
+        // refresh interval behind, and a stale reading turns the key into its own opposite. That
+        // also means the in-flight toast cannot name the direction yet — the outcome one will.
         self.clipboard_status = Some((
             std::time::Instant::now(),
-            format!(
-                "{} {}/{}…",
-                if suspend { "■ suspend" } else { "► resume" },
-                rec.kind,
-                rec.name
-            ),
+            format!("⇅ suspend {}/{}…", rec.kind, rec.name),
         ));
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
         let (api_version, kind, ns, name) =
             (rec.api_version.clone(), rec.kind.clone(), rec.namespace.clone(), rec.name.clone());
         tokio::spawn(async move {
-            set_suspend(client, api_version, kind, ns, name, suspend, status).await;
+            toggle_suspend(client, api_version, kind, ns, name, status).await;
         });
     }
 
@@ -5894,16 +6080,30 @@ impl App {
         });
     }
 
-    // Opens the Flux reconcile menu (resource / +source / root sync).
+    // Opens the Flux reconcile menu (resource / +source / force / reset / root sync).
     fn open_flux_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
+        let mut items = vec![
+            ActionItem { label: st.k_reconcile, desc: st.desc_reconcile, action: MenuAction::Reconcile(ReconcileScope::Resource) },
+            ActionItem { label: st.k_reconcile_src, desc: st.desc_reconcile_src, action: MenuAction::Reconcile(ReconcileScope::WithSource) },
+        ];
+        // Force and reset are helm-controller levers: `forceAt` replays an upgrade the controller
+        // sees no reason to run, `resetAt` clears the counters behind "retries exhausted". They are
+        // offered only on a HelmRelease — elsewhere the annotation is written and nobody reads it,
+        // which is worse than an absent entry because the toast would report a success.
+        let on_helm_release = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .is_some_and(|r| r.kind == "HelmRelease");
+        if on_helm_release {
+            items.push(ActionItem { label: st.k_force_upgrade, desc: st.desc_force_upgrade, action: MenuAction::Reconcile(ReconcileScope::Force) });
+            items.push(ActionItem { label: st.k_reset_failures, desc: st.desc_reset_failures, action: MenuAction::Reconcile(ReconcileScope::Reset) });
+        }
+        items.push(ActionItem { label: st.k_sync_root, desc: st.desc_sync_root, action: MenuAction::Reconcile(ReconcileScope::RootSync) });
         self.action_menu = Some(ActionMenu {
             title: st.menu_flux_title,
-            items: vec![
-                ActionItem { label: st.k_reconcile, desc: st.desc_reconcile, action: MenuAction::Reconcile(ReconcileScope::Resource) },
-                ActionItem { label: st.k_reconcile_src, desc: st.desc_reconcile_src, action: MenuAction::Reconcile(ReconcileScope::WithSource) },
-                ActionItem { label: st.k_sync_root, desc: st.desc_sync_root, action: MenuAction::Reconcile(ReconcileScope::RootSync) },
-            ],
+            items,
             cursor: 0,
             confirm: true,
             confirming: false,
@@ -6477,6 +6677,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.delete_view.is_some() {
             app.poll_delete();
         }
+        if app.repair_view.is_some() {
+            app.poll_repair();
+        }
         if app.edit_view.is_some() {
             app.poll_edit();
         }
@@ -6598,6 +6801,29 @@ fn handle_event(app: &mut App, ev: Event) {
                 app.delete_input(c)
             }
             (KeyCode::Char('q'), _) => app.delete_cancel(),
+            _ => {}
+        }
+        return;
+    }
+    // The repair panel grabs all input while open (Ctrl-C still quits). Same default as the delete
+    // panel — no — but with a cursor first: the arrows pick the move, and only Ctrl-R, the chord
+    // that opened the panel, walks towards playing it.
+    if app.repair_view.is_some() {
+        let typing = app.repair_view.as_ref().is_some_and(|v| v.typed.is_some());
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => app.repair_confirm(),
+            (KeyCode::Enter | KeyCode::Esc, _) => app.repair_cancel(),
+            (KeyCode::Up, _) => app.repair_move(-1),
+            (KeyCode::Down, _) => app.repair_move(1),
+            (KeyCode::Backspace, _) => app.repair_backspace(),
+            // Once the name prompt is open every printable key feeds it, `q` and `k`/`j` included.
+            (KeyCode::Char(c), m) if typing && !m.contains(KeyModifiers::CONTROL) => {
+                app.repair_input(c)
+            }
+            (KeyCode::Char('k'), _) => app.repair_move(-1),
+            (KeyCode::Char('j'), _) => app.repair_move(1),
+            (KeyCode::Char('q'), _) => app.repair_cancel(),
             _ => {}
         }
         return;
@@ -6904,6 +7130,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('-'), _, Mode::Flux) => app.collapse_flux_inventory(),
         (KeyCode::Esc, _, Mode::Flux) => app.exit_flux_mode(),
         (KeyCode::F(5), _, Mode::Flux) => app.refresh_flux(),
+        // Ctrl-R rather than a bare letter: the panel's strict confirmation types an object name,
+        // and every printable key belongs to that buffer once it is open. It has to precede the
+        // bare `r` arm below, which matches any modifier and would otherwise swallow the chord.
+        (KeyCode::Char('r'), KeyModifiers::CONTROL, Mode::Flux) => app.open_repair_view(),
         (KeyCode::Char('r'), _, Mode::Flux) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::Flux) => app.toggle_suspend(),
         (KeyCode::Char('t'), _, Mode::Flux) => app.toggle_flux_tree(),
@@ -6931,6 +7161,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Esc, _, Mode::FluxFull) => app.exit_flux_full(),
         (KeyCode::Char('g'), _, Mode::FluxFull) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::FluxFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL, Mode::FluxFull) => app.open_repair_view(),
         (KeyCode::Char('r'), _, Mode::FluxFull) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::FluxFull) => app.toggle_suspend(),
         (KeyCode::Char('L'), _, Mode::FluxFull) => app.enter_flux_logs(),
@@ -7650,6 +7881,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" +/- ", kbg), Span::raw(format!(" {}   ", st.k_inventory)),
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
+            Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
@@ -7662,6 +7894,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
+            Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
             Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
         ],
@@ -8014,6 +8247,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.delete_view.is_some() {
         draw_delete_popup(f, app, area);
+    }
+    // Right after the delete panel, matching where its block sits in the key-grab chain: the draw
+    // order is the z-order, and the two have to agree.
+    if app.repair_view.is_some() {
+        draw_repair_popup(f, app, area);
     }
     if app.edit_view.is_some() {
         draw_edit_popup(f, app, area);
@@ -8396,6 +8634,214 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Color::Yellow
     };
     let title = format!(" {}  ·  {} {} ", st.delete_title, st.delete_cancel_keys, st.k_cancel);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(border)),
+        );
+    f.render_widget(p, popup_area);
+}
+
+// The localised sentence for one confirmed blockage.
+fn repair_blocker_text(st: &lang::Strings, b: &RpBlocker) -> String {
+    match b {
+        RpBlocker::OrphanWebhook { name, service, fault, .. } => {
+            let why = match fault {
+                RpFault::NamespaceGone => st.rp_fault_ns_gone,
+                RpFault::ServiceGone => st.rp_fault_svc_gone,
+                RpFault::NoEndpoints => st.rp_fault_no_endpoints,
+            };
+            st.rp_orphan_webhook
+                .replace("{d}", name)
+                .replace("{n}", service)
+                .replace("{m}", why)
+        }
+        RpBlocker::EmptyWebhookConfig { name, .. } => st.rp_empty_webhook.replace("{d}", name),
+        RpBlocker::StuckTerminating { name, finalizers, .. } => st
+            .rp_stuck_terminating
+            .replace("{d}", name)
+            .replace("{n}", &finalizers.len().to_string())
+            .replace("{m}", &finalizers.join(", ")),
+        RpBlocker::HelmPending { name, state, version, .. } => st
+            .rp_helm_pending
+            .replace("{d}", name)
+            .replace("{n}", state)
+            .replace("{m}", version),
+        RpBlocker::RetriesExhausted { name, .. } => st.rp_retries.replace("{d}", name),
+        RpBlocker::WaitingOnDependency { reference } => st.rp_dependency.replace("{d}", reference),
+        RpBlocker::MissingKind { kind } => st.rp_missing_kind.replace("{d}", kind),
+        RpBlocker::ImmutableField => st.rp_immutable.to_string(),
+        RpBlocker::AdmissionDenied { webhook } => st.rp_admission_denied.replace("{d}", webhook),
+    }
+}
+
+// The localised label for one counter-move.
+fn repair_remedy_text(st: &lang::Strings, r: &RpRemedy) -> String {
+    match r {
+        RpRemedy::DeleteWebhookConfig { name, .. } => st.rm_delete_webhook.replace("{d}", name),
+        RpRemedy::RemoveFinalizers { finalizers, .. } => st
+            .rm_remove_finalizers
+            .replace("{d}", &finalizers.len().to_string()),
+        RpRemedy::ResetFailures => st.rm_reset.to_string(),
+        RpRemedy::ForceUpgrade => st.rm_force.to_string(),
+        RpRemedy::SuspendResume => st.rm_suspend_cycle.to_string(),
+    }
+}
+
+// Ctrl-R panel: what is blocking the resource, the moves on offer, and the confirmation matching the
+// selected move's severity. Findings come first and are never dropped — a blockage nobody can undo
+// from here is still the answer to "why is this stuck" — with the choices indented underneath the
+// finding they belong to, so the link between a diagnosis and its cure stays visible.
+fn draw_repair_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(v) = app.repair_view.as_ref() else { return };
+    let s = app.repair_state.lock().expect("repair state poisoned").clone();
+    let st = lang::t(app.ai_language);
+
+    let title_line = if v.target.namespace.is_empty() {
+        format!("{} {}", v.target.kind, v.target.name)
+    } else {
+        format!("{} {}/{}", v.target.kind, v.target.namespace, v.target.name)
+    };
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            st.repair_target.replace("{d}", &title_line),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    // Flattened the same way `repair_choices` does, so the cursor index and what is drawn agree.
+    let choices: Vec<(usize, RpRemedy)> = s
+        .blockers
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| b.remedies().into_iter().map(move |r| (i, r)))
+        .collect();
+    let cursor = v.cursor.min(choices.len().saturating_sub(1));
+
+    if s.loading {
+        lines.push(Line::from(Span::styled(
+            st.repair_scanning,
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if let Some(e) = &s.error {
+        lines.push(Line::from(Span::styled(
+            st.repair_failed_scan.replace("{e}", e),
+            Style::default().fg(Color::Red),
+        )));
+    } else if s.blockers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            st.repair_none,
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        for (i, b) in s.blockers.iter().enumerate() {
+            let (marker, color) = match b.level() {
+                DelLevel::Danger => ("✗ ", Color::Red),
+                DelLevel::Warn => ("▲ ", Color::Yellow),
+                DelLevel::Info => ("· ", DIM),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(color)),
+                Span::styled(repair_blocker_text(st, b), Style::default().fg(color)),
+            ]));
+            // A fail-closed orphan deserves the extra sentence: it says why this one is breaking
+            // things right now rather than merely being untidy.
+            // Sub-lines are marked with a glyph rather than indented: the paragraph wraps with
+            // `trim: true`, which strips leading spaces, so an indent made of blanks would simply
+            // disappear and the detail would read as another top-level finding.
+            if matches!(b, RpBlocker::OrphanWebhook { fail_closed: true, .. }) {
+                lines.push(Line::from(Span::styled(
+                    format!("└ {}", st.rp_orphan_fail_closed),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            if let RpBlocker::StuckTerminating { spec_finalizers, .. } = b {
+                if !spec_finalizers.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "└ {}",
+                            st.rp_spec_finalizers.replace("{d}", &spec_finalizers.join(", "))
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            }
+            let mut offered = false;
+            for (ci, (bi, remedy)) in choices.iter().enumerate() {
+                if *bi != i {
+                    continue;
+                }
+                offered = true;
+                let selected = ci == cursor;
+                let style = if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                // Both states carry a glyph, for the same reason: an unselected choice marked only
+                // by blanks would lose them to the trim and sit flush with the findings above it.
+                lines.push(Line::from(Span::styled(
+                    format!("{} {}", if selected { "▸" } else { "·" }, repair_remedy_text(st, remedy)),
+                    style,
+                )));
+            }
+            if !offered {
+                lines.push(Line::from(Span::styled(
+                    format!("└ {}", st.repair_no_remedy),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    let selected_remedy = choices.get(cursor).map(|(_, r)| r.clone());
+    let strict = selected_remedy
+        .as_ref()
+        .is_some_and(|r| r.level() == DelLevel::Danger);
+
+    // Last line: where the confirmation stands, or the outcome once the API has answered.
+    let (prompt, prompt_color) = match (&s.done, s.applying) {
+        (Some(Ok(m)), _) => (st.repair_ok.replace("{d}", m), Color::Green),
+        (Some(Err(e)), _) => (st.repair_failed.replace("{e}", e), Color::Red),
+        (None, true) => (st.repair_running.to_string(), Color::Yellow),
+        (None, false) if s.loading => (String::new(), DIM),
+        (None, false) if selected_remedy.is_none() => (String::new(), DIM),
+        (None, false) => match v.typed.as_ref() {
+            Some(buf) => (st.repair_strict_prompt.replace("{d}", buf), Color::Red),
+            None if strict => (st.repair_strict_hint.to_string(), Color::Red),
+            None if v.armed => (st.repair_arm_prompt.to_string(), Color::Yellow),
+            None => (st.repair_pick_prompt.to_string(), Color::Yellow),
+        },
+    };
+    if !prompt.is_empty() {
+        lines.push(Line::from(Span::styled(
+            prompt,
+            Style::default().fg(prompt_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    let popup_w = (area.width * 76 / 100).max(60).min(area.width);
+    // The findings wrap, so size on how they actually wrap rather than on the line count — a panel
+    // that under-counts its own height pushes its last line, always the prompt, off the bottom.
+    let inner_w = popup_w.saturating_sub(4).max(1) as usize;
+    let height: usize = lines.iter().map(|l| wrapped_rows(l, inner_w)).sum();
+    let popup_h = (height as u16 + 2).clamp(7, area.height);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let border = if s.done.as_ref().is_some_and(|r| r.is_ok()) {
+        Color::Green
+    } else if strict || v.armed {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let title = format!(" {}  ·  {} {} ", st.repair_title, st.delete_cancel_keys, st.k_cancel);
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .block(
@@ -13783,8 +14229,19 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let kind_w = col_width(resources.iter().map(|r| r.kind.as_str()), "KIND", 8, 20);
     let ns_w = col_width(resources.iter().map(|r| r.namespace.as_str()), "NAMESPACE", 9, 24);
     let name_w = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 12, 50);
+    // Those three size themselves on the data and together can ask for 94 cells, which overruns a
+    // narrow terminal before the message column is even reached — ratatui then truncates whatever
+    // comes last and the row runs into the right border. So NAME, the most elastic of them, gives
+    // back whatever is needed to leave the message column a usable width.
+    const MSG_MIN: u16 = 24;
+    let others = kind_w + ns_w + 10 + 20 + 6 + HIGHLIGHT_W + 1 + 6;
+    let budget = area.width.saturating_sub(2).saturating_sub(others);
+    let name_w = name_w.min(budget.saturating_sub(MSG_MIN)).max(12);
     let selected = app.table_state.selected();
-    let msg_w = flux_msg_width(area.width, kind_w + ns_w + name_w + 10 + 20 + 6, 7);
+    // Seven columns, so six inter-column gaps — plus the two cells `highlight_symbol("> ")` takes
+    // off every row, which the focused row's wrapped message would otherwise spend running into the
+    // right border. The trailing +1 keeps the longest wrapped line off that border.
+    let msg_w = flux_msg_width(area.width, kind_w + ns_w + name_w + 10 + 20 + 6 + HIGHLIGHT_W + 1, 7);
 
     let rows: Vec<Row> = resources.iter().enumerate().map(|(i, r)| {
         let (ready_txt, ready_color) = if r.suspended {
@@ -13826,9 +14283,12 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .style(row_style)
     }).collect();
 
+    // Pinned rather than `Min`, for the same reason as the tree below: a `Min` last column swallows
+    // the margin that was reserved for it and the wrapped message lands on the right border.
     let widths = [
         Constraint::Length(kind_w), Constraint::Length(ns_w), Constraint::Length(name_w),
-        Constraint::Length(10), Constraint::Length(20), Constraint::Length(6), Constraint::Min(20),
+        Constraint::Length(10), Constraint::Length(20), Constraint::Length(6),
+        Constraint::Length(msg_w as u16),
     ];
 
     let table = Table::new(rows, widths)
@@ -13899,7 +14359,9 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .max("RESSOURCE".chars().count());
     let name_col = (name_w as u16).clamp(24, 80);
     let selected = app.table_state.selected();
-    let msg_w = flux_msg_width(area.width, name_col + 10 + 18 + 6, 5);
+    // Five columns, four gaps, plus `highlight_symbol("> ")` and the one-cell margin — same reason
+    // as the flat table above.
+    let msg_w = flux_msg_width(area.width, name_col + 10 + 18 + 6 + HIGHLIGHT_W + 1, 5);
 
     let mut emit_idx = 0usize;
     let rows: Vec<Row> = app
@@ -13973,9 +14435,12 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    // The message column is pinned to the width its text was wrapped at, not left as `Min`: a `Min`
+    // column expands over every cell that is left, the reserved margin included, so the wrapped
+    // text ends up flush against the right border however carefully `msg_w` was computed.
     let widths = [
         Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(18),
-        Constraint::Length(6), Constraint::Min(20),
+        Constraint::Length(6), Constraint::Length(msg_w as u16),
     ];
 
     let table = Table::new(rows, widths)
@@ -14060,7 +14525,12 @@ const HIGHLIGHT_W: u16 = 2;
 
 fn flux_msg_width(area_width: u16, fixed: u16, ncols: u16) -> usize {
     let inner = area_width.saturating_sub(2);
-    inner.saturating_sub(fixed).saturating_sub(ncols.saturating_sub(1)).max(20) as usize
+    let avail = inner.saturating_sub(fixed).saturating_sub(ncols.saturating_sub(1));
+    // 20 is a readability floor, not an entitlement: `fixed` already holds back one cell of margin,
+    // and on a narrow terminal a floor that claims more than is actually left spends exactly that
+    // cell — putting the wrapped text back on the border the margin existed to keep it off. When
+    // the two cannot both be had, the border wins and the column is simply narrower.
+    avail.clamp(1, 20.max(avail)) as usize
 }
 
 // The `/` prompt. A single input line, no suggestion list: unlike the palette there is no closed

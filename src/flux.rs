@@ -14,6 +14,11 @@ use crate::events::format_age;
 // Annotation `flux reconcile` sets to request an immediate reconcile: changing its value is enough
 // for the controller to re-run its loop instead of waiting for the next interval.
 const RECONCILE_ANNOTATION: &str = "reconcile.fluxcd.io/requestedAt";
+// Paired with the one above (same value, same patch) to widen what the reconcile is allowed to do:
+// `forceAt` makes helm-controller run the upgrade even with an unchanged chart, `resetAt` wipes the
+// failure counters that put a release in "retries exhausted". Both are HelmRelease-side levers.
+const FORCE_ANNOTATION: &str = "reconcile.fluxcd.io/forceAt";
+const RESET_ANNOTATION: &str = "reconcile.fluxcd.io/resetAt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluxReady {
@@ -136,10 +141,13 @@ pub fn build_flux_tree(resources: &[FluxResource], collapsed: &HashSet<String>) 
         if SOURCE_KINDS.contains(&r.kind.as_str()) {
             continue;
         }
-        // Prefer nesting under a dependsOn Kustomization when present.
-        let dep_parent = r.depends_on.iter().find_map(|(dns, dname)| {
-            by_key.get(&key("Kustomization", dns, dname)).copied()
-        });
+        // Prefer nesting under a dependsOn sibling when present. `dependsOn` always references the
+        // referring object's own kind (a Kustomization waits on Kustomizations, a HelmRelease on
+        // HelmReleases), so the lookup is keyed on `r.kind` rather than on Kustomization alone.
+        let dep_parent = r
+            .depends_on
+            .iter()
+            .find_map(|(dns, dname)| by_key.get(&key(&r.kind, dns, dname)).copied());
         let src_parent = r.source_ref.as_ref().and_then(|(skind, sname, sns)| {
             by_key.get(&key(skind, sns, sname)).copied()
         });
@@ -161,6 +169,15 @@ pub fn build_flux_tree(resources: &[FluxResource], collapsed: &HashSet<String>) 
     for r in roots {
         push_subtree(r, 0, resources, &children, collapsed, &mut visited, &mut out);
     }
+    // A dependency cycle (A dependsOn B, B dependsOn A) gives every member a parent, so none of them
+    // lands in `roots` and the loop above never reaches them. Left there, the resources would simply
+    // vanish from the tree — a view that silently omits rows is worse than one that misplaces them.
+    // Promote whatever is still unvisited to a root, in index order so the problems-first sort holds.
+    for i in 0..resources.len() {
+        if !visited[i] {
+            push_subtree(i, 0, resources, &children, collapsed, &mut visited, &mut out);
+        }
+    }
     out
 }
 
@@ -180,10 +197,31 @@ fn push_subtree(
     let has_children = !children[idx].is_empty();
     let is_collapsed = collapsed.contains(&flux_tree_uid(&resources[idx]));
     out.push(FlatTreeNode { idx, depth, has_children, collapsed: is_collapsed });
-    if has_children && !is_collapsed {
-        for &c in &children[idx] {
-            push_subtree(c, depth + 1, resources, children, collapsed, visited, out);
+    if has_children {
+        if is_collapsed {
+            // Folded away, but still *reached*: the descendants must be marked visited all the same,
+            // or the unreachable-node pass below would take them for orphans and promote them back
+            // to the root — quietly undoing the fold the user just asked for.
+            for &c in &children[idx] {
+                mark_subtree(c, children, visited);
+            }
+        } else {
+            for &c in &children[idx] {
+                push_subtree(c, depth + 1, resources, children, collapsed, visited, out);
+            }
         }
+    }
+}
+
+// Marks a subtree as reached without emitting any row. The `visited` guard doubles as the cycle
+// guard, so a loop among the hidden descendants terminates here too.
+fn mark_subtree(idx: usize, children: &[Vec<usize>], visited: &mut [bool]) {
+    if visited[idx] {
+        return;
+    }
+    visited[idx] = true;
+    for &c in &children[idx] {
+        mark_subtree(c, children, visited);
     }
 }
 
@@ -199,7 +237,7 @@ pub fn new_reconcile_status() -> SharedReconcile {
 }
 
 // Reconcile scope, from the most targeted to the widest.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileScope {
     // Annotate only the selected resource.
     Resource,
@@ -207,6 +245,12 @@ pub enum ReconcileScope {
     WithSource,
     // Annotate the bootstrap `flux-system/flux-system` GitRepository.
     RootSync,
+    // Force a Helm upgrade even when the chart and values are unchanged. The way out of a release
+    // the controller keeps skipping because it sees nothing to do, while the cluster disagrees.
+    Force,
+    // Clear the failure counters so the controller retries an install/upgrade it has given up on
+    // ("retries exhausted"). Changes no desired state — only the controller's memory of failing.
+    Reset,
 }
 
 // (group, candidate versions newest-first, kind) probed via discovery until one resolves.
@@ -261,9 +305,12 @@ pub async fn fetch_flux(client: Client, state: SharedFlux) {
     let mut s = state.lock().expect("flux poisoned");
     s.loading = false;
     s.resources = resources;
+    // A kind that failed to list is reported even when the others succeeded: the view is then missing
+    // rows (an RBAC-denied kind is the common case), and a silently incomplete inventory is exactly
+    // what makes someone conclude a resource does not exist when it merely could not be read.
     s.error = if !found_crd {
         Some("Flux CRDs introuvables (Flux n'est pas installé sur ce cluster ?)".into())
-    } else if s.resources.is_empty() && !errors.is_empty() {
+    } else if !errors.is_empty() {
         Some(errors.join(" · "))
     } else {
         None
@@ -485,6 +532,39 @@ pub async fn reconcile(
     }
 }
 
+// Same request as [`reconcile`], but returning the outcome instead of posting it to a toast — the
+// repair panel reports inside itself and needs to know whether the move actually landed.
+pub async fn reconcile_once(
+    client: &Client,
+    scope: ReconcileScope,
+    api_version: &str,
+    kind: &str,
+    ns: &str,
+    name: &str,
+) -> Result<String, String> {
+    run_reconcile(client, scope, api_version, kind, ns, name).await
+}
+
+// Suspend then immediately resume: the older way of making a controller drop the state it has got
+// stuck in, for the versions that do not honour `resetAt`. The resume is attempted even when the
+// suspend failed — leaving an object suspended because a repair gave up halfway is a worse outcome
+// than the blockage it was trying to clear.
+pub async fn suspend_cycle(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    ns: &str,
+    name: &str,
+) -> Result<String, String> {
+    let suspended = run_set_suspend(client, api_version, kind, ns, name, true).await;
+    let resumed = run_set_suspend(client, api_version, kind, ns, name, false).await;
+    match (suspended, resumed) {
+        (Ok(()), Ok(())) => Ok(format!("cycle suspend/resume effectué : {}/{}", kind, name)),
+        (_, Err(e)) => Err(format!("resume échoué, {}/{} reste suspendu : {}", kind, name, e)),
+        (Err(e), Ok(())) => Err(format!("suspend échoué : {}", e)),
+    }
+}
+
 async fn run_reconcile(
     client: &Client,
     scope: ReconcileScope,
@@ -512,6 +592,13 @@ async fn run_reconcile(
             // A source resource (GitRepository, OCIRepository…) has no sourceRef: just reconcile it.
             match source_ref(&obj, ns) {
                 Some((skind, sname, sns)) => {
+                    // The source is checked too: annotating a suspended source looks like it worked
+                    // while the artifact stays stale, and the resource then reconciles against the
+                    // old revision — the confusing half-success this refusal exists to prevent.
+                    let src = get_obj(client, SOURCE_GROUP, SOURCE_VERSIONS, &skind, &sns, &sname).await?;
+                    if is_suspended(&src) {
+                        return Err(format!("source {}/{} est suspendue", skind, sname));
+                    }
                     annotate_reconcile(client, SOURCE_GROUP, SOURCE_VERSIONS, &skind, &sns, &sname).await?;
                     annotate_reconcile(client, group, &[version], kind, ns, name).await?;
                     Ok(format!("✓ reconcile {}/{} + source {}/{}", kind, name, skind, sname))
@@ -531,6 +618,28 @@ async fn run_reconcile(
             }
             annotate_reconcile(client, SOURCE_GROUP, SOURCE_VERSIONS, "GitRepository", "flux-system", "flux-system").await?;
             Ok("✓ sync racine demandé : GitRepository/flux-system".to_string())
+        }
+        // Force and Reset only mean something to helm-controller. Refusing elsewhere rather than
+        // writing an annotation nobody reads keeps the toast honest: a "✓" has to mean the
+        // controller was actually asked something, not that a patch happened to succeed.
+        ReconcileScope::Force | ReconcileScope::Reset => {
+            if kind != "HelmRelease" {
+                return Err(format!(
+                    "{} : réservé aux HelmRelease (annotation ignorée ailleurs)",
+                    kind
+                ));
+            }
+            let (group, version) = split_api_version(api_version)?;
+            let obj = get_obj(client, group, &[version], kind, ns, name).await?;
+            if is_suspended(&obj) {
+                return Err(format!("{}/{} est suspendu", kind, name));
+            }
+            let (extra, label) = match scope {
+                ReconcileScope::Force => (FORCE_ANNOTATION, "upgrade forcé"),
+                _ => (RESET_ANNOTATION, "compteurs d'échec remis à zéro"),
+            };
+            annotate_reconcile_with(client, group, &[version], kind, ns, name, &[extra]).await?;
+            Ok(format!("✓ {} : {}/{}", label, kind, name))
         }
     }
 }
@@ -604,12 +713,34 @@ async fn annotate_reconcile(
     ns: &str,
     name: &str,
 ) -> Result<(), String> {
+    annotate_reconcile_with(client, group, versions, kind, ns, name, &[]).await
+}
+
+// Requests a reconcile, optionally carrying the extra annotations that turn it into a force or a
+// reset. The controllers only honour those when their value *equals* the one on `requestedAt`, so
+// every key here is stamped with the same timestamp in a single patch — writing them in separate
+// calls would produce two different clock readings and the extra annotation would be ignored.
+async fn annotate_reconcile_with(
+    client: &Client,
+    group: &str,
+    versions: &[&str],
+    kind: &str,
+    ns: &str,
+    name: &str,
+    extra: &[&str],
+) -> Result<(), String> {
     let ar = resolve_ar(client, group, versions, kind).await?;
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ar);
     let now = chrono::Utc::now().to_rfc3339();
-    let patch = serde_json::json!({
-        "metadata": { "annotations": { RECONCILE_ANNOTATION: now } }
-    });
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(
+        RECONCILE_ANNOTATION.to_string(),
+        serde_json::Value::String(now.clone()),
+    );
+    for key in extra {
+        annotations.insert((*key).to_string(), serde_json::Value::String(now.clone()));
+    }
+    let patch = serde_json::json!({ "metadata": { "annotations": annotations } });
     api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map(|_| ())
@@ -909,25 +1040,45 @@ pub fn controller_for_kind(kind: &str) -> &'static str {
     }
 }
 
-// Toggles `spec.suspend` on the selected resource. Suspending only pauses reconciliation (it never
-// deletes anything); resuming re-enables it. Works for any suspendable Flux kind.
-pub async fn set_suspend(
+// Writes `spec.suspend`. Suspending only pauses reconciliation (it never deletes anything);
+// resuming re-enables it. Works for any suspendable Flux kind. Callers go through
+// [`toggle_suspend`], which decides the direction from the live object, or [`suspend_cycle`].
+
+// Flips `spec.suspend` to the opposite of what the *cluster* currently holds. The caller cannot
+// decide the direction from the list snapshot: that snapshot is up to a refresh interval old, and
+// acting on a stale reading inverts the intent — pressing the key to resume something suspends it
+// again. So the live object is read first, inside the same task that patches it.
+pub async fn toggle_suspend(
     client: Client,
     api_version: String,
     kind: String,
     ns: String,
     name: String,
-    suspend: bool,
     status: SharedReconcile,
 ) {
-    let msg = match run_set_suspend(&client, &api_version, &kind, &ns, &name, suspend).await {
-        Ok(()) if suspend => format!("■ suspendu : {}/{}", kind, name),
-        Ok(()) => format!("► repris : {}/{}", kind, name),
+    let msg = match run_toggle_suspend(&client, &api_version, &kind, &ns, &name).await {
+        Ok(true) => format!("■ suspendu : {}/{}", kind, name),
+        Ok(false) => format!("► repris : {}/{}", kind, name),
         Err(e) => format!("✗ suspend : {}", e),
     };
     if let Ok(mut s) = status.lock() {
         *s = Some((Instant::now(), msg));
     }
+}
+
+// Returns the value that was written, so the toast reports what actually happened.
+async fn run_toggle_suspend(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    ns: &str,
+    name: &str,
+) -> Result<bool, String> {
+    let (group, version) = split_api_version(api_version)?;
+    let obj = get_obj(client, group, &[version], kind, ns, name).await?;
+    let target = !is_suspended(&obj);
+    run_set_suspend(client, api_version, kind, ns, name, target).await?;
+    Ok(target)
 }
 
 async fn run_set_suspend(
@@ -946,4 +1097,103 @@ async fn run_set_suspend(
         .await
         .map(|_| ())
         .map_err(|e| format!("{}/{} : {}", kind, name, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn res(kind: &str, name: &str) -> FluxResource {
+        FluxResource {
+            kind: kind.to_string(),
+            api_version: String::new(),
+            namespace: "default".to_string(),
+            name: name.to_string(),
+            ready: FluxReady::Ready,
+            suspended: false,
+            message: String::new(),
+            revision: String::new(),
+            age: String::new(),
+            source_ref: None,
+            depends_on: Vec::new(),
+            prune: None,
+        }
+    }
+
+    fn depends(mut r: FluxResource, on: &str) -> FluxResource {
+        r.depends_on.push(("default".to_string(), on.to_string()));
+        r
+    }
+
+    fn names(rows: &[FlatTreeNode], resources: &[FluxResource]) -> Vec<String> {
+        rows.iter().map(|n| resources[n.idx].name.clone()).collect()
+    }
+
+    #[test]
+    fn a_dependency_cycle_still_shows_every_resource() {
+        // A and B wait on each other: neither has a resolvable root, and before the promotion pass
+        // both simply disappeared from the tree instead of merely being misplaced.
+        let resources = vec![
+            depends(res("Kustomization", "a"), "b"),
+            depends(res("Kustomization", "b"), "a"),
+        ];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert_eq!(names(&rows, &resources), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_cycle_hanging_off_a_source_keeps_the_unreachable_members() {
+        // The source is a root, so `a` is reachable; `b` and `c` only reference each other.
+        let mut a = res("Kustomization", "a");
+        a.source_ref = Some(("GitRepository".to_string(), "repo".to_string(), "default".to_string()));
+        let resources = vec![
+            res("GitRepository", "repo"),
+            a,
+            depends(res("Kustomization", "b"), "c"),
+            depends(res("Kustomization", "c"), "b"),
+        ];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert_eq!(names(&rows, &resources), vec!["repo", "a", "b", "c"]);
+        assert_eq!(rows[1].depth, 1, "a nests under its source");
+        assert_eq!(rows[2].depth, 0, "a cycle member is promoted to a root");
+    }
+
+    #[test]
+    fn a_helmrelease_nests_under_the_helmrelease_it_depends_on() {
+        // `dependsOn` references the referring object's own kind: resolving it against Kustomization
+        // alone lost every HelmRelease-to-HelmRelease edge.
+        let resources = vec![
+            res("HelmRelease", "base"),
+            depends(res("HelmRelease", "app"), "base"),
+        ];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert_eq!(names(&rows, &resources), vec!["base", "app"]);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+        assert!(rows[0].has_children);
+    }
+
+    #[test]
+    fn a_kustomization_does_not_adopt_a_helmrelease_of_the_same_name() {
+        // Same name, different kind: the edge must not be drawn.
+        let resources = vec![
+            res("Kustomization", "infra"),
+            depends(res("HelmRelease", "app"), "infra"),
+        ];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert!(rows.iter().all(|n| n.depth == 0), "no cross-kind dependsOn edge");
+    }
+
+    #[test]
+    fn a_collapsed_node_hides_its_subtree_but_not_itself() {
+        let resources = vec![
+            res("HelmRelease", "base"),
+            depends(res("HelmRelease", "app"), "base"),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(flux_tree_uid(&resources[0]));
+        let rows = build_flux_tree(&resources, &collapsed);
+        assert_eq!(names(&rows, &resources), vec!["base"]);
+        assert!(rows[0].collapsed);
+    }
 }

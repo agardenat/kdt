@@ -25,6 +25,7 @@ mod nodeops;
 mod pdf;
 mod pods;
 mod rbac;
+mod repair;
 mod secrets;
 mod storage;
 mod svc;

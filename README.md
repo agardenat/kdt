@@ -11,7 +11,7 @@ TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter l
 - **Diagnostic cluster** : batterie de vérifications (version, namespaces système, kube-system, CoreDNS, CNI, webhooks, Rancher, pods en erreur, PV, évènements warning récents…).
 - **Extraction complète** : génère un rapport PDF de l'état du cluster dans `~/Downloads`.
 - **Analyse IA** : envoie le contexte courant (évènement, diagnostic, usage) à une API compatible OpenAI pour explication/recommandation, en français ou anglais. La réponse est **streamée** (SSE) et s'affiche au fil de l'eau.
-- **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine), suspend-reprise, logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
+- **FluxCD** : inventaire cluster-wide, réconciliation (ressource / + source / sync racine, plus force et reset sur une HelmRelease), suspend-reprise, **déblocage** (`Ctrl-R` : nomme ce qui bloque une ressource — webhook orphelin, finalizer, release Helm en pending — et propose le contre-coup), logs des controllers (filtrés ou agrégés), inventaire d'objets appliqués et vue arborescente des dépendances.
 - **Vulnérabilités** : liste les images scannées (CVE + score CVSS, nombre de correctifs disponibles) à partir des `VulnerabilityReport` de Trivy Operator, et le risque sur la version de Kubernetes elle-même (CVE du feed officiel + dernier patch de la mineure comme cible). Le scan d'images requiert Trivy Operator ; sans lui, la vue se replie sur les seules infos de version k8s.
 - **YAML de l'objet (`y`)** : depuis n'importe quelle vue, le manifeste de l'objet sélectionné, en brut (`kubectl get -o yaml`) ou en **neat** — sans les attributs de run (`managedFields`, `status`, `resourceVersion`, valeurs par défaut des pod specs…).
 - **Édition avec garde-fous (`e`)** : l'objet part dans `$EDITOR` (vim &co.) puis revient par un `PUT` verrouillé sur son `resourceVersion`. Avant, kdt dit ce qui rendra l'édition vaine — objet GitOps réécrit au prochain reconcile, spec tenue par un contrôleur, `can-i update` refusé ; après, il classe chaque champ modifié entre *appliqué*, *ignoré* et *rejeté par l'API*.
@@ -379,7 +379,12 @@ Panneau de détail à onglets **Logs / Status / Related / Inventory** :
 #### Réconciliation, suspend, logs
 
 La réconciliation pose l'annotation `reconcile.fluxcd.io/requestedAt` via l'API (pas besoin du
-binaire `flux`) ; le suspend/reprise bascule `spec.suspend` (non destructif).
+binaire `flux`) ; le suspend/reprise bascule `spec.suspend` (non destructif). Sur une HelmRelease,
+deux leviers supplémentaires apparaissent dans le menu : **forcer l'upgrade**
+(`reconcile.fluxcd.io/forceAt`, rejoue l'upgrade Helm même sans changement de chart) et **réarmer**
+(`reconcile.fluxcd.io/resetAt`, efface les compteurs d'échec d'une release en *retries exhausted*).
+Les deux annotations ne sont honorées que si elles portent la même valeur que `requestedAt` : kdt les
+écrit dans le même patch, avec le même horodatage.
 
 | Touche | Action |
 |---|---|
@@ -387,7 +392,8 @@ binaire `flux`) ; le suspend/reprise bascule `spec.suspend` (non destructif).
 | `Tab` / `Shift-Tab` | Changer d'onglet (Logs / Status / Related / Inventory) |
 | `Enter` | Détail plein écran (en mode arbre : plier/déplier le nœud) |
 | `Shift-↑/↓`, `g` / `G` | Scroll du détail |
-| `r` | Menu de réconciliation : ressource / **+source** (`--with-source`) / sync racine (`GitRepository/flux-system`), avec confirmation |
+| `r` | Menu de réconciliation : ressource / **+source** (`--with-source`) / sync racine (`GitRepository/flux-system`), plus **forcer l'upgrade** et **réarmer** sur une HelmRelease, avec confirmation |
+| `Ctrl-R` | Déblocage : nomme ce qui bloque la ressource et propose le contre-coup (voir plus bas) |
 | `z` | Suspendre / reprendre la ressource (`spec.suspend`) |
 | `t` | Basculer table ↔ vue arborescente |
 | `L` | Logs globaux de tous les controllers Flux (suivi) |
@@ -401,6 +407,37 @@ Affiche la hiérarchie de dépendances : **source → Kustomization/HelmRelease 
 dépendants** (`dependsOn`). `Enter` / `Espace` plie/déplie un nœud ; les actions `r` (menu
 réconciliation) et `z` s'appliquent au nœud sélectionné. Le contenu appliqué d'une `Kustomization` reste visible dans
 l'onglet **Inventory**.
+
+#### Déblocage (`Ctrl-R`)
+
+Un contrôleur en échec dit *ce qui* n'a pas marché, rarement *quoi faire*, et le geste qui débloque
+n'est presque jamais un reconcile de plus. Le cas d'école : un opérateur est désinstallé, ses
+webhooks d'admission survivent en pointant vers un service qui n'existe plus, et à partir de là
+chaque `apply` du contrôleur est rejeté par l'API server. Flux répète une erreur de webhook
+indéfiniment ; ce qu'il faut réparer est à trois namespaces de là.
+
+kdt lit d'abord le message du contrôleur pour en tirer des **pistes** (webhook injoignable, opération
+Helm déjà en cours, tentatives épuisées, dépendance non prête, CRD absente, champ immuable,
+namespace en cours de suppression), puis il **confirme chaque piste contre le cluster** — une erreur
+qui nomme un webhook ne prouve pas que ce webhook soit cassé. Seuls les constats confirmés sont
+affichés, et seuls eux portent des actions. Quand le message ne donne aucune piste, un balayage des
+configurations d'admission cherche l'orphelin en `failurePolicy: Fail` — la seule panne qui casse
+les applies sans jamais se nommer dans l'objet qu'elle casse.
+
+| Constat | Action proposée |
+|---|---|
+| Webhook orphelin (service, ou namespace, disparu ; aucun endpoint prêt) | Supprimer la configuration |
+| Configuration d'admission sans aucun webhook (résidu d'un opérateur) | Supprimer la configuration |
+| Objet bloqué en `Terminating` par un finalizer | Retirer les finalizers de force |
+| Release Helm en `pending-*` | `resetAt`, puis `forceAt` — jamais une écriture dans le stockage Helm |
+| Tentatives épuisées | `resetAt`, ou cycle suspend/resume |
+| Dépendance non prête, CRD absente, champ immuable, refus d'admission | *Constat seul* : rien à automatiser |
+
+Les deux actions irréversibles — supprimer une configuration d'admission, retirer des finalizers —
+passent par la confirmation stricte : il faut **retaper le nom** de l'objet. Les autres demandent
+deux fois `Ctrl-R`. Dans tous les cas `Entrée` **annule** : refuser est la réponse par défaut, donc
+la touche réflexe n'est jamais celle qui détruit. Un état de release Helm est lu dans les *labels*
+du secret `sh.helm.release.v1.*`, sans décompresser quoi que ce soit.
 
 #### Logs Flux (`L` ou `:flux-logs`)
 
@@ -691,7 +728,7 @@ La valeur n'est jamais transmise à l'API : elle ne sert qu'au rognage local. Re
 - **Données envoyées à l'IA** : la fonction d'analyse (`i`) et l'extraction (`X`) transmettent à l'endpoint configuré le contexte cluster courant : message de l'évènement, **logs du pod** (jusqu'à 200 lignes), status de l'objet, et ressources liées (RBAC, Ingress, PV/PVC, sources Flux/Argo, etc.). Les logs peuvent contenir des secrets. N'utilise que des endpoints de confiance. `enrich.rs` ne retire que les métadonnées de bookkeeping (`managedFields`, `uid`…), pas les données applicatives. Le payload est compacté avant envoi (JSON sans espaces, lignes répétées des logs/status fusionnées, événements liés dédupliqués) et borné par section, ainsi que globalement quand `context_window` est défini.
 - **Endpoint** : un `base_url` en `http://` envoie la clé `Authorization: Bearer` et le payload en clair. Préfère `https://` (ou un endpoint local pour de l'inférence offline).
 - **Clé API** : stockée en clair dans `config.json` ; restreins les permissions du fichier (`chmod 600`). La clé n'est jamais journalisée.
-- **Accès cluster** : toute la navigation est en lecture seule (`get`/`list`/`watch`/`logs`). Les seules écritures sont celles qu'une touche déclenche explicitement — scale / restart / recyclage, reconcile et suspend Flux, renew cert-manager, édition (`e`, un `PUT`), suppression (`Ctrl-D`), touch (`h`, un patch de deux annotations), cordon/uncordon et drain d'un nœud (`o` : un patch de `spec.unschedulable`, puis des évictions) — et elles sont refusées par l'API si le kubeconfig n'en a pas le droit. Deux shell-out, tous deux à la demande : `$EDITOR` lancé par `e`, et `kubectl exec -it` lancé par `E` — ce dernier est la seule dépendance de kdt à un binaire externe, et son absence est dite avant que l'écran ne soit rendu.
+- **Accès cluster** : toute la navigation est en lecture seule (`get`/`list`/`watch`/`logs`). Les seules écritures sont celles qu'une touche déclenche explicitement — scale / restart / recyclage, reconcile / force / reset et suspend Flux, déblocage (`Ctrl-R` : suppression d'une configuration d'admission orphaline, ou retrait de finalizers — les deux derrière une confirmation stricte), renew cert-manager, édition (`e`, un `PUT`), suppression (`Ctrl-D`), touch (`h`, un patch de deux annotations), cordon/uncordon et drain d'un nœud (`o` : un patch de `spec.unschedulable`, puis des évictions) — et elles sont refusées par l'API si le kubeconfig n'en a pas le droit. Deux shell-out, tous deux à la demande : `$EDITOR` lancé par `e`, et `kubectl exec -it` lancé par `E` — ce dernier est la seule dépendance de kdt à un binaire externe, et son absence est dite avant que l'écran ne soit rendu.
 - **Rendu PDF** : le contenu IA est échappé avant d'être évalué comme markup Typst (`convert_inline_md`), ce qui neutralise l'injection de code Typst ; les blocs de code passent par `raw()` (jamais évalué).
 
 ## Logs
@@ -889,7 +926,8 @@ habituels, qui traitent déjà PVC et PV comme de la donnée persistante.
 | `main.rs` | Bootstrap : client kube, logging, lancement TUI |
 | `cli.rs` | Parsing des arguments (clap) |
 | `events.rs` | Watcher d'évènements, logs (pods + controllers Flux), status, nœuds, usage |
-| `flux.rs` | FluxCD : inventaire, réconciliation, suspend, inventaire d'objets, arbre de dépendances |
+| `flux.rs` | FluxCD : inventaire, réconciliation (dont force / reset), suspend, inventaire d'objets, arbre de dépendances |
+| `repair.rs` | Déblocage : classification du message du contrôleur, sondes live, actions réparatrices |
 | `pods.rs` | Workloads et pods : inventaire, scale, restart, recyclage |
 | `svc.rs` | Services / Endpoints / Ingress / IngressClass |
 | `rbac.rs` | Bindings RBAC scorés par sévérité |
