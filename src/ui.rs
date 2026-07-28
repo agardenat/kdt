@@ -17621,7 +17621,7 @@ mod footer_tests {
             key("e"), lbl("erreurs"),
             footer_sep(),
             key("↑↓"), lbl("navigation"),
-            key("Shift+↑↓"), lbl(lang::FR.help_detail_scroll),
+            key("Shift+↑↓"), lbl("défilement détail"),
             key("s"), lbl("figer"),
             footer_sep(),
             key("Enter"), lbl("zoom"),
