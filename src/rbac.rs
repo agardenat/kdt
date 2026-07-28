@@ -7,12 +7,18 @@
 //! the subjects (public groups, system:masters, default SA), and the namespace (kube-system/
 //! flux-system… where a local foothold escalates cluster-wide).
 //!
+//! Scoring stays binding-centric, but the *graph* around it is materialised too: Roles/ClusterRoles,
+//! their aggregation edges and the ServiceAccounts are kept as entities of their own so the view can
+//! be read from any end (by subject, by binding, by role) and so `y`/`e` can open the ClusterRole
+//! itself rather than only the binding that points at it.
+//!
 //! `classify()` is pure and unit-tested; `fetch_rbac()` wires it to the live cluster following the
 //! same Shared-state pattern as `pods.rs`/`flux.rs`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule as K8sPolicyRule, Role, RoleBinding,
 };
@@ -264,6 +270,114 @@ pub struct RbacBinding {
     pub severity: Severity,
     pub findings: Vec<Finding>,
     pub age: String,
+    // Index into `RbacState::roles` of the Role/ClusterRole this binding points at; `None` when the
+    // roleRef dangles (the role was deleted, or lives outside what we could list).
+    pub role_idx: Option<usize>,
+    // Index into `RbacState::service_accounts`, aligned with `subjects`. `None` for User/Group
+    // subjects and for ServiceAccounts that do not exist.
+    pub sa_idx: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleKind {
+    Role,
+    ClusterRole,
+}
+
+impl RoleKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RoleKind::Role => "Role",
+            RoleKind::ClusterRole => "ClusterRole",
+        }
+    }
+    pub fn short(self) -> &'static str {
+        match self {
+            RoleKind::Role => "Role",
+            RoleKind::ClusterRole => "CRole",
+        }
+    }
+}
+
+// A Role or ClusterRole as an object in its own right. The binding-centric rows flatten these into
+// `RbacBinding::rules`; keeping them separate is what lets the tree show aggregation composition,
+// the ClusterRoles reused as per-namespace templates, and the roles nobody ever bound.
+#[derive(Debug, Clone)]
+pub struct RoleEntry {
+    pub kind: RoleKind,
+    pub namespace: String, // empty for a ClusterRole
+    pub name: String,
+    // Rules as they apply: inline rules, or the union pulled in by aggregation.
+    pub rules: Vec<PolicyRule>,
+    // How many rules the object itself declares, before aggregation filled it in.
+    pub own_rules: usize,
+    pub aggregated: bool,
+    // Indices of the ClusterRoles whose labels match this one's aggregation selectors.
+    pub aggregates: Vec<usize>,
+    // Reverse edge: the aggregated ClusterRoles this one feeds.
+    pub aggregates_into: Vec<usize>,
+    // Set when an aggregation selector uses matchExpressions, which we do not evaluate: the rule
+    // union is then a lower bound, and saying so beats silently under-reporting.
+    pub aggregation_partial: bool,
+    pub bound_cluster: usize,
+    // Namespaces where a RoleBinding rebinds this role. A ClusterRole listed in several namespaces
+    // is the "template" pattern: one definition, re-granted namespace by namespace.
+    pub bound_namespaces: Vec<String>,
+    pub provenance: Provenance,
+    pub source: Option<String>,
+    pub age: String,
+    // Severity of the rules themselves, scored cluster-wide: the *potential* of the role, which is
+    // an upper bound on what any single binding of it can grant.
+    pub severity: Severity,
+    pub findings: Vec<Finding>,
+}
+
+impl RoleEntry {
+    pub fn uid(&self) -> String {
+        format!("{}|{}/{}", self.kind.label(), self.namespace, self.name)
+    }
+    // A ClusterRole re-granted in several namespaces: edited once, it moves rights everywhere.
+    pub fn is_template(&self) -> bool {
+        self.kind == RoleKind::ClusterRole && self.bound_namespaces.len() >= 2
+    }
+    // Nobody binds it, so it grants nothing today — inert, but a standing offer.
+    pub fn is_unbound(&self) -> bool {
+        self.bound_cluster == 0 && self.bound_namespaces.is_empty()
+    }
+    // Worst first, like the binding rows: a role nobody can reach yet still ranks by what it would
+    // grant, because that is the question the role view asks.
+    fn sort_key(&self) -> (std::cmp::Reverse<u8>, String, String) {
+        (
+            std::cmp::Reverse(self.severity as u8),
+            self.namespace.clone(),
+            self.name.clone(),
+        )
+    }
+}
+
+// A ServiceAccount as an object, not just a subject string. Lets the view tell "granted to a SA that
+// exists" from "granted to a name nobody created".
+#[derive(Debug, Clone)]
+pub struct SaEntry {
+    pub namespace: String,
+    pub name: String,
+    // False when a binding names it but the cluster has no such object. Never false while
+    // `RbacState::sa_degraded` is set — an unreadable list is not evidence of absence.
+    pub exists: bool,
+    pub automount: Option<bool>,
+    pub secrets: usize,
+    pub image_pull_secrets: usize,
+    // Indices into `RbacState::bindings` that name this ServiceAccount.
+    pub bindings: Vec<usize>,
+    pub provenance: Provenance,
+    pub source: Option<String>,
+    pub age: String,
+}
+
+impl SaEntry {
+    pub fn label(&self) -> String {
+        format!("sa:{}/{}", self.namespace, self.name)
+    }
 }
 
 impl RbacBinding {
@@ -352,14 +466,14 @@ pub fn classify(
             push(
                 Severity::Critical,
                 "rbac-escalate",
-                "escalate/bind sur (cluster)roles — peut s'octroyer plus de droits".into(),
+                st.rbac_escalate.into(),
             );
         }
         if r.has_verb("impersonate") {
             push(
                 Severity::Critical,
                 "impersonate",
-                "verbe impersonate — peut devenir n'importe quel user/group/SA".into(),
+                st.rbac_impersonate.into(),
             );
         }
 
@@ -561,8 +675,26 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
 #[derive(Default, Debug, Clone)]
 pub struct RbacState {
     pub bindings: Vec<RbacBinding>,
+    pub roles: Vec<RoleEntry>,
+    pub service_accounts: Vec<SaEntry>,
+    // The ServiceAccount list failed while the bindings came through (a common read-only setup).
+    // While set, no "this SA does not exist" claim is made anywhere.
+    pub sa_degraded: bool,
+    // Bumped on every successful fetch. The view copies the graph only when this moves, instead of
+    // cloning a few thousand roles on every frame.
+    pub generation: u64,
     pub error: Option<String>,
     pub loading: bool,
+}
+
+impl RbacState {
+    // Display order for the role view: worst potential first. Returns indices, so every cross-link
+    // stored in the graph keeps pointing at the right entry.
+    pub fn role_order(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.roles.len()).collect();
+        idx.sort_by(|&a, &b| self.roles[a].sort_key().cmp(&self.roles[b].sort_key()));
+        idx
+    }
 }
 
 pub type SharedRbac = Arc<Mutex<RbacState>>;
@@ -580,25 +712,51 @@ fn conv_rule(p: &K8sPolicyRule) -> PolicyRule {
     }
 }
 
-// A ClusterRole's own rules plus, for aggregated roles with no inline rules, the union of the rules
-// of every ClusterRole whose labels match the aggregation selectors.
-struct ClusterRoleEntry {
-    labels: std::collections::BTreeMap<String, String>,
-    rules: Vec<PolicyRule>,
-    aggregated: bool,
+type Labels = std::collections::BTreeMap<String, String>;
+
+// The evaluable part of a ClusterRole's `aggregationRule`. Only selectors we can fully evaluate land
+// in `match_labels`; a selector carrying matchExpressions is dropped and flips `partial`, because
+// keeping it as an empty (match-everything) map would invent contributors rather than miss them.
+#[derive(Debug, Clone, Default)]
+pub struct AggregationSelectors {
+    pub match_labels: Vec<Labels>,
+    pub partial: bool,
 }
 
-fn resolve_cluster_rules(
-    name: &str,
-    index: &HashMap<String, ClusterRoleEntry>,
-) -> (Vec<PolicyRule>, bool) {
-    let Some(entry) = index.get(name) else {
-        return (Vec::new(), false);
-    };
-    if !entry.rules.is_empty() || !entry.aggregated {
-        return (entry.rules.clone(), entry.aggregated);
+// Which ClusterRoles feed each aggregated one, by index. Pure so the label matching is testable:
+// `labels[i]` and `selectors[i]` describe the same ClusterRole, and a role never aggregates itself.
+pub fn resolve_aggregation(labels: &[Labels], selectors: &[Option<AggregationSelectors>]) -> Vec<Vec<usize>> {
+    selectors
+        .iter()
+        .enumerate()
+        .map(|(i, sel)| {
+            let Some(sel) = sel else {
+                return Vec::new();
+            };
+            (0..labels.len())
+                .filter(|&j| j != i)
+                .filter(|&j| {
+                    // An empty selector matches everything, as the apiserver does.
+                    sel.match_labels
+                        .iter()
+                        .any(|ml| ml.iter().all(|(k, v)| labels[j].get(k) == Some(v)))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn agg_selectors(rule: &k8s_openapi::api::rbac::v1::AggregationRule) -> AggregationSelectors {
+    let mut out = AggregationSelectors::default();
+    for sel in rule.cluster_role_selectors.as_deref().unwrap_or_default() {
+        if sel.match_expressions.as_ref().map(|e| !e.is_empty()).unwrap_or(false) {
+            out.partial = true;
+            continue;
+        }
+        out.match_labels
+            .push(sel.match_labels.clone().unwrap_or_default().into_iter().collect());
     }
-    (entry.rules.clone(), true)
+    out
 }
 
 pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedRbac) {
@@ -613,20 +771,22 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
     let role_api: Api<Role> = Api::all(client.clone());
     let crb_api: Api<ClusterRoleBinding> = Api::all(client.clone());
     let rb_api: Api<RoleBinding> = Api::all(client.clone());
+    let sa_api: Api<ServiceAccount> = Api::all(client.clone());
     let lp = ListParams::default();
 
-    let (crs, roles, crbs, rbs) = tokio::join!(
+    let (crs, ns_roles, crbs, rbs, sas) = tokio::join!(
         cr_api.list(&lp),
         role_api.list(&lp),
         crb_api.list(&lp),
         rb_api.list(&lp),
+        sa_api.list(&lp),
     );
 
     let crs = match crs {
         Ok(l) => l,
         Err(e) => return fail(&state, e.to_string()),
     };
-    let roles = match roles {
+    let ns_roles = match ns_roles {
         Ok(l) => l,
         Err(e) => return fail(&state, e.to_string()),
     };
@@ -638,63 +798,124 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
         Ok(l) => l,
         Err(e) => return fail(&state, e.to_string()),
     };
+    // The ServiceAccount list is the one that may legitimately be denied while RBAC itself reads
+    // fine. Losing it costs the SA nodes, not the view — and it must silence every "SA missing"
+    // claim, since an unreadable list is not evidence of absence.
+    let (sa_items, sa_degraded) = match sas {
+        Ok(l) => (l.items, false),
+        Err(_) => (Vec::new(), true),
+    };
 
-    // Index ClusterRoles (with labels for aggregation) and namespaced Roles.
-    let mut cr_index: HashMap<String, ClusterRoleEntry> = HashMap::new();
+    // --- Roles and ClusterRoles as objects. ClusterRoles come first so their indices line up with
+    // the label/selector vectors the aggregation pass works on.
+    let mut roles: Vec<RoleEntry> = Vec::new();
+    let mut labels: Vec<Labels> = Vec::new();
+    let mut selectors: Vec<Option<AggregationSelectors>> = Vec::new();
+
     for cr in &crs.items {
-        let name = cr.metadata.name.clone().unwrap_or_default();
-        let rules = cr.rules.as_ref().map(|rs| rs.iter().map(conv_rule).collect()).unwrap_or_default();
-        cr_index.insert(
-            name,
-            ClusterRoleEntry {
-                labels: cr.metadata.labels.clone().unwrap_or_default().into_iter().collect(),
-                rules,
-                aggregated: cr.aggregation_rule.is_some(),
-            },
-        );
+        let rules: Vec<PolicyRule> =
+            cr.rules.as_ref().map(|rs| rs.iter().map(conv_rule).collect()).unwrap_or_default();
+        labels.push(cr.metadata.labels.clone().unwrap_or_default().into_iter().collect());
+        selectors.push(cr.aggregation_rule.as_ref().map(agg_selectors));
+        roles.push(RoleEntry {
+            kind: RoleKind::ClusterRole,
+            namespace: String::new(),
+            name: cr.metadata.name.clone().unwrap_or_default(),
+            own_rules: rules.len(),
+            rules,
+            aggregated: cr.aggregation_rule.is_some(),
+            aggregates: Vec::new(),
+            aggregates_into: Vec::new(),
+            aggregation_partial: false,
+            bound_cluster: 0,
+            bound_namespaces: Vec::new(),
+            provenance: detect_provenance(&cr.metadata),
+            source: None,
+            age: age_of(&cr.metadata),
+            severity: Severity::Info,
+            findings: Vec::new(),
+        });
     }
-    // Fill aggregated roles that ship without inline rules by unioning matching ClusterRoles.
-    let label_snapshot: Vec<(String, std::collections::BTreeMap<String, String>, Vec<PolicyRule>)> = cr_index
-        .iter()
-        .map(|(n, e)| (n.clone(), e.labels.clone(), e.rules.clone()))
-        .collect();
-    for cr in &crs.items {
-        if cr.aggregation_rule.is_none() {
+    let n_cr = roles.len();
+
+    // Aggregation edges are recorded even when the controller already wrote the union into `rules`:
+    // they are what lets the tree show what a role like `admin` is actually made of.
+    let contributors = resolve_aggregation(&labels, &selectors);
+    for i in 0..n_cr {
+        roles[i].aggregates = contributors[i].clone();
+        roles[i].aggregation_partial = selectors[i].as_ref().map(|s| s.partial).unwrap_or(false);
+        for &j in &contributors[i] {
+            roles[j].aggregates_into.push(i);
+        }
+    }
+    // Aggregated roles that ship without inline rules: union what they pull in, so the scoring sees
+    // the rights the binding really grants.
+    for i in 0..n_cr {
+        if !roles[i].aggregated || roles[i].own_rules > 0 {
             continue;
         }
-        let name = cr.metadata.name.clone().unwrap_or_default();
-        if cr_index.get(&name).map(|e| !e.rules.is_empty()).unwrap_or(true) {
-            continue;
-        }
-        let selectors = cr
-            .aggregation_rule
-            .as_ref()
-            .and_then(|a| a.cluster_role_selectors.clone())
-            .unwrap_or_default();
-        let mut acc: Vec<PolicyRule> = Vec::new();
-        for (_, labels, rules) in &label_snapshot {
-            let matches = selectors.iter().any(|sel| {
-                sel.match_labels
-                    .as_ref()
-                    .map(|ml| ml.iter().all(|(k, v)| labels.get(k) == Some(v)))
-                    .unwrap_or(false)
-            });
-            if matches {
-                acc.extend(rules.clone());
+        let acc: Vec<PolicyRule> =
+            contributors[i].iter().flat_map(|&j| roles[j].rules.clone()).collect();
+        roles[i].rules = acc;
+    }
+
+    for r in &ns_roles.items {
+        let rules: Vec<PolicyRule> =
+            r.rules.as_ref().map(|rs| rs.iter().map(conv_rule).collect()).unwrap_or_default();
+        roles.push(RoleEntry {
+            kind: RoleKind::Role,
+            namespace: r.metadata.namespace.clone().unwrap_or_default(),
+            name: r.metadata.name.clone().unwrap_or_default(),
+            own_rules: rules.len(),
+            rules,
+            aggregated: false,
+            aggregates: Vec::new(),
+            aggregates_into: Vec::new(),
+            aggregation_partial: false,
+            bound_cluster: 0,
+            bound_namespaces: Vec::new(),
+            provenance: detect_provenance(&r.metadata),
+            source: None,
+            age: age_of(&r.metadata),
+            severity: Severity::Info,
+            findings: Vec::new(),
+        });
+    }
+
+    let mut cr_by_name: HashMap<String, usize> = HashMap::new();
+    let mut role_by_key: HashMap<(String, String), usize> = HashMap::new();
+    for (i, r) in roles.iter().enumerate() {
+        match r.kind {
+            RoleKind::ClusterRole => {
+                cr_by_name.insert(r.name.clone(), i);
+            }
+            RoleKind::Role => {
+                role_by_key.insert((r.namespace.clone(), r.name.clone()), i);
             }
         }
-        if let Some(e) = cr_index.get_mut(&name) {
-            e.rules = acc;
-        }
     }
 
-    let mut role_index: HashMap<(String, String), Vec<PolicyRule>> = HashMap::new();
-    for r in &roles.items {
-        let ns = r.metadata.namespace.clone().unwrap_or_default();
-        let name = r.metadata.name.clone().unwrap_or_default();
-        let rules = r.rules.as_ref().map(|rs| rs.iter().map(conv_rule).collect()).unwrap_or_default();
-        role_index.insert((ns, name), rules);
-    }
+    // --- ServiceAccounts as objects.
+    let mut service_accounts: Vec<SaEntry> = sa_items
+        .iter()
+        .map(|sa| SaEntry {
+            namespace: sa.metadata.namespace.clone().unwrap_or_default(),
+            name: sa.metadata.name.clone().unwrap_or_default(),
+            exists: true,
+            automount: sa.automount_service_account_token,
+            secrets: sa.secrets.as_ref().map(|v| v.len()).unwrap_or(0),
+            image_pull_secrets: sa.image_pull_secrets.as_ref().map(|v| v.len()).unwrap_or(0),
+            bindings: Vec::new(),
+            provenance: detect_provenance(&sa.metadata),
+            source: None,
+            age: age_of(&sa.metadata),
+        })
+        .collect();
+    let mut sa_by_key: HashMap<(String, String), usize> = service_accounts
+        .iter()
+        .enumerate()
+        .map(|(i, sa)| ((sa.namespace.clone(), sa.name.clone()), i))
+        .collect();
 
     let mut bindings: Vec<RbacBinding> = Vec::new();
 
@@ -703,7 +924,8 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
             kind: crb.role_ref.kind.clone(),
             name: crb.role_ref.name.clone(),
         };
-        let (rules, aggregated) = resolve_cluster_rules(&role_ref.name, &cr_index);
+        let role_idx = cr_by_name.get(&role_ref.name).copied();
+        let (rules, aggregated) = role_rules(&roles, role_idx);
         let subjects = conv_subjects(crb.subjects.as_deref());
         let scope = Scope::ClusterWide;
         let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns, st);
@@ -713,12 +935,14 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
             scope,
             binding_kind: "ClusterRoleBinding".into(),
             binding_name: crb.metadata.name.clone().unwrap_or_default(),
+            sa_idx: vec![None; subjects.len()],
             subjects,
             via_clusterrole: false,
             aggregated,
             provenance,
             source: None,
             role_ref,
+            role_idx,
             rules,
             severity,
             findings,
@@ -733,17 +957,12 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
             name: rb.role_ref.name.clone(),
         };
         let via_clusterrole = role_ref.kind == "ClusterRole";
-        let (rules, aggregated) = if via_clusterrole {
-            resolve_cluster_rules(&role_ref.name, &cr_index)
+        let role_idx = if via_clusterrole {
+            cr_by_name.get(&role_ref.name).copied()
         } else {
-            (
-                role_index
-                    .get(&(ns.clone(), role_ref.name.clone()))
-                    .cloned()
-                    .unwrap_or_default(),
-                false,
-            )
+            role_by_key.get(&(ns.clone(), role_ref.name.clone())).copied()
         };
+        let (rules, aggregated) = role_rules(&roles, role_idx);
         let subjects = conv_subjects(rb.subjects.as_deref());
         let scope = Scope::Namespace(ns);
         let (severity, mut findings) = classify(&scope, &subjects, &rules, &critical_ns, st);
@@ -753,12 +972,14 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
             scope,
             binding_kind: "RoleBinding".into(),
             binding_name: rb.metadata.name.clone().unwrap_or_default(),
+            sa_idx: vec![None; subjects.len()],
             subjects,
             via_clusterrole,
             aggregated,
             provenance,
             source: None,
             role_ref,
+            role_idx,
             rules,
             severity,
             findings,
@@ -766,30 +987,151 @@ pub async fn fetch_rbac(client: Client, critical_ns: Vec<String>, state: SharedR
         });
     }
 
-    // Chain Flux-managed bindings to their real source (Git/OCI/Helm) via the Kustomization /
-    // HelmRelease sourceRef. One GET per distinct Flux object, cached.
-    let mut src_cache: HashMap<String, Option<String>> = HashMap::new();
-    for b in &mut bindings {
-        let key = match &b.provenance {
-            Provenance::FluxKustomization { namespace, name } => Some(format!("ks/{namespace}/{name}")),
-            Provenance::FluxHelmRelease { namespace, name } => Some(format!("hr/{namespace}/{name}")),
-            _ => None,
-        };
-        if let Some(k) = key {
-            if !src_cache.contains_key(&k) {
-                let resolved = resolve_flux_source(&client, &b.provenance).await;
-                src_cache.insert(k.clone(), resolved);
+    bindings.sort_by_key(|a| a.sort_key());
+
+    // --- Wire the graph back together, now that the binding order is final: who binds each role,
+    // which SA each subject resolves to, and the SAs that only exist as a name in a binding.
+    for (bi, b) in bindings.iter_mut().enumerate() {
+        if let Some(ri) = b.role_idx {
+            match &b.scope {
+                Scope::ClusterWide => roles[ri].bound_cluster += 1,
+                Scope::Namespace(ns) => {
+                    if !roles[ri].bound_namespaces.iter().any(|x| x == ns) {
+                        roles[ri].bound_namespaces.push(ns.clone());
+                    }
+                }
             }
-            b.source = src_cache.get(&k).cloned().flatten();
+        }
+        for si in 0..b.subjects.len() {
+            let s = &b.subjects[si];
+            if s.kind != "ServiceAccount" {
+                continue;
+            }
+            // A ClusterRoleBinding subject carries its own namespace; a RoleBinding subject may omit
+            // it, in which case it means the binding's namespace.
+            let ns = match (&s.namespace, &b.scope) {
+                (Some(ns), _) => ns.clone(),
+                (None, Scope::Namespace(ns)) => ns.clone(),
+                (None, Scope::ClusterWide) => String::new(),
+            };
+            let sa_name = s.name.clone();
+            match sa_by_key.get(&(ns.clone(), sa_name.clone())).copied() {
+                Some(idx) => {
+                    service_accounts[idx].bindings.push(bi);
+                    b.sa_idx[si] = Some(idx);
+                }
+                None if !sa_degraded && !ns.is_empty() => {
+                    // Informational, never a severity bump: the grant is dormant until someone
+                    // creates that ServiceAccount — at which point it lights up silently.
+                    let detail = fill(st.rbac_dangling_sa, &[("sa", &format!("{ns}/{sa_name}"))]);
+                    if !b.findings.iter().any(|f| f.tag == "dangling-sa") {
+                        b.findings.push(Finding {
+                            sev: Severity::Info,
+                            tag: "dangling-sa",
+                            detail,
+                        });
+                    }
+                    // Keep it in the graph so the subject view can show the hole.
+                    let idx = service_accounts.len();
+                    service_accounts.push(SaEntry {
+                        namespace: ns.clone(),
+                        name: sa_name.clone(),
+                        exists: false,
+                        automount: None,
+                        secrets: 0,
+                        image_pull_secrets: 0,
+                        bindings: vec![bi],
+                        provenance: Provenance::Unmanaged,
+                        source: None,
+                        age: String::new(),
+                    });
+                    sa_by_key.insert((ns, sa_name), idx);
+                    b.sa_idx[si] = Some(idx);
+                }
+                None => {}
+            }
         }
     }
 
-    bindings.sort_by_key(|a| a.sort_key());
+    // Score each role on its own rules: cluster-wide for a ClusterRole (the worst it can be bound
+    // as), in its own namespace for a Role. That severity is a ceiling, not a live risk.
+    for r in roles.iter_mut() {
+        let scope = match r.kind {
+            RoleKind::ClusterRole => Scope::ClusterWide,
+            RoleKind::Role => Scope::Namespace(r.namespace.clone()),
+        };
+        let (sev, mut findings) = classify(&scope, &[], &r.rules, &critical_ns, st);
+        if r.is_unbound() {
+            findings.push(Finding {
+                sev: Severity::Info,
+                tag: "unbound-role",
+                detail: st.rbac_unbound_role.into(),
+            });
+        }
+        if r.aggregation_partial {
+            findings.push(Finding {
+                sev: Severity::Info,
+                tag: "aggregation-partial",
+                detail: st.rbac_aggregation_partial.into(),
+            });
+        }
+        r.severity = sev;
+        r.findings = findings;
+    }
+
+    // `roles` and `service_accounts` stay in API order: every cross-link above is positional, and a
+    // sort here would silently invalidate all of them. Display order is the view's business — it
+    // sorts a vector of indices (`role_order()`) instead of moving the entries.
+
+    // Chain Flux-managed objects to their real source (Git/OCI/Helm) via the Kustomization /
+    // HelmRelease sourceRef. One GET per distinct Flux object, cached across all three lists.
+    let mut src_cache: HashMap<String, Option<String>> = HashMap::new();
+    for b in &mut bindings {
+        b.source = chain_source(&client, &b.provenance, &mut src_cache).await;
+    }
+    for r in &mut roles {
+        r.source = chain_source(&client, &r.provenance, &mut src_cache).await;
+    }
+    for sa in &mut service_accounts {
+        sa.source = chain_source(&client, &sa.provenance, &mut src_cache).await;
+    }
 
     let mut s = state.lock().expect("rbac poisoned");
     s.loading = false;
     s.bindings = bindings;
+    s.roles = roles;
+    s.service_accounts = service_accounts;
+    s.sa_degraded = sa_degraded;
+    s.generation = s.generation.wrapping_add(1);
     s.error = None;
+}
+
+// Rules a binding actually grants, plus whether they came from an aggregated ClusterRole. A dangling
+// roleRef grants nothing, which is exactly what an empty rule set scores.
+fn role_rules(roles: &[RoleEntry], idx: Option<usize>) -> (Vec<PolicyRule>, bool) {
+    match idx {
+        Some(i) => (roles[i].rules.clone(), roles[i].aggregated),
+        None => (Vec::new(), false),
+    }
+}
+
+// Resolve one object's Flux source, memoised per Flux object so a hundred roles from the same
+// Kustomization cost a single pair of GETs.
+async fn chain_source(
+    client: &Client,
+    prov: &Provenance,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let key = match prov {
+        Provenance::FluxKustomization { namespace, name } => format!("ks/{namespace}/{name}"),
+        Provenance::FluxHelmRelease { namespace, name } => format!("hr/{namespace}/{name}"),
+        _ => return None,
+    };
+    if !cache.contains_key(&key) {
+        let resolved = resolve_flux_source(client, prov).await;
+        cache.insert(key.clone(), resolved);
+    }
+    cache.get(&key).cloned().flatten()
 }
 
 // Flag a risky grant that lives outside GitOps (kubectl/unmanaged/owned): an audit blind spot.
@@ -1027,5 +1369,101 @@ mod tests {
     fn system_masters_is_critical() {
         let s = classify(&Scope::ClusterWide, &[group("system:masters")], &[], &[], &FR).0;
         assert_eq!(s, Severity::Critical);
+    }
+
+    // --- graph model ------------------------------------------------------------------------
+
+    fn labels(pairs: &[(&str, &str)]) -> Labels {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn sel(match_labels: &[&[(&str, &str)]], partial: bool) -> Option<AggregationSelectors> {
+        Some(AggregationSelectors {
+            match_labels: match_labels.iter().map(|ml| labels(ml)).collect(),
+            partial,
+        })
+    }
+
+    fn role(kind: RoleKind, namespace: &str, name: &str) -> RoleEntry {
+        RoleEntry {
+            kind,
+            namespace: namespace.into(),
+            name: name.into(),
+            rules: vec![],
+            own_rules: 0,
+            aggregated: false,
+            aggregates: vec![],
+            aggregates_into: vec![],
+            aggregation_partial: false,
+            bound_cluster: 0,
+            bound_namespaces: vec![],
+            provenance: Provenance::Unmanaged,
+            source: None,
+            age: String::new(),
+            severity: Severity::Info,
+            findings: vec![],
+        }
+    }
+
+    #[test]
+    fn aggregation_matches_labelled_contributors() {
+        // 0 = `admin` aggregating aggregate-to-admin=true; 1 carries the label, 2 does not.
+        let lbl = vec![
+            labels(&[]),
+            labels(&[("rbac.authorization.k8s.io/aggregate-to-admin", "true")]),
+            labels(&[("other", "x")]),
+        ];
+        let sels = vec![
+            sel(&[&[("rbac.authorization.k8s.io/aggregate-to-admin", "true")]], false),
+            None,
+            None,
+        ];
+        let out = resolve_aggregation(&lbl, &sels);
+        assert_eq!(out[0], vec![1]);
+        assert!(out[1].is_empty() && out[2].is_empty());
+    }
+
+    #[test]
+    fn aggregation_never_includes_itself() {
+        // A ClusterRole carrying the very label it aggregates must not become its own contributor.
+        let lbl = vec![labels(&[("agg", "yes")])];
+        let sels = vec![sel(&[&[("agg", "yes")]], false)];
+        assert!(resolve_aggregation(&lbl, &sels)[0].is_empty());
+    }
+
+    #[test]
+    fn match_expressions_selector_is_dropped_not_treated_as_match_all() {
+        // The unevaluable selector is skipped: no contributor is invented, and `partial` says so.
+        let lbl = vec![labels(&[]), labels(&[("a", "b")])];
+        let sels = vec![sel(&[], true), None];
+        assert!(resolve_aggregation(&lbl, &sels)[0].is_empty());
+        assert!(sels[0].as_ref().unwrap().partial);
+    }
+
+    #[test]
+    fn clusterrole_bound_in_two_namespaces_is_a_template() {
+        let mut r = role(RoleKind::ClusterRole, "", "app-editor");
+        r.bound_namespaces = vec!["a".into(), "b".into()];
+        assert!(r.is_template());
+        assert!(!r.is_unbound());
+
+        r.bound_namespaces = vec!["a".into()];
+        assert!(!r.is_template(), "a single namespace is a plain grant, not a reused template");
+    }
+
+    #[test]
+    fn namespaced_role_is_never_a_template() {
+        let mut r = role(RoleKind::Role, "app", "reader");
+        r.bound_namespaces = vec!["app".into(), "app".into()];
+        assert!(!r.is_template());
+    }
+
+    #[test]
+    fn role_nobody_binds_is_unbound() {
+        let mut r = role(RoleKind::ClusterRole, "", "leftover");
+        assert!(r.is_unbound());
+
+        r.bound_cluster = 1;
+        assert!(!r.is_unbound());
     }
 }

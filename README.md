@@ -343,7 +343,7 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 | `nodes` | `no`, `node` | Vue Nodes |
 | `flux` | `fl`, `ks`, `hr` | Vue FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
-| `rbac` | `rb`, `roles`, `bindings`, `sec` | Vue sécurité RBAC (bindings scorés par sévérité) |
+| `rbac` | `rb`, `roles`, `bindings`, `sec` | Vue sécurité RBAC (bindings, rôles, SA — quatre lectures) |
 | `vuln` | `cve`, `cves`, `vulns` | Vue vulnérabilités (images + version k8s) |
 | `secrets` | `secret`, `se`, `tls` | Vue Secrets et certificats TLS |
 | `certs` | `certificates`, `issuers`, `challenges`, `acme` | Vue cert-manager (chaîne d'émission) |
@@ -956,6 +956,69 @@ n'est **pas proposée** : forcer n'y changerait rien, et le panneau dit quoi fai
 La vue fonctionne sans reflector installé : elle le dit dans le bandeau (« contrôleur absent »), ce
 qui est déjà la réponse quand rien ne bouge. Elle distingue « absent » de « non vérifié » — le RBAC
 peut masquer le déploiement.
+
+### RBAC (`:rbac`)
+
+Le graphe RBAC se lit dans quatre sens, et `t` passe de l'un à l'autre. Le sens par défaut reste la
+**liste plate** : une ligne par binding, les grants dangereux en haut. C'est la lecture d'audit, elle
+ne coûte pas une touche.
+
+```
+▾ sa:flux-system/kustomize-controller           ● CRIT  ns:flux-system  ks:flux-system/flux-sy  2 bindings
+  ▾ crb cluster-reconciler-flux-system          ● CRIT  cluster         ks:flux-system/flux-sy  impersonate, wildcard-all
+    ▾ CRole cluster-admin                       ● CRIT  cluster         unmanaged               2 rules
+      · *                                                                                       res *  grp *
+```
+
+| `t` | Ce que l'arbre répond |
+|---|---|
+| plat | « où sont les CRIT » — la table historique |
+| par sujet | « que peut faire cette identité **au total** » : sujet → bindings → rôle → règles |
+| par binding | l'audit déplié : binding → rôle (→ ce qu'il agrège) → règles, sujets en feuilles |
+| par rôle | « ce rôle donne quoi, et à qui » : rôle → contributeurs d'agrégation → namespaces → bindings |
+
+La sévérité est calculée **par binding** : un Role seul est inerte tant que rien ne le lie, et le
+même ClusterRole est anodin en RoleBinding et critique en ClusterRoleBinding. Sur un nœud de rôle,
+la sévérité affichée est un **plafond** — ce que n'importe quel binding de ce rôle *pourrait* donner.
+
+Quatre choses que la liste plate ne peut structurellement pas montrer :
+
+- **Les ClusterRoles-templates.** Un ClusterRole rebindé namespace par namespace est le patron RBAC
+  le plus courant, et il apparaissait comme N lignes sans lien. C'est un nœud unique ici, marqué
+  `template ×N ns`, avec un niveau par namespace : le modifier déplace des droits partout à la fois.
+- **La composition des rôles agrégés.** `admin`, `edit`, `view` n'ont pas de règles à eux : le
+  contrôleur y recopie l'union des ClusterRoles portant le label `aggregate-to-*`. Les contributeurs
+  sont listés sous le rôle (`⊞`), et l'arête inverse (« alimente ») dit depuis un contributeur quels
+  rôles il gonfle — la réponse à « pourquoi `admin` donne-t-il soudain ça ? ». Un sélecteur en
+  `matchExpressions` n'est pas évalué : le rôle est alors marqué `aggregation-partial` plutôt que de
+  sous-rapporter ses règles en silence.
+- **Les ServiceAccounts comme objets.** Un binding qui nomme un SA inexistant est un grant dormant,
+  qui s'allume sans bruit le jour où quelqu'un crée ce nom (`dangling-sa`, `✗` sur le nœud). Si la
+  liste des ServiceAccounts est refusée par le RBAC, la vue le dit dans le bandeau et **cesse
+  d'affirmer** qu'un SA manque : une liste illisible n'est pas une preuve d'absence.
+- **Les rôles que personne ne lie.** Invisibles auparavant par construction. Ils sont marqués
+  `non bindé` : inertes aujourd'hui, mais prêts à l'emploi.
+
+Les lignes sont alignées avec l'instantané partagé, donc `y`, `e`, `h` et `Ctrl-D` portent sur **le
+nœud sous le curseur** : `y` sur un ClusterRole ouvre ce ClusterRole, sur un ServiceAccount ce
+ServiceAccount, sur un binding ce binding. Une ligne sans objet API (une règle, un groupe de
+namespace) vise son parent éditable ; un `User` ou un `Group` n'a rien à ouvrir — c'est un nom
+fourni par l'authentificateur, pas un objet du cluster.
+
+Le repli automatique ferme tout sous-arbre dont le pire nœud est sous `HIGH` et ouvre le reste : sans
+ça l'arbre par sujet fait des milliers de lignes sur un vrai cluster. Un pli manuel (`Space`) est
+définitif.
+
+| Touche | Action |
+|---|---|
+| `↑↓` / `PgUp` `PgDn` | Navigation |
+| `Space` | Plier / déplier |
+| `t` | Orientation : plat → par sujet → par binding → par rôle |
+| `f` | Plancher de sévérité : `INFO` → `LOW` → `MED` → `HIGH` → `CRIT` |
+| `o` | Saut vers l'objet Flux qui gère le nœud |
+| `Enter` | Plein écran sur le détail |
+| `F5` | Rafraîchir |
+| `Shift+↑↓` | Défilement du panneau de détail |
 
 ### Stockage (`:storage`, `:pv`)
 

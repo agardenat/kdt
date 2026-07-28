@@ -144,9 +144,75 @@ use crate::pods::{
     SharedPods, WorkloadResource,
 };
 use crate::rbac::{
-    critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, RbacBinding,
-    Severity as RbacSeverity, SharedRbac,
+    critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, PolicyRule as RbacRule,
+    RbacBinding, RoleEntry, SaEntry, Severity as RbacSeverity, SharedRbac,
 };
+
+// A rendered row of the RBAC graph. One enum for all four orientations, like `KyRow`: whichever is
+// active, the vector stays index-aligned with `App::snapshot`, which is what gives the view `y`,
+// `e`, `Ctrl-D`, the AI panel and the shared search for free.
+//
+// `idx` fields index the *unfiltered* `rbac_view_*` vectors, never a filtered subset — the graph
+// stores its cross-links as positions, so filtering happens by skipping rows, never by compacting
+// the lists out from under those links.
+pub enum RbacRow {
+    // Root of the subject orientation: a ServiceAccount, User or Group, from `rbac_subjects`.
+    Subject { idx: usize, collapsed: bool, has_children: bool },
+    Binding { idx: usize, depth: usize, collapsed: bool, has_children: bool },
+    Role { idx: usize, depth: usize, collapsed: bool, has_children: bool },
+    // A ClusterRole that feeds an aggregated one, shown under it.
+    Contributor { idx: usize, depth: usize },
+    // "re-granted in namespace X", grouping the RoleBindings of a template ClusterRole.
+    NsGroup { role: usize, namespace: String, depth: usize, collapsed: bool },
+    // One resolved rule of a role. Not an API object: its record points at the role.
+    Rule { role: usize, rule: usize, depth: usize },
+    // A subject shown as a leaf under its binding.
+    SubjectLeaf { binding: usize, subject: usize, depth: usize },
+}
+
+// The four readings of the same RBAC graph, cycled with `t`. `Flat` is the default: the severity-
+// sorted audit list is what one opens `:rbac` for, and it should not cost a keystroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbacOrient {
+    Flat,
+    Subject,
+    Binding,
+    Role,
+}
+
+impl RbacOrient {
+    fn next(self) -> Self {
+        match self {
+            RbacOrient::Flat => RbacOrient::Subject,
+            RbacOrient::Subject => RbacOrient::Binding,
+            RbacOrient::Binding => RbacOrient::Role,
+            RbacOrient::Role => RbacOrient::Flat,
+        }
+    }
+    fn label(self, st: &'static Strings) -> &'static str {
+        match self {
+            RbacOrient::Flat => st.rbac_orient_flat,
+            RbacOrient::Subject => st.rbac_orient_subject,
+            RbacOrient::Binding => st.rbac_orient_binding,
+            RbacOrient::Role => st.rbac_orient_role,
+        }
+    }
+}
+
+// A subject root: the same ServiceAccount/User/Group named by several bindings, collapsed into one
+// node. This is the view that answers "what can this identity do in total", which the binding rows
+// cannot: a SA bound five times is five unrelated lines there.
+pub struct RbacSubjectNode {
+    key: String,
+    label: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    // Index into `rbac_view_sas` when the subject is a ServiceAccount we know of.
+    sa: Option<usize>,
+    bindings: Vec<usize>,
+    severity: RbacSeverity,
+}
 use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
@@ -904,10 +970,24 @@ pub struct App {
     // When the namespace picker was opened from the pods view, return to it (not the events view).
     pub ns_return_pods: bool,
     pub rbac_state: SharedRbac,
-    pub rbac_cursor: usize,
     pub rbac_min_sev: RbacSeverity,
     pub rbac_detail_scroll: usize,
     pub rbac_refresh_handle: Option<JoinHandle<()>>,
+    rbac_orient: RbacOrient,
+    rbac_rows: Vec<RbacRow>,
+    // Full, unfiltered copies of the fetched graph: the rows index into these, and the cross-links
+    // inside them are positional, so they are never filtered down. Refreshed only when the fetch
+    // bumps its generation, since re-cloning a few thousand roles on every tick is pure waste.
+    rbac_view_bindings: Vec<RbacBinding>,
+    rbac_view_roles: Vec<RoleEntry>,
+    rbac_view_sas: Vec<SaEntry>,
+    rbac_subjects: Vec<RbacSubjectNode>,
+    rbac_view_gen: u64,
+    rbac_sa_degraded: bool,
+    rbac_collapsed: std::collections::HashSet<String>,
+    // Nodes the user folded or unfolded by hand, which auto-folding must never override.
+    rbac_user_toggled: std::collections::HashSet<String>,
+    last_rbac_sel_uid: Option<String>,
     pub vuln_state: SharedVuln,
     pub vuln_cursor: usize,
     pub vuln_min_sev: VulnSev,
@@ -1135,10 +1215,20 @@ impl App {
             last_pods_sel_uid: None,
             ns_return_pods: false,
             rbac_state: new_rbac_state(),
-            rbac_cursor: 0,
             rbac_min_sev: RbacSeverity::Info,
             rbac_detail_scroll: 0,
             rbac_refresh_handle: None,
+            rbac_orient: RbacOrient::Flat,
+            rbac_rows: Vec::new(),
+            rbac_view_bindings: Vec::new(),
+            rbac_view_roles: Vec::new(),
+            rbac_view_sas: Vec::new(),
+            rbac_subjects: Vec::new(),
+            rbac_view_gen: 0,
+            rbac_sa_degraded: false,
+            rbac_collapsed: std::collections::HashSet::new(),
+            rbac_user_toggled: std::collections::HashSet::new(),
+            last_rbac_sel_uid: None,
             vuln_state: new_vuln_state(),
             vuln_cursor: 0,
             vuln_min_sev: VulnSev::Unknown,
@@ -1894,18 +1984,14 @@ impl App {
                 let n = self.selected_node()?;
                 Some(("v1".to_string(), "Node".to_string(), String::new(), n.name))
             }
+            // The RBAC rows are index-aligned with the snapshot, so the node under the cursor
+            // answers here: `y` on a ClusterRole opens that ClusterRole, on a ServiceAccount that
+            // ServiceAccount. Rows with nothing to open carry an empty kind and fall out below.
             Mode::Rbac | Mode::RbacFull => {
-                let b = self.rbac_selected()?;
-                let ns = match &b.scope {
-                    crate::rbac::Scope::Namespace(ns) => ns.clone(),
-                    crate::rbac::Scope::ClusterWide => String::new(),
-                };
-                Some((
-                    "rbac.authorization.k8s.io/v1".to_string(),
-                    b.binding_kind.clone(),
-                    ns,
-                    b.binding_name.clone(),
-                ))
+                let rec = self.snapshot.get(self.table_state.selected()?)?;
+                if rec.kind.is_empty() || rec.name.is_empty() { return None; }
+                let api_version = if rec.api_version.is_empty() { "v1" } else { &rec.api_version };
+                Some((api_version.to_string(), rec.kind.clone(), rec.namespace.clone(), rec.name.clone()))
             }
             Mode::Secrets | Mode::SecretsFull => {
                 let s = self.secret_selected()?;
@@ -3125,7 +3211,7 @@ impl App {
     fn visible_row_count(&self) -> usize {
         match self.mode {
             Mode::Nodes | Mode::NodesFull => self.node_rows().len(),
-            Mode::Rbac | Mode::RbacFull => self.rbac_visible().len(),
+            Mode::Rbac | Mode::RbacFull => self.rbac_rows.len(),
             Mode::Vuln | Mode::VulnFull => self.vuln_rows().len(),
             Mode::Secrets | Mode::SecretsFull => self.secret_rows().len(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.configmap_rows().len(),
@@ -3200,7 +3286,6 @@ impl App {
         // a few rows would leave it scrolled past all of them — a view that looks empty but counts
         // three matches. It only ever grows again from a scroll, so resetting it here is enough.
         *self.table_state.offset_mut() = 0;
-        self.rbac_cursor = 0;
         self.vuln_cursor = 0;
         self.secrets_cursor = 0;
         self.configmaps_cursor = 0;
@@ -3220,6 +3305,7 @@ impl App {
             Mode::Capacity | Mode::CapacityFull => self.refresh_capacity_snapshot(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
+            Mode::Rbac | Mode::RbacFull => self.refresh_rbac_snapshot(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
             _ => {}
         }
@@ -4483,8 +4569,12 @@ impl App {
 
     fn enter_rbac_mode(&mut self) {
         self.mode = Mode::Rbac;
-        self.rbac_cursor = 0;
         self.rbac_detail_scroll = 0;
+        self.table_state.select(Some(0));
+        *self.table_state.offset_mut() = 0;
+        self.snapshot.clear();
+        self.rbac_rows.clear();
+        self.last_rbac_sel_uid = None;
         self.refresh_rbac();
         self.start_rbac_auto_refresh();
     }
@@ -4541,43 +4631,436 @@ impl App {
         }
     }
 
-    // Indices of bindings passing the active severity floor, highest severity first (already sorted).
-    // The one place the RBAC rows are derived: both the table and the selection go through it, so
-    // the search filter lands here and the cursor can never point past the visible list.
-    fn rbac_visible(&self) -> Vec<RbacBinding> {
-        let s = self.rbac_state.lock().expect("rbac poisoned");
-        s.bindings
-            .iter()
-            .filter(|b| b.severity >= self.rbac_min_sev)
-            .filter(|b| match self.search_query.as_deref() {
-                None => true,
-                Some(q) => fields_match_search(
-                    &[&b.binding_kind, &b.binding_name, &b.role_ref.label(), &b.scope.label()],
-                    q,
-                ) || b.subjects.iter().any(|s| fields_match_search(&[&s.label()], q)),
-            })
-            .cloned()
-            .collect()
+    // Copy the fetched graph into the view, but only when a fetch actually produced a new one. The
+    // rows index into these vectors, so they are kept whole (never filtered), and re-cloning a few
+    // thousand roles on every frame would cost more than everything else the view does.
+    fn sync_rbac_view(&mut self) {
+        let (bindings, roles, sas, degraded, generation) = {
+            let s = self.rbac_state.lock().expect("rbac poisoned");
+            if s.generation == self.rbac_view_gen {
+                return;
+            }
+            (
+                s.bindings.clone(),
+                s.roles.clone(),
+                s.service_accounts.clone(),
+                s.sa_degraded,
+                s.generation,
+            )
+        };
+        self.rbac_subjects = build_rbac_subjects(&bindings, &sas);
+        self.rbac_view_bindings = bindings;
+        self.rbac_view_roles = roles;
+        self.rbac_view_sas = sas;
+        self.rbac_sa_degraded = degraded;
+        self.rbac_view_gen = generation;
     }
 
-    fn rbac_selected(&self) -> Option<RbacBinding> {
-        self.rbac_visible().into_iter().nth(self.rbac_cursor)
+    // Rebuilds `rbac_rows` and `App::snapshot` in lockstep, so a selected index means the same row
+    // in both. That alignment is what gives this view `y`, `e`, `Ctrl-D`, the AI panel and the
+    // shared search without any code of its own.
+    fn refresh_rbac_snapshot(&mut self) {
+        self.sync_rbac_view();
+        self.apply_rbac_autofold();
+
+        let (rows, recs) = match self.rbac_orient {
+            RbacOrient::Flat => self.build_rbac_flat_rows(),
+            RbacOrient::Subject => self.build_rbac_subject_rows(),
+            RbacOrient::Binding => self.build_rbac_binding_rows(),
+            RbacOrient::Role => self.build_rbac_role_rows(),
+        };
+        self.rbac_rows = rows;
+
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.rbac_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_rbac_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_rbac_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_rbac_sel_uid = Some(cur_uid);
+            self.rbac_detail_scroll = 0;
+        }
+    }
+
+    // Auto-folding: on a real cluster the subject tree runs to thousands of lines, and almost all of
+    // it is the read-only plumbing nobody opened this view for. Fold everything whose worst node is
+    // below HIGH, open the rest — but never against a node the user folded or unfolded by hand.
+    fn apply_rbac_autofold(&mut self) {
+        if self.rbac_orient == RbacOrient::Flat {
+            return;
+        }
+        let mut want: Vec<(String, bool)> = Vec::new();
+        for (i, n) in self.rbac_subjects.iter().enumerate() {
+            let _ = i;
+            want.push((format!("subj|{}", n.key), n.severity < RbacSeverity::High));
+        }
+        for b in self.rbac_view_bindings.iter() {
+            want.push((rbac_binding_uid(b), b.severity < RbacSeverity::High));
+        }
+        for r in self.rbac_view_roles.iter() {
+            want.push((r.uid(), r.severity < RbacSeverity::High));
+        }
+        for (uid, fold) in want {
+            if self.rbac_user_toggled.contains(&uid) {
+                continue;
+            }
+            if fold {
+                self.rbac_collapsed.insert(uid);
+            } else {
+                self.rbac_collapsed.remove(&uid);
+            }
+        }
+    }
+
+    fn rbac_collapsed(&self, uid: &str) -> bool {
+        self.rbac_collapsed.contains(uid)
+    }
+
+    // The flat audit list: one row per binding, worst first. No nesting, no folding — the reading
+    // `:rbac` exists for, kept as an orientation rather than replaced by the tree.
+    fn build_rbac_flat_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
+        let mut rows = Vec::new();
+        let mut recs = Vec::new();
+        for (i, b) in self.rbac_view_bindings.iter().enumerate() {
+            if b.severity < self.rbac_min_sev {
+                continue;
+            }
+            rows.push(RbacRow::Binding { idx: i, depth: 0, collapsed: false, has_children: false });
+            recs.push(synthetic_rbac_binding_record(b, &rbac_binding_uid(b)));
+        }
+        (rows, recs)
+    }
+
+    // Identity -> its bindings -> the role each one grants -> the rules. Answers "what can this
+    // ServiceAccount do in total", which the flat list structurally cannot.
+    fn build_rbac_subject_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
+        let mut rows = Vec::new();
+        let mut recs = Vec::new();
+        for (si, n) in self.rbac_subjects.iter().enumerate() {
+            if n.severity < self.rbac_min_sev {
+                continue;
+            }
+            let root = format!("subj|{}", n.key);
+            let collapsed = self.rbac_collapsed(&root);
+            rows.push(RbacRow::Subject { idx: si, collapsed, has_children: !n.bindings.is_empty() });
+            recs.push(synthetic_rbac_subject_record(n, &self.rbac_view_sas, &root));
+            if collapsed {
+                continue;
+            }
+            for &bi in &n.bindings {
+                let b = &self.rbac_view_bindings[bi];
+                if b.severity < self.rbac_min_sev {
+                    continue;
+                }
+                let buid = format!("{root}/{}", rbac_binding_uid(b));
+                let bcollapsed = self.rbac_collapsed(&rbac_binding_uid(b));
+                rows.push(RbacRow::Binding {
+                    idx: bi,
+                    depth: 1,
+                    collapsed: bcollapsed,
+                    has_children: b.role_idx.is_some(),
+                });
+                recs.push(synthetic_rbac_binding_record(b, &buid));
+                if bcollapsed {
+                    continue;
+                }
+                if let Some(ri) = b.role_idx {
+                    self.push_role_subtree(ri, 2, &buid, &mut rows, &mut recs);
+                }
+            }
+        }
+        (rows, recs)
+    }
+
+    // The audit list, unfolded: binding -> role (-> what it aggregates) -> rules, with the subjects
+    // as leaves. The same rows as `Flat`, with everything the flat row summarises made walkable.
+    fn build_rbac_binding_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
+        let mut rows = Vec::new();
+        let mut recs = Vec::new();
+        for (i, b) in self.rbac_view_bindings.iter().enumerate() {
+            if b.severity < self.rbac_min_sev {
+                continue;
+            }
+            let uid = rbac_binding_uid(b);
+            let collapsed = self.rbac_collapsed(&uid);
+            rows.push(RbacRow::Binding {
+                idx: i,
+                depth: 0,
+                collapsed,
+                has_children: !b.subjects.is_empty() || b.role_idx.is_some(),
+            });
+            recs.push(synthetic_rbac_binding_record(b, &uid));
+            if collapsed {
+                continue;
+            }
+            for (si, s) in b.subjects.iter().enumerate() {
+                rows.push(RbacRow::SubjectLeaf { binding: i, subject: si, depth: 1 });
+                let sa = b.sa_idx.get(si).copied().flatten().map(|x| &self.rbac_view_sas[x]);
+                recs.push(synthetic_rbac_subject_leaf_record(s, sa, &format!("{uid}/subj|{si}")));
+            }
+            if let Some(ri) = b.role_idx {
+                self.push_role_subtree(ri, 1, &uid, &mut rows, &mut recs);
+            }
+        }
+        (rows, recs)
+    }
+
+    // Role -> what it aggregates -> where it is granted -> to whom, plus its rules. The orientation
+    // that makes templates and unbound roles visible: a ClusterRole re-granted in ten namespaces is
+    // one node here, and ten unrelated lines everywhere else.
+    fn build_rbac_role_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
+        let mut rows = Vec::new();
+        let mut recs = Vec::new();
+        // Which bindings reach each role, grouped by the namespace they grant it in.
+        let mut by_role: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for (bi, b) in self.rbac_view_bindings.iter().enumerate() {
+            if let Some(ri) = b.role_idx {
+                by_role.entry(ri).or_default().push(bi);
+            }
+        }
+
+        let order = {
+            let s = self.rbac_state.lock().expect("rbac poisoned");
+            s.role_order()
+        };
+        for ri in order {
+            let Some(r) = self.rbac_view_roles.get(ri) else { continue };
+            if r.severity < self.rbac_min_sev {
+                continue;
+            }
+            let uid = r.uid();
+            let collapsed = self.rbac_collapsed(&uid);
+            let bindings = by_role.get(&ri).cloned().unwrap_or_default();
+            let has_children =
+                !r.rules.is_empty() || !r.aggregates.is_empty() || !bindings.is_empty();
+            rows.push(RbacRow::Role { idx: ri, depth: 0, collapsed, has_children });
+            recs.push(synthetic_rbac_role_record(r, &uid));
+            if collapsed {
+                continue;
+            }
+            self.push_contributors(r, 1, &uid, &mut rows, &mut recs);
+
+            // A template ClusterRole gets a level per namespace: the point of the node is that the
+            // same definition lands in many places, and the namespaces are the answer.
+            if r.is_template() {
+                for ns in &r.bound_namespaces {
+                    let guid = format!("{uid}/ns|{ns}");
+                    let gcollapsed = self.rbac_collapsed(&guid);
+                    rows.push(RbacRow::NsGroup {
+                        role: ri,
+                        namespace: ns.clone(),
+                        depth: 1,
+                        collapsed: gcollapsed,
+                    });
+                    recs.push(synthetic_rbac_nsgroup_record(r, ns, &guid));
+                    if gcollapsed {
+                        continue;
+                    }
+                    for &bi in &bindings {
+                        let b = &self.rbac_view_bindings[bi];
+                        if !matches!(&b.scope, crate::rbac::Scope::Namespace(n) if n == ns) {
+                            continue;
+                        }
+                        rows.push(RbacRow::Binding {
+                            idx: bi,
+                            depth: 2,
+                            collapsed: false,
+                            has_children: false,
+                        });
+                        recs.push(synthetic_rbac_binding_record(
+                            b,
+                            &format!("{guid}/{}", rbac_binding_uid(b)),
+                        ));
+                    }
+                }
+                // ClusterRoleBindings of a template still belong directly under the role.
+                for &bi in &bindings {
+                    let b = &self.rbac_view_bindings[bi];
+                    if !matches!(b.scope, crate::rbac::Scope::ClusterWide) {
+                        continue;
+                    }
+                    rows.push(RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false });
+                    recs.push(synthetic_rbac_binding_record(
+                        b,
+                        &format!("{uid}/{}", rbac_binding_uid(b)),
+                    ));
+                }
+            } else {
+                for &bi in &bindings {
+                    let b = &self.rbac_view_bindings[bi];
+                    rows.push(RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false });
+                    recs.push(synthetic_rbac_binding_record(
+                        b,
+                        &format!("{uid}/{}", rbac_binding_uid(b)),
+                    ));
+                }
+            }
+            self.push_rules(r, ri, 1, &uid, &mut rows, &mut recs);
+        }
+        (rows, recs)
+    }
+
+    // A role node with everything under it, used wherever a binding leads to one.
+    fn push_role_subtree(
+        &self,
+        ri: usize,
+        depth: usize,
+        parent: &str,
+        rows: &mut Vec<RbacRow>,
+        recs: &mut Vec<EventRecord>,
+    ) {
+        let Some(r) = self.rbac_view_roles.get(ri) else { return };
+        let uid = format!("{parent}/{}", r.uid());
+        let collapsed = self.rbac_collapsed(&r.uid());
+        rows.push(RbacRow::Role {
+            idx: ri,
+            depth,
+            collapsed,
+            has_children: !r.rules.is_empty() || !r.aggregates.is_empty(),
+        });
+        recs.push(synthetic_rbac_role_record(r, &uid));
+        if collapsed {
+            return;
+        }
+        self.push_contributors(r, depth + 1, &uid, rows, recs);
+        self.push_rules(r, ri, depth + 1, &uid, rows, recs);
+    }
+
+    // The ClusterRoles an aggregated role is composed of. Shown as leaves, not as role nodes: the
+    // question here is what `admin` is made of, not what each ingredient is bound to.
+    fn push_contributors(
+        &self,
+        r: &RoleEntry,
+        depth: usize,
+        parent: &str,
+        rows: &mut Vec<RbacRow>,
+        recs: &mut Vec<EventRecord>,
+    ) {
+        for &ci in &r.aggregates {
+            let Some(c) = self.rbac_view_roles.get(ci) else { continue };
+            rows.push(RbacRow::Contributor { idx: ci, depth });
+            recs.push(synthetic_rbac_role_record(c, &format!("{parent}/agg|{}", c.uid())));
+        }
+    }
+
+    fn push_rules(
+        &self,
+        r: &RoleEntry,
+        ri: usize,
+        depth: usize,
+        parent: &str,
+        rows: &mut Vec<RbacRow>,
+        recs: &mut Vec<EventRecord>,
+    ) {
+        for (i, rule) in r.rules.iter().enumerate() {
+            rows.push(RbacRow::Rule { role: ri, rule: i, depth });
+            recs.push(synthetic_rbac_rule_record(r, rule, &format!("{parent}/rule|{i}")));
+        }
+    }
+
+    fn rbac_selected(&self) -> Option<&RbacRow> {
+        self.rbac_rows.get(self.table_state.selected()?)
+    }
+
+    // The binding the selection is about: the row itself when it is one, otherwise the binding its
+    // row belongs to. Keeps the detail panel and `o` working from any node of the tree.
+    fn rbac_selected_binding(&self) -> Option<&RbacBinding> {
+        match self.rbac_selected()? {
+            RbacRow::Binding { idx, .. } => self.rbac_view_bindings.get(*idx),
+            RbacRow::SubjectLeaf { binding, .. } => self.rbac_view_bindings.get(*binding),
+            _ => None,
+        }
     }
 
     fn move_rbac_selection(&mut self, delta: i32) {
-        let len = self.rbac_visible().len();
-        if len == 0 { return; }
-        let cur = self.rbac_cursor as i32;
-        self.rbac_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        if self.snapshot.is_empty() {
+            return;
+        }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
         self.rbac_detail_scroll = 0;
     }
 
-    // `o` on an RBAC binding: jump to the Flux object that manages it (Kustomization/HelmRelease),
+    // `t`: read the same graph from the next end. The fold state is kept — coming back to an
+    // orientation should find it as it was left.
+    fn toggle_rbac_orientation(&mut self) {
+        self.rbac_orient = self.rbac_orient.next();
+        self.table_state.select(Some(0));
+        *self.table_state.offset_mut() = 0;
+        self.rbac_detail_scroll = 0;
+        self.refresh_rbac_snapshot();
+    }
+
+    // `Space`: fold or unfold the node under the cursor, and remember that it was a human decision
+    // so auto-folding leaves it alone from now on.
+    fn toggle_rbac_node(&mut self) {
+        let Some(uid) = self.rbac_fold_uid() else { return };
+        if self.rbac_collapsed.contains(&uid) {
+            self.rbac_collapsed.remove(&uid);
+        } else {
+            self.rbac_collapsed.insert(uid.clone());
+        }
+        self.rbac_user_toggled.insert(uid);
+        self.refresh_rbac_snapshot();
+    }
+
+    // The fold key of the selected row, which is the node's own identity rather than its path: a
+    // ClusterRole reached from two different bindings folds as one thing, as it should.
+    fn rbac_fold_uid(&self) -> Option<String> {
+        match self.rbac_selected()? {
+            RbacRow::Subject { idx, .. } => {
+                Some(format!("subj|{}", self.rbac_subjects.get(*idx)?.key))
+            }
+            RbacRow::Binding { idx, .. } => {
+                Some(rbac_binding_uid(self.rbac_view_bindings.get(*idx)?))
+            }
+            RbacRow::Role { idx, .. } => Some(self.rbac_view_roles.get(*idx)?.uid()),
+            RbacRow::NsGroup { role, namespace, .. } => {
+                Some(format!("{}/ns|{namespace}", self.rbac_view_roles.get(*role)?.uid()))
+            }
+            _ => None,
+        }
+    }
+
+    // `o` on an RBAC node: jump to the Flux object that manages it (Kustomization/HelmRelease),
     // landing on it in the Flux tree. No-op for non-Flux provenance.
     fn rbac_open_origin(&mut self) {
         use crate::rbac::Provenance;
-        let Some(b) = self.rbac_selected() else { return; };
-        let (kind, ns, name) = match &b.provenance {
+        let prov = match self.rbac_selected() {
+            Some(RbacRow::Role { idx, .. }) | Some(RbacRow::Contributor { idx, .. }) => {
+                self.rbac_view_roles.get(*idx).map(|r| r.provenance.clone())
+            }
+            Some(RbacRow::Subject { idx, .. }) => self
+                .rbac_subjects
+                .get(*idx)
+                .and_then(|n| n.sa)
+                .and_then(|i| self.rbac_view_sas.get(i))
+                .map(|sa| sa.provenance.clone()),
+            _ => self.rbac_selected_binding().map(|b| b.provenance.clone()),
+        };
+        let Some(prov) = prov else { return };
+        let (kind, ns, name) = match &prov {
             Provenance::FluxKustomization { namespace, name } => ("Kustomization", namespace.clone(), name.clone()),
             Provenance::FluxHelmRelease { namespace, name } => ("HelmRelease", namespace.clone(), name.clone()),
             other => {
@@ -4599,15 +5082,20 @@ impl App {
         self.flux_pending_select = Some(format!("{}|{}/{}", kind, ns, name));
     }
 
-    // Cycle the severity floor: all → HIGH+ → CRITICAL → all.
+    // Cycle the severity floor through every step. It used to jump straight from "everything" to
+    // HIGH, which made MED and LOW unreachable — the two levels where over-broad reads live.
     fn cycle_rbac_filter(&mut self) {
         self.rbac_min_sev = match self.rbac_min_sev {
-            RbacSeverity::Info => RbacSeverity::High,
+            RbacSeverity::Info => RbacSeverity::Low,
+            RbacSeverity::Low => RbacSeverity::Medium,
+            RbacSeverity::Medium => RbacSeverity::High,
             RbacSeverity::High => RbacSeverity::Critical,
-            _ => RbacSeverity::Info,
+            RbacSeverity::Critical => RbacSeverity::Info,
         };
-        self.rbac_cursor = 0;
+        self.table_state.select(Some(0));
+        *self.table_state.offset_mut() = 0;
         self.rbac_detail_scroll = 0;
+        self.refresh_rbac_snapshot();
     }
 
     // --- Vulnerability view -------------------------------------------------------------------
@@ -6819,7 +7307,12 @@ impl App {
     // Build an event-shaped record describing the selected binding so the AI panel can explain why
     // it is risky (findings + resolved rules), reusing the existing prompt plumbing.
     fn synthetic_rbac_record(&self) -> Option<EventRecord> {
-        let b = self.rbac_selected()?;
+        // A role node asks a different question than a binding does — "what would this grant" versus
+        // "what does this grant, to whom" — so the model gets the one the cursor is on.
+        if let Some(r) = self.rbac_selected_role_node() {
+            return Some(self.synthetic_rbac_role_prompt(r));
+        }
+        let b = self.rbac_selected_binding()?;
         let subjects = b.subjects.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ");
         let findings = b
             .findings
@@ -6867,6 +7360,72 @@ impl App {
             host: String::new(),
             count: 1,
         })
+    }
+
+    // Only the rows whose subject really is a role, so a binding row keeps its own prompt.
+    fn rbac_selected_role_node(&self) -> Option<&RoleEntry> {
+        match self.rbac_selected()? {
+            RbacRow::Role { idx, .. } | RbacRow::Contributor { idx, .. } => {
+                self.rbac_view_roles.get(*idx)
+            }
+            RbacRow::Rule { role, .. } | RbacRow::NsGroup { role, .. } => {
+                self.rbac_view_roles.get(*role)
+            }
+            _ => None,
+        }
+    }
+
+    fn synthetic_rbac_role_prompt(&self, r: &RoleEntry) -> EventRecord {
+        let rules = r
+            .rules
+            .iter()
+            .map(|x| format!(
+                "  apiGroups={:?} resources={:?} verbs={:?}",
+                x.api_groups, x.resources, x.verbs
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let contributors = r
+            .aggregates
+            .iter()
+            .filter_map(|&i| self.rbac_view_roles.get(i))
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let findings = r
+            .findings
+            .iter()
+            .map(|f| format!("[{}] {}: {}", f.sev.label(), f.tag, f.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = format!(
+            "{} {}\nseverity={}\norigin={}\nsource={}\nboundClusterWide={}\nboundNamespaces={}\naggregated={} contributors={}\nfindings:\n{}\nrules:\n{}",
+            r.kind.label(),
+            r.name,
+            r.severity.label(),
+            r.provenance.label(),
+            r.source.clone().unwrap_or_default(),
+            r.bound_cluster,
+            r.bound_namespaces.join(","),
+            r.aggregated,
+            contributors,
+            findings,
+            rules,
+        );
+        EventRecord {
+            uid: format!("rbac|{}", r.uid()),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: Severity::Warning,
+            reason: format!("RBAC/{}", r.severity.label()),
+            api_version: "rbac.authorization.k8s.io/v1".to_string(),
+            kind: r.kind.label().to_string(),
+            namespace: r.namespace.clone(),
+            name: r.name.clone(),
+            message,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        }
     }
 
     // Event-shaped record for the AI panel: the selected image's CVEs (or the k8s version risk), so
@@ -7270,6 +7829,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull) {
             app.refresh_kyverno_snapshot();
+        }
+        if matches!(app.mode, Mode::Rbac | Mode::RbacFull) {
+            app.refresh_rbac_snapshot();
         }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
@@ -7830,6 +8392,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Down, _, Mode::Rbac) => app.move_rbac_selection(1),
         (KeyCode::PageUp, _, Mode::Rbac) => app.move_rbac_selection(-10),
         (KeyCode::PageDown, _, Mode::Rbac) => app.move_rbac_selection(10),
+        (KeyCode::Char(' '), _, Mode::Rbac) => app.toggle_rbac_node(),
+        (KeyCode::Char('t'), _, Mode::Rbac) => app.toggle_rbac_orientation(),
         (KeyCode::Enter, _, Mode::Rbac) => app.enter_rbac_full(),
         (KeyCode::Char('o'), _, Mode::Rbac) => app.rbac_open_origin(),
         (KeyCode::Char('f'), _, Mode::Rbac) => app.cycle_rbac_filter(),
@@ -7843,6 +8407,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::PageUp, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(10),
         (KeyCode::PageDown, _, Mode::RbacFull) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_add(10),
         (KeyCode::Char('g'), _, Mode::RbacFull) => app.rbac_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::RbacFull) => app.rbac_detail_scroll = usize::MAX / 2,
         (KeyCode::Enter, _, Mode::RbacFull) => app.exit_rbac_full(),
         (KeyCode::Esc, _, Mode::RbacFull) => app.exit_rbac_full(),
         (KeyCode::Char('i'), _, Mode::RbacFull) => app.enter_ai_panel(),
@@ -8346,7 +8911,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 draw_flux_table(f, app, ta);
             }
         } else if draw_mode == Mode::Rbac {
-            draw_rbac_table(f, app, ta);
+            if app.rbac_orient == RbacOrient::Flat {
+                draw_rbac_table(f, app, ta);
+            } else {
+                draw_rbac_tree(f, app, ta);
+            }
         } else if draw_mode == Mode::Vuln {
             draw_vuln_table(f, app, ta);
         } else if draw_mode == Mode::Secrets {
@@ -8553,6 +9122,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+            footer_sep(),
+            Span::styled(" t ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_orient, app.rbac_orient.label(st))),
+            Span::styled(" Espace ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
             footer_sep(),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
             Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.rbac_min_sev.label())),
@@ -12718,6 +13290,246 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 // Colour for a severity tier, shared by the RBAC table rows and the detail findings.
+// Identity of a binding, used both as a fold key and as a snapshot uid. Kind plus scope plus name is
+// unique cluster-wide, which is what the selection needs to survive a rebuild.
+fn rbac_binding_uid(b: &RbacBinding) -> String {
+    format!("{}|{}/{}", b.binding_kind, rbac_binding_ns(b), b.binding_name)
+}
+
+fn rbac_binding_ns(b: &RbacBinding) -> String {
+    match &b.scope {
+        crate::rbac::Scope::Namespace(ns) => ns.clone(),
+        crate::rbac::Scope::ClusterWide => String::new(),
+    }
+}
+
+// Collapse the subject strings scattered across every binding into one node per identity. A
+// ServiceAccount bound five times is one node with five children here, five unrelated rows in the
+// flat list — which is the whole point of the subject orientation.
+fn build_rbac_subjects(bindings: &[RbacBinding], sas: &[SaEntry]) -> Vec<RbacSubjectNode> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, RbacSubjectNode> =
+        std::collections::HashMap::new();
+
+    for (bi, b) in bindings.iter().enumerate() {
+        for (si, s) in b.subjects.iter().enumerate() {
+            // A RoleBinding may name a ServiceAccount without its namespace, meaning its own.
+            let ns = match (&s.namespace, &b.scope) {
+                (Some(ns), _) => ns.clone(),
+                (None, crate::rbac::Scope::Namespace(ns)) if s.kind == "ServiceAccount" => ns.clone(),
+                _ => String::new(),
+            };
+            let key = format!("{}|{}/{}", s.kind, ns, s.name);
+            let node = by_key.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                RbacSubjectNode {
+                    key: key.clone(),
+                    label: s.label(),
+                    kind: s.kind.clone(),
+                    namespace: ns.clone(),
+                    name: s.name.clone(),
+                    sa: b.sa_idx.get(si).copied().flatten(),
+                    bindings: Vec::new(),
+                    severity: RbacSeverity::Info,
+                }
+            });
+            if node.sa.is_none() {
+                node.sa = b.sa_idx.get(si).copied().flatten();
+            }
+            if !node.bindings.contains(&bi) {
+                node.bindings.push(bi);
+            }
+            node.severity = node.severity.max(b.severity);
+        }
+    }
+
+    // A ServiceAccount nobody binds is still worth a node: it is the other half of the "who can do
+    // what" question, and an unused SA with a mounted token is its own small finding.
+    for (i, sa) in sas.iter().enumerate() {
+        if !sa.exists || !sa.bindings.is_empty() {
+            continue;
+        }
+        let key = format!("ServiceAccount|{}/{}", sa.namespace, sa.name);
+        by_key.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            RbacSubjectNode {
+                key,
+                label: sa.label(),
+                kind: "ServiceAccount".to_string(),
+                namespace: sa.namespace.clone(),
+                name: sa.name.clone(),
+                sa: Some(i),
+                bindings: Vec::new(),
+                severity: RbacSeverity::Info,
+            }
+        });
+    }
+
+    let mut out: Vec<RbacSubjectNode> = order.into_iter().filter_map(|k| by_key.remove(&k)).collect();
+    out.sort_by_key(|n| (std::cmp::Reverse(n.severity as u8), n.label.clone()));
+    out
+}
+
+fn rbac_event_severity(s: RbacSeverity) -> Severity {
+    if s >= RbacSeverity::High {
+        Severity::Warning
+    } else {
+        Severity::Normal
+    }
+}
+
+// Snapshot records for the RBAC view. What each record points at decides what the shared `y`, `e`,
+// `h` and `Ctrl-D` act on — which is the whole reason the tree is worth building: `y` on a
+// ClusterRole node opens that ClusterRole, something the binding-only view could not do. Rows that
+// are not API objects (a rule, a namespace group) point at their nearest editable parent, and rows
+// with no object at all (a User, a Group, a ServiceAccount that does not exist) carry an empty kind,
+// which `current_object_ref` reads as "nothing to open".
+fn synthetic_rbac_binding_record(b: &RbacBinding, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: rbac_event_severity(b.severity),
+        reason: b.severity.label().to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: b.binding_kind.clone(),
+        namespace: rbac_binding_ns(b),
+        name: b.binding_name.clone(),
+        message: format!("{} · {}", b.role_ref.label(), b.risk_tags()),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_rbac_role_record(r: &RoleEntry, uid: &str) -> EventRecord {
+    let mut message = format!("{} rules", r.rules.len());
+    if r.aggregated {
+        message.push_str(&format!(" · aggregates {}", r.aggregates.len()));
+    }
+    if r.is_template() {
+        message.push_str(&format!(" · template ×{}", r.bound_namespaces.len()));
+    } else if r.is_unbound() {
+        message.push_str(" · unbound");
+    }
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: rbac_event_severity(r.severity),
+        reason: r.severity.label().to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_rbac_subject_record(
+    n: &RbacSubjectNode,
+    sas: &[SaEntry],
+    uid: &str,
+) -> EventRecord {
+    let sa = n.sa.and_then(|i| sas.get(i));
+    // Only a ServiceAccount that actually exists is an object one can open.
+    let openable = n.kind == "ServiceAccount" && sa.map(|s| s.exists).unwrap_or(false);
+    let message = match sa {
+        Some(s) if !s.exists => "does not exist".to_string(),
+        Some(s) => {
+            let mut m = format!("{} bindings", n.bindings.len());
+            if s.automount == Some(false) {
+                m.push_str(" · automount off");
+            }
+            if s.image_pull_secrets > 0 {
+                m.push_str(&format!(" · {} imagePullSecrets", s.image_pull_secrets));
+            }
+            m
+        }
+        None => format!("{} bindings", n.bindings.len()),
+    };
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: rbac_event_severity(n.severity),
+        reason: n.severity.label().to_string(),
+        api_version: if openable { "v1".to_string() } else { String::new() },
+        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
+        namespace: n.namespace.clone(),
+        name: n.name.clone(),
+        message,
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_rbac_subject_leaf_record(
+    s: &crate::rbac::Subject,
+    sa: Option<&SaEntry>,
+    uid: &str,
+) -> EventRecord {
+    let openable = s.kind == "ServiceAccount" && sa.map(|x| x.exists).unwrap_or(false);
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: s.kind.clone(),
+        api_version: if openable { "v1".to_string() } else { String::new() },
+        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
+        namespace: sa.map(|x| x.namespace.clone()).unwrap_or_default(),
+        name: s.name.clone(),
+        message: if sa.map(|x| !x.exists).unwrap_or(false) {
+            "does not exist".to_string()
+        } else {
+            s.label()
+        },
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_rbac_rule_record(r: &RoleEntry, rule: &RbacRule, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "rule".to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message: format!(
+            "verbs {} · res {} · grp {}",
+            join_or_star(&rule.verbs),
+            join_or_star(&rule.resources),
+            join_or_star(&rule.api_groups)
+        ),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_rbac_nsgroup_record(r: &RoleEntry, ns: &str, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "namespace".to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message: format!("granted in {ns}"),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 fn rbac_sev_color(s: RbacSeverity) -> Color {
     match s {
         RbacSeverity::Critical => Color::Red,
@@ -12738,36 +13550,57 @@ fn rbac_sev_icon(s: RbacSeverity) -> &'static str {
     }
 }
 
-// Binding-centric security table: one row per binding, sorted by severity, dangerous grants on top.
-fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, total, counts) = {
+// Title shared by both RBAC renderings: what the fetch found, which way it is being read, and where
+// the severity floor sits.
+fn rbac_title(app: &App) -> String {
+    let st = lang::t(app.ai_language);
+    let (loading, error, n_bind, n_roles, n_sa, degraded, counts) = {
         let s = app.rbac_state.lock().expect("rbac poisoned");
         let mut c = [0usize; 5];
         for b in &s.bindings {
             c[b.severity as usize] += 1;
         }
-        (s.loading, s.error.clone(), s.bindings.len(), c)
-    };
-    let visible = app.rbac_visible();
-    if !visible.is_empty() {
-        app.rbac_cursor = app.rbac_cursor.min(visible.len() - 1);
-    }
-
-    let title = if let Some(e) = &error {
-        format!("rbac (erreur: {})", e)
-    } else if loading && total == 0 {
-        "rbac (chargement...)".to_string()
-    } else {
-        format!(
-            "rbac ({} bindings · crit{} high{} med{} low{}) · min={}",
-            total,
-            counts[RbacSeverity::Critical as usize],
-            counts[RbacSeverity::High as usize],
-            counts[RbacSeverity::Medium as usize],
-            counts[RbacSeverity::Low as usize],
-            app.rbac_min_sev.label(),
+        (
+            s.loading,
+            s.error.clone(),
+            s.bindings.len(),
+            s.roles.len(),
+            s.service_accounts.len(),
+            s.sa_degraded,
+            c,
         )
     };
+    if let Some(e) = &error {
+        return lang::fill(st.rbac_title_error, &[("e", e)]);
+    }
+    if loading && n_bind == 0 {
+        return st.rbac_title_loading.to_string();
+    }
+    let mut title = lang::fill(
+        st.rbac_title,
+        &[
+            ("b", &n_bind.to_string()),
+            ("r", &n_roles.to_string()),
+            ("s", &n_sa.to_string()),
+            ("c", &counts[RbacSeverity::Critical as usize].to_string()),
+            ("h", &counts[RbacSeverity::High as usize].to_string()),
+            ("orient", app.rbac_orient.label(st)),
+            ("min", app.rbac_min_sev.label()),
+        ],
+    );
+    // An unreadable ServiceAccount list changes what the view can claim, so it says so rather than
+    // quietly showing a graph with holes in it.
+    if degraded {
+        title.push_str(" · ");
+        title.push_str(st.rbac_sa_degraded);
+    }
+    title
+}
+
+// Binding-centric security table: one row per binding, sorted by severity, dangerous grants on top.
+// The `Flat` orientation, unchanged — it is the reading `:rbac` is opened for.
+fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let title = rbac_title(app);
 
     let header_row = Row::new(vec![
         Cell::from("SEV"), Cell::from("SCOPE"), Cell::from("SUBJECT"),
@@ -12775,7 +13608,9 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = visible.iter().map(|b| {
+    let rows: Vec<Row> = app.rbac_rows.iter().filter_map(|row| {
+        let RbacRow::Binding { idx, .. } = row else { return None };
+        let b = app.rbac_view_bindings.get(*idx)?;
         let color = rbac_sev_color(b.severity);
         let subject = match b.subjects.split_first() {
             Some((first, [])) => first.label(),
@@ -12787,7 +13622,7 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         };
-        Row::new(vec![
+        Some(Row::new(vec![
             Cell::from(format!("{} {}", rbac_sev_icon(b.severity), b.severity.label()))
                 .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Cell::from(b.scope.label()).style(Style::default().fg(scope_color(b))),
@@ -12797,7 +13632,7 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(b.risk_tags()).style(Style::default().fg(color)),
             Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
         ])
-        .style(row_style)
+        .style(row_style))
     }).collect();
 
     let widths = [
@@ -12805,16 +13640,276 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(24), Constraint::Length(22), Constraint::Min(20), Constraint::Length(6),
     ];
 
-    let mut ts = TableState::default();
-    if !visible.is_empty() {
-        ts.select(Some(app.rbac_cursor));
-    }
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ts);
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// The indented label of one tree row, built in its own pass because the NODE column has to be sized
+// from the longest of them before any row can be laid out.
+fn rbac_row_label(app: &App, row: &RbacRow) -> String {
+    match row {
+        RbacRow::Subject { idx, collapsed, has_children } => {
+            let Some(n) = app.rbac_subjects.get(*idx) else { return String::new() };
+            let missing = n
+                .sa
+                .and_then(|i| app.rbac_view_sas.get(i))
+                .map(|sa| !sa.exists)
+                .unwrap_or(false);
+            let mark = if missing { " ✗" } else { "" };
+            format!("{} {}{}", fold_marker(*has_children, *collapsed), n.label, mark)
+        }
+        RbacRow::Binding { idx, depth, collapsed, has_children } => {
+            let Some(b) = app.rbac_view_bindings.get(*idx) else { return String::new() };
+            let kind = if b.binding_kind == "ClusterRoleBinding" { "crb" } else { "rb" };
+            format!(
+                "{}{} {} {}",
+                "  ".repeat(*depth),
+                fold_marker(*has_children, *collapsed),
+                kind,
+                b.binding_name
+            )
+        }
+        RbacRow::Role { idx, depth, collapsed, has_children } => {
+            let Some(r) = app.rbac_view_roles.get(*idx) else { return String::new() };
+            format!(
+                "{}{} {} {}",
+                "  ".repeat(*depth),
+                fold_marker(*has_children, *collapsed),
+                r.kind.short(),
+                r.name
+            )
+        }
+        RbacRow::Contributor { idx, depth } => {
+            let Some(r) = app.rbac_view_roles.get(*idx) else { return String::new() };
+            // `⊞` reads as "folded into the parent", the same marker the Flux tree uses for the
+            // inventory an object pulls in.
+            format!("{}⊞ {}", "  ".repeat(*depth), r.name)
+        }
+        RbacRow::NsGroup { namespace, depth, collapsed, .. } => {
+            format!("{}{} ns {}", "  ".repeat(*depth), fold_marker(true, *collapsed), namespace)
+        }
+        RbacRow::Rule { role, rule, depth } => {
+            let Some(rl) = app.rbac_view_roles.get(*role).and_then(|r| r.rules.get(*rule)) else {
+                return String::new();
+            };
+            format!("{}· {}", "  ".repeat(*depth), join_or_star(&rl.verbs))
+        }
+        RbacRow::SubjectLeaf { binding, subject, depth } => {
+            let Some(s) = app
+                .rbac_view_bindings
+                .get(*binding)
+                .and_then(|b| b.subjects.get(*subject))
+            else {
+                return String::new();
+            };
+            format!("{}· {}", "  ".repeat(*depth), s.label())
+        }
+    }
+}
+
+// The three tree orientations. Same columns throughout, so a subject, a binding, a role and a rule
+// line up under each other and severity stays readable down the whole column.
+fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let title = rbac_title(app);
+    let header_row = Row::new(vec![
+        Cell::from("NODE"), Cell::from("SEV"), Cell::from("SCOPE"),
+        Cell::from("ORIGIN"), Cell::from("DETAIL"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // First pass sizes the NODE column, which everything to its right depends on.
+    let labels: Vec<String> = app.rbac_rows.iter().map(|r| rbac_row_label(app, r)).collect();
+    let name_w = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("NODE".chars().count());
+    let name_col = (name_w as u16).clamp(30, 64);
+
+    let sev_cell = |s: RbacSeverity| {
+        Cell::from(format!("{} {}", rbac_sev_icon(s), s.label()))
+            .style(Style::default().fg(rbac_sev_color(s)).add_modifier(Modifier::BOLD))
+    };
+    let dim = || Cell::from("");
+
+    let rows: Vec<Row> = app
+        .rbac_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| {
+            let label = labels[vi].clone();
+            match row {
+                RbacRow::Subject { idx, .. } => {
+                    let Some(n) = app.rbac_subjects.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let sa = n.sa.and_then(|i| app.rbac_view_sas.get(i));
+                    let (origin, age) = match sa {
+                        Some(s) if s.exists => (
+                            Cell::from(s.provenance.label())
+                                .style(Style::default().fg(provenance_color(&s.provenance))),
+                            Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
+                        ),
+                        _ => (dim(), dim()),
+                    };
+                    let detail = rbac_subject_detail(app, n, sa);
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
+                        sev_cell(n.severity),
+                        Cell::from(if n.namespace.is_empty() {
+                            n.kind.clone()
+                        } else {
+                            format!("ns:{}", n.namespace)
+                        })
+                        .style(Style::default().fg(DIM)),
+                        origin,
+                        detail,
+                        age,
+                    ])
+                }
+                RbacRow::Binding { idx, .. } => {
+                    let Some(b) = app.rbac_view_bindings.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let color = rbac_sev_color(b.severity);
+                    Row::new(vec![
+                        Cell::from(label),
+                        sev_cell(b.severity),
+                        Cell::from(b.scope.label()).style(Style::default().fg(scope_color(b))),
+                        Cell::from(b.provenance.label())
+                            .style(Style::default().fg(provenance_color(&b.provenance))),
+                        Cell::from(b.risk_tags()).style(Style::default().fg(color)),
+                        Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                RbacRow::Role { idx, .. } | RbacRow::Contributor { idx, .. } => {
+                    let Some(r) = app.rbac_view_roles.get(*idx) else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let scope = if r.namespace.is_empty() {
+                        "cluster".to_string()
+                    } else {
+                        format!("ns:{}", r.namespace)
+                    };
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(Color::Cyan)),
+                        sev_cell(r.severity),
+                        Cell::from(scope).style(Style::default().fg(DIM)),
+                        Cell::from(r.provenance.label())
+                            .style(Style::default().fg(provenance_color(&r.provenance))),
+                        rbac_role_detail(app, r),
+                        Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                RbacRow::NsGroup { role, namespace, .. } => {
+                    let n = app
+                        .rbac_view_bindings
+                        .iter()
+                        .filter(|b| {
+                            b.role_idx == Some(*role)
+                                && matches!(&b.scope, crate::rbac::Scope::Namespace(x) if x == namespace)
+                        })
+                        .count();
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(Color::Magenta)),
+                        dim(),
+                        Cell::from(format!("ns:{namespace}")).style(Style::default().fg(DIM)),
+                        dim(),
+                        Cell::from(lang::fill(
+                            lang::t(app.ai_language).rbac_n_bindings,
+                            &[("n", &n.to_string())],
+                        ))
+                        .style(Style::default().fg(DIM)),
+                        dim(),
+                    ])
+                }
+                RbacRow::Rule { role, rule, .. } => {
+                    let Some(rl) = app.rbac_view_roles.get(*role).and_then(|r| r.rules.get(*rule))
+                    else {
+                        return Row::new(vec![Cell::from(label)]);
+                    };
+                    let mut detail = format!(
+                        "res {}  grp {}",
+                        join_or_star(&rl.resources),
+                        join_or_star(&rl.api_groups)
+                    );
+                    if !rl.resource_names.is_empty() {
+                        detail.push_str(&format!("  names {}", rl.resource_names.join(",")));
+                    }
+                    Row::new(vec![
+                        Cell::from(label).style(Style::default().fg(Color::Yellow)),
+                        dim(),
+                        dim(),
+                        dim(),
+                        Cell::from(detail),
+                        dim(),
+                    ])
+                }
+                RbacRow::SubjectLeaf { binding, subject, .. } => {
+                    let sa = app
+                        .rbac_view_bindings
+                        .get(*binding)
+                        .and_then(|b| b.sa_idx.get(*subject).copied().flatten())
+                        .and_then(|i| app.rbac_view_sas.get(i));
+                    let detail = match sa {
+                        Some(s) if !s.exists => Cell::from(lang::t(app.ai_language).rbac_sa_missing)
+                            .style(Style::default().fg(Color::Red)),
+                        _ => dim(),
+                    };
+                    Row::new(vec![Cell::from(label), dim(), dim(), dim(), detail, dim()])
+                }
+            }
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(name_col), Constraint::Length(9), Constraint::Length(18),
+        Constraint::Length(22), Constraint::Min(20), Constraint::Length(6),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// What a role node says about itself: how many rules it carries, and the two states that only this
+// view can show — a definition re-granted namespace by namespace, and one nobody binds at all.
+fn rbac_role_detail(app: &App, r: &RoleEntry) -> Cell<'static> {
+    let st = lang::t(app.ai_language);
+    let mut parts: Vec<String> = vec![lang::fill(st.rbac_n_rules, &[("n", &r.rules.len().to_string())])];
+    if r.aggregated {
+        parts.push(lang::fill(st.rbac_aggregates, &[("n", &r.aggregates.len().to_string())]));
+    }
+    if r.is_template() {
+        parts.push(lang::fill(
+            st.rbac_template,
+            &[("n", &r.bound_namespaces.len().to_string())],
+        ));
+    } else if r.is_unbound() {
+        parts.push(st.rbac_unbound.to_string());
+    }
+    let color = if r.is_unbound() { DIM } else { rbac_sev_color(r.severity) };
+    Cell::from(parts.join(" · ")).style(Style::default().fg(color))
+}
+
+fn rbac_subject_detail(app: &App, n: &RbacSubjectNode, sa: Option<&SaEntry>) -> Cell<'static> {
+    let st = lang::t(app.ai_language);
+    if sa.map(|s| !s.exists).unwrap_or(false) {
+        return Cell::from(st.rbac_sa_missing).style(Style::default().fg(Color::Red));
+    }
+    let mut parts = vec![lang::fill(st.rbac_n_bindings, &[("n", &n.bindings.len().to_string())])];
+    if sa.map(|s| s.automount == Some(false)).unwrap_or(false) {
+        parts.push(st.rbac_automount_off.to_string());
+    }
+    Cell::from(parts.join(" · ")).style(Style::default().fg(DIM))
 }
 
 // A namespaced binding in a critical namespace is highlighted even though its scope is "just" a ns.
@@ -12839,10 +13934,12 @@ fn provenance_color(p: &crate::rbac::Provenance) -> Color {
     }
 }
 
-// Detail panel (split top / full screen): selected binding's findings, then its resolved rules.
+// Detail panel (split top / full screen). What it describes follows the cursor: a binding row shows
+// the grant and its findings, a role row shows the role — what it is composed of, where it is
+// granted — and a subject row shows the identity and everything it adds up to.
 fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let st = lang::t(app.ai_language);
-    let Some(b) = app.rbac_selected() else {
+    let Some(row) = app.rbac_selected() else {
         let p = Paragraph::new(Line::from(Span::styled(
             lang::t(app.ai_language).rbac_empty_select, Style::default().fg(DIM),
         )))
@@ -12851,67 +13948,34 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let title = Line::from(Span::styled(
-        format!(" {} {} ", b.binding_kind, b.binding_name),
-        Style::default().fg(Color::Black).bg(rbac_sev_color(b.severity)).add_modifier(Modifier::BOLD),
-    ));
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let label = |k: &str, v: String| {
-        Line::from(vec![
-            Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
-            Span::raw(v),
-        ])
-    };
-    lines.push(label("severity", b.severity.label().to_string()));
-    lines.push(label("scope", b.scope.label()));
-    lines.push(label("role", b.role_ref.label()));
-    if b.via_clusterrole {
-        lines.push(label("via", format!("ClusterRole rabattu sur {}", b.scope.label())));
-    }
-    if b.aggregated {
-        lines.push(label("aggregated", st.rbac_aggregated.to_string()));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(format!("{:<10}", "origin"), Style::default().fg(DIM)),
-        Span::styled(b.provenance.label(), Style::default().fg(provenance_color(&b.provenance))),
-    ]));
-    if let Some(src) = &b.source {
-        lines.push(label("source", src.clone()));
-    }
-    for (i, s) in b.subjects.iter().enumerate() {
-        lines.push(label(if i == 0 { "subjects" } else { "" }, s.label()));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("FINDINGS", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
-    if b.findings.is_empty() {
-        lines.push(Line::from(Span::styled(st.rbac_read_only, Style::default().fg(DIM))));
-    }
-    for fd in &b.findings {
-        lines.push(rbac_finding_line(fd));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("RULES", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
-    if b.rules.is_empty() {
-        lines.push(Line::from(Span::styled(st.rbac_no_rule, Style::default().fg(DIM))));
-    }
-    for r in &b.rules {
-        let mut spans = vec![
-            Span::styled("  verbs ", Style::default().fg(DIM)),
-            Span::styled(join_or_star(&r.verbs), Style::default().fg(Color::Yellow)),
-            Span::styled("  res ", Style::default().fg(DIM)),
-            Span::raw(join_or_star(&r.resources)),
-            Span::styled("  grp ", Style::default().fg(DIM)),
-            Span::styled(join_or_star(&r.api_groups), Style::default().fg(DIM)),
-        ];
-        if !r.resource_names.is_empty() {
-            spans.push(Span::styled("  names ", Style::default().fg(DIM)));
-            spans.push(Span::styled(r.resource_names.join(","), Style::default().fg(Color::Green)));
+    let (title, mut lines) = match row {
+        RbacRow::Subject { idx, .. } => match app.rbac_subjects.get(*idx) {
+            Some(n) => rbac_subject_detail_lines(app, n, st),
+            None => return,
+        },
+        RbacRow::Role { idx, .. } | RbacRow::Contributor { idx, .. } => {
+            match app.rbac_view_roles.get(*idx) {
+                Some(r) => rbac_role_detail_lines(app, r, st),
+                None => return,
+            }
         }
-        lines.push(Line::from(spans));
-    }
+        // A rule and a namespace group both describe their role: that is the object the panel can
+        // say something useful about.
+        RbacRow::Rule { role, .. } | RbacRow::NsGroup { role, .. } => {
+            match app.rbac_view_roles.get(*role) {
+                Some(r) => rbac_role_detail_lines(app, r, st),
+                None => return,
+            }
+        }
+        RbacRow::Binding { idx, .. } => match app.rbac_view_bindings.get(*idx) {
+            Some(b) => rbac_binding_detail_lines(app, b, st),
+            None => return,
+        },
+        RbacRow::SubjectLeaf { binding, .. } => match app.rbac_view_bindings.get(*binding) {
+            Some(b) => rbac_binding_detail_lines(app, b, st),
+            None => return,
+        },
+    };
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
@@ -12923,6 +13987,282 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .scroll((app.rbac_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
+}
+
+fn rbac_detail_label(k: &str, v: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
+        Span::raw(v),
+    ])
+}
+
+fn rbac_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn rbac_rule_line(r: &RbacRule) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  verbs ", Style::default().fg(DIM)),
+        Span::styled(join_or_star(&r.verbs), Style::default().fg(Color::Yellow)),
+        Span::styled("  res ", Style::default().fg(DIM)),
+        Span::raw(join_or_star(&r.resources)),
+        Span::styled("  grp ", Style::default().fg(DIM)),
+        Span::styled(join_or_star(&r.api_groups), Style::default().fg(DIM)),
+    ];
+    if !r.resource_names.is_empty() {
+        spans.push(Span::styled("  names ", Style::default().fg(DIM)));
+        spans.push(Span::styled(r.resource_names.join(","), Style::default().fg(Color::Green)));
+    }
+    Line::from(spans)
+}
+
+fn rbac_binding_detail_lines(
+    app: &App,
+    b: &RbacBinding,
+    st: &'static Strings,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" {} {} ", b.binding_kind, b.binding_name),
+        Style::default().fg(Color::Black).bg(rbac_sev_color(b.severity)).add_modifier(Modifier::BOLD),
+    ));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(rbac_detail_label(st.rbac_lbl_severity, b.severity.label().to_string()));
+    lines.push(rbac_detail_label(st.rbac_lbl_scope, b.scope.label()));
+    lines.push(rbac_detail_label(st.rbac_lbl_role, b.role_ref.label()));
+    if b.via_clusterrole {
+        lines.push(rbac_detail_label(
+            st.rbac_lbl_via,
+            lang::fill(st.rbac_via_clusterrole, &[("scope", &b.scope.label())]),
+        ));
+    }
+    if b.aggregated {
+        lines.push(rbac_detail_label(st.rbac_lbl_aggregated, st.rbac_aggregated.to_string()));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+        Span::styled(b.provenance.label(), Style::default().fg(provenance_color(&b.provenance))),
+    ]));
+    if let Some(src) = &b.source {
+        lines.push(rbac_detail_label(st.rbac_lbl_source, src.clone()));
+    }
+    for (i, s) in b.subjects.iter().enumerate() {
+        // A subject naming a ServiceAccount nobody created grants nothing today; say so on the line
+        // rather than leaving it looking like any other holder.
+        let missing = b
+            .sa_idx
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|x| app.rbac_view_sas.get(x))
+            .map(|sa| !sa.exists)
+            .unwrap_or(false);
+        let text = if missing {
+            format!("{}  ({})", s.label(), st.rbac_sa_missing)
+        } else {
+            s.label()
+        };
+        lines.push(rbac_detail_label(
+            if i == 0 { st.rbac_lbl_subjects } else { "" },
+            text,
+        ));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(rbac_section(st.rbac_sec_findings));
+    if b.findings.is_empty() {
+        lines.push(Line::from(Span::styled(st.rbac_read_only, Style::default().fg(DIM))));
+    }
+    for fd in &b.findings {
+        lines.push(rbac_finding_line(fd));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(rbac_section(st.rbac_sec_rules));
+    if b.rules.is_empty() {
+        lines.push(Line::from(Span::styled(st.rbac_no_rule, Style::default().fg(DIM))));
+    }
+    for r in &b.rules {
+        lines.push(rbac_rule_line(r));
+    }
+    (title, lines)
+}
+
+// The role as an object: what it is made of, where it is granted, and what it would allow. Severity
+// here is a ceiling — what any binding of this role could give — not a live grant.
+fn rbac_role_detail_lines(
+    app: &App,
+    r: &RoleEntry,
+    st: &'static Strings,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" {} {} ", r.kind.label(), r.name),
+        Style::default().fg(Color::Black).bg(rbac_sev_color(r.severity)).add_modifier(Modifier::BOLD),
+    ));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(rbac_detail_label(st.rbac_lbl_severity, r.severity.label().to_string()));
+    lines.push(rbac_detail_label(
+        st.rbac_lbl_scope,
+        if r.namespace.is_empty() { "cluster".to_string() } else { format!("ns:{}", r.namespace) },
+    ));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+        Span::styled(r.provenance.label(), Style::default().fg(provenance_color(&r.provenance))),
+    ]));
+    if let Some(src) = &r.source {
+        lines.push(rbac_detail_label(st.rbac_lbl_source, src.clone()));
+    }
+
+    if r.is_unbound() {
+        lines.push(rbac_detail_label(st.rbac_lbl_bound, st.rbac_unbound.to_string()));
+    } else {
+        let mut where_ = Vec::new();
+        if r.bound_cluster > 0 {
+            where_.push(lang::fill(st.rbac_bound_cluster, &[("n", &r.bound_cluster.to_string())]));
+        }
+        if !r.bound_namespaces.is_empty() {
+            where_.push(lang::fill(
+                st.rbac_bound_ns,
+                &[("n", &r.bound_namespaces.len().to_string())],
+            ));
+        }
+        lines.push(rbac_detail_label(st.rbac_lbl_bound, where_.join(" · ")));
+        if r.is_template() {
+            lines.push(rbac_detail_label(st.rbac_lbl_template, r.bound_namespaces.join(", ")));
+        }
+    }
+
+    if r.aggregated {
+        lines.push(Line::from(""));
+        lines.push(rbac_section(st.rbac_sec_aggregation));
+        if r.aggregates.is_empty() {
+            lines.push(Line::from(Span::styled(st.rbac_aggregates_none, Style::default().fg(DIM))));
+        }
+        for &ci in &r.aggregates {
+            if let Some(c) = app.rbac_view_roles.get(ci) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ⊞ ", Style::default().fg(DIM)),
+                    Span::styled(c.name.clone(), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        lang::fill(st.rbac_n_rules_paren, &[("n", &c.rules.len().to_string())]),
+                        Style::default().fg(DIM),
+                    ),
+                ]));
+            }
+        }
+    }
+    // The reverse edge answers "why does `admin` suddenly grant this?" from the contributor's side.
+    if !r.aggregates_into.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(rbac_section(st.rbac_sec_feeds));
+        for &pi in &r.aggregates_into {
+            if let Some(p) = app.rbac_view_roles.get(pi) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ↑ ", Style::default().fg(DIM)),
+                    Span::styled(p.name.clone(), Style::default().fg(Color::Cyan)),
+                ]));
+            }
+        }
+    }
+
+    if !r.findings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(rbac_section(st.rbac_sec_findings));
+        for fd in &r.findings {
+            lines.push(rbac_finding_line(fd));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(rbac_section(st.rbac_sec_rules));
+    if r.rules.is_empty() {
+        lines.push(Line::from(Span::styled(st.rbac_no_rule, Style::default().fg(DIM))));
+    }
+    for rule in &r.rules {
+        lines.push(rbac_rule_line(rule));
+    }
+    (title, lines)
+}
+
+// The identity: the ServiceAccount object when there is one, then every grant it holds, worst first.
+fn rbac_subject_detail_lines(
+    app: &App,
+    n: &RbacSubjectNode,
+    st: &'static Strings,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let title = Line::from(Span::styled(
+        format!(" {} ", n.label),
+        Style::default().fg(Color::Black).bg(rbac_sev_color(n.severity)).add_modifier(Modifier::BOLD),
+    ));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(rbac_detail_label(st.rbac_lbl_severity, n.severity.label().to_string()));
+    lines.push(rbac_detail_label(st.rbac_lbl_kind, n.kind.clone()));
+    if !n.namespace.is_empty() {
+        lines.push(rbac_detail_label(st.rbac_lbl_namespace, n.namespace.clone()));
+    }
+
+    match n.sa.and_then(|i| app.rbac_view_sas.get(i)) {
+        Some(sa) if !sa.exists => {
+            lines.push(Line::from(Span::styled(
+                st.rbac_sa_missing_detail,
+                Style::default().fg(Color::Red),
+            )));
+        }
+        Some(sa) => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+                Span::styled(sa.provenance.label(), Style::default().fg(provenance_color(&sa.provenance))),
+            ]));
+            if let Some(src) = &sa.source {
+                lines.push(rbac_detail_label(st.rbac_lbl_source, src.clone()));
+            }
+            lines.push(rbac_detail_label(
+                st.rbac_lbl_automount,
+                match sa.automount {
+                    Some(true) => st.rbac_automount_on.to_string(),
+                    Some(false) => st.rbac_automount_off.to_string(),
+                    None => st.rbac_automount_default.to_string(),
+                },
+            ));
+            if sa.secrets > 0 || sa.image_pull_secrets > 0 {
+                lines.push(rbac_detail_label(
+                    st.rbac_lbl_secrets,
+                    format!("{} · imagePull {}", sa.secrets, sa.image_pull_secrets),
+                ));
+            }
+            lines.push(rbac_detail_label(st.rbac_lbl_age, sa.age.clone()));
+        }
+        // No ServiceAccount object behind it: a User or a Group is a name the authenticator hands
+        // over, not something the cluster stores. Nothing more can honestly be said about it.
+        None if n.kind != "ServiceAccount" => {
+            lines.push(Line::from(Span::styled(st.rbac_external_subject, Style::default().fg(DIM))));
+        }
+        None => {}
+    }
+
+    lines.push(Line::from(""));
+    lines.push(rbac_section(st.rbac_sec_grants));
+    if n.bindings.is_empty() {
+        lines.push(Line::from(Span::styled(st.rbac_no_grant, Style::default().fg(DIM))));
+    }
+    for &bi in &n.bindings {
+        let Some(b) = app.rbac_view_bindings.get(bi) else { continue };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", rbac_sev_icon(b.severity)), Style::default().fg(rbac_sev_color(b.severity))),
+            Span::styled(
+                format!("{:<8}", b.severity.label()),
+                Style::default().fg(rbac_sev_color(b.severity)).add_modifier(Modifier::BOLD),
+            ),
+            // Padding alone is not a separator: a role name longer than its column would run
+            // straight into the scope. The explicit gaps keep the three fields apart at any length.
+            Span::styled(format!("{:<26}", b.role_ref.label()), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  {:<16}", b.scope.label()), Style::default().fg(DIM)),
+            Span::raw(format!("  {}", b.risk_tags())),
+        ]));
+    }
+    (title, lines)
 }
 
 fn rbac_finding_line(fd: &RbacFinding) -> Line<'static> {
