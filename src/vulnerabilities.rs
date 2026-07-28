@@ -486,8 +486,18 @@ fn parse_cvss(content: &str) -> (Sev, f64) {
     (Sev::Unknown, 0.0)
 }
 
+// Bounded end to end: these fetches run in a background task whose only failure mode the UI knows
+// is "no answer", so a feed that hangs must resolve to None rather than pin the task forever.
+fn http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()
+}
+
 async fn http_text(url: &str) -> Option<String> {
-    let resp = reqwest::get(url).await.ok()?;
+    let resp = http_client()?.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -495,7 +505,7 @@ async fn http_text(url: &str) -> Option<String> {
 }
 
 async fn http_json(url: &str) -> Option<Value> {
-    let resp = reqwest::get(url).await.ok()?;
+    let resp = http_client()?.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }

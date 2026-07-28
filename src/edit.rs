@@ -478,13 +478,15 @@ pub fn temp_path(kind: &str, namespace: &str, name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kdt-edit-{}-{}.yaml", stem, std::process::id()))
 }
 
-// Written 0600 and never world-readable: a Secret's data goes through this file.
+// Written 0600 and never world-readable: a Secret's data goes through this file. `create_new`
+// (O_EXCL) rather than `create`: reusing a file that already exists would follow a planted symlink
+// and keep whatever mode the old file had — the 0600 only applies to a file created here.
 pub fn write_temp(path: &Path, content: &str) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("{} : {e}", path.display()))?;
