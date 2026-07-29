@@ -9124,7 +9124,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
             Span::styled(" t ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_orient, app.rbac_orient.label(st))),
-            Span::styled(" Espace ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
+            Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
             footer_sep(),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_origin)),
             Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_rbac_filter, app.rbac_min_sev.label())),
@@ -9333,7 +9333,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 footer_sep(),
                 Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
-                Span::styled(" Espace ", kbg), Span::raw(format!(" {}   ", st.k_refl_fold)),
+                Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_refl_fold)),
                 footer_sep(),
                 Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_refl_filter, app.refl_filter.label())),
@@ -16030,16 +16030,23 @@ fn ky_policy_scope(p: &KyPolicy) -> String {
 }
 
 fn kyverno_panel_title(app: &App) -> String {
+    let st = lang::t(app.ai_language);
     let s = app.kyverno_state.lock().expect("kyverno poisoned");
-    let kind = if app.ky_by_resource { "kyverno par ressource" } else { "kyverno par policy" };
+    // Same wording as the `t` key in the footer: the title names the axis the footer offers to
+    // flip, so the two must not drift apart.
+    let axis = if app.ky_by_resource { st.k_ky_by_resource } else { st.k_ky_by_policy };
+    let kind = lang::fill(st.ky_view, &[("axis", axis)]);
     if let Some(e) = &s.error {
-        return format!("{} (erreur: {})", kind, e);
+        return lang::fill(st.ui_title_error, &[("view", &kind), ("e", e)]);
     }
     if s.loading && s.policies.is_empty() {
-        return format!("{} (chargement...)", kind);
+        return lang::fill(st.ui_title_loading, &[("view", &kind)]);
     }
     if s.policies.is_empty() {
-        return format!("{} (aucune policy sur ce cluster) · filtre={}", kind, app.ky_filter.label());
+        return lang::fill(
+            st.ky_title_empty,
+            &[("view", &kind), ("filter", app.ky_filter.label())],
+        );
     }
     let (total, enforce, not_ready, fail, warn, error) = s.counts();
     let mut parts = vec![format!("{} policies", total), format!("{} enforce", enforce)];
@@ -16057,9 +16064,16 @@ fn kyverno_panel_title(app: &App) -> String {
         parts.push(counters.join(" "));
     }
     if not_ready > 0 {
-        parts.push(format!("{} non-Ready", not_ready));
+        parts.push(lang::fill(st.ky_not_ready_count, &[("n", &not_ready.to_string())]));
     }
-    format!("{} ({}) · filtre={}", kind, parts.join(" · "), app.ky_filter.label())
+    lang::fill(
+        st.ky_title,
+        &[
+            ("view", &kind),
+            ("parts", &parts.join(" · ")),
+            ("filter", app.ky_filter.label()),
+        ],
+    )
 }
 
 // Policy -> rule -> the resources that fail it. The column headers stay fixed while the meaning of
@@ -16447,15 +16461,18 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
     } else if !ok {
         (st.ky_degraded, Color::Red)
     } else if health.silently_inactive() {
-        (" kyverno inactif ", Color::Yellow)
+        (st.ky_inactive, Color::Yellow)
     } else {
         (" kyverno ", Color::Green)
     };
+    // The bright badge colours carry black text, but DarkGray does not: bold black is brightened
+    // into DarkGray itself on many terminals, and the badge reads as an empty rectangle.
+    let badge_fg = if badge_color == Color::DarkGray { Color::White } else { Color::Black };
 
     let mut spans = vec![
         Span::styled(
             badge,
-            Style::default().fg(Color::Black).bg(badge_color).add_modifier(Modifier::BOLD),
+            Style::default().fg(badge_fg).bg(badge_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(if health.version.is_empty() {
             String::new()
@@ -16478,7 +16495,7 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
         ));
     }
 
-    let mut second = vec![Span::raw(" webhooks ressources: ")];
+    let mut second = vec![Span::raw(st.ky_webhooks)];
     let hook_color = |n: usize| if n == 0 { Color::Yellow } else { Color::Green };
     second.push(Span::styled(
         format!("validating {}", health.validating_webhooks),
@@ -16490,14 +16507,11 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
         Style::default().fg(hook_color(health.mutating_webhooks)),
     ));
     second.push(Span::styled(
-        format!("  ·  {} rapports", reports),
+        lang::fill(st.ky_reports, &[("n", &reports.to_string())]),
         Style::default().fg(DIM),
     ));
     if !cel {
-        second.push(Span::styled(
-            "  ·  moteur CEL absent",
-            Style::default().fg(DIM),
-        ));
+        second.push(Span::styled(st.ky_no_cel, Style::default().fg(DIM)));
     }
     if health.silently_inactive() {
         second.push(Span::styled(
@@ -16513,7 +16527,10 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
 fn section(label: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {} ", label),
-        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        // Blanc et non noir : beaucoup de terminaux rendent le gras en couleur claire, et un
+        // noir éclairci vaut exactement le DarkGray du fond — le titre disparaissait alors
+        // sans laisser autre chose qu'un rectangle gris.
+        Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -16586,7 +16603,10 @@ fn ky_policy_lines(
         // namespace.
         out.push(Line::from(vec![
             Span::styled("  override    ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{} sur ns {}", o.action.label(), o.namespaces.join(", "))),
+            Span::raw(lang::fill(
+                st.ky_override_ns,
+                &[("action", o.action.label()), ("namespaces", &o.namespaces.join(", "))],
+            )),
         ]));
     }
 
