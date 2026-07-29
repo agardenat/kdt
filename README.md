@@ -2,6 +2,8 @@
 
 TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter les nœuds, lancer un diagnostic complet du cluster, exporter des rapports PDF et obtenir une analyse assistée par IA.
 
+![kdt en action : flux d'évènements live, arbre FluxCD, marge de capacité, policies Kyverno et arbre RBAC](demo/hero.gif)
+
 ## Fonctionnalités
 
 - **Flux d'évènements live** : watch des `Event` Kubernetes avec filtrage All / Warnings / Errors et mise en évidence des `reason` critiques.
@@ -360,6 +362,8 @@ Inspirée de k9s : `:` ouvre une invite où l'on tape le nom d'une vue. `Tab` co
 
 ### FluxCD (`:flux`)
 
+![Vue FluxCD : l'arbre de dépendances des Kustomization, HelmRelease et sources](demo/flux.gif)
+
 Vue globale de l'état Flux sur tout le cluster : `Kustomization`, `HelmRelease` et sources
 (`GitRepository`, `OCIRepository`, `HelmRepository`, `HelmChart`, `Bucket`). Les ressources
 en échec sont remontées en tête, puis `Unknown`, puis suspendues, puis `Ready`. Le bandeau
@@ -590,6 +594,8 @@ les pods de DaemonSet, les pods statiques et les pods terminés sont laissés en
 > caractère tapé.
 
 ### Capacité / marge de manœuvre (`:capacity`, `:quota`)
+
+![Vue capacité : les mondes nœuds, workloads et quotas, avec le verdict sur la marge restante](demo/capacity.gif)
 
 Toutes les autres vues disent l'état ; celle-ci dit **la marge**. Un seul fetch alimente trois
 mondes, `g` passe de l'un à l'autre :
@@ -838,6 +844,8 @@ bandeau.
 
 ### Kyverno (`:kyverno`)
 
+![Vue Kyverno : santé du moteur, policies, règles et ce qu'elles interceptent](demo/kyverno.gif)
+
 Vue dédiée au moteur d'admission, pensée pour répondre à « qu'est-ce que Kyverno applique, à quoi,
 et qu'est-ce qui casse ? » sans faire la jointure à la main. Un `PolicyReport` ne nomme sa policy et
 sa règle que par une chaîne de caractères : pour savoir ce qui était vérifié il faut aller relire la
@@ -958,6 +966,8 @@ qui est déjà la réponse quand rien ne bouge. Elle distingue « absent » de �
 peut masquer le déploiement.
 
 ### RBAC (`:rbac`)
+
+![Vue RBAC : la liste plate d'audit puis les orientations en arbre du graphe des droits](demo/rbac.gif)
 
 Le graphe RBAC se lit dans quatre sens, et `t` passe de l'un à l'autre. Le sens par défaut reste la
 **liste plate** : une ligne par binding, les grants dangereux en haut. C'est la lecture d'audit, elle
