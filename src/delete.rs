@@ -46,6 +46,11 @@ pub enum Reason {
     SystemNamespace { namespace: String },
     NodeDrain,
     PersistentData,
+    // A velero Backup: deleting the object is not deleting the backup. The data stays in object
+    // storage, and velero's backup-sync controller reads the bucket back and re-creates the object
+    // within the minute (`backup_sync_controller.go`). The only deletion that removes anything is a
+    // `DeleteBackupRequest`, which the `:velero` view files under `o`.
+    VeleroBackup,
     Finalizers,
 }
 
@@ -59,7 +64,8 @@ impl Reason {
             Reason::OwnedBy { .. }
             | Reason::SystemNamespace { .. }
             | Reason::NodeDrain
-            | Reason::PersistentData => Level::Warn,
+            | Reason::PersistentData
+            | Reason::VeleroBackup => Level::Warn,
             Reason::Finalizers => Level::Info,
         }
     }
@@ -218,6 +224,7 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
         "CustomResourceDefinition" => out.push(Reason::CrdCascade),
         "Node" => out.push(Reason::NodeDrain),
         "PersistentVolumeClaim" | "PersistentVolume" => out.push(Reason::PersistentData),
+        "Backup" if api_version.starts_with("velero.io/") => out.push(Reason::VeleroBackup),
         _ => {}
     }
     if let Some((kind, name)) = controller_owner(meta) {
@@ -330,6 +337,25 @@ fn lookup<'a>(map: Option<&'a Map<String, Value>>, key: &str) -> Option<&'a str>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Deleting a velero Backup object is the one deletion in this list that does not delete
+    // anything: the bucket keeps the data and the sync controller re-creates the object. The rule
+    // has to be scoped to the velero group — plenty of CRDs are called `Backup`.
+    #[test]
+    fn a_velero_backup_warns_that_the_object_is_not_the_backup() {
+        let reasons = assess(&json!({
+            "apiVersion": "velero.io/v1",
+            "kind": "Backup",
+            "metadata": { "name": "daily-20260730", "namespace": "velero" },
+        }));
+        assert!(reasons.contains(&Reason::VeleroBackup));
+        let other = assess(&json!({
+            "apiVersion": "postgresql.cnpg.io/v1",
+            "kind": "Backup",
+            "metadata": { "name": "pg", "namespace": "db" },
+        }));
+        assert!(!other.contains(&Reason::VeleroBackup));
+    }
 
     #[test]
     fn flux_kustomize_labels_are_a_danger() {

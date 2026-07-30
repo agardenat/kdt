@@ -33,6 +33,7 @@ mod storage;
 mod svc;
 mod touch;
 mod ui;
+mod velero;
 mod vulnerabilities;
 mod yaml;
 

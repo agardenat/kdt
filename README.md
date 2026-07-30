@@ -75,6 +75,9 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | `certs` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
 | `kyverno` | `ky`, `policies`, `polr`, `cpol`, `admission` | Kyverno |
 | `reflector` | `refl`, `mirror`, `miroir` | Reflector |
+| `velero` | `vel`, `backup`, `backups`, `schedules` | Velero, côté backups et schedules |
+| `restores` | `restore`, `restauration` | Velero, côté restaurations |
+| `bsl` | `backupstoragelocation`, `backuprepositories` | Velero, côté stockage et dépôts |
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
@@ -194,6 +197,15 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
 
   ![Vue RBAC](demo/rbac.gif)
 
+- **Velero** (`:velero`, `:restores`, `:bsl`) — un backup n'a qu'une question : *si tout brûle
+  maintenant, qu'est-ce qui revient ?* `PartiallyFailed` est affiché comme un échec, parce que c'en
+  est un — le backup est allé au bout sans tout capturer. La vue évalue le **cron elle-même** pour
+  dire qu'un schedule a cessé de tourner (velero ne le signale nulle part : il ne crée simplement
+  pas de backup), signale un TTL plus court que la période du cron, une location indisponible, un
+  dépôt kopia sans maintenance, et surtout les **namespaces à PVC que plus aucun schedule ne
+  couvre**. `o` ouvre les opérations : lancer un backup depuis un schedule, mettre en pause,
+  restaurer, et supprimer *vraiment* un backup — via une `DeleteBackupRequest`, parce que supprimer
+  l'objet ne supprime rien et que la resynchronisation le recrée. `L` va chercher le log du run.
 - **Stockage** (`:storage`, `:pv`) — `kubectl get pvc` dit qu'un PVC est `Pending`, jamais
   pourquoi. Ici : StorageClass introuvable, aucune classe par défaut (ou deux), `WaitForFirstConsumer`
   qui attend un pod, classe sans provisioner — et si le provisioner a laissé un `ProvisioningFailed`,
@@ -342,6 +354,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `flux.rs` · `repair.rs` | FluxCD (inventaire, reconcile, arbre) et déblocage `Ctrl-R` |
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | RBAC scoré, Secrets/TLS, chaîne cert-manager |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVE |
+| `velero.rs` | Velero : backups, schedules (cron évalué), restaurations, locations |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
 | `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, rendu Typst |

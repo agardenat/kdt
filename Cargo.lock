@@ -2128,6 +2128,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "flate2",
  "futures",
  "http",
  "k8s-openapi",

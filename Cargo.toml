@@ -30,6 +30,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 http = "1"
 base64 = "0.22"
 x509-parser = "0.16"
+# Everything velero serves through a DownloadRequest (backup logs, restore logs, results) is
+# gzipped, with no option to ask for plain text: reading a run log means un-gzipping it.
+flate2 = "1"
 typst = "0.14"
 typst-pdf = "0.14"
 typst-as-lib = { version = "0.15", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }

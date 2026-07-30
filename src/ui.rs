@@ -355,6 +355,64 @@ use crate::reflector::{
     apply_force, fetch_reflector, force_plan, new_reflector_state, ForceWrite,
     HintLevel as ReflHintLevel, ReflOrphan, ReflSource, ReflTarget, SharedReflector, TargetStatus,
 };
+use crate::velero::{
+    apply_write, fetch_run_log, fetch_velero, format_span, format_span_short, new_vel_log,
+    new_velero_state, LogSource, SharedVelLog, SharedVelero, VelBackup, VelLocation, VelRepo,
+    VelRestore, VelSchedule, VelSnapLocation, VelWrite,
+};
+
+// The three questions the velero view answers, cycled with `g` off a single fetch: what is being
+// backed up (and by which schedule), what has been restored, and whether the plumbing underneath —
+// locations and file-system repositories — can actually carry any of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VelWorld {
+    Backups,
+    Restores,
+    Infra,
+}
+
+// One visual row of the velero view, index-aligned with `App::snapshot` like every other tree view
+// here. The two big ones are boxed: this vector holds one entry per visible line, and a backup is
+// several times the size of a repository row.
+#[derive(Debug, Clone)]
+enum VelRow {
+    Schedule(Box<VelSchedule>),
+    Backup(Box<VelBackup>),
+    Restore(Box<VelRestore>),
+    Location(VelLocation),
+    SnapLocation(VelSnapLocation),
+    Repo(VelRepo),
+    // The parent row that collects the backups no schedule claims — a manual run, or one whose
+    // schedule has since been deleted.
+    Orphans,
+}
+
+impl VelRow {
+    fn hints(&self) -> &[crate::storage::Hint] {
+        match self {
+            VelRow::Schedule(s) => &s.hints,
+            VelRow::Backup(b) => &b.hints,
+            VelRow::Restore(r) => &r.hints,
+            VelRow::Location(l) => &l.hints,
+            VelRow::SnapLocation(l) => &l.hints,
+            VelRow::Repo(r) => &r.hints,
+            VelRow::Orphans => &[],
+        }
+    }
+
+    fn has_problem(&self) -> bool {
+        self.hints().iter().any(|h| h.level >= StoHintLevel::Warn)
+    }
+
+    // The fold key of a row that has children, `None` for a leaf.
+    fn fold_key(&self) -> Option<String> {
+        match self {
+            VelRow::Schedule(s) => Some(s.key()),
+            VelRow::Orphans => Some("|orphans".to_string()),
+            _ => None,
+        }
+    }
+}
 
 // The three ways to look at reflector's work (`g`). Sources is the tree everything hangs from;
 // Mirrors flattens the copies so one can scan versions side by side; Orphans isolates the copies no
@@ -551,7 +609,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull }
+pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -578,6 +636,11 @@ enum MenuAction {
     CertAcmeRetry,
     // Clear the recorded version on the selected mirror(s) so reflector pushes the source again.
     ReflForce,
+    // Velero: run a schedule now, pause/resume it, restore a backup, delete one for real.
+    VelBackupNow,
+    VelPause(bool),
+    VelRestore,
+    VelDeleteBackup,
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
@@ -633,6 +696,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::CertsFull
             | Mode::KyvernoFull
             | Mode::ReflectorFull
+            | Mode::VeleroFull
             | Mode::ConfigmapsFull
             | Mode::ServicesFull
             | Mode::StorageFull
@@ -722,6 +786,12 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // `mirror`/`miroir` belong here rather than to the Secrets view: on a cluster running reflector
     // that is what those words mean.
     ("reflector", &["refl", "reflect", "reflection", "mirror", "mirrors", "miroir", "miroirs"]),
+    // `backup`/`backups` belong here rather than to the storage view: on a cluster running velero
+    // that is what those words mean. `restores` and `bsl` are commands of their own so that each
+    // opens on the world it names instead of one `g` away from it.
+    ("velero", &["vel", "backup", "backups", "sauvegarde", "sauvegardes", "schedule", "schedules"]),
+    ("restores", &["restore", "restauration", "restaurations"]),
+    ("bsl", &["backupstoragelocation", "backuplocation", "backuplocations", "backuprepository", "backuprepositories"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -1031,6 +1101,21 @@ pub struct App {
     pub ky_detail_scroll: usize,
     pub ky_refresh_handle: Option<JoinHandle<()>>,
     last_ky_sel_uid: Option<String>,
+    pub velero_state: SharedVelero,
+    // The run log of one backup or restore, fetched on demand (`L`) and shown at the bottom of the
+    // detail panel. Its own state because the fetch is slow — a download request, a poll, and a
+    // possible fallback — and must not hold the view.
+    pub vel_log: SharedVelLog,
+    vel_world: VelWorld,
+    vel_filter: StoFilter,
+    // Backups grouped under the schedule that produced them (`t`). Off, the world is a flat list of
+    // backups newest first — which is what one wants when hunting a single failed run.
+    vel_group: bool,
+    // Schedules the user folded (`Espace`), keyed by "ns/name".
+    vel_collapsed: std::collections::HashSet<String>,
+    vel_rows: Vec<VelRow>,
+    pub vel_detail_scroll: usize,
+    pub vel_refresh_handle: Option<JoinHandle<()>>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -1266,6 +1351,15 @@ impl App {
             ky_detail_scroll: 0,
             ky_refresh_handle: None,
             last_ky_sel_uid: None,
+            velero_state: new_velero_state(),
+            vel_log: new_vel_log(),
+            vel_world: VelWorld::Backups,
+            vel_filter: StoFilter::All,
+            vel_group: true,
+            vel_collapsed: std::collections::HashSet::new(),
+            vel_rows: Vec::new(),
+            vel_detail_scroll: 0,
+            vel_refresh_handle: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -2029,7 +2123,9 @@ impl App {
             | Mode::Certs
             | Mode::CertsFull
             | Mode::Kyverno
-            | Mode::KyvernoFull => {
+            | Mode::KyvernoFull
+            | Mode::Velero
+            | Mode::VeleroFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -2946,6 +3042,7 @@ impl App {
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
+            Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             _ => {}
         }
@@ -3320,6 +3417,7 @@ impl App {
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac_snapshot(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
+            Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
             _ => {}
         }
     }
@@ -3427,6 +3525,21 @@ impl App {
                 self.leave_special_modes();
                 self.enter_reflector_mode();
             }
+            "velero" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_velero_mode(VelWorld::Backups);
+            }
+            "restores" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_velero_mode(VelWorld::Restores);
+            }
+            "bsl" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_velero_mode(VelWorld::Infra);
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -3499,6 +3612,10 @@ impl App {
             }
             Mode::Reflector | Mode::ReflectorFull => {
                 self.stop_reflector_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Velero | Mode::VeleroFull => {
+                self.stop_velero_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -6044,6 +6161,460 @@ impl App {
         }
     }
 
+    // --- Velero view ----------------------------------------------------------------------------
+
+    // Open the velero view on the given world. The three worlds share one fetch and one snapshot;
+    // `g` moves between them without refetching.
+    fn enter_velero_mode(&mut self, world: VelWorld) {
+        self.mode = Mode::Velero;
+        self.vel_world = world;
+        self.vel_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_velero();
+        self.start_velero_auto_refresh();
+        self.refresh_velero_snapshot();
+    }
+
+    fn exit_velero_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_velero_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_velero_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.vel_detail_scroll = 0;
+        self.mode = Mode::VeleroFull;
+    }
+
+    fn exit_velero_full(&mut self) {
+        self.mode = Mode::Velero;
+    }
+
+    fn refresh_velero(&self) {
+        {
+            let mut s = self.velero_state.lock().expect("velero poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.velero_state.clone();
+        tokio::spawn(async move { fetch_velero(client, state).await; });
+    }
+
+    // 20s: a backup takes minutes and a schedule fires at best hourly, so there is nothing to watch
+    // at five. The moment one does want to watch — a backup just launched from the menu — is covered
+    // by the refresh the action itself triggers.
+    fn start_velero_auto_refresh(&mut self) {
+        self.stop_velero_auto_refresh();
+        let client = self.client.clone();
+        let state = self.velero_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_velero(client.clone(), state.clone()).await;
+            }
+        });
+        self.vel_refresh_handle = Some(handle);
+    }
+
+    fn stop_velero_auto_refresh(&mut self) {
+        if let Some(h) = self.vel_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `vel_rows` and `App::snapshot` in lockstep, so a selected index means the same row in
+    // both. That alignment is what gives this view `y`, `Ctrl-D`, the search and the AI panel
+    // without any code of its own.
+    fn refresh_velero_snapshot(&mut self) {
+        let (schedules, backups, restores, locations, snap_locations, repos) = {
+            let s = self.velero_state.lock().expect("velero poisoned");
+            (
+                s.schedules.clone(),
+                s.backups.clone(),
+                s.restores.clone(),
+                s.locations.clone(),
+                s.snap_locations.clone(),
+                s.repos.clone(),
+            )
+        };
+        let st = lang::t(self.ai_language);
+        let ns_filter = self.current_ns_opt();
+        let ns_ok = |ns: &str| ns_filter.as_deref().is_none_or(|f| f == ns);
+        let mut rows: Vec<VelRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        match self.vel_world {
+            VelWorld::Backups => {
+                if self.vel_group {
+                    for s in schedules.iter().filter(|s| ns_ok(&s.namespace)) {
+                        let mine: Vec<&VelBackup> = backups
+                            .iter()
+                            .filter(|b| b.schedule.as_deref() == Some(s.name.as_str()))
+                            .collect();
+                        // The Problems filter never hides a schedule above a failing backup:
+                        // dropping it would strand the backup and lose the context one came for.
+                        let keep = self.vel_filter == StoFilter::All
+                            || s.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                            || mine
+                                .iter()
+                                .any(|b| VelRow::Backup(Box::new((*b).clone())).has_problem());
+                        if !keep { continue; }
+                        let collapsed = self.vel_collapsed.contains(&s.key());
+                        recs.push(synthetic_vel_schedule_record(s, mine.len(), st));
+                        rows.push(VelRow::Schedule(Box::new(s.clone())));
+                        if collapsed { continue; }
+                        for b in mine {
+                            if self.vel_filter == StoFilter::Problems
+                                && !b.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                            {
+                                continue;
+                            }
+                            recs.push(synthetic_vel_backup_record(b, st));
+                            rows.push(VelRow::Backup(Box::new(b.clone())));
+                        }
+                    }
+                    // Backups no schedule claims: a manual run, or one whose schedule was deleted
+                    // out from under it. They would otherwise simply not be in the view.
+                    let known: std::collections::HashSet<&str> =
+                        schedules.iter().map(|s| s.name.as_str()).collect();
+                    let orphans: Vec<&VelBackup> = backups
+                        .iter()
+                        .filter(|b| ns_ok(&b.namespace))
+                        .filter(|b| {
+                            b.schedule.as_deref().is_none_or(|name| !known.contains(name))
+                        })
+                        .filter(|b| {
+                            self.vel_filter == StoFilter::All
+                                || b.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                        })
+                        .collect();
+                    if !orphans.is_empty() {
+                        let collapsed = self.vel_collapsed.contains("|orphans");
+                        recs.push(synthetic_vel_orphans_record(orphans.len(), st));
+                        rows.push(VelRow::Orphans);
+                        if !collapsed {
+                            for b in orphans {
+                                recs.push(synthetic_vel_backup_record(b, st));
+                                rows.push(VelRow::Backup(Box::new(b.clone())));
+                            }
+                        }
+                    }
+                } else {
+                    for b in backups.iter().filter(|b| ns_ok(&b.namespace)) {
+                        if self.vel_filter == StoFilter::Problems
+                            && !b.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                        {
+                            continue;
+                        }
+                        recs.push(synthetic_vel_backup_record(b, st));
+                        rows.push(VelRow::Backup(Box::new(b.clone())));
+                    }
+                }
+            }
+            VelWorld::Restores => {
+                for r in restores.iter().filter(|r| ns_ok(&r.namespace)) {
+                    if self.vel_filter == StoFilter::Problems
+                        && !r.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                    {
+                        continue;
+                    }
+                    recs.push(synthetic_vel_restore_record(r, st));
+                    rows.push(VelRow::Restore(Box::new(r.clone())));
+                }
+            }
+            VelWorld::Infra => {
+                for l in locations.iter().filter(|l| ns_ok(&l.namespace)) {
+                    if self.vel_filter == StoFilter::Problems
+                        && !l.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                    {
+                        continue;
+                    }
+                    recs.push(synthetic_vel_location_record(l, st));
+                    rows.push(VelRow::Location(l.clone()));
+                }
+                for l in snap_locations.iter().filter(|l| ns_ok(&l.namespace)) {
+                    if self.vel_filter == StoFilter::Problems
+                        && !l.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                    {
+                        continue;
+                    }
+                    recs.push(synthetic_vel_snaploc_record(l, st));
+                    rows.push(VelRow::SnapLocation(l.clone()));
+                }
+                for r in repos.iter().filter(|r| ns_ok(&r.namespace)) {
+                    if self.vel_filter == StoFilter::Problems
+                        && !r.hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+                    {
+                        continue;
+                    }
+                    recs.push(synthetic_vel_repo_record(r, st));
+                    rows.push(VelRow::Repo(r.clone()));
+                }
+            }
+        }
+
+        self.vel_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.vel_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_vel_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.vel_detail_scroll = 0;
+    }
+
+    fn vel_selected(&self) -> Option<&VelRow> {
+        self.vel_rows.get(self.table_state.selected()?)
+    }
+
+    // Space: fold the schedule under the cursor, or the one the backup under it belongs to — the
+    // cursor is already inside the node one wants to close.
+    fn toggle_vel_node(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return };
+        let key = match self.vel_rows.get(sel) {
+            Some(row) => row.fold_key().or_else(|| {
+                // On a child, walk back up to the parent that owns it.
+                self.vel_rows[..sel]
+                    .iter()
+                    .rev()
+                    .find_map(|r| r.fold_key())
+            }),
+            None => None,
+        };
+        let Some(key) = key else { return };
+        if self.vel_collapsed.contains(&key) {
+            self.vel_collapsed.remove(&key);
+        } else {
+            self.vel_collapsed.insert(key);
+        }
+        self.refresh_velero_snapshot();
+    }
+
+    fn cycle_vel_world(&mut self) {
+        self.vel_world = match self.vel_world {
+            VelWorld::Backups => VelWorld::Restores,
+            VelWorld::Restores => VelWorld::Infra,
+            VelWorld::Infra => VelWorld::Backups,
+        };
+        self.vel_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_velero_snapshot();
+    }
+
+    fn cycle_vel_filter(&mut self) {
+        self.vel_filter = match self.vel_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.vel_detail_scroll = 0;
+        self.refresh_velero_snapshot();
+    }
+
+    fn toggle_vel_group(&mut self) {
+        self.vel_group = !self.vel_group;
+        self.vel_detail_scroll = 0;
+        self.refresh_velero_snapshot();
+    }
+
+    // `L`: fetch the run log of the selected backup or restore, or put it away when it is already
+    // showing. Only runs have one — a schedule is a template, it never ran anything itself.
+    fn vel_toggle_log(&mut self) {
+        let st = lang::t(self.ai_language);
+        let target = match self.vel_selected() {
+            Some(VelRow::Backup(b)) => Some(("Backup", b.namespace.clone(), b.name.clone())),
+            Some(VelRow::Restore(r)) => Some(("Restore", r.namespace.clone(), r.name.clone())),
+            _ => None,
+        };
+        let Some((kind, namespace, name)) = target else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.vel_log_no_run.to_string()));
+            return;
+        };
+        let key = format!("{}|{}/{}", kind, namespace, name);
+        {
+            let mut s = self.vel_log.lock().expect("velero log poisoned");
+            // Second press on the same run closes the log rather than fetching it again.
+            if s.key == key {
+                *s = crate::velero::VelLog::default();
+                return;
+            }
+        }
+        self.vel_detail_scroll = 0;
+        let client = self.client.clone();
+        let state = self.vel_log.clone();
+        tokio::spawn(async move {
+            fetch_run_log(client, namespace, kind, name, state).await;
+        });
+    }
+
+    // The operations available on the row under the cursor. A row with none says so rather than
+    // opening an empty menu — the same rule the reflector view follows.
+    fn open_velero_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let items: Vec<ActionItem> = match self.vel_selected() {
+            Some(VelRow::Schedule(s)) => {
+                let mut items = vec![ActionItem {
+                    label: st.k_vel_backup_now,
+                    desc: st.desc_vel_backup_now,
+                    action: MenuAction::VelBackupNow,
+                }];
+                items.push(if s.paused {
+                    ActionItem {
+                        label: st.k_vel_unpause,
+                        desc: st.desc_vel_unpause,
+                        action: MenuAction::VelPause(false),
+                    }
+                } else {
+                    ActionItem {
+                        label: st.k_vel_pause,
+                        desc: st.desc_vel_pause,
+                        action: MenuAction::VelPause(true),
+                    }
+                });
+                items
+            }
+            Some(VelRow::Backup(b)) => {
+                let mut items = Vec::new();
+                // Restoring from a backup that never completed would replay a partial capture as if
+                // it were whole, so the entry is not offered at all.
+                if b.usable() || b.partially_failed() {
+                    items.push(ActionItem {
+                        label: st.k_vel_restore,
+                        desc: st.desc_vel_restore,
+                        action: MenuAction::VelRestore,
+                    });
+                }
+                if !b.deleting && b.phase != "Deleting" {
+                    items.push(ActionItem {
+                        label: st.k_vel_delete,
+                        desc: st.desc_vel_delete,
+                        action: MenuAction::VelDeleteBackup,
+                    });
+                }
+                items
+            }
+            _ => Vec::new(),
+        };
+        if items.is_empty() {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.vel_no_action.to_string()));
+            return;
+        }
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_vel_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+        });
+    }
+
+    // Run one write, then refetch so the outcome shows without waiting on the 20s ticker.
+    fn vel_run_write(&mut self, write: VelWrite, ok: &'static str, failed: &'static str) {
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.velero_state.clone();
+        let target = write.target();
+        tokio::spawn(async move {
+            let message = match apply_write(client.clone(), write).await {
+                Ok(name) => {
+                    let name = if name.is_empty() { target } else { name };
+                    lang::fill(ok, &[("name", &name)])
+                }
+                Err(e) => lang::fill(failed, &[("e", &e)]),
+            };
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((std::time::Instant::now(), message));
+            }
+            fetch_velero(client, state).await;
+        });
+    }
+
+    fn vel_backup_now(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(VelRow::Schedule(s)) = self.vel_selected() else { return };
+        let write = VelWrite::BackupNow(s.clone());
+        self.vel_run_write(write, st.msg_vel_backup_started, st.msg_vel_backup_failed);
+    }
+
+    fn vel_set_paused(&mut self, paused: bool) {
+        let st = lang::t(self.ai_language);
+        let Some(VelRow::Schedule(s)) = self.vel_selected() else { return };
+        let write = VelWrite::Pause {
+            namespace: s.namespace.clone(),
+            name: s.name.clone(),
+            paused,
+        };
+        let ok = if paused { st.msg_vel_paused } else { st.msg_vel_unpaused };
+        self.vel_run_write(write, ok, st.msg_vel_pause_failed);
+    }
+
+    fn vel_restore(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(VelRow::Backup(b)) = self.vel_selected() else { return };
+        let write = VelWrite::Restore {
+            namespace: b.namespace.clone(),
+            backup: b.name.clone(),
+        };
+        self.vel_run_write(write, st.msg_vel_restore_started, st.msg_vel_restore_failed);
+    }
+
+    fn vel_delete_backup(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(VelRow::Backup(b)) = self.vel_selected() else { return };
+        let write = VelWrite::DeleteBackup {
+            namespace: b.namespace.clone(),
+            backup: b.name.clone(),
+            uid: b.k8s_uid.clone(),
+        };
+        self.vel_run_write(write, st.msg_vel_delete_requested, st.msg_vel_delete_failed);
+    }
+
     // --- Reflector view -------------------------------------------------------------------------
 
     fn enter_reflector_mode(&mut self) {
@@ -7234,6 +7805,10 @@ impl App {
             Some(MenuAction::CertRenew) => self.certs_renew(),
             Some(MenuAction::CertAcmeRetry) => self.certs_acme_retry(),
             Some(MenuAction::ReflForce) => self.refl_force(),
+            Some(MenuAction::VelBackupNow) => self.vel_backup_now(),
+            Some(MenuAction::VelPause(p)) => self.vel_set_paused(p),
+            Some(MenuAction::VelRestore) => self.vel_restore(),
+            Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
@@ -7867,6 +8442,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Rbac | Mode::RbacFull) {
             app.refresh_rbac_snapshot();
         }
+        if matches!(app.mode, Mode::Velero | Mode::VeleroFull) {
+            app.refresh_velero_snapshot();
+            // The velero operations report through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -8139,13 +8719,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_search();
         }
 
@@ -8168,12 +8748,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_edit_view();
         }
 
@@ -8186,12 +8766,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_delete_view();
         }
 
@@ -8661,6 +9241,45 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::CapacityFull) => app.enter_ai_panel(),
         (_, _, Mode::CapacityFull) => {}
 
+        (KeyCode::Up, _, Mode::Velero) => app.move_vel_selection(-1),
+        (KeyCode::Down, _, Mode::Velero) => app.move_vel_selection(1),
+        (KeyCode::PageUp, _, Mode::Velero) => app.move_vel_selection(-10),
+        (KeyCode::PageDown, _, Mode::Velero) => app.move_vel_selection(10),
+        (KeyCode::Char(' '), _, Mode::Velero) => app.toggle_vel_node(),
+        (KeyCode::Char('t'), _, Mode::Velero) => app.toggle_vel_group(),
+        (KeyCode::Char('g'), _, Mode::Velero) => app.cycle_vel_world(),
+        (KeyCode::Char('f'), _, Mode::Velero) => app.cycle_vel_filter(),
+        (KeyCode::Char('o'), _, Mode::Velero) => app.open_velero_action_menu(),
+        (KeyCode::Char('L'), _, Mode::Velero) => app.vel_toggle_log(),
+        (KeyCode::Enter, _, Mode::Velero) => app.enter_velero_full(),
+        (KeyCode::F(5), _, Mode::Velero) => app.refresh_velero(),
+        (KeyCode::Esc, _, Mode::Velero) => app.exit_velero_mode(),
+        (KeyCode::Char('n'), _, Mode::Velero) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Velero) => app.clear_namespace_filter(),
+        (KeyCode::Char('i'), _, Mode::Velero) => app.enter_ai_panel(),
+        (_, _, Mode::Velero) => {}
+
+        (KeyCode::Up, m, Mode::VeleroFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::VeleroFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_add(1)
+        }
+        (KeyCode::PageUp, _, Mode::VeleroFull) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(10)
+        }
+        (KeyCode::PageDown, _, Mode::VeleroFull) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_add(10)
+        }
+        (KeyCode::Enter, _, Mode::VeleroFull) => app.exit_velero_full(),
+        (KeyCode::Esc, _, Mode::VeleroFull) => app.exit_velero_full(),
+        (KeyCode::Char('g'), _, Mode::VeleroFull) => app.vel_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::VeleroFull) => app.vel_detail_scroll = usize::MAX,
+        (KeyCode::Char('o'), _, Mode::VeleroFull) => app.open_velero_action_menu(),
+        (KeyCode::Char('L'), _, Mode::VeleroFull) => app.vel_toggle_log(),
+        (KeyCode::Char('i'), _, Mode::VeleroFull) => app.enter_ai_panel(),
+        (_, _, Mode::VeleroFull) => {}
+
         (KeyCode::Up, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
         (KeyCode::Down, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
@@ -8822,7 +9441,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -8853,11 +9472,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -8873,8 +9492,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -8900,6 +9519,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Certs | Mode::CertsFull => st.mode_certs,
         Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
         Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
+        Mode::Velero | Mode::VeleroFull => st.mode_velero,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Services | Mode::ServicesFull => st.mode_services,
         Mode::Storage | Mode::StorageFull => st.mode_storage,
@@ -8968,6 +9588,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             }
         } else if draw_mode == Mode::Reflector {
             draw_reflector_table(f, app, ta);
+        } else if draw_mode == Mode::Velero {
+            draw_velero_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Services {
@@ -8979,7 +9601,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
+                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -9382,6 +10004,41 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
+        Mode::Velero => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.vel_world {
+                VelWorld::Backups => st.k_vel_restores,
+                VelWorld::Restores => st.k_vel_infra,
+                VelWorld::Infra => st.k_vel_backups,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_vel_fold)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_vel_tree)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_vel_filter, app.vel_filter.label())),
+                footer_sep(),
+                Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::VeleroFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
+        ],
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
     // Second line: the tool bar available in every view, always grouped at the same place.
@@ -9743,6 +10400,7 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
         DelReason::SystemNamespace { namespace } => st.del_system_ns.replace("{d}", namespace),
         DelReason::NodeDrain => st.del_node.to_string(),
         DelReason::PersistentData => st.del_persistent.to_string(),
+        DelReason::VeleroBackup => st.del_velero_backup.to_string(),
         DelReason::Finalizers => st.del_finalizers.to_string(),
     }
 }
@@ -10593,7 +11251,20 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let st = lang::t(app.ai_language);
 
     let popup_w = (area.width * 60 / 100).max(48).min(area.width);
-    let popup_h = (menu.items.len() as u16 + 6).min(area.height.saturating_sub(2)).max(8);
+    // The description under the list wraps, and the confirmation prompt sits under it. Sizing the
+    // footer at a fixed three rows pushed that prompt out of the frame as soon as the description
+    // took two lines — so the action looked like it did nothing when Enter armed it. Measure the
+    // wrap, and give the popup the rows it actually needs.
+    let desc = menu.items.get(menu.cursor).map(|it| it.desc).unwrap_or("");
+    let desc_rows = wrapped_rows(
+        &Line::from(desc),
+        popup_w.saturating_sub(2) as usize,
+    )
+    .max(1) as u16;
+    let footer_h = desc_rows + 2;
+    let popup_h = (menu.items.len() as u16 + footer_h + 3)
+        .min(area.height.saturating_sub(2))
+        .max(8);
     let popup_area = centered_rect(popup_w, popup_h, area);
     f.render_widget(Clear, popup_area);
 
@@ -10607,7 +11278,7 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(footer_h)])
         .split(inner);
 
     let items: Vec<ListItem> = menu
@@ -10622,7 +11293,6 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let desc = menu.items.get(menu.cursor).map(|it| it.desc).unwrap_or("");
     let footer = if let Some(buf) = menu.input.as_ref() {
         Line::from(Span::styled(
             st.menu_input_prompt.replace("{n}", buf),
@@ -12624,6 +13294,776 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// --- Velero view rendering ----------------------------------------------------------------------
+
+// The EventRecord a velero row stands in for. Severity comes from the diagnosis rather than from
+// the phase: a `Completed` backup with a warning is worth surfacing, and a `New` one is not.
+fn vel_severity(hints: &[crate::storage::Hint]) -> Severity {
+    match hints.iter().map(|h| h.level).max() {
+        Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
+        _ => Severity::Normal,
+    }
+}
+
+fn vel_record(
+    uid: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[crate::storage::Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: vel_severity(hints),
+        reason: reason.to_string(),
+        api_version: "velero.io/v1".to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_vel_schedule_record(
+    s: &VelSchedule,
+    backups: usize,
+    st: &'static Strings,
+) -> EventRecord {
+    let state = if s.paused { st.vel_state_paused } else { st.vel_state_enabled };
+    let last = match s.last_backup {
+        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now_secs()))]),
+        None => st.vel_never.to_string(),
+    };
+    vel_record(
+        &s.uid,
+        "Schedule",
+        &s.namespace,
+        &s.name,
+        if s.phase.is_empty() { "Schedule" } else { &s.phase },
+        lang::fill(
+            st.vel_rec_schedule,
+            &[
+                ("cron", &s.cron),
+                ("state", state),
+                ("backups", &backups.to_string()),
+                ("last", &last),
+            ],
+        ),
+        &s.hints,
+    )
+}
+
+fn synthetic_vel_backup_record(b: &VelBackup, st: &'static Strings) -> EventRecord {
+    let volumes = b.volume_snapshots_attempted + b.pvb_total as i64;
+    let expires = match b.expiration {
+        Some(e) if e > now_secs() => format_span(e - now_secs(), st),
+        Some(_) => st.vel_never.to_string(),
+        None => "—".to_string(),
+    };
+    vel_record(
+        &b.uid,
+        "Backup",
+        &b.namespace,
+        &b.name,
+        if b.phase.is_empty() { "New" } else { &b.phase },
+        lang::fill(
+            st.vel_rec_backup,
+            &[
+                ("phase", &b.phase),
+                ("items", &b.items_backed_up.to_string()),
+                ("volumes", &volumes.to_string()),
+                ("expires", &expires),
+            ],
+        ),
+        &b.hints,
+    )
+}
+
+// The parent row of the backups no schedule claims. It stands for no object, so it carries no kind:
+// `y`, `e` and `Ctrl-D` correctly find nothing to act on.
+fn synthetic_vel_orphans_record(n: usize, st: &'static Strings) -> EventRecord {
+    EventRecord {
+        uid: "vel|orphans".to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: String::new(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: st.vel_orphan_backups.to_string(),
+        message: n.to_string(),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_vel_restore_record(r: &VelRestore, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &r.uid,
+        "Restore",
+        &r.namespace,
+        &r.name,
+        if r.phase.is_empty() { "New" } else { &r.phase },
+        lang::fill(
+            st.vel_rec_restore,
+            &[
+                ("phase", &r.phase),
+                ("backup", &r.backup),
+                ("items", &r.items_restored.to_string()),
+            ],
+        ),
+        &r.hints,
+    )
+}
+
+fn synthetic_vel_location_record(l: &VelLocation, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &l.uid,
+        "BackupStorageLocation",
+        &l.namespace,
+        &l.name,
+        if l.phase.is_empty() { "Unknown" } else { &l.phase },
+        lang::fill(
+            st.vel_rec_location,
+            &[
+                ("phase", &l.phase),
+                ("provider", &l.provider),
+                ("bucket", &l.bucket),
+                ("backups", &l.backups.to_string()),
+            ],
+        ),
+        &l.hints,
+    )
+}
+
+fn synthetic_vel_snaploc_record(l: &VelSnapLocation, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &l.uid,
+        "VolumeSnapshotLocation",
+        &l.namespace,
+        &l.name,
+        if l.phase.is_empty() { "Unknown" } else { &l.phase },
+        lang::fill(
+            st.vel_rec_snaploc,
+            &[("phase", &l.phase), ("provider", &l.provider)],
+        ),
+        &l.hints,
+    )
+}
+
+fn synthetic_vel_repo_record(r: &VelRepo, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &r.uid,
+        "BackupRepository",
+        &r.namespace,
+        &r.name,
+        if r.phase.is_empty() { "Unknown" } else { &r.phase },
+        lang::fill(
+            st.vel_rec_repo,
+            &[
+                ("type", &r.repo_type),
+                ("phase", &r.phase),
+                ("ns", &r.volume_namespace),
+            ],
+        ),
+        &r.hints,
+    )
+}
+
+fn now_secs() -> i64 {
+    k8s_openapi::jiff::Timestamp::now().as_second()
+}
+
+// The phase cell, coloured by what the phase means for whoever has to restore from it. The point of
+// the view is that `PartiallyFailed` is not a shade of success: it is red, next to `Failed`.
+fn vel_phase_cell(phase: &str) -> Cell<'static> {
+    let color = match phase {
+        "Completed" | "Available" | "Ready" | "Enabled" => Color::Green,
+        "PartiallyFailed" | "FinalizingPartiallyFailed"
+        | "WaitingForPluginOperationsPartiallyFailed" => Color::Red,
+        "Failed" | "FailedValidation" | "Unavailable" | "NotReady" => Color::Red,
+        "InProgress" | "New" | "Queued" | "ReadyToStart" | "Finalizing"
+        | "WaitingForPluginOperations" => Color::Cyan,
+        "Deleting" => Color::Yellow,
+        _ => DIM,
+    };
+    let label = if phase.is_empty() { "—".to_string() } else { phase.to_string() };
+    Cell::from(label).style(Style::default().fg(color))
+}
+
+// Velero table: one shape for all three worlds, because the columns answer the same questions
+// whichever object owns the row — what it is, what state it is in, what it holds, and when it goes.
+fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let (loading, error, n_sched, n_backup, problems, last_success) = {
+        let s = app.velero_state.lock().expect("velero poisoned");
+        (
+            s.loading,
+            s.error.clone(),
+            s.schedules.len(),
+            s.backups.len(),
+            s.problems(),
+            s.last_success,
+        )
+    };
+    let world = match app.vel_world {
+        VelWorld::Backups => st.vel_world_backups,
+        VelWorld::Restores => st.vel_world_restores,
+        VelWorld::Infra => st.vel_world_infra,
+    };
+    let next_world = match app.vel_world {
+        VelWorld::Backups => st.vel_world_restores,
+        VelWorld::Restores => st.vel_world_infra,
+        VelWorld::Infra => st.vel_world_backups,
+    };
+    // How long ago the last restorable backup finished goes in the title rather than in a row: it
+    // belongs to the cluster and not to any object, and it is the reason to open this view at all.
+    let rpo = match last_success {
+        Some(t) => lang::fill(st.vel_title_rpo, &[("age", &crate::velero::age_of(t, now_secs()))]),
+        None if n_backup > 0 => st.vel_title_no_backup.to_string(),
+        None => String::new(),
+    };
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "velero"), ("e", e)])
+    } else if loading && app.vel_rows.is_empty() {
+        lang::fill(st.ui_title_loading, &[("view", "velero")])
+    } else {
+        lang::fill(
+            st.vel_title,
+            &[
+                ("world", world),
+                ("schedules", &n_sched.to_string()),
+                ("backups", &n_backup.to_string()),
+                ("problems", &problems.to_string()),
+                ("rpo", &rpo),
+                ("ns", &app.namespace_label),
+                ("next", next_world),
+                ("filter", app.vel_filter.label()),
+            ],
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("STATE"),
+        Cell::from("INFO"), Cell::from("EXPIRE"), Cell::from("AGE"), Cell::from("ALERT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // Children are indented only when the grouping actually nests them.
+    let grouped = app.vel_group && app.vel_world == VelWorld::Backups;
+    let names = vel_row_names(&app.vel_rows, grouped, st);
+    let alert = |hints: &[crate::storage::Hint]| match hints.first() {
+        None => Cell::from(""),
+        Some(h) => Cell::from(h.text.clone())
+            .style(Style::default().fg(sto_hint_color(hints).unwrap_or(DIM))),
+    };
+    let blank = || Cell::from("");
+
+    let rows: Vec<Row> = app
+        .vel_rows
+        .iter()
+        .zip(names.iter())
+        .map(|(row, name)| {
+            let flag = sto_hint_color(row.hints());
+            let parent_style = match flag {
+                Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            };
+            let leaf_style = match flag {
+                Some(color) => Style::default().fg(color),
+                None => Style::default(),
+            };
+            match row {
+                VelRow::Schedule(s) => {
+                    let state = if s.paused {
+                        Cell::from(st.vel_state_paused.to_string())
+                            .style(Style::default().fg(Color::Yellow))
+                    } else {
+                        vel_phase_cell(if s.phase.is_empty() { "Enabled" } else { &s.phase })
+                    };
+                    let next = match (s.paused, s.next_run) {
+                        (false, Some(t)) if t > now_secs() => format_span_short(t - now_secs()),
+                        (false, Some(_)) => "—".to_string(),
+                        _ => "—".to_string(),
+                    };
+                    Row::new(vec![
+                        Cell::from(s.namespace.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(name.clone()).style(parent_style),
+                        Cell::from("Schedule").style(Style::default().fg(DIM)),
+                        state,
+                        Cell::from(s.cron.clone()),
+                        Cell::from(next).style(Style::default().fg(DIM)),
+                        Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
+                        alert(&s.hints),
+                    ])
+                }
+                VelRow::Backup(b) => {
+                    let volumes = b.volume_snapshots_attempted + b.pvb_total as i64;
+                    let expires = match b.expiration {
+                        Some(e) if e > now_secs() => format_span_short(e - now_secs()),
+                        Some(_) => "—".to_string(),
+                        None => "—".to_string(),
+                    };
+                    Row::new(vec![
+                        Cell::from(b.namespace.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(name.clone()).style(leaf_style),
+                        Cell::from("Backup").style(Style::default().fg(DIM)),
+                        vel_phase_cell(&b.phase),
+                        Cell::from(format!("{} items · {} vol", b.items_backed_up, volumes))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(expires).style(Style::default().fg(DIM)),
+                        Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
+                        alert(&b.hints),
+                    ])
+                }
+                VelRow::Restore(r) => Row::new(vec![
+                    Cell::from(r.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(name.clone()).style(leaf_style),
+                    Cell::from("Restore").style(Style::default().fg(DIM)),
+                    vel_phase_cell(&r.phase),
+                    Cell::from(r.backup.clone()).style(Style::default().fg(DIM)),
+                    blank(),
+                    Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                    alert(&r.hints),
+                ]),
+                VelRow::Location(l) => {
+                    let info = if l.bucket.is_empty() {
+                        l.provider.clone()
+                    } else {
+                        format!("{} {}", l.provider, l.bucket)
+                    };
+                    Row::new(vec![
+                        Cell::from(l.namespace.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(name.clone()).style(parent_style),
+                        Cell::from("BSL").style(Style::default().fg(DIM)),
+                        vel_phase_cell(&l.phase),
+                        Cell::from(info).style(Style::default().fg(DIM)),
+                        blank(),
+                        Cell::from(l.age.clone()).style(Style::default().fg(DIM)),
+                        alert(&l.hints),
+                    ])
+                }
+                VelRow::SnapLocation(l) => Row::new(vec![
+                    Cell::from(l.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(name.clone()).style(leaf_style),
+                    Cell::from("VSL").style(Style::default().fg(DIM)),
+                    vel_phase_cell(&l.phase),
+                    Cell::from(l.provider.clone()).style(Style::default().fg(DIM)),
+                    blank(),
+                    Cell::from(l.age.clone()).style(Style::default().fg(DIM)),
+                    alert(&l.hints),
+                ]),
+                VelRow::Repo(r) => Row::new(vec![
+                    Cell::from(r.namespace.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(name.clone()).style(leaf_style),
+                    Cell::from("Repo").style(Style::default().fg(DIM)),
+                    vel_phase_cell(&r.phase),
+                    Cell::from(format!("{} · {}", r.repo_type, r.volume_namespace))
+                        .style(Style::default().fg(DIM)),
+                    blank(),
+                    Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
+                    alert(&r.hints),
+                ]),
+                VelRow::Orphans => Row::new(vec![
+                    blank(),
+                    Cell::from(name.clone()).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
+            }
+        })
+        .collect();
+
+    let ns_values: Vec<String> = app
+        .vel_rows
+        .iter()
+        .map(|r| match r {
+            VelRow::Schedule(s) => s.namespace.clone(),
+            VelRow::Backup(b) => b.namespace.clone(),
+            VelRow::Restore(r) => r.namespace.clone(),
+            VelRow::Location(l) => l.namespace.clone(),
+            VelRow::SnapLocation(l) => l.namespace.clone(),
+            VelRow::Repo(r) => r.namespace.clone(),
+            VelRow::Orphans => String::new(),
+        })
+        .collect();
+    let ns_w = col_width(ns_values.iter().map(|s| s.as_str()), "NAMESPACE", 9, 20);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40);
+    // The alert column takes what is left, as a percentage rather than `Min`: a `Min` last column
+    // eats the right border as soon as the terminal is narrower than the sum of the fixed widths.
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(9),
+        Constraint::Length(16), Constraint::Length(22), Constraint::Length(8),
+        Constraint::Length(5), Constraint::Percentage(100),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// The name column as it is actually drawn — marker and indent included, because measuring the bare
+// names would size the column two characters short and clip every parent row.
+fn vel_row_names(rows: &[VelRow], grouped: bool, st: &'static Strings) -> Vec<String> {
+    let indent = if grouped { "    " } else { "" };
+    rows.iter()
+        .map(|r| match r {
+            VelRow::Schedule(s) if grouped => format!("▾ {}", s.name),
+            VelRow::Schedule(s) => s.name.clone(),
+            VelRow::Backup(b) => format!("{}{}", indent, b.name),
+            VelRow::Restore(r) => r.name.clone(),
+            VelRow::Location(l) => l.name.clone(),
+            VelRow::SnapLocation(l) => l.name.clone(),
+            VelRow::Repo(r) => r.name.clone(),
+            VelRow::Orphans => format!("▾ {}", st.vel_orphan_backups),
+        })
+        .collect()
+}
+
+// Velero detail: the facts of the selected object, then what the rules make of them — the same shape
+// as the storage and reflector panels, so the three read alike. The findings that belong to the
+// installation as a whole (no default location, namespaces nobody backs up) are appended under every
+// row: they are the context in which the selected object's own state has to be read.
+fn draw_velero_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let (cluster_hints, server) = {
+        let s = app.velero_state.lock().expect("velero poisoned");
+        (s.cluster_hints.clone(), s.server.clone())
+    };
+    let Some((title, mut lines)) = velero_detail_lines(app, &cluster_hints, &server, st) else {
+        let p = Paragraph::new(st.vel_empty_select)
+            .block(Block::default().borders(Borders::ALL).title(" velero "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.vel_detail_scroll > max_scroll {
+        app.vel_detail_scroll = max_scroll;
+    }
+    app.vel_detail_scroll = text_search_top(
+        app, Mode::VeleroFull, &mut lines, visible, app.vel_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .scroll((app.vel_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn velero_detail_lines(
+    app: &App,
+    cluster_hints: &[crate::storage::Hint],
+    server: &crate::velero::ServerFacts,
+    st: &'static Strings,
+) -> Option<(String, Vec<Line<'static>>)> {
+    // Width chosen so the longest label ("prochaine exécution") lines up with the shortest.
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<21}", k), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+    let now = now_secs();
+    let stamp = |t: Option<i64>| match t {
+        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now))]),
+        None => st.vel_never.to_string(),
+    };
+    let scope = |included: &[String], excluded: &[String]| {
+        let inc = if included.is_empty() || included.iter().any(|i| i == "*") {
+            st.vel_all_namespaces.to_string()
+        } else {
+            included.join(", ")
+        };
+        if excluded.is_empty() {
+            inc
+        } else {
+            lang::fill(st.vel_scope_except, &[("inc", &inc), ("exc", &excluded.join(", "))])
+        }
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let own_hints: Vec<crate::storage::Hint>;
+    let title = match app.vel_selected()? {
+        VelRow::Schedule(s) => {
+            own_hints = s.hints.clone();
+            lines.push(label(st.vel_lbl_cron, dash(&s.cron)));
+            lines.push(label(
+                st.vel_lbl_next_run,
+                match (s.paused, s.next_run) {
+                    (true, _) => st.vel_state_paused.to_string(),
+                    (false, Some(t)) if t > now => format_span(t - now, st),
+                    (false, Some(t)) => lang::fill(
+                        st.vel_sched_overdue,
+                        &[("age", &crate::velero::age_of(t, now)), ("cron", &s.cron)],
+                    ),
+                    (false, None) => "—".to_string(),
+                },
+            ));
+            lines.push(label(st.vel_lbl_last_backup, stamp(s.last_backup)));
+            // `skipImmediately` moves the next run without leaving anything else behind: without
+            // this line a schedule that skipped looks like one that simply has not fired yet.
+            if let Some(t) = s.last_skipped {
+                lines.push(label(st.vel_lbl_last_skipped, stamp(Some(t))));
+            }
+            lines.push(label(
+                st.vel_lbl_ttl,
+                s.ttl.map(|t| format_span(t, st)).unwrap_or_else(|| "—".to_string()),
+            ));
+            lines.push(label(st.vel_lbl_scope, scope(&s.included_ns, &s.excluded_ns)));
+            lines.push(label(st.vel_lbl_volumes, vel_volume_mode(s, st)));
+            lines.push(label(
+                st.vel_lbl_location,
+                s.storage_location.clone().unwrap_or_else(|| "—".to_string()),
+            ));
+            lang::fill(st.vel_banner_schedule, &[("ns", &s.namespace), ("name", &s.name)])
+        }
+        VelRow::Backup(b) => {
+            own_hints = b.hints.clone();
+            lines.push(label(st.vel_lbl_phase, dash(&b.phase)));
+            lines.push(label(
+                st.vel_lbl_schedule,
+                b.schedule.clone().unwrap_or_else(|| st.vel_orphan_backups.to_string()),
+            ));
+            lines.push(label(st.vel_lbl_started, stamp(b.started.or(Some(b.created)))));
+            if let (Some(a), Some(z)) = (b.started, b.completed) {
+                lines.push(label(st.vel_lbl_duration, format_span(z - a, st)));
+            }
+            lines.push(label(
+                st.vel_lbl_items,
+                format!("{} / {}", b.items_backed_up, b.total_items),
+            ));
+            lines.push(label(
+                st.vel_lbl_captured,
+                format!(
+                    "{} snapshots · {} fs-backup",
+                    b.volume_snapshots_completed, b.pvb_total
+                ),
+            ));
+            lines.push(label(
+                st.vel_lbl_expires,
+                match b.expiration {
+                    Some(e) if e > now => format_span(e - now, st),
+                    Some(e) => lang::fill(
+                        st.vel_bk_expired,
+                        &[("age", &crate::velero::age_of(e, now))],
+                    ),
+                    None => "—".to_string(),
+                },
+            ));
+            lines.push(label(
+                st.vel_lbl_errors,
+                format!("{} / {}", b.errors, b.warnings),
+            ));
+            lines.push(label(
+                st.vel_lbl_ttl,
+                b.ttl.map(|t| format_span(t, st)).unwrap_or_else(|| "—".to_string()),
+            ));
+            lines.push(label(st.vel_lbl_scope, scope(&b.included_ns, &b.excluded_ns)));
+            lines.push(label(st.vel_lbl_location, dash(&b.storage_location)));
+            lines.push(label(st.vel_lbl_restores, b.restores.to_string()));
+            // The per-volume failures, verbatim: they carry the one message that says which volume
+            // did not make it, which the backup's own failureReason never does.
+            if !b.pvb_failed.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", st.vel_lbl_failed_volumes),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                for v in &b.pvb_failed {
+                    lines.push(Line::from(Span::styled(
+                        format!("  · {}", v),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+            lang::fill(st.vel_banner_backup, &[("ns", &b.namespace), ("name", &b.name)])
+        }
+        VelRow::Restore(r) => {
+            own_hints = r.hints.clone();
+            lines.push(label(st.vel_lbl_phase, dash(&r.phase)));
+            lines.push(label(st.vel_lbl_backup, dash(&r.backup)));
+            // A restore created with `--from-schedule` records the schedule it picked its backup
+            // from; without the line the chosen backup looks arbitrary.
+            if let Some(sched) = &r.schedule {
+                lines.push(label(st.vel_lbl_schedule, sched.clone()));
+            }
+            lines.push(label(st.vel_lbl_started, stamp(r.started.or(Some(r.created)))));
+            if let (Some(a), Some(z)) = (r.started, r.completed) {
+                lines.push(label(st.vel_lbl_duration, format_span(z - a, st)));
+            }
+            lines.push(label(
+                st.vel_lbl_items,
+                format!("{} / {}", r.items_restored, r.total_items),
+            ));
+            lines.push(label(
+                st.vel_lbl_errors,
+                format!("{} / {}", r.errors, r.warnings),
+            ));
+            lang::fill(st.vel_banner_restore, &[("ns", &r.namespace), ("name", &r.name)])
+        }
+        VelRow::Location(l) => {
+            own_hints = l.hints.clone();
+            lines.push(label(st.vel_lbl_phase, dash(&l.phase)));
+            lines.push(label(st.vel_lbl_provider, dash(&l.provider)));
+            lines.push(label(
+                st.vel_lbl_bucket,
+                if l.prefix.is_empty() {
+                    dash(&l.bucket)
+                } else {
+                    format!("{}/{}", l.bucket, l.prefix)
+                },
+            ));
+            lines.push(label(
+                st.vel_lbl_access,
+                if l.read_only() { "ReadOnly".to_string() } else { "ReadWrite".to_string() },
+            ));
+            lines.push(label(st.vel_lbl_validated, stamp(l.last_validated)));
+            lines.push(label(st.vel_world_backups, l.backups.to_string()));
+            lang::fill(st.vel_banner_location, &[("ns", &l.namespace), ("name", &l.name)])
+        }
+        VelRow::SnapLocation(l) => {
+            own_hints = l.hints.clone();
+            lines.push(label(st.vel_lbl_phase, dash(&l.phase)));
+            lines.push(label(st.vel_lbl_provider, dash(&l.provider)));
+            lang::fill(st.vel_banner_snaploc, &[("ns", &l.namespace), ("name", &l.name)])
+        }
+        VelRow::Repo(r) => {
+            own_hints = r.hints.clone();
+            lines.push(label(st.vel_lbl_phase, dash(&r.phase)));
+            lines.push(label(st.vel_lbl_repo_type, dash(&r.repo_type)));
+            lines.push(label(st.vel_lbl_scope, dash(&r.volume_namespace)));
+            lines.push(label(st.vel_lbl_maintenance, stamp(r.last_maintenance)));
+            lang::fill(st.vel_banner_repo, &[("ns", &r.namespace), ("name", &r.name)])
+        }
+        // The orphan header stands for no object; the installation summary is all it can show.
+        VelRow::Orphans => {
+            own_hints = Vec::new();
+            format!(" {} ", st.vel_orphan_backups)
+        }
+    };
+
+    lines.push(Line::from(""));
+    lines.push(label(
+        st.vel_lbl_server,
+        if server.found {
+            lang::fill(
+                st.vel_server_line,
+                &[
+                    ("ready", &server.ready.to_string()),
+                    ("desired", &server.desired.to_string()),
+                    ("version", if server.version.is_empty() { "?" } else { &server.version }),
+                    ("ns", &server.namespace),
+                ],
+            )
+        } else {
+            st.vel_server_missing.to_string()
+        },
+    ));
+    lines.push(label(
+        st.vel_lbl_node_agent,
+        match server.node_agent {
+            Some((ready, desired)) => lang::fill(
+                st.vel_node_agent_line,
+                &[("ready", &ready.to_string()), ("desired", &desired.to_string())],
+            ),
+            None => st.vel_node_agent_absent.to_string(),
+        },
+    ));
+
+    push_storage_hints(&mut lines, st.lbl_diagnostic, &own_hints);
+    push_storage_hints(&mut lines, st.lbl_cluster, cluster_hints);
+    push_velero_log(app, &mut lines, st);
+    Some((title, lines))
+}
+
+// The run log, when one has been asked for on this row. Appended to the panel rather than given a
+// mode of its own: `Enter` then makes it full-screen and `/` searches it, which is the whole point
+// of opening it — a `Completed` backup reporting one warning says nowhere else which item it was.
+fn push_velero_log(app: &App, lines: &mut Vec<Line<'static>>, st: &'static Strings) {
+    let log = app.vel_log.lock().expect("velero log poisoned").clone();
+    if log.key.is_empty() {
+        return;
+    }
+    // The log belongs to the row it was fetched for; on any other row the panel stays as it was.
+    let current = match app.vel_selected() {
+        Some(VelRow::Backup(b)) => format!("Backup|{}/{}", b.namespace, b.name),
+        Some(VelRow::Restore(r)) => format!("Restore|{}/{}", r.namespace, r.name),
+        _ => String::new(),
+    };
+    if current != log.key {
+        return;
+    }
+
+    lines.push(Line::from(""));
+    let title = match log.source {
+        LogSource::Server => st.vel_log_title_server,
+        _ => st.vel_log_title_download,
+    };
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    if log.loading {
+        lines.push(Line::from(Span::styled(
+            st.vel_log_loading.to_string(),
+            Style::default().fg(DIM),
+        )));
+        return;
+    }
+    // The download failure is kept on screen even when the fallback succeeded: the reader is then
+    // looking at a partial log, and has to know that is what happened.
+    if let Some(e) = &log.error {
+        lines.push(Line::from(Span::styled(
+            format!("▲ {}", e),
+            Style::default().fg(Color::Rgb(255, 140, 0)),
+        )));
+    }
+    for l in &log.lines {
+        let colour = if l.contains("level=error") || l.contains("level=fatal") {
+            Color::Red
+        } else if l.contains("level=warning") {
+            Color::Rgb(255, 140, 0)
+        } else {
+            Color::Gray
+        };
+        lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(colour))));
+    }
+}
+
+// How a schedule says it captures volume data, in the order velero applies the mechanisms.
+fn vel_volume_mode(s: &VelSchedule, st: &'static Strings) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if s.fs_backup_default {
+        parts.push(st.vel_volumes_fsbackup);
+    }
+    if s.snapshot_move_data {
+        parts.push(st.vel_volumes_movedata);
+    }
+    if s.snapshot_volumes != Some(false) {
+        parts.push(st.vel_volumes_snapshot);
+    }
+    if parts.is_empty() {
+        return st.vel_volumes_none.to_string();
+    }
+    parts.join(" · ")
 }
 
 // --- Reflector view rendering ---------------------------------------------------------------------
@@ -17609,6 +19049,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_reflector_detail(f, app, area);
         return;
     }
+    let is_velero_mode = matches!(view_mode(app), Mode::Velero | Mode::VeleroFull);
+    if is_velero_mode {
+        draw_velero_detail(f, app, area);
+        return;
+    }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
     if is_configmaps_mode {
         draw_configmaps_detail(f, app, area);
@@ -18982,6 +20427,21 @@ mod palette_tests {
         assert_eq!(sto, vec!["pv"]);
         assert_eq!(resolve_command("volumes"), Some("storage"));
         assert_eq!(resolve_command("persistentvolume"), Some("pv"));
+    }
+
+    // The three velero entries share a prefix on purpose — `backup` opens the view, and every
+    // `backup*` location word opens it on the locations. Each has to keep landing on its own world.
+    #[test]
+    fn the_velero_words_land_on_their_own_world() {
+        assert_eq!(command_name_suggestions("backup").first(), Some(&"velero"));
+        assert_eq!(command_name_suggestions("backups").first(), Some(&"velero"));
+        assert_eq!(command_name_suggestions("bsl").first(), Some(&"bsl"));
+        assert_eq!(command_name_suggestions("restore").first(), Some(&"restores"));
+        assert_eq!(resolve_command("schedules"), Some("velero"));
+        assert_eq!(resolve_command("backuprepositories"), Some("bsl"));
+        // `backupstoragelocation` starts with `backup`, which is velero's exact alias; the exact
+        // match still has to win for the shorter word and the longer one must reach the locations.
+        assert_eq!(resolve_command("backupstoragelocation"), Some("bsl"));
     }
 }
 
