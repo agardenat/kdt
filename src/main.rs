@@ -28,6 +28,7 @@ mod rbac;
 mod reflector;
 mod repair;
 mod secrets;
+mod splash;
 mod storage;
 mod svc;
 mod touch;
@@ -43,8 +44,10 @@ use kube::Client;
 use tracing_subscriber::EnvFilter;
 
 // Build a kube client from the kubeconfig: an explicit context if given, otherwise inferred
-// (in-cluster service account or current kubeconfig context).
-async fn build_client(context: Option<&str>) -> Result<Client> {
+// (in-cluster service account or current kubeconfig context). Reads files only — nothing here
+// contacts the cluster, which is why the startup screen exists to do it visibly.
+// Also returns the API server URL, shown on that screen: it is what makes a wrong context obvious.
+async fn build_client(context: Option<&str>) -> Result<(Client, String)> {
     use kube::config::{Config, KubeConfigOptions};
     let config = match context {
         Some(ctx) => {
@@ -56,7 +59,8 @@ async fn build_client(context: Option<&str>) -> Result<Client> {
         }
         None => Config::infer().await?,
     };
-    Ok(Client::try_from(config)?)
+    let url = config.cluster_url.to_string();
+    Ok((Client::try_from(config)?, url))
 }
 
 // Resolve the log file path: explicit env var, then XDG state dir, HOME, finally /tmp.
@@ -119,7 +123,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let client = build_client(args.context.as_deref()).await?;
+    let (client, api_url) = build_client(args.context.as_deref()).await?;
 
     let ns = if args.all_namespaces { None } else { args.namespace.clone() };
     let ns_label = match &ns { Some(n) => n.clone(), None => "all".to_string() };
@@ -130,7 +134,7 @@ async fn main() -> Result<()> {
     let watcher = events::spawn_watcher(client.clone(), ns, buffer.clone(), args.buffer_size);
 
     let ai_state = ai::new_ai_state();
-    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
+    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, api_url, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
     ui::run(app).await
 }
 

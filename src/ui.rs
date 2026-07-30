@@ -836,6 +836,8 @@ pub struct App {
     pub namespace_label: String,
     pub context_label: String,
     pub cluster_label: String,
+    // API server URL from the kubeconfig, shown on the startup screen.
+    pub api_url: String,
     pub should_quit: bool,
     pub mode: Mode,
     pub table_state: TableState,
@@ -1091,6 +1093,7 @@ impl App {
         namespace_label: String,
         context_label: String,
         cluster_label: String,
+        api_url: String,
         client: kube::Client,
         log_state: SharedLog,
         status_state: SharedStatus,
@@ -1115,6 +1118,7 @@ impl App {
             namespace_label,
             context_label,
             cluster_label,
+            api_url,
             should_quit: false,
             mode: Mode::Selection,
             table_state: TableState::default(),
@@ -1785,7 +1789,16 @@ impl App {
             update_sections_count(&state, &key, extra.len());
             update_stage(&state, &key, "Construction du prompt...");
             let char_budget = prompt_char_budget(config.context_window);
-            let prompt = build_ai_prompt(&rec, &ctx_label, &ns_label, &logs_text, &status_text, &related_text, &extra, char_budget);
+            let prompt = build_ai_prompt(
+                &rec,
+                &ctx_label,
+                &ns_label,
+                logs_text.as_deref(),
+                status_text.as_deref(),
+                related_text.as_deref(),
+                &extra,
+                char_budget,
+            );
             {
                 let mut s = state.lock().expect("ai state poisoned");
                 if s.current_key.as_deref() == Some(&key) {
@@ -7767,6 +7780,27 @@ impl App {
 
 pub async fn run(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
+    // The startup screen runs on the same terminal as the UI: leaving and re-entering the alternate
+    // screen between the two would flash the shell. It returns as soon as the cluster answers, so a
+    // healthy connection only ever shows a frame or two.
+    let target = crate::splash::Target {
+        context: &app.context_label,
+        cluster: &app.cluster_label,
+        namespace: &app.namespace_label,
+        server: &app.api_url,
+    };
+    let outcome = crate::splash::run(&mut terminal, app.client.clone(), target).await;
+    match outcome {
+        Ok(crate::splash::Outcome::Ready) => {}
+        Ok(crate::splash::Outcome::Aborted) => {
+            ratatui::restore();
+            return Ok(());
+        }
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    }
     app.spawn_cluster_info_refresh();
     let result = run_loop(&mut terminal, &mut app).await;
     ratatui::restore();
@@ -18597,32 +18631,36 @@ fn cap_chars_tail(s: String, max: usize) -> String {
     lang::fill(lang::active().prompt_truncated, &[("body", &s[start..])])
 }
 
-fn capture_logs_text(state: &SharedLog) -> String {
+// `None` means "there is nothing here", and the section is then left out of the prompt entirely:
+// an empty heading costs tokens and, worse, reads as a hole the model may try to fill. An error or a
+// pending fetch is not nothing — that text stays, because "logs unavailable: forbidden" is a fact
+// about the cluster the analysis needs.
+fn capture_logs_text(state: &SharedLog) -> Option<String> {
     let st = lang::active();
     let s = state.lock().expect("log state poisoned");
-    if let Some(e) = &s.error { return lang::fill(st.cap_unavailable, &[("e", e)]); }
-    if s.loading && s.lines.is_empty() { return st.cap_loading.to_string(); }
-    if s.lines.is_empty() { return st.cap_no_log.to_string(); }
+    if let Some(e) = &s.error { return Some(lang::fill(st.cap_unavailable, &[("e", e)])); }
+    if s.loading && s.lines.is_empty() { return Some(st.cap_loading.to_string()); }
+    if s.lines.is_empty() { return None; }
     let n = s.lines.len();
     let start = n.saturating_sub(200);
     let collapsed = collapse_repeats(s.lines[start..].iter().map(|l| l.as_str()));
-    cap_chars_tail(collapsed.join("\n"), MAX_LOGS_CHARS)
+    Some(cap_chars_tail(collapsed.join("\n"), MAX_LOGS_CHARS))
 }
 
-fn capture_status_text(state: &SharedStatus) -> String {
+fn capture_status_text(state: &SharedStatus) -> Option<String> {
     let st = lang::active();
     let s = state.lock().expect("status state poisoned");
-    if let Some(e) = &s.error { return lang::fill(st.cap_unavailable, &[("e", e)]); }
-    if s.loading && s.lines.is_empty() { return st.cap_loading.to_string(); }
-    if s.lines.is_empty() { return st.cap_no_status.to_string(); }
+    if let Some(e) = &s.error { return Some(lang::fill(st.cap_unavailable, &[("e", e)])); }
+    if s.loading && s.lines.is_empty() { return Some(st.cap_loading.to_string()); }
+    if s.lines.is_empty() { return None; }
     let collapsed = collapse_repeats(s.lines.iter().map(|(_, t)| t.as_str()));
-    cap_chars_tail(collapsed.join("\n"), MAX_STATUS_CHARS)
+    Some(cap_chars_tail(collapsed.join("\n"), MAX_STATUS_CHARS))
 }
 
 // Aggregate buffered events for the same object into the prompt's "related events" section.
 // Duplicates (same severity/reason/message) collapse into one line, summing their occurrence
 // counts and keeping the most recent timestamp, then the 50 most recent lines are kept.
-fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
+fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> Option<String> {
     let buf = buffer.lock().expect("buffer poisoned");
     use k8s_openapi::jiff::Timestamp;
     let mut order: Vec<(Severity, String, String)> = Vec::new();
@@ -18661,9 +18699,9 @@ fn capture_related_text(buffer: &SharedBuffer, rec: &EventRecord) -> String {
         related.drain(0..drop);
     }
     if related.is_empty() {
-        lang::active().cap_no_related.to_string()
+        None
     } else {
-        related.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+        Some(related.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
     }
 }
 
@@ -18716,63 +18754,43 @@ fn build_ai_prompt(
     rec: &EventRecord,
     ctx_label: &str,
     ns_label: &str,
-    logs: &str,
-    status: &str,
-    related: &str,
+    logs: Option<&str>,
+    status: Option<&str>,
+    related: Option<&str>,
     extra: &[(String, String)],
     char_budget: Option<usize>,
 ) -> String {
     // Two-pass: render the skeleton with a placeholder for the enrichment block, measure the fixed
-    // part, then fill the block with whatever fits in the remaining budget.
+    // part, then fill the block with whatever fits in the remaining budget. With no enrichment at
+    // all there is no placeholder to substitute and the section is dropped along with it.
     const PLACEHOLDER: &str = "\u{0}";
-    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, logs, status, related, PLACEHOLDER);
+    let has_extra = !extra.is_empty();
+    let ph = if has_extra { Some(PLACEHOLDER) } else { None };
+    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, logs, status, related, ph);
+    if !has_extra { return skeleton; }
     let fixed_len = skeleton.len() - PLACEHOLDER.len();
     let extra_budget = char_budget.map(|b| b.saturating_sub(fixed_len));
     let extra_block = build_extra_block(extra, extra_budget);
     skeleton.replace(PLACEHOLDER, &extra_block)
 }
 
+// Kept deliberately terse: every heading here is paid for on each analysis, and the model already
+// has its instructions from the system prompt — repeating them in the request only costs tokens and
+// nudges it towards finding something to say. Sections with nothing in them are not emitted at all.
 fn build_ai_prompt_inner(
     rec: &EventRecord,
     ctx_label: &str,
     ns_label: &str,
-    logs: &str,
-    status: &str,
-    related: &str,
-    extra_block: &str,
+    logs: Option<&str>,
+    status: Option<&str>,
+    related: Option<&str>,
+    extra_block: Option<&str>,
 ) -> String {
-    format!(
-"# Analyse d'un événement Kubernetes
-
-## Contexte cluster
-- Context: {ctx}
-- Namespace surveillé: {ns_label}
-
-## Événement principal
-- Time: {time}
-- Severity: {sev}
-- Reason: {reason}
-- Kind: {kind}
-- ApiVersion: {api}
-- Object: {ns}/{name}
-- Component: {comp}
-- Count: {count}
-- Message: {msg}
-
-## Statut de l'objet impliqué
-{status}
-
-## Logs récents (objet/pod, jusqu'à 200 dernières lignes)
-{logs}
-
-## Événements liés (même objet)
-{related}
-
-## Ressources contextuelles attachées
-{extra_block}
-
-## Demande
-Donne un diagnostic concis : cause racine la plus probable, vérifications à mener, et actions correctives concrètes (commandes kubectl quand pertinent). Si des policies Kyverno ou des règles RBAC sont fournies, exploite-les pour identifier la règle bloquante et proposer le patch minimal.",
+    let mut out = format!(
+"# Événement Kubernetes
+cluster {ctx} · ns {ns_label}
+{time} {sev} {reason} · {kind} {api} · {ns}/{name} · {comp} · x{count}
+{msg}",
         ctx = ctx_label,
         ns_label = ns_label,
         time = rec.time,
@@ -18785,7 +18803,19 @@ Donne un diagnostic concis : cause racine la plus probable, vérifications à me
         comp = rec.component,
         count = rec.count,
         msg = rec.message,
-    )
+    );
+    for (title, body) in [
+        ("## Statut", status),
+        ("## Logs (200 dernières lignes)", logs),
+        ("## Événements liés", related),
+        ("## Contexte attaché", extra_block),
+    ] {
+        if let Some(body) = body {
+            out.push_str(&format!("\n\n{title}\n{body}"));
+        }
+    }
+    out.push_str("\n\n## Demande\nAnalyse ce contexte selon tes règles. Si des policies Kyverno ou des règles RBAC sont fournies, désigne la règle en cause et le patch minimal.");
+    out
 }
 
 fn build_diag_doc(

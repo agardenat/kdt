@@ -741,12 +741,18 @@ pub struct Strings {
     pub prompt_none: &'static str,
     pub prompt_sys_containers: &'static str,
 
+    // Startup screen, shown while the API server is being reached.
+    pub splash_connecting: &'static str,
+    pub splash_unreachable: &'static str,
+    pub splash_timeout: &'static str,
+    pub splash_hint: &'static str,
+    pub splash_abort: &'static str,
+    pub splash_retry: &'static str,
+    pub splash_continue: &'static str,
+
     // Capture helpers feeding the AI prompt and the copy buffer.
     pub cap_unavailable: &'static str,
     pub cap_loading: &'static str,
-    pub cap_no_log: &'static str,
-    pub cap_no_status: &'static str,
-    pub cap_no_related: &'static str,
     pub prompt_sections_omitted_one: &'static str,
     pub prompt_sections_omitted_many: &'static str,
 
@@ -1784,12 +1790,18 @@ pub const FR: Strings = Strings {
     prompt_none: "(aucun)",
     prompt_sys_containers: "System containers ({n}, hors influence directe utilisateur): cpu req={creq} use={cuse}, mem req={mreq} use={muse}\n",
 
+    // Startup screen, shown while the API server is being reached.
+    splash_connecting: "Connexion au cluster",
+    splash_unreachable: "Cluster injoignable",
+    splash_timeout: "Aucune réponse de l'API server après {n}s.",
+    splash_hint: "Vérifie le VPN, le contexte kubeconfig et l'accès réseau à l'API server.",
+    splash_abort: "abandonner",
+    splash_retry: "réessayer",
+    splash_continue: "entrer quand même",
+
     // Capture helpers feeding the AI prompt and the copy buffer.
     cap_unavailable: "(indisponible: {e})",
     cap_loading: "(en cours de chargement)",
-    cap_no_log: "(aucun log)",
-    cap_no_status: "(aucun status)",
-    cap_no_related: "(aucun évènement lié)",
     prompt_sections_omitted_one: "\n\n... ({n} section contextuelle omise — budget de contexte atteint)",
     prompt_sections_omitted_many: "\n\n... ({n} sections contextuelles omises — budget de contexte atteint)",
 
@@ -2826,12 +2838,18 @@ pub const EN: Strings = Strings {
     prompt_none: "(none)",
     prompt_sys_containers: "System containers ({n}, outside direct user control): cpu req={creq} use={cuse}, mem req={mreq} use={muse}\n",
 
+    // Startup screen, shown while the API server is being reached.
+    splash_connecting: "Connecting to the cluster",
+    splash_unreachable: "Cluster unreachable",
+    splash_timeout: "No answer from the API server after {n}s.",
+    splash_hint: "Check the VPN, the kubeconfig context and network access to the API server.",
+    splash_abort: "abort",
+    splash_retry: "retry",
+    splash_continue: "enter anyway",
+
     // Capture helpers feeding the AI prompt and the copy buffer.
     cap_unavailable: "(unavailable: {e})",
     cap_loading: "(loading)",
-    cap_no_log: "(no log)",
-    cap_no_status: "(no status)",
-    cap_no_related: "(no related event)",
     prompt_sections_omitted_one: "\n\n... ({n} context section omitted — context budget reached)",
     prompt_sections_omitted_many: "\n\n... ({n} context sections omitted — context budget reached)",
 
