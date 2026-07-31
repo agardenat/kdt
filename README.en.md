@@ -101,7 +101,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `e` / `h` / `Ctrl-D` | Edit / touch / delete the object (guardrails) |
 | `i` | AI pane |
 | `c` | Copy the view (OSC 52, works over SSH) |
-| `l` / `m` | Language FR/EN · next AI provider |
+| `L` / `m` | Language FR/EN · next AI provider |
 | `F5` | Refresh |
 | `:` | Command palette |
 | `Esc` | Back (clears the active search first) |
@@ -115,7 +115,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | Workloads | `t` list ↔ tree · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` usage view · `s` sort · `o` cordon/uncordon/drain · `p`/`P` PDF export |
 | Capacity | `g` world (nodes → workloads → quotas) · `f` problems only |
-| FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `L` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
+| FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
 | Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) |
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE |
@@ -204,7 +204,7 @@ shows the query and its effect (`/coredns  (3)`).
   location, a kopia repository with no maintenance, and above all the **namespaces holding PVCs
   that no schedule covers any more**. `o` opens the operations: run a backup from a schedule, pause
   it, restore, and *actually* delete a backup — through a `DeleteBackupRequest`, because deleting
-  the object deletes nothing and the next sync brings it back. `L` fetches the run log.
+  the object deletes nothing and the next sync brings it back. `l` fetches the run log.
 - **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
   missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
   with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message
@@ -216,7 +216,7 @@ shows the query and its effect (`/coredns  (3)`).
   Rancher, failing pods, PVs, recent warnings.
 - **Extract** (`X`) — full PDF report of the cluster state into `~/Downloads`.
 - **AI** (`i`) — sends the current context to an OpenAI-compatible API; the answer is streamed (SSE)
-  and rendered as it arrives. `l` re-runs it in the other language.
+  and rendered as it arrives. `L` re-runs it in the other language.
 
 ## Writing to the cluster
 
@@ -291,7 +291,7 @@ The whole UI is bilingual (panes, diagnostics, PDF reports, prompts). Selection 
 `language` config key, then the system locale (`LC_ALL`, `LC_MESSAGES`, `LANG`, `LANGUAGE` — `fr*`
 gives French, anything else English), else French.
 
-`l` switches at runtime, even inside a view, and rewrites **only the `language` key** of the config
+`L` switches at runtime, even inside a view, and rewrites **only the `language` key** of the config
 file (everything else, permissions included, is left alone). Kubernetes jargon stays in English on
 both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 

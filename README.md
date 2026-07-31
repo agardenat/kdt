@@ -101,7 +101,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | `e` / `h` / `Ctrl-D` | Éditer / toucher / supprimer l'objet (garde-fous) |
 | `i` | Panneau IA |
 | `c` | Copier la vue (OSC 52, fonctionne à travers SSH) |
-| `l` / `m` | Langue FR/EN · fournisseur IA suivant |
+| `L` / `m` | Langue FR/EN · fournisseur IA suivant |
 | `F5` | Rafraîchir |
 | `:` | Palette de commandes |
 | `Esc` | Retour (retire d'abord la recherche active) |
@@ -115,7 +115,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | Workloads | `t` liste ↔ arbre · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` vue usage · `s` tri · `o` cordon/uncordon/drain · `p`/`P` export PDF |
 | Capacité | `g` monde (nœuds → workloads → quotas) · `f` problèmes seulement |
-| FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `L` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
+| FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `l` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
 | Vulnérabilités | `f` seuil de sévérité (tous → HIGH+ → CRIT) |
 | cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME |
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `f` ALL/PROBLEMS/ENFORCE |
@@ -205,7 +205,7 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   dépôt kopia sans maintenance, et surtout les **namespaces à PVC que plus aucun schedule ne
   couvre**. `o` ouvre les opérations : lancer un backup depuis un schedule, mettre en pause,
   restaurer, et supprimer *vraiment* un backup — via une `DeleteBackupRequest`, parce que supprimer
-  l'objet ne supprime rien et que la resynchronisation le recrée. `L` va chercher le log du run.
+  l'objet ne supprime rien et que la resynchronisation le recrée. `l` va chercher le log du run.
 - **Stockage** (`:storage`, `:pv`) — `kubectl get pvc` dit qu'un PVC est `Pending`, jamais
   pourquoi. Ici : StorageClass introuvable, aucune classe par défaut (ou deux), `WaitForFirstConsumer`
   qui attend un pod, classe sans provisioner — et si le provisioner a laissé un `ProvisioningFailed`,
@@ -217,7 +217,7 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   webhooks, Rancher, pods en erreur, PV, warnings récents.
 - **Extraction** (`X`) — rapport PDF complet de l'état du cluster dans `~/Downloads`.
 - **IA** (`i`) — envoie le contexte courant à une API compatible OpenAI ; la réponse est streamée
-  (SSE) et s'affiche au fil de l'eau. `l` relance dans l'autre langue.
+  (SSE) et s'affiche au fil de l'eau. `L` relance dans l'autre langue.
 
 ## Écrire dans le cluster
 
@@ -293,7 +293,7 @@ Toute l'interface est bilingue (panneaux, diagnostics, rapports PDF, prompts). L
 clé `language` du fichier de config, puis la locale système (`LC_ALL`, `LC_MESSAGES`, `LANG`,
 `LANGUAGE` — `fr*` donne le français, le reste l'anglais), sinon le français.
 
-`l` bascule à chaud, y compris à l'intérieur d'une vue, et réécrit **la seule clé `language`** du
+`L` bascule à chaud, y compris à l'intérieur d'une vue, et réécrit **la seule clé `language`** du
 fichier de config (le reste et les permissions sont laissés tels quels). Le jargon Kubernetes reste
 en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les en-têtes de colonnes.
 

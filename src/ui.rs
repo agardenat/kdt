@@ -8783,10 +8783,11 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
 
         // Language toggle, available from every view. The prompt modes never get here (the arms
-        // above feed every character to the query being typed); these three swallow `l` instead of
-        // switching language, as they always have.
-        (KeyCode::Char('l'), _, Mode::NsPicker | Mode::Extract | Mode::FluxLogs) => {}
-        (KeyCode::Char('l'), _, _) => app.toggle_language(),
+        // above feed every character to the query being typed); these three swallow `L` instead of
+        // switching language, as they always have. Lowercase `l` is reserved for logs everywhere,
+        // so this arm must stay uppercase — it precedes every per-mode arm and would shadow them.
+        (KeyCode::Char('L'), _, Mode::NsPicker | Mode::Extract | Mode::FluxLogs) => {}
+        (KeyCode::Char('L'), _, _) => app.toggle_language(),
 
         (KeyCode::Up, _, Mode::NsPicker) => {
             if app.ns_cursor > 0 { app.ns_cursor -= 1; }
@@ -8918,7 +8919,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('r'), _, Mode::Flux) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::Flux) => app.toggle_suspend(),
         (KeyCode::Char('t'), _, Mode::Flux) => app.toggle_flux_tree(),
-        (KeyCode::Char('L'), _, Mode::Flux) => app.enter_flux_logs(),
+        (KeyCode::Char('l'), _, Mode::Flux) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::Flux) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Flux) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Flux) => app.scroll_detail_bottom(),
@@ -8944,7 +8945,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('r'), KeyModifiers::CONTROL, Mode::FluxFull) => app.open_repair_view(),
         (KeyCode::Char('r'), _, Mode::FluxFull) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::FluxFull) => app.toggle_suspend(),
-        (KeyCode::Char('L'), _, Mode::FluxFull) => app.enter_flux_logs(),
+        (KeyCode::Char('l'), _, Mode::FluxFull) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::FluxFull) => app.enter_ai_panel(),
         (_, _, Mode::FluxFull) => {}
 
@@ -8955,7 +8956,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::FluxLogs) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::FluxLogs) => app.scroll_detail_bottom(),
         (KeyCode::Esc, _, Mode::FluxLogs) => app.exit_flux_logs(),
-        (KeyCode::Char('L'), _, Mode::FluxLogs) => app.exit_flux_logs(),
+        (KeyCode::Char('l'), _, Mode::FluxLogs) => app.exit_flux_logs(),
         (_, _, Mode::FluxLogs) => {}
 
         (KeyCode::Up, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -9250,7 +9251,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::Velero) => app.cycle_vel_world(),
         (KeyCode::Char('f'), _, Mode::Velero) => app.cycle_vel_filter(),
         (KeyCode::Char('o'), _, Mode::Velero) => app.open_velero_action_menu(),
-        (KeyCode::Char('L'), _, Mode::Velero) => app.vel_toggle_log(),
+        (KeyCode::Char('l'), _, Mode::Velero) => app.vel_toggle_log(),
         (KeyCode::Enter, _, Mode::Velero) => app.enter_velero_full(),
         (KeyCode::F(5), _, Mode::Velero) => app.refresh_velero(),
         (KeyCode::Esc, _, Mode::Velero) => app.exit_velero_mode(),
@@ -9276,7 +9277,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::VeleroFull) => app.vel_detail_scroll = 0,
         (KeyCode::Char('G'), _, Mode::VeleroFull) => app.vel_detail_scroll = usize::MAX,
         (KeyCode::Char('o'), _, Mode::VeleroFull) => app.open_velero_action_menu(),
-        (KeyCode::Char('L'), _, Mode::VeleroFull) => app.vel_toggle_log(),
+        (KeyCode::Char('l'), _, Mode::VeleroFull) => app.vel_toggle_log(),
         (KeyCode::Char('i'), _, Mode::VeleroFull) => app.enter_ai_panel(),
         (_, _, Mode::VeleroFull) => {}
 
@@ -9723,7 +9724,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
-            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::FluxFull => vec![
@@ -9736,7 +9737,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
             Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
-            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
         ],
         Mode::Pods => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
@@ -10025,7 +10026,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_vel_tree)),
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_vel_filter, app.vel_filter.label())),
                 footer_sep(),
-                Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
+                Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
@@ -10036,7 +10037,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             footer_sep(),
-            Span::styled(" L ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
         ],
         Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
@@ -10075,7 +10076,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     global_spans.push(Span::styled(" i ", kbg));
     global_spans.push(Span::raw(format!(" {}   ", st.k_ai)));
-    global_spans.push(Span::styled(" l ", kbg));
+    global_spans.push(Span::styled(" L ", kbg));
     global_spans.push(Span::raw(format!(" {}:{}   ", st.k_lang, app.ai_language.label())));
     global_spans.push(Span::styled(" m ", kbg));
     global_spans.push(Span::raw(format!(" {}:{}", st.k_provider, app.ai_provider_name())));
@@ -11682,7 +11683,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Span::styled(" p ", kbg), Span::raw(format!(" {}   ", st_f.k_pdf)),
         Span::styled(" c ", kbg), Span::raw(st_f.k_copy_word),
         Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st_f.k_ai)),
-        Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st_f.k_lang, app.ai_language.label())),
+        Span::styled(" L ", kbg), Span::raw(format!(" {}:{}", st_f.k_lang, app.ai_language.label())),
     ];
     if let Some(m) = app.clipboard_status_active() {
         spans.push(Span::raw("   "));
@@ -12043,7 +12044,7 @@ fn draw_diagnostic_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Span::styled(" p ", kbg), Span::raw(format!(" {}   ", st.k_pdf)),
         Span::styled(" c ", kbg), Span::raw(st.k_copy_word),
         Span::styled(" i ", kbg), Span::raw(format!(" {}   ", st.k_send_to_ai)),
-        Span::styled(" l ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
+        Span::styled(" L ", kbg), Span::raw(format!(" {}:{}", st.k_lang, app.ai_language.label())),
     ];
     if let Some(m) = app.clipboard_status_active() {
         spans.push(Span::raw("   "));
@@ -12077,7 +12078,7 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .map(|m| format!("  · ⊡ {}", m))
         .unwrap_or_default();
     let title = format!(
-        " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  l {}  m {}{}  c copier  Esc {}{}{}{} ",
+        " {} [{} · {}]  ↑↓ {}  PgUp/PgDn {}  g/G {}  L {}  m {}{}  c copier  Esc {}{}{}{} ",
         st.title_ai_analysis,
         app.ai_language.label(),
         app.ai_provider_name(),
@@ -20483,7 +20484,7 @@ mod footer_tests {
         let tools = vec![
             key("c"), lbl("copier"),
             key("i"), lbl("IA"),
-            key("l"), lbl("langue:fr"),
+            key("L"), lbl("langue:fr"),
             key("m"), lbl("modèle:local"),
         ];
         (spans, tools)
