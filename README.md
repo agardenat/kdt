@@ -206,6 +206,11 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   couvre**. `o` ouvre les opérations : lancer un backup depuis un schedule, mettre en pause,
   restaurer, et supprimer *vraiment* un backup — via une `DeleteBackupRequest`, parce que supprimer
   l'objet ne supprime rien et que la resynchronisation le recrée. `l` va chercher le log du run.
+  `+` déplie ce que le backup contient réellement — namespaces, puis types, puis objets — et
+  *Restaurer (options)* s'en sert pour préremplir un `Restore` restreint : namespaces à cocher,
+  remapping vers un namespace neuf, filtre par type et par labels, et le choix d'ignorer ou
+  d'écraser ce qui existe déjà. Velero ne sait pas cibler un objet par son nom : la vue s'arrête
+  donc là où l'API s'arrête, sans promettre une case à cocher par objet.
 - **Stockage** (`:storage`, `:pv`) — `kubectl get pvc` dit qu'un PVC est `Pending`, jamais
   pourquoi. Ici : StorageClass introuvable, aucune classe par défaut (ou deux), `WaitForFirstConsumer`
   qui attend un pod, classe sans provisioner — et si le provisioner a laissé un `ProvisioningFailed`,

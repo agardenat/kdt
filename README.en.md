@@ -204,7 +204,12 @@ shows the query and its effect (`/coredns  (3)`).
   location, a kopia repository with no maintenance, and above all the **namespaces holding PVCs
   that no schedule covers any more**. `o` opens the operations: run a backup from a schedule, pause
   it, restore, and *actually* delete a backup — through a `DeleteBackupRequest`, because deleting
-  the object deletes nothing and the next sync brings it back. `l` fetches the run log.
+  the object deletes nothing and the next sync brings it back. `l` fetches the run log. `+` unfolds
+  what the backup really holds — namespaces, then kinds, then objects — and *Restore (options)*
+  uses that to prefill a narrowed `Restore`: namespaces to tick, remapping into a fresh namespace,
+  a filter by kind and by label, and the choice between stepping around what already exists and
+  overwriting it. Velero cannot target an object by name, so the view stops where the API stops
+  rather than promising a tick box per object.
 - **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
   missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
   with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message

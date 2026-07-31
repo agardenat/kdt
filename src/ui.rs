@@ -313,6 +313,142 @@ enum EditPhase {
     Review,
 }
 
+// The restore form: which parts of a backup to replay, and where. Opened from the velero action
+// menu, on the same footing as the drain panel — a gesture that has to *choose* before it can
+// confirm, so a cursor runs over the fields first and the confirmation comes last.
+//
+// Everything here is a narrowing of `VelWrite::Restore`. The one thing it deliberately cannot offer
+// is a per-object tick box: velero restores by namespace, kind and label, never by name.
+struct VelRestoreView {
+    namespace: String,
+    backup: String,
+    // The namespaces the backup holds, each with whether it is ticked. Empty when the inventory
+    // could not be downloaded — the form then falls back to the free-text field, and says so rather
+    // than showing an empty list that would read as "this backup holds nothing".
+    namespaces: Vec<(String, bool)>,
+    kinds: Vec<(String, String, bool)>,
+    // Set when the inventory was unavailable: the namespaces are typed instead of ticked.
+    manual_namespaces: bool,
+    ns_text: String,
+    target_ns: String,
+    labels: String,
+    overwrite: bool,
+    // Index into the flattened selectable rows (`VelRestoreView::rows`). Headers are drawn but never
+    // land under the cursor.
+    cursor: usize,
+    // True while the row under the cursor is taking keystrokes. Only the three text rows can be in
+    // this state, and the field is always visible with its expected shape while it is.
+    editing: bool,
+    armed: bool,
+    typed: Option<String>,
+}
+
+// One selectable row of the restore form, in drawing order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VelRoRow {
+    // Tick one of the backup's namespaces.
+    Ns(usize),
+    // The free-text namespace list, shown instead of the tick boxes when the inventory is missing.
+    NsText,
+    Target,
+    Kind(usize),
+    Labels,
+    Existing,
+}
+
+impl VelRestoreView {
+    // The selectable rows, in drawing order. Headers are not in here: the cursor never stops on a
+    // line that cannot be acted on.
+    fn rows(&self) -> Vec<VelRoRow> {
+        let mut rows = Vec::new();
+        if self.manual_namespaces {
+            rows.push(VelRoRow::NsText);
+        } else {
+            rows.extend((0..self.namespaces.len()).map(VelRoRow::Ns));
+        }
+        rows.push(VelRoRow::Target);
+        rows.extend((0..self.kinds.len()).map(VelRoRow::Kind));
+        rows.push(VelRoRow::Labels);
+        rows.push(VelRoRow::Existing);
+        rows
+    }
+
+    // The namespaces this restore will name, ticked or typed.
+    fn selected_namespaces(&self) -> Vec<String> {
+        if self.manual_namespaces {
+            return self
+                .ns_text
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+        }
+        self.namespaces
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(ns, _)| ns.clone())
+            .collect()
+    }
+
+    // The kinds that need resolving before the restore can be built. All of them ticked means "no
+    // filter at all", which is a *shorter* spec than listing every kind — and one that keeps
+    // working for a kind the inventory happens not to mention.
+    fn kinds_to_resolve(&self) -> Vec<(String, String)> {
+        if self.kinds.is_empty() || self.kinds.iter().all(|(_, _, on)| *on) {
+            return Vec::new();
+        }
+        self.kinds
+            .iter()
+            .filter(|(_, _, on)| *on)
+            .map(|(api_version, kind, _)| (api_version.clone(), kind.clone()))
+            .collect()
+    }
+
+    fn parsed_labels(&self) -> Vec<(String, String)> {
+        self.labels
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _)| !k.is_empty())
+            .collect()
+    }
+
+    // Everything but `includedResources`, which cannot be filled in without asking the API server.
+    fn options_without_resources(&self) -> RestoreOptions {
+        let namespaces = self.selected_namespaces();
+        // Velero maps namespace by namespace. With several sources ticked there is no single source
+        // to map from, so the target is not applied rather than guessed at — the form greys the
+        // field out in that state, and this keeps the two in step.
+        let target = self.target_ns.trim();
+        let namespace_mapping = match namespaces.as_slice() {
+            [only] if !target.is_empty() && target != only => {
+                Some((only.clone(), target.to_string()))
+            }
+            _ => None,
+        };
+        RestoreOptions {
+            namespaces,
+            namespace_mapping,
+            resources: Vec::new(),
+            label_selector: self.parsed_labels(),
+            overwrite_existing: self.overwrite,
+        }
+    }
+
+    // The spec as it will be sent, for the preview. Resource names are the one thing it cannot show
+    // for real before discovery has run, so it shows the Kinds and says they are Kinds.
+    fn preview_options(&self) -> RestoreOptions {
+        let mut opts = self.options_without_resources();
+        opts.resources = self
+            .kinds_to_resolve()
+            .into_iter()
+            .map(|(_, kind)| kind)
+            .collect();
+        opts
+    }
+}
+
 // A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
 // or one scanned image.
 #[derive(Clone)]
@@ -356,9 +492,10 @@ use crate::reflector::{
     HintLevel as ReflHintLevel, ReflOrphan, ReflSource, ReflTarget, SharedReflector, TargetStatus,
 };
 use crate::velero::{
-    apply_write, fetch_run_log, fetch_velero, format_span, format_span_short, new_vel_log,
-    new_velero_state, LogSource, SharedVelLog, SharedVelero, VelBackup, VelLocation, VelRepo,
-    VelRestore, VelSchedule, VelSnapLocation, VelWrite,
+    apply_write, fetch_contents, fetch_run_log, fetch_velero, format_span, format_span_short,
+    new_vel_contents, new_vel_log, new_velero_state, resolve_resources, restore_from_backup,
+    LogSource, RestoreOptions, SharedVelContents, SharedVelLog, SharedVelero, VelBackup,
+    VelLocation, VelRepo, VelRestore, VelSchedule, VelSnapLocation, VelWrite,
 };
 
 // The three questions the velero view answers, cycled with `g` off a single fetch: what is being
@@ -385,6 +522,13 @@ enum VelRow {
     // The parent row that collects the backups no schedule claims — a manual run, or one whose
     // schedule has since been deleted.
     Orphans,
+    // The three levels of a backup's contents, unfolded under it with `+`. They stand for what the
+    // backup *holds*, not for velero objects — which is why the two grouping levels carry no kind at
+    // all (see `synthetic_vel_ct_*`), and why the namespace they name is the captured one rather
+    // than velero's own.
+    CtNs { backup_uid: String, namespace: String, objects: usize, kinds: usize },
+    CtKind { backup_uid: String, namespace: String, kind: String, objects: usize },
+    CtObject { api_version: String, kind: String, namespace: String, name: String },
 }
 
 impl VelRow {
@@ -396,7 +540,8 @@ impl VelRow {
             VelRow::Location(l) => &l.hints,
             VelRow::SnapLocation(l) => &l.hints,
             VelRow::Repo(r) => &r.hints,
-            VelRow::Orphans => &[],
+            VelRow::Orphans | VelRow::CtNs { .. } | VelRow::CtKind { .. }
+            | VelRow::CtObject { .. } => &[],
         }
     }
 
@@ -409,6 +554,32 @@ impl VelRow {
         match self {
             VelRow::Schedule(s) => Some(s.key()),
             VelRow::Orphans => Some("|orphans".to_string()),
+            _ => None,
+        }
+    }
+
+    // A contents row stands for something inside a backup rather than for a velero object. The
+    // gestures that reach out to the cluster — the namespace filter, the action menu — have to tell
+    // the two apart.
+    fn is_contents(&self) -> bool {
+        matches!(
+            self,
+            VelRow::CtNs { .. } | VelRow::CtKind { .. } | VelRow::CtObject { .. }
+        )
+    }
+
+    // The key this row expands under, for `+` and `-`. Three levels, each prefixed by the one above
+    // so a namespace of one backup never folds the same-named namespace of another.
+    fn contents_key(&self) -> Option<String> {
+        match self {
+            VelRow::Backup(b) => Some(b.uid.clone()),
+            VelRow::CtNs { backup_uid, namespace, .. } => {
+                Some(format!("{}|{}", backup_uid, namespace))
+            }
+            VelRow::CtKind { backup_uid, namespace, kind, .. } => {
+                Some(format!("{}|{}|{}", backup_uid, namespace, kind))
+            }
+            // An object is a leaf: there is nothing under it to unfold.
             _ => None,
         }
     }
@@ -640,6 +811,8 @@ enum MenuAction {
     VelBackupNow,
     VelPause(bool),
     VelRestore,
+    // Like the drain, this one has no argument: it opens its own panel to choose before it writes.
+    VelRestoreOptions,
     VelDeleteBackup,
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
@@ -744,6 +917,44 @@ fn node_matches_search(n: &NodeSummary, q: &str) -> bool {
     fields_match_search(&[&n.name, &n.roles, &n.version, &n.ready], q)
         || fields_match_search(&n.abnormal, q)
         || (!n.schedulable && "cordoned".contains(q))
+}
+
+// How deep a velero row sits in the tree. Only used to keep a match's ancestors on screen, so the
+// levels that never nest all share the root.
+fn vel_depth(row: &VelRow) -> usize {
+    match row {
+        VelRow::Schedule(_) | VelRow::Orphans => 0,
+        VelRow::Restore(_) | VelRow::Location(_) | VelRow::SnapLocation(_) | VelRow::Repo(_) => 0,
+        VelRow::Backup(_) => 1,
+        VelRow::CtNs { .. } => 2,
+        VelRow::CtKind { .. } => 3,
+        VelRow::CtObject { .. } => 4,
+    }
+}
+
+// Widen a search's keep-set so a surviving row keeps the rows it hangs from. Without it `/nginx`
+// leaves a ConfigMap floating with no backup above it and no namespace beside it — the match is
+// found and the context that makes it readable is gone.
+//
+// It is the same rule the Problems filter already follows for a schedule above a failing backup,
+// applied to every level. One forward pass: the most recent row at each shallower depth is, by
+// construction of the tree order, the ancestor chain of the row being kept.
+fn vel_keep_ancestors(rows: &[VelRow], keep: &mut [bool]) {
+    const DEPTHS: usize = 5;
+    let mut last_at: [Option<usize>; DEPTHS] = [None; DEPTHS];
+    for (i, row) in rows.iter().enumerate() {
+        let d = vel_depth(row).min(DEPTHS - 1);
+        if keep.get(i).copied().unwrap_or(false) {
+            for ancestor in last_at.iter().take(d).flatten() {
+                keep[*ancestor] = true;
+            }
+        }
+        last_at[d] = Some(i);
+        // Anything deeper belonged to the previous branch and can no longer be an ancestor.
+        for slot in last_at.iter_mut().skip(d + 1) {
+            *slot = None;
+        }
+    }
 }
 
 // Which rows of a freshly rebuilt snapshot survive the active query, or `None` when there is
@@ -1114,8 +1325,18 @@ pub struct App {
     // Schedules the user folded (`Espace`), keyed by "ns/name".
     vel_collapsed: std::collections::HashSet<String>,
     vel_rows: Vec<VelRow>,
+    // What each unfolded backup holds, one store per backup. Kept per backup and never refreshed on
+    // the ticker: a finished backup's contents cannot change, and each fetch costs a DownloadRequest
+    // plus up to twenty seconds of polling.
+    vel_contents: std::collections::HashMap<String, SharedVelContents>,
+    // Contents nodes the user unfolded (`+`), at all three levels — see `VelRow::contents_key`.
+    vel_ct_expanded: std::collections::HashSet<String>,
     pub vel_detail_scroll: usize,
     pub vel_refresh_handle: Option<JoinHandle<()>>,
+    // The restore form (`o` → Restaurer (options)). Like every other overlay it holds only the
+    // choices and the confirmation state; nothing it needs is fetched while it is open except the
+    // resource-kind resolution, which lands in `vel_ro_resolved`.
+    vel_restore_view: Option<VelRestoreView>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -1358,8 +1579,11 @@ impl App {
             vel_group: true,
             vel_collapsed: std::collections::HashSet::new(),
             vel_rows: Vec::new(),
+            vel_contents: std::collections::HashMap::new(),
+            vel_ct_expanded: std::collections::HashSet::new(),
             vel_detail_scroll: 0,
             vel_refresh_handle: None,
+            vel_restore_view: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -6287,8 +6511,7 @@ impl App {
                             {
                                 continue;
                             }
-                            recs.push(synthetic_vel_backup_record(b, st));
-                            rows.push(VelRow::Backup(Box::new(b.clone())));
+                            self.push_vel_backup(b, &mut rows, &mut recs, st);
                         }
                     }
                     // Backups no schedule claims: a manual run, or one whose schedule was deleted
@@ -6312,8 +6535,7 @@ impl App {
                         rows.push(VelRow::Orphans);
                         if !collapsed {
                             for b in orphans {
-                                recs.push(synthetic_vel_backup_record(b, st));
-                                rows.push(VelRow::Backup(Box::new(b.clone())));
+                                self.push_vel_backup(b, &mut rows, &mut recs, st);
                             }
                         }
                     }
@@ -6324,8 +6546,7 @@ impl App {
                         {
                             continue;
                         }
-                        recs.push(synthetic_vel_backup_record(b, st));
-                        rows.push(VelRow::Backup(Box::new(b.clone())));
+                        self.push_vel_backup(b, &mut rows, &mut recs, st);
                     }
                 }
             }
@@ -6379,7 +6600,8 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
-        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+        if let Some(mut keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            vel_keep_ancestors(&self.vel_rows, &mut keep);
             retain_aligned(&mut self.vel_rows, &keep);
             retain_aligned(&mut self.snapshot, &keep);
         }
@@ -6394,6 +6616,62 @@ impl App {
             });
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    // One backup row, plus whatever of its contents the user has unfolded. Called from the three
+    // places a backup is emitted (under its schedule, under the orphan header, and flat) so the
+    // unfolding behaves the same in all three.
+    fn push_vel_backup(
+        &self,
+        b: &VelBackup,
+        rows: &mut Vec<VelRow>,
+        recs: &mut Vec<EventRecord>,
+        st: &'static Strings,
+    ) {
+        recs.push(synthetic_vel_backup_record(b, st));
+        rows.push(VelRow::Backup(Box::new(b.clone())));
+        if !self.vel_ct_expanded.contains(&b.uid) {
+            return;
+        }
+        let Some(store) = self.vel_contents.get(&b.uid) else { return };
+        let contents = store.lock().expect("velero contents poisoned").clone();
+        // Downloading, failed, or captured nothing: all three are statements about the backup and
+        // belong in the detail panel. None of them may invent rows here.
+        for ns in &contents.namespaces {
+            let ns_key = format!("{}|{}", b.uid, ns.namespace);
+            recs.push(synthetic_vel_ct_ns_record(&b.uid, ns, st));
+            rows.push(VelRow::CtNs {
+                backup_uid: b.uid.clone(),
+                namespace: ns.namespace.clone(),
+                objects: ns.objects(),
+                kinds: ns.kinds.len(),
+            });
+            if !self.vel_ct_expanded.contains(&ns_key) {
+                continue;
+            }
+            for k in &ns.kinds {
+                let kind_key = format!("{}|{}", ns_key, k.kind);
+                recs.push(synthetic_vel_ct_kind_record(&b.uid, &ns.namespace, k, st));
+                rows.push(VelRow::CtKind {
+                    backup_uid: b.uid.clone(),
+                    namespace: ns.namespace.clone(),
+                    kind: k.kind.clone(),
+                    objects: k.names.len(),
+                });
+                if !self.vel_ct_expanded.contains(&kind_key) {
+                    continue;
+                }
+                for name in &k.names {
+                    recs.push(synthetic_vel_ct_object_record(k, &ns.namespace, name));
+                    rows.push(VelRow::CtObject {
+                        api_version: k.api_version.clone(),
+                        kind: k.kind.clone(),
+                        namespace: ns.namespace.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+        }
     }
 
     fn move_vel_selection(&mut self, delta: i32) {
@@ -6490,6 +6768,112 @@ impl App {
         });
     }
 
+    // `n` narrows the view to the namespace of the *velero* object under the cursor. On a contents
+    // row that namespace is the captured one — `prod`, where every velero object lives in `velero` —
+    // so applying it would empty the view and look like a bug. It says nothing instead.
+    fn vel_filter_ns(&mut self) {
+        if self.vel_selected().is_some_and(|r| r.is_contents()) {
+            let st = lang::t(self.ai_language);
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.vel_ct_no_ns_filter.to_string()));
+            return;
+        }
+        self.filter_ns_to_selected();
+    }
+
+    // `+`: unfold one level of a backup's contents — its namespaces, then a namespace's kinds, then
+    // a kind's objects. On a backup nothing has been downloaded for yet, this is also what starts
+    // the download.
+    fn vel_expand_contents(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(row) = self.vel_selected() else { return };
+        let Some(key) = row.contents_key() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.vel_ct_no_backup.to_string()));
+            return;
+        };
+        let backup = match row {
+            VelRow::Backup(b) => Some((
+                b.uid.clone(),
+                b.namespace.clone(),
+                b.name.clone(),
+                b.storage_location.clone(),
+            )),
+            _ => None,
+        };
+        // On the backup itself the fetch has to be started before the key is marked expanded, so the
+        // "downloading" line has somewhere to come from.
+        if let Some((uid, namespace, name, location)) = backup {
+            self.vel_fetch_contents(&uid, &namespace, &name, &location, false);
+        }
+        self.vel_ct_expanded.insert(key);
+        self.vel_detail_scroll = 0;
+        self.refresh_velero_snapshot();
+    }
+
+    // `-`: fold the node under the cursor, or the one that owns it when the cursor is on a leaf —
+    // the same walk back up `Espace` does for schedules.
+    fn vel_collapse_contents(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return };
+        let key = self.vel_rows.get(sel).and_then(|row| match row.contents_key() {
+            // A node that is open folds itself; one that is already closed hands the gesture to its
+            // parent, so repeated `-` walks out of the tree instead of doing nothing.
+            Some(key) if self.vel_ct_expanded.contains(&key) => Some(key),
+            _ => self.vel_rows[..sel]
+                .iter()
+                .rev()
+                .find_map(|r| r.contents_key())
+                .filter(|k| self.vel_ct_expanded.contains(k)),
+        });
+        let Some(key) = key else { return };
+        // Folding a level throws away the levels underneath: leaving them marked would have them
+        // spring back open the next time the parent is unfolded.
+        let prefix = format!("{}|", key);
+        self.vel_ct_expanded.retain(|k| *k != key && !k.starts_with(&prefix));
+        self.vel_detail_scroll = 0;
+        self.refresh_velero_snapshot();
+    }
+
+    // Download one backup's inventory, unless it is already there. `force` is the `F5` path: a
+    // backup still running has a resource list that grows, and nothing else ever invalidates it.
+    fn vel_fetch_contents(
+        &mut self,
+        uid: &str,
+        namespace: &str,
+        name: &str,
+        location: &str,
+        force: bool,
+    ) {
+        let state = self
+            .vel_contents
+            .entry(uid.to_string())
+            .or_insert_with(new_vel_contents)
+            .clone();
+        {
+            let s = state.lock().expect("velero contents poisoned");
+            // Already downloaded, downloading, or failed: none of the three is worth a second
+            // DownloadRequest unless the user asked for one.
+            if !force && !s.key.is_empty() {
+                return;
+            }
+        }
+        // The endpoint of the location this backup sits in, so an unreachable signed URL can name
+        // its usual cause instead of surfacing a bare connection error.
+        let s3_url = {
+            let s = self.velero_state.lock().expect("velero poisoned");
+            s.locations
+                .iter()
+                .find(|l| l.name == location && l.namespace == namespace)
+                .map(|l| l.s3_url.clone())
+                .filter(|u| !u.is_empty())
+        };
+        let client = self.client.clone();
+        let (namespace, name) = (namespace.to_string(), name.to_string());
+        tokio::spawn(async move {
+            fetch_contents(client, namespace, name, s3_url, state).await;
+        });
+    }
+
     // The operations available on the row under the cursor. A row with none says so rather than
     // opening an empty menu — the same rule the reflector view follows.
     fn open_velero_action_menu(&mut self) {
@@ -6525,6 +6909,11 @@ impl App {
                         label: st.k_vel_restore,
                         desc: st.desc_vel_restore,
                         action: MenuAction::VelRestore,
+                    });
+                    items.push(ActionItem {
+                        label: st.k_vel_restore_opts,
+                        desc: st.desc_vel_restore_opts,
+                        action: MenuAction::VelRestoreOptions,
                     });
                 }
                 if !b.deleting && b.phase != "Deleting" {
@@ -6597,11 +6986,258 @@ impl App {
     fn vel_restore(&mut self) {
         let st = lang::t(self.ai_language);
         let Some(VelRow::Backup(b)) = self.vel_selected() else { return };
+        // The fast path: the whole backup, where it came from, stepping around what already exists.
         let write = VelWrite::Restore {
             namespace: b.namespace.clone(),
             backup: b.name.clone(),
+            opts: Box::default(),
         };
         self.vel_run_write(write, st.msg_vel_restore_started, st.msg_vel_restore_failed);
+    }
+
+    // Open the restore form on the selected backup, prefilled from its inventory when one has been
+    // downloaded. Without an inventory the namespaces are typed rather than ticked: the form has to
+    // stay usable exactly when the bucket is out of reach, which is the case it exists for.
+    fn open_vel_restore_view(&mut self) {
+        let Some(VelRow::Backup(b)) = self.vel_selected() else { return };
+        let (uid, namespace, backup) = (b.uid.clone(), b.namespace.clone(), b.name.clone());
+        let (namespaces, kinds) = match self.vel_contents.get(&uid) {
+            Some(store) => {
+                let s = store.lock().expect("velero contents poisoned");
+                let namespaces: Vec<(String, bool)> = s
+                    .namespaces
+                    .iter()
+                    // Cluster-scoped objects have no namespace to include or map, and velero
+                    // governs them with `includeClusterResources`, not with this list.
+                    .filter(|n| !n.namespace.is_empty())
+                    .map(|n| (n.namespace.clone(), true))
+                    .collect();
+                let mut kinds: Vec<(String, String, bool)> = Vec::new();
+                for ns in &s.namespaces {
+                    for k in &ns.kinds {
+                        if !kinds.iter().any(|(_, kind, _)| *kind == k.kind) {
+                            kinds.push((k.api_version.clone(), k.kind.clone(), true));
+                        }
+                    }
+                }
+                (namespaces, kinds)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let manual_namespaces = namespaces.is_empty();
+        self.vel_restore_view = Some(VelRestoreView {
+            namespace,
+            backup,
+            namespaces,
+            kinds,
+            manual_namespaces,
+            ns_text: String::new(),
+            target_ns: String::new(),
+            labels: String::new(),
+            overwrite: false,
+            cursor: 0,
+            editing: false,
+            armed: false,
+            typed: None,
+        });
+    }
+
+    fn vel_restore_move(&mut self, delta: i32) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if view.editing || view.armed {
+            return;
+        }
+        let len = view.rows().len();
+        if len == 0 {
+            return;
+        }
+        let cur = view.cursor as i32;
+        view.cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+    }
+
+    // Space: tick or untick the row under the cursor. On the two single-value rows it flips the
+    // choice, which is the same gesture with the same meaning.
+    fn vel_restore_toggle(&mut self) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if view.editing || view.armed {
+            return;
+        }
+        match view.rows().get(view.cursor).copied() {
+            Some(VelRoRow::Ns(i)) => {
+                if let Some(entry) = view.namespaces.get_mut(i) {
+                    entry.1 = !entry.1;
+                }
+            }
+            Some(VelRoRow::Kind(i)) => {
+                if let Some(entry) = view.kinds.get_mut(i) {
+                    entry.2 = !entry.2;
+                }
+            }
+            Some(VelRoRow::Existing) => view.overwrite = !view.overwrite,
+            _ => {}
+        }
+    }
+
+    // Enter, whatever the form is in the middle of: it declines a pending question, and otherwise
+    // opens or closes the field under the cursor. Never a yes.
+    fn vel_restore_enter(&mut self) {
+        if self.vel_restore_view.as_ref().is_some_and(|v| v.armed) {
+            self.vel_restore_cancel();
+        } else {
+            self.vel_restore_edit();
+        }
+    }
+
+    // Start typing into the row under the cursor, or accept what was typed.
+    fn vel_restore_edit(&mut self) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if view.armed {
+            return;
+        }
+        if view.editing {
+            view.editing = false;
+            return;
+        }
+        if matches!(
+            view.rows().get(view.cursor),
+            Some(VelRoRow::NsText | VelRoRow::Target | VelRoRow::Labels)
+        ) {
+            view.editing = true;
+        }
+    }
+
+    fn vel_restore_input(&mut self, c: char) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if let Some(buf) = view.typed.as_mut() {
+            buf.push(c);
+            return;
+        }
+        if !view.editing {
+            return;
+        }
+        let row = view.rows().get(view.cursor).copied();
+        // A namespace is 253 characters at most; the label field takes a few pairs. Neither is a
+        // free-form text box, and letting them grow without bound would only break the layout.
+        let field = match row {
+            Some(VelRoRow::NsText) => Some((&mut view.ns_text, 253usize * 4)),
+            Some(VelRoRow::Target) => Some((&mut view.target_ns, 253)),
+            Some(VelRoRow::Labels) => Some((&mut view.labels, 512)),
+            _ => None,
+        };
+        if let Some((buf, max)) = field {
+            if buf.chars().count() < max {
+                buf.push(c);
+            }
+        }
+    }
+
+    fn vel_restore_backspace(&mut self) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if let Some(buf) = view.typed.as_mut() {
+            buf.pop();
+            return;
+        }
+        if !view.editing {
+            return;
+        }
+        match view.rows().get(view.cursor).copied() {
+            Some(VelRoRow::NsText) => { view.ns_text.pop(); }
+            Some(VelRoRow::Target) => { view.target_ns.pop(); }
+            Some(VelRoRow::Labels) => { view.labels.pop(); }
+            _ => {}
+        }
+    }
+
+    // Esc: leave the field, back out of the confirmation, or close the form — one step at a time,
+    // the same ladder the delete and repair panels climb down.
+    fn vel_restore_cancel(&mut self) {
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if view.typed.is_some() {
+            view.typed = None;
+            view.armed = false;
+        } else if view.armed {
+            view.armed = false;
+        } else if view.editing {
+            view.editing = false;
+        } else {
+            self.vel_restore_view = None;
+        }
+    }
+
+    // `r`: arm the confirmation, answer it, or — when the overwrite policy is on — check the typed
+    // backup name first. Enter never confirms: it is the key that says no.
+    fn vel_restore_submit(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(view) = self.vel_restore_view.as_mut() else { return };
+        if view.editing {
+            return;
+        }
+        // Nothing selected is not "everything": an empty include list would silently restore the
+        // whole backup, which is the opposite of what an emptied list asks for.
+        if view.selected_namespaces().is_empty() {
+            self.clipboard_status = Some((std::time::Instant::now(), st.vel_ro_no_ns.to_string()));
+            return;
+        }
+        if !view.armed {
+            view.armed = true;
+            // Overwriting live objects is on the same footing as a deletion: the name has to be
+            // typed out, not just confirmed.
+            if view.overwrite {
+                view.typed = Some(String::new());
+            }
+            return;
+        }
+        if let Some(typed) = &view.typed {
+            if typed != &view.backup {
+                return;
+            }
+        }
+        // The kinds have to become resource names before the restore can be built, and only the API
+        // server knows the mapping. Hand the whole thing to one task rather than blocking the UI.
+        let opts_kinds: Vec<(String, String)> = view.kinds_to_resolve();
+        let base = view.options_without_resources();
+        let (namespace, backup) = (view.namespace.clone(), view.backup.clone());
+        self.vel_restore_view = None;
+
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.velero_state.clone();
+        tokio::spawn(async move {
+            let mut opts = base;
+            let mut unresolved = Vec::new();
+            if !opts_kinds.is_empty() {
+                let (resolved, missed) = resolve_resources(&client, &opts_kinds).await;
+                opts.resources = resolved;
+                unresolved = missed;
+            }
+            let write = VelWrite::Restore {
+                namespace,
+                backup: backup.clone(),
+                opts: Box::new(opts),
+            };
+            let st = lang::active();
+            let mut message = match apply_write(client.clone(), write).await {
+                Ok(name) => {
+                    let name = if name.is_empty() { backup } else { name };
+                    lang::fill(st.msg_vel_restore_started, &[("name", &name)])
+                }
+                Err(e) => lang::fill(st.msg_vel_restore_failed, &[("e", &e)]),
+            };
+            // A kind discovery could not place is left out of the restore. Saying so next to the
+            // success is the only chance the user gets to notice it did not come back.
+            if !unresolved.is_empty() {
+                message.push_str(" · ");
+                message.push_str(&lang::fill(
+                    st.vel_ro_unresolved,
+                    &[("kinds", &unresolved.join(", "))],
+                ));
+            }
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((std::time::Instant::now(), message));
+            }
+            fetch_velero(client, state).await;
+        });
     }
 
     fn vel_delete_backup(&mut self) {
@@ -7790,7 +8426,17 @@ impl App {
                 menu.input = Some(String::new());
                 return;
             }
-            Some(menu) if menu.confirm && !menu.confirming => {
+            // Opening the restore form writes nothing and decides nothing. Arming a confirmation
+            // here would put the question before any of the choices it is about — the form asks it
+            // itself, once there is something to answer.
+            Some(menu)
+                if menu.confirm
+                    && !menu.confirming
+                    && !matches!(
+                        menu.items.get(menu.cursor).map(|it| &it.action),
+                        Some(MenuAction::VelRestoreOptions)
+                    ) =>
+            {
                 menu.confirming = true;
                 return;
             }
@@ -7808,6 +8454,7 @@ impl App {
             Some(MenuAction::VelBackupNow) => self.vel_backup_now(),
             Some(MenuAction::VelPause(p)) => self.vel_set_paused(p),
             Some(MenuAction::VelRestore) => self.vel_restore(),
+            Some(MenuAction::VelRestoreOptions) => self.open_vel_restore_view(),
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
@@ -8643,6 +9290,37 @@ fn handle_event(app: &mut App, ev: Event) {
         }
         return;
     }
+    // The restore form grabs all input while open (Ctrl-C still quits). Only Ctrl-R walks towards
+    // creating the Restore — it has to be a chord for the same reason the drain's is: three of these
+    // rows are text fields, and while one has the cursor every printable key belongs to it.
+    if app.vel_restore_view.is_some() {
+        let feeding = app
+            .vel_restore_view
+            .as_ref()
+            .is_some_and(|v| v.editing || v.typed.is_some());
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => app.vel_restore_submit(),
+            (KeyCode::Backspace, _) => app.vel_restore_backspace(),
+            (KeyCode::Char(c), m) if feeding && !m.contains(KeyModifiers::CONTROL) => {
+                app.vel_restore_input(c)
+            }
+            // Enter is the answer "no" whenever something is being asked, and "type into this row"
+            // the rest of the time. It never confirms.
+            (KeyCode::Enter, _) => app.vel_restore_enter(),
+            (KeyCode::Esc, _) => app.vel_restore_cancel(),
+            (KeyCode::Up, _) => app.vel_restore_move(-1),
+            (KeyCode::Down, _) => app.vel_restore_move(1),
+            (KeyCode::PageUp, _) => app.vel_restore_move(-10),
+            (KeyCode::PageDown, _) => app.vel_restore_move(10),
+            (KeyCode::Char(' '), _) => app.vel_restore_toggle(),
+            (KeyCode::Char('k'), _) => app.vel_restore_move(-1),
+            (KeyCode::Char('j'), _) => app.vel_restore_move(1),
+            (KeyCode::Char('q'), _) => app.vel_restore_cancel(),
+            _ => {}
+        }
+        return;
+    }
     // The action menu overlay grabs all input while open (Ctrl-C still quits).
     if app.action_menu.is_some() {
         match (k.code, k.modifiers) {
@@ -9252,10 +9930,12 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('f'), _, Mode::Velero) => app.cycle_vel_filter(),
         (KeyCode::Char('o'), _, Mode::Velero) => app.open_velero_action_menu(),
         (KeyCode::Char('l'), _, Mode::Velero) => app.vel_toggle_log(),
+        (KeyCode::Char('+'), _, Mode::Velero) => app.vel_expand_contents(),
+        (KeyCode::Char('-'), _, Mode::Velero) => app.vel_collapse_contents(),
         (KeyCode::Enter, _, Mode::Velero) => app.enter_velero_full(),
         (KeyCode::F(5), _, Mode::Velero) => app.refresh_velero(),
         (KeyCode::Esc, _, Mode::Velero) => app.exit_velero_mode(),
-        (KeyCode::Char('n'), _, Mode::Velero) => app.filter_ns_to_selected(),
+        (KeyCode::Char('n'), _, Mode::Velero) => app.vel_filter_ns(),
         (KeyCode::Char('0'), _, Mode::Velero) => app.clear_namespace_filter(),
         (KeyCode::Char('i'), _, Mode::Velero) => app.enter_ai_panel(),
         (_, _, Mode::Velero) => {}
@@ -10021,6 +10701,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
                 Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_vel_fold)),
+                Span::styled(" +/- ", kbg), Span::raw(format!(" {}   ", st.k_vel_contents)),
                 footer_sep(),
                 Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
                 Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_vel_tree)),
@@ -10142,6 +10823,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.action_menu.is_some() {
         draw_action_menu_popup(f, app, area);
+    }
+    // Above the menu it was opened from, and grabbing keys ahead of it too: the draw order is the
+    // z-order, and the two have to agree.
+    if app.vel_restore_view.is_some() {
+        draw_vel_restore_view(f, app, area);
     }
     if app.secrets_copy_menu.is_some() {
         draw_secrets_copy_menu_popup(f, app, area);
@@ -10966,6 +11652,252 @@ fn draw_node_op_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 .title(title)
                 .border_style(Style::default().fg(border)),
         );
+    f.render_widget(p, popup_area);
+}
+
+// The restore form. Deliberately not wrapped: every row here is a field with a marker, a tick box
+// and a value in fixed columns, and `Wrap { trim: true }` would eat the indentation that makes the
+// three levels readable. A value too long for the popup is clipped, not reflowed.
+fn draw_vel_restore_view(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let Some(v) = app.vel_restore_view.as_ref() else { return };
+    let rows = v.rows();
+    let selected = rows.get(v.cursor).copied();
+
+    let popup_w = (area.width * 70 / 100).max(56).min(area.width);
+
+    let header = |text: &str, extra: String| {
+        let mut spans = vec![Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )];
+        if !extra.is_empty() {
+            spans.push(Span::styled(format!("  {}", extra), Style::default().fg(DIM)));
+        }
+        Line::from(spans)
+    };
+    // One selectable row: the cursor marker, then the row's own content. The highlight is the
+    // marker and the colour rather than a background bar, so a ticked box stays legible under it.
+    let field = |row: VelRoRow, content: Vec<Span<'static>>| {
+        let here = selected == Some(row);
+        // The same marker the tables use for their selected row, so "this is where you are"
+        // reads the same everywhere.
+        let mut spans = vec![Span::styled(
+            if here { "> " } else { "  " },
+            Style::default().fg(if here { Color::Cyan } else { DIM }),
+        )];
+        spans.extend(content);
+        let mut line = Line::from(spans);
+        if here {
+            line = line.style(Style::default().add_modifier(Modifier::BOLD));
+        }
+        line
+    };
+    let tick = |on: bool| {
+        Span::styled(
+            if on { "[x] " } else { "[ ] " },
+            Style::default().fg(if on { Color::Green } else { DIM }),
+        )
+    };
+    // A text field is always drawn as a field, with its expected shape shown as a placeholder when
+    // it is empty: nothing here asks for input without saying what input it wants.
+    let text_field = |value: &str, hint: &str, editing: bool| {
+        let shown = if value.is_empty() && !editing {
+            Span::styled(hint.to_string(), Style::default().fg(DIM))
+        } else {
+            Span::styled(value.to_string(), Style::default().fg(Color::White))
+        };
+        vec![
+            Span::styled("[", Style::default().fg(DIM)),
+            shown,
+            Span::styled(if editing { "▏" } else { "" }, Style::default().fg(Color::Cyan)),
+            Span::styled("]", Style::default().fg(DIM)),
+        ]
+    };
+
+    let mut body: Vec<Line> = Vec::new();
+    // Where the cursor sits in the body, so the scroll can keep it on screen.
+    let mut cursor_line = 0usize;
+
+    // --- namespaces
+    let picked = v.selected_namespaces();
+    body.push(header(
+        st.vel_ro_fld_namespaces,
+        if v.manual_namespaces {
+            st.vel_ro_no_contents.to_string()
+        } else {
+            lang::fill(
+                st.vel_ro_selected,
+                &[("n", &picked.len().to_string()), ("total", &v.namespaces.len().to_string())],
+            )
+        },
+    ));
+    if v.manual_namespaces {
+        if selected == Some(VelRoRow::NsText) {
+            cursor_line = body.len();
+        }
+        body.push(field(
+            VelRoRow::NsText,
+            text_field(&v.ns_text, st.vel_ro_ns_hint, v.editing && selected == Some(VelRoRow::NsText)),
+        ));
+    } else {
+        for (i, (ns, on)) in v.namespaces.iter().enumerate() {
+            if selected == Some(VelRoRow::Ns(i)) {
+                cursor_line = body.len();
+            }
+            body.push(field(VelRoRow::Ns(i), vec![tick(*on), Span::raw(ns.clone())]));
+        }
+    }
+
+    // --- target namespace
+    body.push(Line::from(""));
+    body.push(header(st.vel_ro_fld_target, String::new()));
+    let single = match picked.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    let target_content = match &single {
+        Some(from) => {
+            let mut spans = vec![Span::styled(format!("{} → ", from), Style::default().fg(DIM))];
+            spans.extend(text_field(
+                &v.target_ns,
+                st.vel_ro_same_ns,
+                v.editing && selected == Some(VelRoRow::Target),
+            ));
+            spans
+        }
+        // Velero maps one source namespace to one target. With several ticked there is no single
+        // source, and the field says why rather than silently doing nothing with what is typed.
+        None => vec![Span::styled(
+            st.vel_ro_target_disabled.to_string(),
+            Style::default().fg(DIM),
+        )],
+    };
+    if selected == Some(VelRoRow::Target) {
+        cursor_line = body.len();
+    }
+    body.push(field(VelRoRow::Target, target_content));
+
+    // --- kinds
+    body.push(Line::from(""));
+    let ticked_kinds = v.kinds.iter().filter(|(_, _, on)| *on).count();
+    body.push(header(
+        st.vel_ro_fld_kinds,
+        lang::fill(
+            st.vel_ro_selected,
+            &[("n", &ticked_kinds.to_string()), ("total", &v.kinds.len().to_string())],
+        ),
+    ));
+    for (i, (_, kind, on)) in v.kinds.iter().enumerate() {
+        if selected == Some(VelRoRow::Kind(i)) {
+            cursor_line = body.len();
+        }
+        body.push(field(VelRoRow::Kind(i), vec![tick(*on), Span::raw(kind.clone())]));
+    }
+
+    // --- labels
+    body.push(Line::from(""));
+    body.push(header(st.vel_ro_fld_labels, String::new()));
+    if selected == Some(VelRoRow::Labels) {
+        cursor_line = body.len();
+    }
+    body.push(field(
+        VelRoRow::Labels,
+        text_field(&v.labels, st.vel_ro_labels_hint, v.editing && selected == Some(VelRoRow::Labels)),
+    ));
+
+    // --- existing objects
+    body.push(Line::from(""));
+    body.push(header(st.vel_ro_fld_existing, String::new()));
+    if selected == Some(VelRoRow::Existing) {
+        cursor_line = body.len();
+    }
+    body.push(field(
+        VelRoRow::Existing,
+        vec![if v.overwrite {
+            Span::styled(st.vel_ro_existing_update.to_string(), Style::default().fg(Color::Red))
+        } else {
+            Span::styled(st.vel_ro_existing_skip.to_string(), Style::default().fg(Color::Green))
+        }],
+    ));
+
+    // --- preview, built by the very function that will build the write
+    body.push(Line::from(""));
+    body.push(header(st.vel_ro_preview, String::new()));
+    let (_, doc) = restore_from_backup(&v.namespace, &v.backup, &v.preview_options(), 0);
+    let spec = serde_json::to_string_pretty(&doc["spec"]).unwrap_or_default();
+    for l in spec.lines() {
+        body.push(Line::from(Span::styled(
+            format!("  {}", l),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+
+    let head: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", st.vel_lbl_backup), Style::default().fg(DIM)),
+            Span::styled(
+                v.backup.clone(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let mut tail: Vec<Line> = vec![Line::from("")];
+    let (prompt, color) = match (&v.typed, v.armed, v.editing) {
+        (Some(buf), _, _) => {
+            let mut p = lang::fill(st.vel_ro_confirm_overwrite, &[("name", &v.backup)]);
+            p.push_str(&format!("  [{}▏]", buf));
+            (p, Color::Red)
+        }
+        (None, true, _) => (st.vel_ro_confirm.to_string(), Color::Yellow),
+        (None, false, true) => (st.vel_ro_help_edit.to_string(), Color::Cyan),
+        (None, false, false) => (st.vel_ro_help.to_string(), DIM),
+    };
+    tail.push(Line::from(Span::styled(
+        prompt,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+
+    // The body scrolls; the head and the prompt never do. A form whose prompt scrolls off is a form
+    // that cannot be answered.
+    // As tall as the form needs up to 28 rows, and never taller than the screen — no `clamp` with a
+    // floor here: a floor above `area.height` would draw the popup off the bottom of a short window.
+    let popup_h = area.height.min(28);
+    let budget = (popup_h as usize).saturating_sub(2 + head.len() + tail.len());
+    let scroll = if body.len() <= budget {
+        0
+    } else {
+        // Keep the row under the cursor on screen, with a little of what surrounds it.
+        cursor_line
+            .saturating_sub(budget / 2)
+            .min(body.len() - budget)
+    };
+    let visible: Vec<Line> = body.into_iter().skip(scroll).take(budget.max(1)).collect();
+    let lines: Vec<Line> = head.into_iter().chain(visible).chain(tail).collect();
+
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+    let border = if app.vel_restore_view.as_ref().is_some_and(|v| v.typed.is_some()) {
+        Color::Red
+    } else if app.vel_restore_view.as_ref().is_some_and(|v| v.armed) {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let backup = app
+        .vel_restore_view
+        .as_ref()
+        .map(|v| v.backup.clone())
+        .unwrap_or_default();
+    let title = lang::fill(st.vel_ro_title, &[("backup", &backup)]);
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(border)),
+    );
     f.render_widget(p, popup_area);
 }
 
@@ -13388,6 +14320,98 @@ fn synthetic_vel_backup_record(b: &VelBackup, st: &'static Strings) -> EventReco
     )
 }
 
+// The two grouping levels of a backup's contents. Like the orphan header they stand for no object,
+// so they carry no kind and `y`, `e` and `Ctrl-D` correctly find nothing to act on. The uid keeps
+// the backup in it: two backups holding the same namespace are two different rows.
+fn synthetic_vel_ct_ns_record(
+    backup_uid: &str,
+    ns: &crate::velero::VelNsContent,
+    st: &'static Strings,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("ct|{}|{}", backup_uid, ns.namespace),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Contents".to_string(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: vel_ct_ns_label(&ns.namespace, st),
+        name: String::new(),
+        message: vel_ct_counts(ns.objects(), ns.kinds.len(), st),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_vel_ct_kind_record(
+    backup_uid: &str,
+    namespace: &str,
+    k: &crate::velero::VelKindContent,
+    st: &'static Strings,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("ct|{}|{}|{}", backup_uid, namespace, k.kind),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Contents".to_string(),
+        api_version: String::new(),
+        // No kind, on purpose: this row is a heading over N objects, not one of them.
+        kind: String::new(),
+        namespace: vel_ct_ns_label(namespace, st),
+        name: k.kind.clone(),
+        message: st.plural(k.names.len(), st.vel_ct_objects_one, st.vel_ct_objects_many),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// One captured object. This one *does* carry its real GVK, so `y` opens it live — which is the
+// question one actually asks in front of a backup: does this still exist, and does it still look
+// like what was captured? The same contract as the Flux inventory rows, with the same consequence:
+// the gestures that write reach the live object, not the copy in the bucket.
+fn synthetic_vel_ct_object_record(
+    k: &crate::velero::VelKindContent,
+    namespace: &str,
+    name: &str,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("cto|{}|{}|{}/{}", k.api_version, k.kind, namespace, name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Captured".to_string(),
+        api_version: k.api_version.clone(),
+        kind: k.kind.clone(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message: format!("{} {}", k.kind, name),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// "54 objects · 18 kinds", both counts pluralised — a namespace holding one of each would otherwise
+// read as "1 objects · 1 kinds".
+fn vel_ct_counts(objects: usize, kinds: usize, st: &'static Strings) -> String {
+    format!(
+        "{} · {}",
+        st.plural(objects, st.vel_ct_objects_one, st.vel_ct_objects_many),
+        st.plural(kinds, st.vel_ct_kinds_one, st.vel_ct_kinds_many),
+    )
+}
+
+// Cluster-scoped objects have no namespace; the empty string that marks them would render as a
+// blank cell that reads like missing data.
+fn vel_ct_ns_label(namespace: &str, st: &'static Strings) -> String {
+    if namespace.is_empty() {
+        st.vel_ct_cluster_scoped.to_string()
+    } else {
+        namespace.to_string()
+    }
+}
+
 // The parent row of the backups no schedule claims. It stands for no object, so it carries no kind:
 // `y`, `e` and `Ctrl-D` correctly find nothing to act on.
 fn synthetic_vel_orphans_record(n: usize, st: &'static Strings) -> EventRecord {
@@ -13561,7 +14585,7 @@ fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     // Children are indented only when the grouping actually nests them.
     let grouped = app.vel_group && app.vel_world == VelWorld::Backups;
-    let names = vel_row_names(&app.vel_rows, grouped, st);
+    let names = vel_row_names(&app.vel_rows, grouped, &app.vel_ct_expanded, st);
     let alert = |hints: &[crate::storage::Hint]| match hints.first() {
         None => Cell::from(""),
         Some(h) => Cell::from(h.text.clone())
@@ -13684,6 +14708,44 @@ fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     blank(),
                     blank(),
                 ]),
+                // Contents rows say what the backup holds, not how anything is doing: no phase, no
+                // expiry, no alert. The NAMESPACE column stays empty on all three — it names the
+                // velero object's namespace everywhere else in this table, and a captured namespace
+                // put there would read as the same thing when it is not.
+                VelRow::CtNs { namespace, objects, kinds, .. } => Row::new(vec![
+                    blank(),
+                    Cell::from(name.clone())
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Cell::from(if namespace.is_empty() { "Cluster" } else { "Namespace" })
+                        .style(Style::default().fg(DIM)),
+                    blank(),
+                    Cell::from(vel_ct_counts(*objects, *kinds, st))
+                        .style(Style::default().fg(DIM)),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
+                VelRow::CtKind { objects, .. } => Row::new(vec![
+                    blank(),
+                    Cell::from(name.clone()).style(Style::default().fg(DIM)),
+                    blank(),
+                    blank(),
+                    Cell::from(st.plural(*objects, st.vel_ct_objects_one, st.vel_ct_objects_many))
+                        .style(Style::default().fg(DIM)),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
+                VelRow::CtObject { kind, .. } => Row::new(vec![
+                    blank(),
+                    Cell::from(name.clone()),
+                    Cell::from(kind.clone()).style(Style::default().fg(DIM)),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
             }
         })
         .collect();
@@ -13698,7 +14760,10 @@ fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             VelRow::Location(l) => l.namespace.clone(),
             VelRow::SnapLocation(l) => l.namespace.clone(),
             VelRow::Repo(r) => r.namespace.clone(),
-            VelRow::Orphans => String::new(),
+            VelRow::Orphans
+            | VelRow::CtNs { .. }
+            | VelRow::CtKind { .. }
+            | VelRow::CtObject { .. } => String::new(),
         })
         .collect();
     let ns_w = col_width(ns_values.iter().map(|s| s.as_str()), "NAMESPACE", 9, 20);
@@ -13721,18 +14786,35 @@ fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 // The name column as it is actually drawn — marker and indent included, because measuring the bare
 // names would size the column two characters short and clip every parent row.
-fn vel_row_names(rows: &[VelRow], grouped: bool, st: &'static Strings) -> Vec<String> {
+fn vel_row_names(
+    rows: &[VelRow],
+    grouped: bool,
+    expanded: &std::collections::HashSet<String>,
+    st: &'static Strings,
+) -> Vec<String> {
     let indent = if grouped { "    " } else { "" };
+    // The marker a foldable row wears. Every backup gets one before anything has been downloaded:
+    // it is what says `+` has something to do here, on a row that otherwise looks like a leaf.
+    let marker = |row: &VelRow| match row.contents_key() {
+        Some(key) if expanded.contains(&key) => "▾ ",
+        Some(_) => "▸ ",
+        None => "",
+    };
     rows.iter()
         .map(|r| match r {
             VelRow::Schedule(s) if grouped => format!("▾ {}", s.name),
             VelRow::Schedule(s) => s.name.clone(),
-            VelRow::Backup(b) => format!("{}{}", indent, b.name),
+            VelRow::Backup(b) => format!("{}{}{}", indent, marker(r), b.name),
             VelRow::Restore(r) => r.name.clone(),
             VelRow::Location(l) => l.name.clone(),
             VelRow::SnapLocation(l) => l.name.clone(),
             VelRow::Repo(r) => r.name.clone(),
             VelRow::Orphans => format!("▾ {}", st.vel_orphan_backups),
+            VelRow::CtNs { namespace, .. } => {
+                format!("{}  {}{}", indent, marker(r), vel_ct_ns_label(namespace, st))
+            }
+            VelRow::CtKind { kind, .. } => format!("{}    {}{}", indent, marker(r), kind),
+            VelRow::CtObject { name, .. } => format!("{}      {}", indent, name),
         })
         .collect()
 }
@@ -13880,6 +14962,7 @@ fn velero_detail_lines(
             lines.push(label(st.vel_lbl_scope, scope(&b.included_ns, &b.excluded_ns)));
             lines.push(label(st.vel_lbl_location, dash(&b.storage_location)));
             lines.push(label(st.vel_lbl_restores, b.restores.to_string()));
+            lines.push(label(st.vel_ct_lbl_contents, vel_contents_summary(app, &b.uid, st)));
             // The per-volume failures, verbatim: they carry the one message that says which volume
             // did not make it, which the backup's own failureReason never does.
             if !b.pvb_failed.is_empty() {
@@ -13959,6 +15042,31 @@ fn velero_detail_lines(
             own_hints = Vec::new();
             format!(" {} ", st.vel_orphan_backups)
         }
+        // Contents rows describe what was captured, and nothing about the cluster's current state —
+        // there are no hints to draw, because no rule here has anything to say about a tarball.
+        VelRow::CtNs { backup_uid, namespace, objects, kinds } => {
+            own_hints = Vec::new();
+            lines.push(label(st.vel_ct_lbl_contents, vel_ct_counts(*objects, *kinds, st)));
+            lines.push(label(st.vel_lbl_backup, vel_backup_of_uid(backup_uid).to_string()));
+            format!(" {} ", vel_ct_ns_label(namespace, st))
+        }
+        VelRow::CtKind { backup_uid, namespace, kind, objects } => {
+            own_hints = Vec::new();
+            lines.push(label(
+                st.vel_ct_lbl_contents,
+                st.plural(*objects, st.vel_ct_objects_one, st.vel_ct_objects_many),
+            ));
+            lines.push(label(st.vel_lbl_scope, vel_ct_ns_label(namespace, st)));
+            lines.push(label(st.vel_lbl_backup, vel_backup_of_uid(backup_uid).to_string()));
+            format!(" {} ", kind)
+        }
+        VelRow::CtObject { api_version, kind, namespace, name } => {
+            own_hints = Vec::new();
+            lines.push(label(st.vel_lbl_scope, vel_ct_ns_label(namespace, st)));
+            lines.push(label("apiVersion", api_version.clone()));
+            lines.push(label("kind", kind.clone()));
+            format!(" {} ", name)
+        }
     };
 
     lines.push(Line::from(""));
@@ -13993,6 +15101,40 @@ fn velero_detail_lines(
     push_storage_hints(&mut lines, st.lbl_cluster, cluster_hints);
     push_velero_log(app, &mut lines, st);
     Some((title, lines))
+}
+
+// Where the backup's inventory stands, as one line of the detail panel. Nothing has been asked for
+// yet, it is downloading, it failed, or it is there — and a failure says so in full rather than
+// collapsing to a count of zero, which would read as a backup that captured nothing.
+fn vel_contents_summary(app: &App, backup_uid: &str, st: &'static Strings) -> String {
+    let Some(store) = app.vel_contents.get(backup_uid) else {
+        return st.vel_ct_not_loaded.to_string();
+    };
+    let s = store.lock().expect("velero contents poisoned");
+    if s.key.is_empty() {
+        return st.vel_ct_not_loaded.to_string();
+    }
+    if s.loading {
+        return st.vel_ct_loading.to_string();
+    }
+    if let Some(e) = &s.error {
+        return e.clone();
+    }
+    if s.total == 0 {
+        return st.vel_ct_empty.to_string();
+    }
+    format!(
+        "{} · {}",
+        st.plural(s.total, st.vel_ct_objects_one, st.vel_ct_objects_many),
+        st.plural(s.namespaces.len(), st.vel_ct_summary_one, st.vel_ct_summary_many),
+    )
+}
+
+// The backup a contents row hangs from, read back out of the row uid (`vel|backup|ns/name`). The
+// rows carry the uid rather than the name so two same-named backups in different namespaces stay
+// apart; the panel wants the readable half.
+fn vel_backup_of_uid(uid: &str) -> &str {
+    uid.rsplit('/').next().unwrap_or(uid)
 }
 
 // The run log, when one has been asked for on this row. Appended to the panel rather than given a
@@ -20443,6 +21585,156 @@ mod palette_tests {
         // `backupstoragelocation` starts with `backup`, which is velero's exact alias; the exact
         // match still has to win for the shorter word and the longer one must reach the locations.
         assert_eq!(resolve_command("backupstoragelocation"), Some("bsl"));
+    }
+}
+
+#[cfg(test)]
+mod velero_view_tests {
+    use super::*;
+
+    fn backup(name: &str) -> VelRow {
+        VelRow::Backup(Box::new(VelBackup {
+            uid: format!("vel|backup|velero/{}", name),
+            namespace: "velero".to_string(),
+            name: name.to_string(),
+            ..VelBackup::default()
+        }))
+    }
+
+    fn ct_ns(uid: &str, ns: &str) -> VelRow {
+        VelRow::CtNs {
+            backup_uid: uid.to_string(),
+            namespace: ns.to_string(),
+            objects: 1,
+            kinds: 1,
+        }
+    }
+
+    fn ct_object(ns: &str, name: &str) -> VelRow {
+        VelRow::CtObject {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: ns.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_matched_object_keeps_the_rows_it_hangs_from() {
+        // `/nginx` matching a ConfigMap deep inside a backup must not leave it floating: without the
+        // namespace and the backup above it, the match names an object and says nothing about where
+        // it came from — which is the only reason one was looking.
+        let uid = "vel|backup|velero/daily-1";
+        let rows = vec![
+            backup("daily-1"),
+            ct_ns(uid, "prod"),
+            VelRow::CtKind {
+                backup_uid: uid.to_string(),
+                namespace: "prod".to_string(),
+                kind: "ConfigMap".to_string(),
+                objects: 2,
+            },
+            ct_object("prod", "nginx-conf"),
+            ct_object("prod", "other"),
+        ];
+        let mut keep = vec![false, false, false, true, false];
+        vel_keep_ancestors(&rows, &mut keep);
+        assert_eq!(keep, vec![true, true, true, true, false]);
+    }
+
+    #[test]
+    fn a_folded_branch_is_not_an_ancestor_of_the_next_one() {
+        // Two backups side by side: a match under the second must not drag the first one's namespace
+        // back on screen just because it was the most recent row at that depth.
+        let (a, b) = ("vel|backup|velero/a", "vel|backup|velero/b");
+        let rows = vec![
+            backup("a"),
+            ct_ns(a, "prod"),
+            backup("b"),
+            ct_ns(b, "staging"),
+        ];
+        let mut keep = vec![false, false, false, true];
+        vel_keep_ancestors(&rows, &mut keep);
+        assert_eq!(keep, vec![false, false, true, true]);
+    }
+
+    fn form(namespaces: &[(&str, bool)], kinds: &[(&str, bool)]) -> VelRestoreView {
+        VelRestoreView {
+            namespace: "velero".to_string(),
+            backup: "daily-1".to_string(),
+            namespaces: namespaces.iter().map(|(n, on)| (n.to_string(), *on)).collect(),
+            kinds: kinds
+                .iter()
+                .map(|(k, on)| ("v1".to_string(), k.to_string(), *on))
+                .collect(),
+            manual_namespaces: false,
+            ns_text: String::new(),
+            target_ns: String::new(),
+            labels: String::new(),
+            overwrite: false,
+            cursor: 0,
+            editing: false,
+            armed: false,
+            typed: None,
+        }
+    }
+
+    #[test]
+    fn a_target_namespace_needs_exactly_one_source() {
+        // Velero maps namespace by namespace. With two sources ticked there is no single source to
+        // map from, and quietly mapping one of them would send half the restore somewhere the user
+        // never asked for.
+        let mut v = form(&[("prod", true), ("staging", true)], &[]);
+        v.target_ns = "restore-here".to_string();
+        assert_eq!(v.options_without_resources().namespace_mapping, None);
+
+        v.namespaces[1].1 = false;
+        assert_eq!(
+            v.options_without_resources().namespace_mapping,
+            Some(("prod".to_string(), "restore-here".to_string()))
+        );
+        // Mapping a namespace onto itself is what velero does by default; saying it twice adds
+        // nothing to the spec.
+        v.target_ns = "prod".to_string();
+        assert_eq!(v.options_without_resources().namespace_mapping, None);
+    }
+
+    #[test]
+    fn every_kind_ticked_means_no_kind_filter() {
+        // An `includedResources` listing every kind of the backup is not the same spec as no filter
+        // at all: it also excludes anything the inventory did not mention, which for a backup still
+        // running is a moving target.
+        let v = form(&[("prod", true)], &[("ConfigMap", true), ("Secret", true)]);
+        assert!(v.kinds_to_resolve().is_empty());
+
+        let v = form(&[("prod", true)], &[("ConfigMap", true), ("Secret", false)]);
+        assert_eq!(
+            v.kinds_to_resolve(),
+            vec![("v1".to_string(), "ConfigMap".to_string())]
+        );
+    }
+
+    #[test]
+    fn typed_namespaces_are_split_and_trimmed() {
+        // The fallback path, used exactly when the inventory could not be downloaded — which on an
+        // in-cluster MinIO is the common case, not the exotic one.
+        let mut v = form(&[], &[]);
+        v.manual_namespaces = true;
+        v.ns_text = " prod , , staging ".to_string();
+        assert_eq!(v.selected_namespaces(), vec!["prod", "staging"]);
+    }
+
+    #[test]
+    fn a_label_selector_ignores_what_is_not_a_pair() {
+        let mut v = form(&[("prod", true)], &[]);
+        v.labels = "app=web, broken ,tier=front,=novalue".to_string();
+        assert_eq!(
+            v.parsed_labels(),
+            vec![
+                ("app".to_string(), "web".to_string()),
+                ("tier".to_string(), "front".to_string())
+            ]
+        );
     }
 }
 

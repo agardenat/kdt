@@ -1935,15 +1935,28 @@ pub async fn fetch_run_log(
     };
 }
 
-// Ask velero for a pre-signed URL, then read what is behind it. The request object is removed
-// afterwards: velero garbage-collects them on expiry, but leaving one per keypress would litter the
-// namespace for the ten minutes each URL lives.
 async fn download_run_log(
     client: &Client,
     namespace: &str,
     target: &str,
     name: &str,
 ) -> Result<String, String> {
+    download_target(client, namespace, target, name).await.map(|b| gunzip(&b))
+}
+
+// Ask velero for a pre-signed URL, then read what is behind it. The request object is removed
+// afterwards: velero garbage-collects them on expiry, but leaving one per keypress would litter the
+// namespace for the ten minutes each URL lives.
+//
+// `target` is one of the `DownloadTargetKind` values: `BackupLog` and `RestoreLog` for the run logs,
+// `BackupResourceList` for the inventory. The bytes come back raw because they are not all text —
+// the caller decides between `gunzip` and a JSON parse.
+async fn download_target(
+    client: &Client,
+    namespace: &str,
+    target: &str,
+    name: &str,
+) -> Result<Vec<u8>, String> {
     let st = crate::lang::active();
     let api = crate::yaml::dynamic_api(client, API_V1, "DownloadRequest", namespace).await?;
     let body = json!({
@@ -1988,7 +2001,7 @@ async fn download_run_log(
         return Err(fill(st.vel_log_http, &[("code", resp.status().as_str())]));
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    Ok(gunzip(&bytes))
+    Ok(bytes.to_vec())
 }
 
 // Everything velero serves this way is gzipped — but a proxy or a future target that is not would
@@ -2047,6 +2060,168 @@ async fn server_log(client: &Client, namespace: &str, name: &str) -> Result<Vec<
     Ok(hits)
 }
 
+// --- Contents -----------------------------------------------------------------------------------
+
+// What a backup actually captured, as velero wrote it next to the tarball. The `Backup` object only
+// ever gives a count (`items 2431 / 2431`); this is the one place that says *which* 2431 — and
+// therefore the only way to decide what is worth restoring before restoring it.
+//
+// Velero serves it as `BackupResourceList`, a gzipped `map[string][]string` keyed by
+// `group/version/Kind` and holding `namespace/name` (or a bare `name` for cluster-scoped objects).
+#[derive(Default, Debug, Clone)]
+pub struct VelContents {
+    // "ns/backup" of the backup this belongs to. Same anti-race rule as `VelLog`: a result whose key
+    // no longer matches is dropped rather than shown under another backup.
+    pub key: String,
+    pub namespaces: Vec<VelNsContent>,
+    pub total: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+// One namespace of the backup. `namespace` is empty for the cluster-scoped objects — an empty string
+// cannot collide with a real namespace, which a reserved name like "cluster-wide" could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VelNsContent {
+    pub namespace: String,
+    pub kinds: Vec<VelKindContent>,
+}
+
+impl VelNsContent {
+    pub fn objects(&self) -> usize {
+        self.kinds.iter().map(|k| k.names.len()).sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VelKindContent {
+    pub api_version: String,
+    pub kind: String,
+    pub names: Vec<String>,
+}
+
+pub type SharedVelContents = Arc<Mutex<VelContents>>;
+
+pub fn new_vel_contents() -> SharedVelContents {
+    Arc::new(Mutex::new(VelContents::default()))
+}
+
+// Fetch the inventory of one backup.
+//
+// Unlike the run log there is **no fallback**: the list exists only in object storage, and the
+// controller's log never held it. So a failure here is reported as a failure and nothing else — an
+// unreachable bucket must never render as a backup that captured nothing.
+//
+// `s3_url` is the location's endpoint, used only to name the usual cause: velero signs the URL
+// against the address *the cluster* uses, so an in-cluster MinIO produces a hostname that does not
+// resolve from a laptop, and the raw connection error says nothing about why.
+pub async fn fetch_contents(
+    client: Client,
+    namespace: String,
+    backup: String,
+    s3_url: Option<String>,
+    state: SharedVelContents,
+) {
+    let st = crate::lang::active();
+    let key = format!("{}/{}", namespace, backup);
+    {
+        let mut s = state.lock().expect("velero contents poisoned");
+        *s = VelContents { key: key.clone(), loading: true, ..VelContents::default() };
+    }
+
+    let outcome = match download_target(&client, &namespace, "BackupResourceList", &backup).await {
+        Ok(bytes) => parse_resource_list(&gunzip(&bytes)),
+        Err(e) => Err(match s3_url.as_deref() {
+            Some(url) if internal_endpoint(url) => {
+                fill(st.vel_ct_internal_endpoint, &[("e", &e), ("url", url)])
+            }
+            _ => e,
+        }),
+    };
+
+    let mut s = state.lock().expect("velero contents poisoned");
+    // A selection that moved on while this was in flight owns the panel now.
+    if s.key != key {
+        return;
+    }
+    s.loading = false;
+    match outcome {
+        Ok(namespaces) => {
+            s.total = namespaces.iter().map(|n| n.objects()).sum();
+            s.namespaces = namespaces;
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
+
+// Turn the `BackupResourceList` document into the tree the view walks. Pure, so the shapes velero
+// emits can be pinned down in tests without a cluster.
+pub fn parse_resource_list(raw: &str) -> Result<Vec<VelNsContent>, String> {
+    let st = crate::lang::active();
+    let doc: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let Some(map) = doc.as_object() else {
+        return Err(st.vel_ct_bad_json.to_string());
+    };
+
+    // namespace -> (api_version, kind) -> names
+    let mut by_ns: HashMap<String, HashMap<(String, String), Vec<String>>> = HashMap::new();
+    for (gvk, entries) in map {
+        let (api_version, kind) = split_gvk(gvk);
+        let Some(entries) = entries.as_array() else { continue };
+        for entry in entries {
+            let Some(entry) = entry.as_str() else { continue };
+            // A namespaced object is `ns/name`; a cluster-scoped one is a bare name. Object names
+            // never contain a slash, so the split is unambiguous.
+            let (ns, name) = match entry.split_once('/') {
+                Some((ns, name)) => (ns.to_string(), name.to_string()),
+                None => (String::new(), entry.to_string()),
+            };
+            by_ns.entry(ns)
+                .or_default()
+                .entry((api_version.clone(), kind.clone()))
+                .or_default()
+                .push(name);
+        }
+    }
+
+    let mut out: Vec<VelNsContent> = by_ns
+        .into_iter()
+        .map(|(namespace, kinds)| {
+            let mut kinds: Vec<VelKindContent> = kinds
+                .into_iter()
+                .map(|((api_version, kind), mut names)| {
+                    names.sort();
+                    VelKindContent { api_version, kind, names }
+                })
+                .collect();
+            kinds.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.api_version.cmp(&b.api_version)));
+            VelNsContent { namespace, kinds }
+        })
+        .collect();
+    // Alphabetical, with the cluster-scoped group last: it is the one nobody goes looking for first.
+    out.sort_by(|a, b| match (a.namespace.is_empty(), b.namespace.is_empty()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => a.namespace.cmp(&b.namespace),
+    });
+    Ok(out)
+}
+
+// `group/version/Kind` -> (apiVersion, Kind). Core objects come as `v1/Pod`, and a key velero wrote
+// without a version at all still yields a usable Kind rather than being dropped.
+fn split_gvk(gvk: &str) -> (String, String) {
+    let parts: Vec<&str> = gvk.split('/').collect();
+    match parts.as_slice() {
+        [group, version, kind] => (format!("{}/{}", group, version), kind.to_string()),
+        [version, kind] => (version.to_string(), kind.to_string()),
+        [kind] => ("v1".to_string(), kind.to_string()),
+        _ => (
+            parts[..parts.len() - 1].join("/"),
+            parts.last().copied().unwrap_or_default().to_string(),
+        ),
+    }
+}
+
 // --- Writes -------------------------------------------------------------------------------------
 
 // The four operations the view offers, each reproducing what the `velero` CLI does rather than
@@ -2059,10 +2234,11 @@ pub enum VelWrite {
     BackupNow(Box<VelSchedule>),
     // `spec.paused`. The controller stops creating backups; nothing existing is touched.
     Pause { namespace: String, name: String, paused: bool },
-    // `velero restore create --from-backup`. With no `existingResourcePolicy` velero *skips* the
-    // objects that already exist rather than overwriting them, which is what makes this recoverable
-    // — the panel says so, because the assumption otherwise runs the other way.
-    Restore { namespace: String, backup: String },
+    // `velero restore create --from-backup`, with whatever the restore form narrowed it to. Left at
+    // its default it restores everything into the namespaces it came from, and *skips* the objects
+    // that already exist rather than overwriting them — which is what makes it recoverable, and what
+    // `RestoreOptions::overwrite_existing` gives up.
+    Restore { namespace: String, backup: String, opts: Box<RestoreOptions> },
     // A `DeleteBackupRequest`, and not a delete of the Backup object.
     //
     // Deleting the object deletes nothing: the data stays in object storage, and the backup-sync
@@ -2079,7 +2255,7 @@ impl VelWrite {
         match self {
             VelWrite::BackupNow(s) => format!("{}/{}", s.namespace, s.name),
             VelWrite::Pause { namespace, name, .. } => format!("{}/{}", namespace, name),
-            VelWrite::Restore { namespace, backup } => format!("{}/{}", namespace, backup),
+            VelWrite::Restore { namespace, backup, .. } => format!("{}/{}", namespace, backup),
             VelWrite::DeleteBackup { namespace, backup, .. } => format!("{}/{}", namespace, backup),
         }
     }
@@ -2139,17 +2315,101 @@ fn to_object(pairs: &[(String, String)]) -> Value {
     Value::Object(pairs.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
 }
 
-pub fn restore_from_backup(namespace: &str, backup: &str, now: i64) -> (String, Value) {
+// How the restore form narrows a restore. Every field is a *narrowing*: left empty it does not
+// appear in the spec at all, so `RestoreOptions::default()` produces exactly the whole-backup
+// restore the view has always offered.
+//
+// Note what is deliberately absent — a list of object names. Velero has no such field: a restore
+// selects by namespace, by resource and by label, never by name. Offering a per-object tick box
+// would be a promise the API cannot keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreOptions {
+    // `includedNamespaces`. Empty means every namespace the backup holds.
+    pub namespaces: Vec<String>,
+    // `namespaceMapping`, source -> target: restore somewhere other than where it came from. Velero
+    // creates the target namespace if it does not exist.
+    pub namespace_mapping: Option<(String, String)>,
+    // `includedResources`, already resolved to the `plural.group` form velero expects — see
+    // [`resolve_resources`]. Empty means every kind.
+    pub resources: Vec<String>,
+    // `labelSelector.matchLabels`.
+    pub label_selector: Vec<(String, String)>,
+    // `existingResourcePolicy: update`. The only setting here that destroys anything: it overwrites
+    // live objects instead of stepping around them.
+    pub overwrite_existing: bool,
+}
+
+pub fn restore_from_backup(
+    namespace: &str,
+    backup: &str,
+    opts: &RestoreOptions,
+    now: i64,
+) -> (String, Value) {
     let name = timestamped_name(backup, now);
+    let mut spec = json!({ "backupName": backup });
+    let map = spec.as_object_mut().expect("restore spec is an object");
+    if !opts.namespaces.is_empty() {
+        map.insert("includedNamespaces".to_string(), json!(opts.namespaces));
+    }
+    if let Some((from, to)) = &opts.namespace_mapping {
+        map.insert("namespaceMapping".to_string(), json!({ from: to }));
+    }
+    if !opts.resources.is_empty() {
+        map.insert("includedResources".to_string(), json!(opts.resources));
+    }
+    if !opts.label_selector.is_empty() {
+        map.insert(
+            "labelSelector".to_string(),
+            json!({ "matchLabels": to_object(&opts.label_selector) }),
+        );
+    }
+    // `none` is what velero does when the field is absent, so only the other value is ever written:
+    // spelling out the default would suggest a choice was made where none was.
+    if opts.overwrite_existing {
+        map.insert("existingResourcePolicy".to_string(), json!("update"));
+    }
     (
         name.clone(),
         json!({
             "apiVersion": API_V1,
             "kind": "Restore",
             "metadata": { "name": name, "namespace": namespace },
-            "spec": { "backupName": backup },
+            "spec": spec,
         }),
     )
+}
+
+// Turn the Kinds the inventory shows into the resource names `includedResources` matches on.
+//
+// The two are not the same string and the mapping cannot be computed: `Endpoints` is `endpoints`,
+// `NetworkPolicy` is `networkpolicies`, `Ingress` is `ingresses`. Only the API server knows, so it
+// is asked — the same discovery the YAML and edit flows already go through.
+//
+// Returns the resolved names and, separately, the Kinds discovery could not place: a CRD deleted
+// since the backup was taken resolves to nothing, and dropping it silently would quietly leave its
+// objects out of a restore the user asked for.
+pub async fn resolve_resources(
+    client: &Client,
+    kinds: &[(String, String)],
+) -> (Vec<String>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for (api_version, kind) in kinds {
+        match crate::yaml::dynamic_resource(client, api_version, kind, "default").await {
+            Ok((_, ar)) => {
+                let name = if ar.group.is_empty() {
+                    ar.plural.clone()
+                } else {
+                    format!("{}.{}", ar.plural, ar.group)
+                };
+                if !resolved.contains(&name) {
+                    resolved.push(name);
+                }
+            }
+            Err(_) => unresolved.push(kind.clone()),
+        }
+    }
+    (resolved, unresolved)
 }
 
 // `velero backup delete`: a request with a generated name, carrying both the backup's name and its
@@ -2177,8 +2437,8 @@ pub async fn apply_write(client: Client, write: VelWrite) -> Result<String, Stri
             create(&client, "Backup", &s.namespace, body).await?;
             Ok(name)
         }
-        VelWrite::Restore { namespace, backup } => {
-            let (name, body) = restore_from_backup(&namespace, &backup, now);
+        VelWrite::Restore { namespace, backup, opts } => {
+            let (name, body) = restore_from_backup(&namespace, &backup, &opts, now);
             create(&client, "Restore", &namespace, body).await?;
             Ok(name)
         }
@@ -2547,5 +2807,100 @@ mod tests {
         assert_eq!(parse_go_duration("90m"), Some(5400));
         assert_eq!(parse_go_duration("1h30m"), Some(5400));
         assert_eq!(parse_go_duration("nope"), None);
+    }
+
+
+
+    // --- Contents -------------------------------------------------------------------------------
+
+    const RESOURCE_LIST: &str = r#"{
+        "v1/ConfigMap": ["prod/app-config", "monitoring/grafana"],
+        "v1/Pod": ["prod/api-7d9f", "prod/api-5c2a"],
+        "apps/v1/Deployment": ["prod/api"],
+        "v1/Namespace": ["prod", "monitoring"],
+        "rbac.authorization.k8s.io/v1/ClusterRole": ["view"]
+    }"#;
+
+    #[test]
+    fn the_resource_list_groups_by_namespace() {
+        let out = parse_resource_list(RESOURCE_LIST).expect("parses");
+        // Namespaces alphabetically, cluster-scoped last — it is the group nobody looks for first.
+        let names: Vec<&str> = out.iter().map(|n| n.namespace.as_str()).collect();
+        assert_eq!(names, vec!["monitoring", "prod", ""]);
+
+        let prod = &out[1];
+        assert_eq!(prod.objects(), 4);
+        let kinds: Vec<&str> = prod.kinds.iter().map(|k| k.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["ConfigMap", "Deployment", "Pod"]);
+        // The apiVersion has to survive the grouping: it is what lets `y` open the live object.
+        let dep = prod.kinds.iter().find(|k| k.kind == "Deployment").expect("Deployment");
+        assert_eq!(dep.api_version, "apps/v1");
+        let cm = prod.kinds.iter().find(|k| k.kind == "ConfigMap").expect("ConfigMap");
+        assert_eq!(cm.api_version, "v1");
+    }
+
+    #[test]
+    fn a_bare_name_is_a_cluster_scoped_object() {
+        // Velero writes `ns/name` for a namespaced object and the bare name for a cluster-scoped
+        // one. Reading a ClusterRole as a namespace called "view" would invent a namespace that
+        // never existed — and offer it in the restore form.
+        let out = parse_resource_list(RESOURCE_LIST).expect("parses");
+        let cluster = out.last().expect("a cluster-scoped group");
+        assert_eq!(cluster.namespace, "");
+        assert_eq!(cluster.kinds.len(), 2);
+        let cr = cluster.kinds.iter().find(|k| k.kind == "ClusterRole").expect("ClusterRole");
+        assert_eq!(cr.names, vec!["view"]);
+        assert_eq!(cr.api_version, "rbac.authorization.k8s.io/v1");
+    }
+
+    #[test]
+    fn an_empty_list_is_not_a_failure() {
+        // A backup that captured nothing is a real thing, and a different statement from a backup
+        // whose inventory could not be downloaded. The two must not collapse into one.
+        assert_eq!(parse_resource_list("{}").expect("parses"), Vec::new());
+        assert!(parse_resource_list("not json at all").is_err());
+        assert!(parse_resource_list("[\"a\", \"b\"]").is_err());
+    }
+
+    // --- Restore options ------------------------------------------------------------------------
+
+    #[test]
+    fn a_default_restore_is_the_one_the_view_always_made() {
+        // The form is a narrowing of the plain restore, so with nothing narrowed it has to produce
+        // byte for byte what `o` → Restaurer has always sent.
+        let (name, body) = restore_from_backup("velero", "daily-1", &RestoreOptions::default(), NOW);
+        assert!(name.starts_with("daily-1-"));
+        assert_eq!(body["spec"], json!({ "backupName": "daily-1" }));
+    }
+
+    #[test]
+    fn a_narrowed_restore_carries_only_what_was_chosen() {
+        let opts = RestoreOptions {
+            namespaces: vec!["prod".to_string()],
+            namespace_mapping: Some(("prod".to_string(), "prod-restore".to_string())),
+            resources: vec!["configmaps".to_string(), "deployments.apps".to_string()],
+            label_selector: vec![("app".to_string(), "web".to_string())],
+            overwrite_existing: true,
+        };
+        let (_, body) = restore_from_backup("velero", "daily-1", &opts, NOW);
+        let spec = &body["spec"];
+        assert_eq!(spec["includedNamespaces"], json!(["prod"]));
+        assert_eq!(spec["namespaceMapping"], json!({ "prod": "prod-restore" }));
+        assert_eq!(spec["includedResources"], json!(["configmaps", "deployments.apps"]));
+        assert_eq!(spec["labelSelector"], json!({ "matchLabels": { "app": "web" } }));
+        assert_eq!(spec["existingResourcePolicy"], json!("update"));
+    }
+
+    #[test]
+    fn skipping_existing_objects_is_written_by_saying_nothing() {
+        // `none` is what velero does with the field absent. Spelling it out would read as a decision
+        // where none was made, and would break on the velero versions that predate the field.
+        let opts = RestoreOptions {
+            namespaces: vec!["prod".to_string()],
+            overwrite_existing: false,
+            ..RestoreOptions::default()
+        };
+        let (_, body) = restore_from_backup("velero", "daily-1", &opts, NOW);
+        assert!(body["spec"].get("existingResourcePolicy").is_none());
     }
 }
