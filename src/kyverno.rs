@@ -45,6 +45,7 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
+use futures::StreamExt;
 
 use crate::events::format_age;
 
@@ -83,6 +84,11 @@ const EPHEMERAL_VERSIONS: &[&str] = &["v1"];
 // Above this many stuck (Pending + Failed) requests the backlog is treated as an anomaly and shown
 // in red with its worst offenders, rather than as an incidental count.
 pub const UR_PILEUP: usize = 50;
+
+// How many UpdateRequest deletions to run at once during a purge. Sequential deletes against a slow
+// apiserver turned a ~900-request purge into minutes; a bounded fan-out keeps it to seconds without
+// flooding the server.
+const PURGE_CONCURRENCY: usize = 32;
 
 // Per-resource reports are one object per scanned resource: a real cluster has thousands. Only the
 // non-passing results are ever materialised as rows, but the cap bounds the parse itself.
@@ -1376,31 +1382,39 @@ pub async fn purge_stuck_update_requests(client: Client) -> Result<usize, String
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
     let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
 
-    let mut deleted = 0usize;
-    let mut errors = 0usize;
-    for obj in &list.items {
-        let stuck = obj
-            .data
-            .get("status")
-            .and_then(|s| s.get("state"))
-            .and_then(|v| v.as_str())
-            .map(KyRequestState::parse)
-            .unwrap_or(KyRequestState::Other)
-            .is_stuck();
-        if !stuck {
-            continue;
+    // Resolve the targets first, then delete them in a bounded concurrent fan-out.
+    let targets: Vec<(String, String)> = list
+        .items
+        .iter()
+        .filter(|obj| {
+            obj.data
+                .get("status")
+                .and_then(|s| s.get("state"))
+                .and_then(|v| v.as_str())
+                .map(KyRequestState::parse)
+                .unwrap_or(KyRequestState::Other)
+                .is_stuck()
+        })
+        .filter_map(|obj| {
+            let name = obj.metadata.name.clone().unwrap_or_default();
+            (!name.is_empty()).then(|| (obj.metadata.namespace.clone().unwrap_or_default(), name))
+        })
+        .collect();
+
+    let outcomes: Vec<bool> = futures::stream::iter(targets.into_iter().map(|(ns, name)| {
+        let client = client.clone();
+        let ar = ar.clone();
+        async move {
+            let nsapi: Api<DynamicObject> = Api::namespaced_with(client, &ns, &ar);
+            nsapi.delete(&name, &DeleteParams::background()).await.is_ok()
         }
-        let name = obj.metadata.name.clone().unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        let nsapi: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, &ar);
-        match nsapi.delete(&name, &DeleteParams::background()).await {
-            Ok(_) => deleted += 1,
-            Err(_) => errors += 1,
-        }
-    }
+    }))
+    .buffer_unordered(PURGE_CONCURRENCY)
+    .collect()
+    .await;
+
+    let deleted = outcomes.iter().filter(|ok| **ok).count();
+    let errors = outcomes.len() - deleted;
 
     if errors > 0 {
         Err(crate::lang::fill(
