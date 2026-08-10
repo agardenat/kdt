@@ -9989,6 +9989,12 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::CapacityFull) => app.enter_ai_panel(),
         (_, _, Mode::CapacityFull) => {}
 
+        (KeyCode::Up, m, Mode::Velero) if m.contains(KeyModifiers::SHIFT) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::Velero) if m.contains(KeyModifiers::SHIFT) => {
+            app.vel_detail_scroll = app.vel_detail_scroll.saturating_add(1)
+        }
         (KeyCode::Up, _, Mode::Velero) => app.move_vel_selection(-1),
         (KeyCode::Down, _, Mode::Velero) => app.move_vel_selection(1),
         (KeyCode::PageUp, _, Mode::Velero) => app.move_vel_selection(-10),
@@ -11158,6 +11164,7 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
         DelReason::NodeDrain => st.del_node.to_string(),
         DelReason::PersistentData => st.del_persistent.to_string(),
         DelReason::VeleroBackup => st.del_velero_backup.to_string(),
+        DelReason::VeleroBackupRunning => st.del_velero_backup_running.to_string(),
         DelReason::Finalizers => st.del_finalizers.to_string(),
     }
 }

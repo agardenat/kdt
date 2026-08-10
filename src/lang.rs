@@ -159,6 +159,7 @@ pub struct Strings {
     pub del_node: &'static str,
     pub del_persistent: &'static str,
     pub del_velero_backup: &'static str,
+    pub del_velero_backup_running: &'static str,
     pub del_finalizers: &'static str,
 
     // Repair panel (Ctrl-R): the blockages found, and the moves offered against them.
@@ -591,6 +592,7 @@ pub struct Strings {
     pub vel_ns_uncovered_many: &'static str,
     pub vel_ns_opted_out: &'static str,
     pub vel_rpo: &'static str,
+    pub vel_rpo_degraded: &'static str,
     pub vel_no_usable_backup: &'static str,
     pub vel_deletes_failing: &'static str,
 
@@ -1445,6 +1447,7 @@ pub const FR: Strings = Strings {
     del_node: "Node : à drainer (kubectl drain) avant suppression",
     del_persistent: "Stockage persistant : les données peuvent être perdues définitivement",
     del_velero_backup: "Supprimer l'objet ne supprime pas le backup : les données restent dans le bucket et velero recréera l'objet à la resynchronisation. Passer par o → supprimer ce backup.",
+    del_velero_backup_running: "Backup en cours d'exécution : le supprimer l'annule et peut bloquer la file d'attente velero (queuePosition figée) jusqu'au redémarrage du serveur. Attendre sa fin, ou ne supprimer qu'un backup Queued/New.",
     del_finalizers: "Finalizers présents : la suppression peut rester bloquée en Terminating",
 
     k_repair: "débloquer",
@@ -1876,6 +1879,7 @@ pub const FR: Strings = Strings {
     vel_ns_uncovered_many: "{n} namespaces avec des PVC ne sont couverts par aucun schedule actif : {list}",
     vel_ns_opted_out: "namespaces exclus volontairement (velero.io/exclude-from-backup) : {list}",
     vel_rpo: "dernier backup exploitable il y a {age}",
+    vel_rpo_degraded: "dernier backup restaurable il y a {age} (échec partiel) — exploitable, vérifie ses erreurs",
     vel_no_usable_backup: "aucun backup exploitable : tout ce qui existe est en échec ou en cours",
     vel_deletes_failing: "{n} backups bloqués en Deleting avec des erreurs : l'espace n'est pas libéré",
 
@@ -2726,6 +2730,7 @@ pub const EN: Strings = Strings {
     del_node: "Node: drain it (kubectl drain) before deleting",
     del_persistent: "Persistent storage: data may be lost for good",
     del_velero_backup: "Deleting the object does not delete the backup: the data stays in the bucket and velero re-creates the object on its next sync. Use o → delete this backup instead.",
+    del_velero_backup_running: "Backup is running: deleting it cancels the run and can wedge velero's queue (queuePosition stuck) until the server restarts. Wait for it to finish, or only delete a Queued/New backup.",
     del_finalizers: "Finalizers present: the deletion may hang in Terminating",
 
     k_repair: "unblock",
@@ -3156,6 +3161,7 @@ pub const EN: Strings = Strings {
     vel_ns_uncovered_many: "{n} namespaces with PVCs are covered by no active schedule: {list}",
     vel_ns_opted_out: "namespaces excluded on purpose (velero.io/exclude-from-backup): {list}",
     vel_rpo: "last usable backup {age} ago",
+    vel_rpo_degraded: "newest restorable backup {age} ago (partially failed) — usable, check its errors",
     vel_no_usable_backup: "no usable backup: everything that exists has failed or is still running",
     vel_deletes_failing: "{n} backups stuck in Deleting with errors: the space is not being freed",
 

@@ -1805,10 +1805,23 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
         cluster_hints.push(info(fill(st.vel_ns_opted_out, &[("list", &list.join(", "))])));
     }
 
-    match backups.iter().filter(|b| b.usable()).map(|b| b.completed.unwrap_or(b.created)).max() {
-        Some(last) => cluster_hints.push(info(fill(st.vel_rpo, &[("age", &age_of(last, now))]))),
-        None if !backups.is_empty() => cluster_hints.push(danger(st.vel_no_usable_backup.to_string())),
-        None => {}
+    // A `PartiallyFailed` backup ran to completion with some items missing: it still restores (the
+    // action menu offers it), so it is a real, if degraded, recovery point. Only the absence of both
+    // a clean and a partially-failed backup means there is genuinely nothing to restore from.
+    let clean = |b: &&VelBackup| b.usable();
+    let restorable = |b: &&VelBackup| b.usable() || b.partially_failed();
+    let newest = |f: &dyn Fn(&&VelBackup) -> bool| {
+        backups.iter().filter(|b| f(b)).map(|b| b.completed.unwrap_or(b.created)).max()
+    };
+    match (newest(&clean), newest(&restorable)) {
+        (Some(last), _) => cluster_hints.push(info(fill(st.vel_rpo, &[("age", &age_of(last, now))]))),
+        (None, Some(last)) => {
+            cluster_hints.push(warn(fill(st.vel_rpo_degraded, &[("age", &age_of(last, now))])))
+        }
+        (None, None) if !backups.is_empty() => {
+            cluster_hints.push(danger(st.vel_no_usable_backup.to_string()))
+        }
+        (None, None) => {}
     }
 
     let stuck_deletes = backups.iter().filter(|b| b.phase == "Deleting").count();
@@ -2636,6 +2649,43 @@ mod tests {
         one.errors = 1;
         let d = run(Inventory { backups: vec![one], ..inventory() });
         assert!(d.backups[0].hints.iter().any(|h| reads_as(&h.text, FR.vel_bk_partial_one)));
+    }
+
+    #[test]
+    fn a_partially_failed_backup_is_a_degraded_recovery_point_not_a_void() {
+        // Only partially-failed backups exist: they still restore, so the verdict is a warning about
+        // a degraded point, never the red "nothing to restore from".
+        let d = run(Inventory {
+            backups: vec![backup("daily-1", "PartiallyFailed", Some("daily"))],
+            ..inventory()
+        });
+        let rpo = d.cluster_hints.iter().find(|h| reads_as(&h.text, FR.vel_rpo_degraded));
+        assert!(rpo.is_some(), "degraded RPO hint expected");
+        assert_eq!(rpo.unwrap().level, HintLevel::Warn);
+        assert!(!d.cluster_hints.iter().any(|h| reads_as(&h.text, FR.vel_no_usable_backup)));
+
+        // A clean backup outranks it: the plain RPO line, not the degraded one.
+        let d = run(Inventory {
+            backups: vec![
+                backup("daily-1", "PartiallyFailed", Some("daily")),
+                backup("daily-2", "Completed", Some("daily")),
+            ],
+            ..inventory()
+        });
+        assert!(d.cluster_hints.iter().any(|h| reads_as(&h.text, FR.vel_rpo)));
+        assert!(!d.cluster_hints.iter().any(|h| reads_as(&h.text, FR.vel_rpo_degraded)));
+
+        // Nothing restorable at all: only then does the danger fire.
+        let mut running = backup("daily-1", "InProgress", Some("daily"));
+        running.completed = None;
+        let d = run(Inventory {
+            backups: vec![running, backup("daily-2", "Failed", Some("daily"))],
+            ..inventory()
+        });
+        let void = d.cluster_hints.iter().find(|h| reads_as(&h.text, FR.vel_no_usable_backup));
+        assert!(void.is_some(), "void verdict expected");
+        assert_eq!(void.unwrap().level, HintLevel::Danger);
+        assert!(!d.cluster_hints.iter().any(|h| reads_as(&h.text, FR.vel_rpo_degraded)));
     }
 
     #[test]

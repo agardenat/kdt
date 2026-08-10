@@ -51,6 +51,12 @@ pub enum Reason {
     // within the minute (`backup_sync_controller.go`). The only deletion that removes anything is a
     // `DeleteBackupRequest`, which the `:velero` view files under `o`.
     VeleroBackup,
+    // The same Backup, but one that velero has actually started running. Deleting it cancels the run
+    // mid-flight, and because a forced deletion does not reliably release velero's single backup
+    // slot, the 1.18 backup queue can stay stuck (`queuePosition` never advancing) until the server
+    // is restarted. A `Queued`/`New` backup has not started and is the safe one to clear, so it does
+    // not raise this.
+    VeleroBackupRunning,
     Finalizers,
 }
 
@@ -60,6 +66,7 @@ impl Reason {
             Reason::GitOps { .. }
             | Reason::GitOpsRoot { .. }
             | Reason::NamespaceCascade
+            | Reason::VeleroBackupRunning
             | Reason::CrdCascade => Level::Danger,
             Reason::OwnedBy { .. }
             | Reason::SystemNamespace { .. }
@@ -224,7 +231,12 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
         "CustomResourceDefinition" => out.push(Reason::CrdCascade),
         "Node" => out.push(Reason::NodeDrain),
         "PersistentVolumeClaim" | "PersistentVolume" => out.push(Reason::PersistentData),
-        "Backup" if api_version.starts_with("velero.io/") => out.push(Reason::VeleroBackup),
+        "Backup" if api_version.starts_with("velero.io/") => {
+            out.push(Reason::VeleroBackup);
+            if velero_backup_running(obj) {
+                out.push(Reason::VeleroBackupRunning);
+            }
+        }
         _ => {}
     }
     if let Some((kind, name)) = controller_owner(meta) {
@@ -320,6 +332,21 @@ fn controller_owner(meta: Option<&Value>) -> Option<(String, String)> {
     Some((kind.to_string(), name.to_string()))
 }
 
+// The backup phases where velero has started the run and holds the single backup slot. `Queued`,
+// `New` and `ReadyToStart` are excluded on purpose: they never held the slot, so clearing them is
+// the safe cleanup, not the hazard.
+fn velero_backup_running(obj: &Value) -> bool {
+    let phase = obj.get("status").map(|s| str_at(s, "phase")).unwrap_or_default();
+    matches!(
+        phase,
+        "InProgress"
+            | "WaitingForPluginOperations"
+            | "WaitingForPluginOperationsPartiallyFailed"
+            | "Finalizing"
+            | "FinalizingPartiallyFailed"
+    )
+}
+
 fn str_at<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -355,6 +382,35 @@ mod tests {
             "metadata": { "name": "pg", "namespace": "db" },
         }));
         assert!(!other.contains(&Reason::VeleroBackup));
+    }
+
+    #[test]
+    fn deleting_a_running_velero_backup_is_a_danger_a_queued_one_is_not() {
+        // In progress: cancels the run and can wedge velero's backup queue, so it earns the strict
+        // confirmation on top of the plain "the object is not the backup" warning.
+        let running = assess(&json!({
+            "apiVersion": "velero.io/v1",
+            "kind": "Backup",
+            "metadata": { "name": "daily-1", "namespace": "velero" },
+            "status": { "phase": "InProgress" },
+        }));
+        assert!(running.contains(&Reason::VeleroBackupRunning));
+        assert_eq!(running[0].level(), Level::Danger);
+        let s = DeleteState { reasons: running, ..Default::default() };
+        assert!(s.needs_strict_confirm());
+
+        // Queued has not started: it is exactly the backup the operator clears to unblock things,
+        // so only the ordinary warning shows and no strict confirmation is forced.
+        let queued = assess(&json!({
+            "apiVersion": "velero.io/v1",
+            "kind": "Backup",
+            "metadata": { "name": "daily-2", "namespace": "velero" },
+            "status": { "phase": "Queued" },
+        }));
+        assert!(!queued.contains(&Reason::VeleroBackupRunning));
+        assert!(queued.contains(&Reason::VeleroBackup));
+        let s = DeleteState { reasons: queued, ..Default::default() };
+        assert!(!s.needs_strict_confirm());
     }
 
     #[test]
