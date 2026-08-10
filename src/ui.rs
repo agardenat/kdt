@@ -133,8 +133,9 @@ impl KyvernoFilter {
     }
 }
 use crate::kyverno::{
-    fetch_kyverno, is_admission_denial, new_kyverno_state, parse_denial_message, KyAction, KyCounts,
-    KyPolicy, KyReady, KyResult, KyViolation, SharedKyverno,
+    fetch_kyverno, is_admission_denial, new_kyverno_state, parse_denial_message,
+    purge_stuck_update_requests, KyAction, KyCounts, KyPolicy, KyReady, KyResult, KyViolation,
+    SharedKyverno,
 };
 use crate::lang;
 use crate::lang::Strings;
@@ -814,6 +815,8 @@ enum MenuAction {
     // Like the drain, this one has no argument: it opens its own panel to choose before it writes.
     VelRestoreOptions,
     VelDeleteBackup,
+    // Kyverno: delete every stuck (Pending/Failed) UpdateRequest to unjam the generate queue.
+    KyPurgeRequests,
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
@@ -836,6 +839,9 @@ struct ActionMenu {
     confirm: bool,
     confirming: bool,
     input: Option<String>,
+    // A dynamic line shown above the description, in warning yellow: used to state the blast radius
+    // of a bulk action (how many objects it will delete) that a static label cannot carry.
+    note: Option<String>,
 }
 
 // The view a drawing pass should behave as. The AI panel, the command palette and the search prompt
@@ -2761,6 +2767,7 @@ impl App {
             confirm: false,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -6939,6 +6946,7 @@ impl App {
             confirm: true,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -7613,6 +7621,7 @@ impl App {
             confirm: true,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -7661,6 +7670,59 @@ impl App {
                 ));
             }
             fetch_reflector(client, state).await;
+        });
+    }
+
+    // `P` on the Kyverno view: offer to purge the stuck request backlog, behind the shared menu's
+    // armed confirmation. Refuse to open an empty action — say why instead — and put the exact count
+    // in the note so the confirmation states its blast radius.
+    fn open_kyverno_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let stuck = {
+            let s = self.kyverno_state.lock().expect("kyverno poisoned");
+            s.backlog.stuck()
+        };
+        if stuck == 0 {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ky_purge_none.to_string()));
+            return;
+        }
+        let items = vec![ActionItem {
+            label: st.k_ky_purge,
+            desc: st.desc_ky_purge,
+            action: MenuAction::KyPurgeRequests,
+        }];
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_ky_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note: Some(lang::fill(st.ky_purge_note, &[("n", &stuck.to_string())])),
+        });
+    }
+
+    // Delete the stuck UpdateRequests, report the count in a toast, then refetch so the backlog line
+    // updates without waiting on the ticker. The generate rules recreate what they still need.
+    fn ky_purge_requests(&mut self) {
+        let st = lang::t(self.ai_language);
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.kyverno_state.clone();
+        tokio::spawn(async move {
+            let result = purge_stuck_update_requests(client.clone()).await;
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((
+                    std::time::Instant::now(),
+                    match result {
+                        Ok(n) => st.plural(n, st.msg_ky_purged_one, st.msg_ky_purged_many),
+                        Err(e) => e,
+                    },
+                ));
+            }
+            fetch_kyverno(client, state).await;
         });
     }
 
@@ -7747,6 +7809,7 @@ impl App {
             confirm: true,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -8339,6 +8402,7 @@ impl App {
             confirm: true,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -8361,6 +8425,7 @@ impl App {
             confirm: false,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -8392,6 +8457,7 @@ impl App {
             confirm: true,
             confirming: false,
             input: None,
+            note: None,
         });
     }
 
@@ -8456,6 +8522,7 @@ impl App {
             Some(MenuAction::VelRestore) => self.vel_restore(),
             Some(MenuAction::VelRestoreOptions) => self.open_vel_restore_view(),
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
+            Some(MenuAction::KyPurgeRequests) => self.ky_purge_requests(),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
@@ -9802,6 +9869,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Kyverno) => app.refresh_kyverno(),
         (KeyCode::Esc, _, Mode::Kyverno) => app.exit_kyverno_mode(),
         (KeyCode::Char('i'), _, Mode::Kyverno) => app.enter_ai_panel(),
+        (KeyCode::Char('P'), _, Mode::Kyverno) => app.open_kyverno_action_menu(),
         // Catch-all: without it the global keys (`q`, the horizontal scroll) leak into this view.
         (_, _, Mode::Kyverno) => {}
 
@@ -9813,6 +9881,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
         (KeyCode::Esc, _, Mode::KyvernoFull) => app.exit_kyverno_full(),
         (KeyCode::Char('i'), _, Mode::KyvernoFull) => app.enter_ai_panel(),
+        (KeyCode::Char('P'), _, Mode::KyvernoFull) => app.open_kyverno_action_menu(),
         (_, _, Mode::KyvernoFull) => {}
 
         (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
@@ -10543,6 +10612,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             )),
             Span::styled(" f ", kbg), Span::raw(format!(" {}:{}   ", st.k_ky_filter, app.ky_filter.label())),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            Span::styled(" P ", kbg), Span::raw(format!(" {}   ", st.k_ky_purge_short)),
         ],
         Mode::KyvernoFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -12194,7 +12264,14 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         popup_w.saturating_sub(2) as usize,
     )
     .max(1) as u16;
-    let footer_h = desc_rows + 2;
+    // The optional note (blast-radius count) sits above the description and needs its own row, or it
+    // pushes the confirmation prompt out of the frame exactly like an unmeasured two-line desc did.
+    let note_rows = menu
+        .note
+        .as_ref()
+        .map(|n| wrapped_rows(&Line::from(n.as_str()), popup_w.saturating_sub(2) as usize).max(1) as u16)
+        .unwrap_or(0);
+    let footer_h = desc_rows + note_rows + 2;
     let popup_h = (menu.items.len() as u16 + footer_h + 3)
         .min(area.height.saturating_sub(2))
         .max(8);
@@ -12239,12 +12316,17 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         Line::from(Span::styled(st.menu_hint, Style::default().fg(DIM)))
     };
-    let p = Paragraph::new(vec![
-        Line::from(Span::styled(desc, Style::default().fg(Color::Gray))),
-        Line::from(""),
-        footer,
-    ])
-    .wrap(ratatui::widgets::Wrap { trim: true });
+    let mut para_lines: Vec<Line> = Vec::new();
+    if let Some(note) = menu.note.as_ref() {
+        para_lines.push(Line::from(Span::styled(
+            note.clone(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    }
+    para_lines.push(Line::from(Span::styled(desc, Style::default().fg(Color::Gray))));
+    para_lines.push(Line::from(""));
+    para_lines.push(footer);
+    let p = Paragraph::new(para_lines).wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(p, chunks[1]);
 }
 
@@ -18683,6 +18765,11 @@ fn kyverno_panel_title(app: &App) -> String {
     if not_ready > 0 {
         parts.push(lang::fill(st.ky_not_ready_count, &[("n", &not_ready.to_string())]));
     }
+    // The resource axis only ever shows violations; with none, its empty body reads as broken. Say
+    // "0 violation" so an empty scan is legibly distinct from a failed fetch.
+    if app.ky_by_resource && s.violations.is_empty() {
+        parts.push(st.ky_no_violation.to_string());
+    }
     lang::fill(
         st.ky_title,
         &[
@@ -19067,9 +19154,9 @@ fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // intercepting a thing, and nothing else on the cluster says so.
 fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
     let st = lang::t(app.ai_language);
-    let (health, cel, reports) = {
+    let (health, cel, reports, backlog) = {
         let s = app.kyverno_state.lock().expect("kyverno poisoned");
-        (s.health.clone(), s.cel_installed, s.health.reports)
+        (s.health.clone(), s.cel_installed, s.health.reports, s.backlog.clone())
     };
 
     let ok = health.controllers_ok();
@@ -19137,7 +19224,65 @@ fn ky_health_lines(app: &App) -> (String, Vec<Line<'static>>) {
         ));
     }
 
-    let lines = vec![Line::from(spans), Line::from(second), Line::from("")];
+    let mut lines = vec![Line::from(spans), Line::from(second)];
+
+    // The generate/mutateExisting request queue. Silent everywhere else: a stuck queue leaves no
+    // PolicyReport and no admission denial, so this band is the only place it shows.
+    if backlog.total > 0 || backlog.ephemeral_reports > 0 {
+        let pileup = backlog.has_pileup();
+        let mut third = vec![Span::raw(st.ky_requests)];
+        let total_style = if pileup {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        third.push(Span::styled(backlog.total.to_string(), total_style));
+        if backlog.pending > 0 {
+            third.push(Span::raw("  ·  "));
+            third.push(Span::styled(
+                lang::fill(st.ky_req_pending, &[("n", &backlog.pending.to_string())]),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if backlog.failed > 0 {
+            third.push(Span::raw(" · "));
+            third.push(Span::styled(
+                lang::fill(st.ky_req_failed, &[("n", &backlog.failed.to_string())]),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if let Some(age) = &backlog.oldest_stuck {
+            third.push(Span::styled(
+                format!("  ·  {}", lang::fill(st.ky_req_oldest, &[("age", age)])),
+                Style::default().fg(DIM),
+            ));
+        }
+        if backlog.ephemeral_reports > 0 {
+            third.push(Span::styled(
+                format!("  ·  {}", lang::fill(st.ky_ephemeral, &[("n", &backlog.ephemeral_reports.to_string())])),
+                Style::default().fg(DIM),
+            ));
+        }
+        lines.push(Line::from(third));
+
+        // Name the policies that own the backlog only when it is an anomaly: the fix is to unblock
+        // those generate rules, and naming them is the shortest path to the crashing controller.
+        if pileup && !backlog.by_policy.is_empty() {
+            let top = backlog
+                .by_policy
+                .iter()
+                .take(3)
+                .map(|(p, n)| format!("{} {}", p, n))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(Line::from(Span::styled(
+                lang::fill(st.ky_req_top, &[("list", &top)]),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
     (" kyverno ".to_string(), lines)
 }
 

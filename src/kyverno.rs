@@ -41,7 +41,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{Api, DynamicObject, ListParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
@@ -54,11 +54,11 @@ use crate::events::format_age;
 const CANDIDATES: &[(&str, &[&str], &str)] = &[
     ("kyverno.io", &["v1"], "ClusterPolicy"),
     ("kyverno.io", &["v1"], "Policy"),
-    ("policies.kyverno.io", &["v1"], "ValidatingPolicy"),
-    ("policies.kyverno.io", &["v1"], "MutatingPolicy"),
-    ("policies.kyverno.io", &["v1"], "ImageValidatingPolicy"),
-    ("policies.kyverno.io", &["v1"], "GeneratingPolicy"),
-    ("policies.kyverno.io", &["v1"], "DeletingPolicy"),
+    ("policies.kyverno.io", &["v1", "v1alpha1"], "ValidatingPolicy"),
+    ("policies.kyverno.io", &["v1", "v1alpha1"], "MutatingPolicy"),
+    ("policies.kyverno.io", &["v1", "v1alpha1"], "ImageValidatingPolicy"),
+    ("policies.kyverno.io", &["v1", "v1alpha1"], "GeneratingPolicy"),
+    ("policies.kyverno.io", &["v1", "v1alpha1"], "DeletingPolicy"),
     ("kyverno.io", &["v2"], "ClusterCleanupPolicy"),
     ("kyverno.io", &["v2"], "CleanupPolicy"),
     ("kyverno.io", &["v2"], "PolicyException"),
@@ -69,6 +69,20 @@ const CEL_GROUP: &str = "policies.kyverno.io";
 const REPORT_GROUP: &str = "wgpolicyk8s.io";
 const REPORT_VERSIONS: &[&str] = &["v1alpha2"];
 const KYVERNO_NS: &str = "kyverno";
+
+// UpdateRequests are the queue Kyverno drains to apply `generate` and `mutateExisting` rules. When
+// the background controller cannot keep up they stack up `Pending` and those rules quietly stop
+// producing anything — a failure that leaves no PolicyReport and no admission denial, so nothing
+// else in this view would show it.
+const UR_VERSIONS: &[&str] = &["v2", "v1"];
+// Intermediate per-resource reports awaiting aggregation into the PolicyReports; a large standing
+// count means the reports controller is behind.
+const EPHEMERAL_GROUP: &str = "reports.kyverno.io";
+const EPHEMERAL_VERSIONS: &[&str] = &["v1"];
+
+// Above this many stuck (Pending + Failed) requests the backlog is treated as an anomaly and shown
+// in red with its worst offenders, rather than as an incidental count.
+pub const UR_PILEUP: usize = 50;
 
 // Per-resource reports are one object per scanned resource: a real cluster has thousands. Only the
 // non-passing results are ever materialised as rows, but the cap bounds the parse itself.
@@ -476,10 +490,68 @@ impl KyHealth {
     }
 }
 
+// The lifecycle state Kyverno stamps on an UpdateRequest (`status.state`). Only `Pending` and
+// `Failed` are backlog; `Completed`/`Skip` are drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KyRequestState {
+    Pending,
+    Failed,
+    Completed,
+    Skip,
+    Other,
+}
+
+impl KyRequestState {
+    fn parse(s: &str) -> KyRequestState {
+        match s.trim() {
+            "Pending" => KyRequestState::Pending,
+            "Failed" => KyRequestState::Failed,
+            "Completed" => KyRequestState::Completed,
+            "Skip" => KyRequestState::Skip,
+            _ => KyRequestState::Other,
+        }
+    }
+
+    fn is_stuck(self) -> bool {
+        matches!(self, KyRequestState::Pending | KyRequestState::Failed)
+    }
+}
+
+// The generate/mutateExisting request queue, folded to what a human needs: how deep the backlog is,
+// which policies own it, and how long the oldest one has been waiting.
+#[derive(Debug, Clone, Default)]
+pub struct KyBacklog {
+    // Whether the UpdateRequest CRD exists at all: absent Kyverno, or a build without generate.
+    pub known: bool,
+    pub total: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub completed: usize,
+    pub skip: usize,
+    // (policy, stuck count) for the worst offenders, most first.
+    pub by_policy: Vec<(String, usize)>,
+    // Age of the oldest stuck request: a queue draining normally never shows an old one here.
+    pub oldest_stuck: Option<String>,
+    // Intermediate reports (`reports.kyverno.io`) still awaiting aggregation.
+    pub ephemeral_reports: usize,
+}
+
+impl KyBacklog {
+    pub fn stuck(&self) -> usize {
+        self.pending + self.failed
+    }
+
+    // A backlog worth flagging: enough stuck requests that the controller is visibly not keeping up.
+    pub fn has_pileup(&self) -> bool {
+        self.stuck() >= UR_PILEUP
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct KyvernoState {
     pub policies: Vec<KyPolicy>,
     pub violations: Vec<KyViolation>,
+    pub backlog: KyBacklog,
     pub health: KyHealth,
     pub error: Option<String>,
     pub loading: bool,
@@ -529,10 +601,11 @@ pub async fn fetch_kyverno(client: Client, state: SharedKyverno) {
     // Twelve policy kinds plus two report kinds means fourteen discovery round-trips, and each one
     // is a full API hop. Done in sequence that is fifteen seconds of blank view on a remote
     // cluster, so the three independent halves of the fetch run as one wave instead.
-    let (listed, reports, mut health) = futures::future::join3(
+    let (listed, reports, mut health, backlog) = futures::future::join4(
         list_policy_kinds(&client),
         list_reports(&client),
         fetch_health(&client),
+        fetch_backlog(&client),
     )
     .await;
 
@@ -560,6 +633,7 @@ pub async fn fetch_kyverno(client: Client, state: SharedKyverno) {
     s.cel_installed = cel_installed;
     s.policies = policies;
     s.violations = violations;
+    s.backlog = backlog;
     s.health = health;
     s.error = if !installed {
         Some(crate::lang::active().ky_crds_missing.to_string())
@@ -1190,6 +1264,152 @@ fn result_time(res: &Value) -> Option<Timestamp> {
     let secs = ts.get("seconds").and_then(|v| v.as_i64())?;
     let nanos = ts.get("nanos").and_then(|v| v.as_i64()).unwrap_or(0);
     Timestamp::new(secs, nanos as i32).ok()
+}
+
+// --- backlog ------------------------------------------------------------------------------------
+
+// Resolve the newest available version of a kind and list it, or `None` if the kind does not exist
+// on this cluster (older Kyverno, or a build without the generate/reports controllers).
+async fn probe_list(
+    client: &Client,
+    group: &str,
+    versions: &[&str],
+    kind: &str,
+) -> Option<Vec<DynamicObject>> {
+    for v in versions {
+        let gvk = GroupVersionKind::gvk(group, v, kind);
+        if let Ok((ar, _caps)) = discovery::pinned_kind(client, &gvk).await {
+            let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+            return api.list(&ListParams::default()).await.ok().map(|l| l.items);
+        }
+    }
+    None
+}
+
+// Folds the UpdateRequest queue and the intermediate reports into the backlog summary. Kept apart
+// from the policy and report listings so it rides the same concurrent wave.
+async fn fetch_backlog(client: &Client) -> KyBacklog {
+    let (urs, ephr, cephr) = futures::future::join3(
+        probe_list(client, KYVERNO_GROUP, UR_VERSIONS, "UpdateRequest"),
+        probe_list(client, EPHEMERAL_GROUP, EPHEMERAL_VERSIONS, "EphemeralReport"),
+        probe_list(client, EPHEMERAL_GROUP, EPHEMERAL_VERSIONS, "ClusterEphemeralReport"),
+    )
+    .await;
+
+    let mut b = KyBacklog {
+        ephemeral_reports: ephr.map(|v| v.len()).unwrap_or(0)
+            + cephr.map(|v| v.len()).unwrap_or(0),
+        ..KyBacklog::default()
+    };
+
+    let Some(urs) = urs else { return b };
+    b.known = true;
+    fold_update_requests(&urs, &mut b);
+    b
+}
+
+// Pure fold of the UpdateRequest list into `b`: state tallies, the worst offenders by stuck count,
+// and the oldest stuck request's age.
+fn fold_update_requests(urs: &[DynamicObject], b: &mut KyBacklog) {
+    let mut stuck_by_policy: HashMap<String, usize> = HashMap::new();
+    let mut oldest: Option<Timestamp> = None;
+
+    for obj in urs {
+        b.total += 1;
+        let state = obj
+            .data
+            .get("status")
+            .and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str())
+            .map(KyRequestState::parse)
+            .unwrap_or(KyRequestState::Other);
+        match state {
+            KyRequestState::Pending => b.pending += 1,
+            KyRequestState::Failed => b.failed += 1,
+            KyRequestState::Completed => b.completed += 1,
+            KyRequestState::Skip => b.skip += 1,
+            KyRequestState::Other => {}
+        }
+        if !state.is_stuck() {
+            continue;
+        }
+        let policy = obj
+            .data
+            .get("spec")
+            .and_then(|s| s.get("policy"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        *stuck_by_policy.entry(policy).or_default() += 1;
+        if let Some(ts) = ur_created(obj) {
+            if oldest.map(|o| ts < o).unwrap_or(true) {
+                oldest = Some(ts);
+            }
+        }
+    }
+
+    let mut by_policy: Vec<(String, usize)> = stuck_by_policy.into_iter().collect();
+    // Worst first, then by name so the order is stable across refreshes at equal depth.
+    by_policy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    b.by_policy = by_policy;
+    b.oldest_stuck = oldest.map(|t| format_age(&t));
+}
+
+fn ur_created(obj: &DynamicObject) -> Option<Timestamp> {
+    obj.metadata.creation_timestamp.as_ref().map(|t| t.0)
+}
+
+// Delete every stuck (Pending/Failed) UpdateRequest. This is the manual break in the feedback loop
+// a jammed background controller cannot break on its own: the requests it can never drain are gone,
+// and `synchronize: true` rules regenerate what is still needed on the next reconcile. Completed and
+// Skip requests are left alone — they are not backlog. Returns the number actually deleted.
+pub async fn purge_stuck_update_requests(client: Client) -> Result<usize, String> {
+    let mut resolved = None;
+    for v in UR_VERSIONS {
+        let gvk = GroupVersionKind::gvk(KYVERNO_GROUP, v, "UpdateRequest");
+        if let Ok((ar, _caps)) = discovery::pinned_kind(&client, &gvk).await {
+            resolved = Some(ar);
+            break;
+        }
+    }
+    let ar = resolved.ok_or_else(|| crate::lang::active().ky_ur_missing.to_string())?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
+
+    let mut deleted = 0usize;
+    let mut errors = 0usize;
+    for obj in &list.items {
+        let stuck = obj
+            .data
+            .get("status")
+            .and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str())
+            .map(KyRequestState::parse)
+            .unwrap_or(KyRequestState::Other)
+            .is_stuck();
+        if !stuck {
+            continue;
+        }
+        let name = obj.metadata.name.clone().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let ns = obj.metadata.namespace.clone().unwrap_or_default();
+        let nsapi: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, &ar);
+        match nsapi.delete(&name, &DeleteParams::background()).await {
+            Ok(_) => deleted += 1,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if errors > 0 {
+        Err(crate::lang::fill(
+            crate::lang::active().ky_purge_partial,
+            &[("ok", &deleted.to_string()), ("ko", &errors.to_string())],
+        ))
+    } else {
+        Ok(deleted)
+    }
 }
 
 // --- health -------------------------------------------------------------------------------------
@@ -1824,5 +2044,74 @@ mod tests {
         let (target, rule) = parse_denial_message(msg).expect("message");
         assert_eq!(target, "Pod kdt-kyverno-test/refused");
         assert_eq!(rule, "validate-resources");
+    }
+
+    // --- backlog ---
+
+    fn update_request(policy: &str, state: &str, created: &str) -> DynamicObject {
+        serde_json::from_value(json!({
+            "apiVersion": "kyverno.io/v2",
+            "kind": "UpdateRequest",
+            "metadata": { "name": "ur-x", "namespace": "kyverno", "creationTimestamp": created },
+            "spec": { "policy": policy, "requestType": "generate" },
+            "status": { "state": state },
+        }))
+        .expect("UpdateRequest")
+    }
+
+    #[test]
+    fn backlog_tallies_states_and_worst_offenders() {
+        let urs = vec![
+            update_request("gen-rbac", "Pending", "2026-08-06T00:00:00Z"),
+            update_request("gen-rbac", "Pending", "2026-08-08T00:00:00Z"),
+            update_request("gen-np", "Failed", "2026-08-09T00:00:00Z"),
+            update_request("gen-np", "Completed", "2026-08-09T00:00:00Z"),
+        ];
+        let mut b = KyBacklog::default();
+        fold_update_requests(&urs, &mut b);
+        assert_eq!((b.total, b.pending, b.failed, b.completed), (4, 2, 1, 1));
+        assert_eq!(b.stuck(), 3);
+        // Only Pending and Failed are stuck; gen-rbac owns two of them, gen-np one.
+        assert_eq!(b.by_policy, vec![("gen-rbac".into(), 2), ("gen-np".into(), 1)]);
+        // A stuck request that has been waiting since 2026-08-06 has a non-empty age.
+        assert!(b.oldest_stuck.is_some_and(|a| !a.is_empty()));
+    }
+
+    // A Completed request never counts as backlog, however old it is.
+    #[test]
+    fn completed_requests_are_not_backlog() {
+        let urs = vec![
+            update_request("gen-np", "Completed", "2020-01-01T00:00:00Z"),
+            update_request("gen-np", "Skip", "2026-08-09T00:00:00Z"),
+        ];
+        let mut b = KyBacklog::default();
+        fold_update_requests(&urs, &mut b);
+        assert_eq!(b.stuck(), 0);
+        assert!(b.by_policy.is_empty());
+        assert!(b.oldest_stuck.is_none());
+    }
+
+    // A request whose status has not been written yet is `Other`, not stuck.
+    #[test]
+    fn missing_state_is_not_stuck() {
+        let obj: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "kyverno.io/v2",
+            "kind": "UpdateRequest",
+            "metadata": { "name": "ur-x", "namespace": "kyverno" },
+            "spec": { "policy": "gen-np", "requestType": "generate" },
+        }))
+        .expect("UpdateRequest");
+        let mut b = KyBacklog::default();
+        fold_update_requests(std::slice::from_ref(&obj), &mut b);
+        assert_eq!(b.total, 1);
+        assert_eq!(b.stuck(), 0);
+    }
+
+    #[test]
+    fn pileup_threshold_gates_the_anomaly() {
+        let below = KyBacklog { pending: UR_PILEUP - 1, ..KyBacklog::default() };
+        let at = KyBacklog { pending: UR_PILEUP, ..KyBacklog::default() };
+        assert!(!below.has_pileup());
+        assert!(at.has_pileup());
     }
 }
