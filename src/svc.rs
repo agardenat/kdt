@@ -18,6 +18,7 @@ use kube::api::{Api, ListParams};
 use kube::Client;
 
 use crate::events::format_age;
+use crate::netpol::{list_netpols, NetPolResource};
 
 // The standard label EndpointSlices carry to point back at the Service they belong to.
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
@@ -84,7 +85,11 @@ pub struct NetworkState {
     pub endpoints: Vec<EndpointRow>,
     pub ingresses: Vec<IngressResource>,
     pub ingress_classes: Vec<IngressClassResource>,
+    pub netpols: Vec<NetPolResource>,
     pub error: Option<String>,
+    // Error listing native NetworkPolicies; kept apart from `error` so the netpol world shows its own
+    // failure without blanking the Services/Ingress worlds (and vice versa).
+    pub netpol_error: Option<String>,
     pub loading: bool,
 }
 
@@ -126,6 +131,7 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
 
     let ingresses = list_ingresses(&client, &namespace).await.unwrap_or_default();
     let ingress_classes = list_ingress_classes(&client).await.unwrap_or_default();
+    let (netpols, netpol_error) = list_netpols(&client, &namespace).await;
 
     let mut s = state.lock().expect("network poisoned");
     s.loading = false;
@@ -134,6 +140,8 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
     s.endpoints = endpoints;
     s.ingresses = ingresses;
     s.ingress_classes = ingress_classes;
+    s.netpols = netpols;
+    s.netpol_error = netpol_error;
 }
 
 // (ready, total) endpoint counts keyed by (namespace, service name).

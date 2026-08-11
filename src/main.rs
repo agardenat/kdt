@@ -22,6 +22,7 @@ mod glyphs;
 mod kyverno;
 mod lang;
 mod namespaces;
+mod netpol;
 mod nodeops;
 mod pdf;
 mod pods;

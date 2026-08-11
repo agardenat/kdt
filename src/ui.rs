@@ -470,12 +470,14 @@ use crate::svc::{
     endpoint_belongs_to, fetch_network, new_network_state, EndpointRow, IngressClassResource,
     IngressResource, ServiceResource, SharedNetwork,
 };
+use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
 
 // The two object worlds the Services/Ingress view toggles between (palette `svc` vs `ingress`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetWorld {
     Services,
     Ingress,
+    NetworkPolicy,
 }
 
 // One visual row of the network view: a parent (Service / IngressClass) or its children, plus the
@@ -486,6 +488,7 @@ enum NetRow {
     Endpoint(EndpointRow),
     Ingress(IngressResource),
     IngressClass(IngressClassResource),
+    NetPol(NetPolResource),
 }
 use crate::storage::{
     fetch_storage, new_storage_state, volume_in_class, HintLevel as StoHintLevel, PvResource,
@@ -1015,6 +1018,8 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
+    // NetworkPolicies (native + Cilium/Calico CRDs) are the third world of the network view.
+    ("netpol", &["netpols", "networkpolicy", "networkpolicies", "np", "cilium", "ciliumnetworkpolicy", "calico"]),
     // The claims world answers to the PVC words, the volumes world to the PV/class ones — `:pv` and
     // `:pvc` land on the side of the view the user was already thinking in.
     ("storage", &["stockage", "pvc", "claims", "volumes"]),
@@ -3778,6 +3783,11 @@ impl App {
                 self.leave_special_modes();
                 self.enter_network_mode(NetWorld::Ingress);
             }
+            "netpol" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_network_mode(NetWorld::NetworkPolicy);
+            }
             "storage" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -4387,11 +4397,12 @@ impl App {
         self.refresh_net_snapshot();
     }
 
-    // `g`: switch between the Services and Ingress worlds (same shared inventory, no reload needed).
+    // `g`: cycle Services → Ingress → NetworkPolicy (same shared inventory, no reload needed).
     fn cycle_network_world(&mut self) {
         self.net_world = match self.net_world {
             NetWorld::Services => NetWorld::Ingress,
-            NetWorld::Ingress => NetWorld::Services,
+            NetWorld::Ingress => NetWorld::NetworkPolicy,
+            NetWorld::NetworkPolicy => NetWorld::Services,
         };
         self.last_net_sel_uid = None;
         self.last_status_key = None;
@@ -4483,6 +4494,10 @@ impl App {
                 // Ingress, flat: just the Ingress rows.
                 (NetWorld::Ingress, false) => {
                     s.ingresses.iter().cloned().map(NetRow::Ingress).collect()
+                }
+                // NetworkPolicy: always flat (policies don't nest); `t` is a no-op here.
+                (NetWorld::NetworkPolicy, _) => {
+                    s.netpols.iter().cloned().map(NetRow::NetPol).collect()
                 }
             }
         };
@@ -10759,16 +10774,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
         Mode::Services => {
-            // `t` shows the opposite of the current grouping; `g` names the other world to switch to.
-            let toggle_label = if app.net_group {
-                st.k_net_flat
-            } else if app.net_world == NetWorld::Services {
-                "endpoints"
-            } else {
-                st.k_net_byclass
+            // `g` names the next world to switch to; `t` (grouping) only applies to Services/Ingress.
+            let world_label = match app.net_world {
+                NetWorld::Services => "ingress",
+                NetWorld::Ingress => "netpol",
+                NetWorld::NetworkPolicy => "services",
             };
-            let world_label = if app.net_world == NetWorld::Services { "ingress" } else { "services" };
-            vec![
+            let mut spans = vec![
                 Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
                 Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
                 footer_sep(),
@@ -10777,9 +10789,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
                 footer_sep(),
                 Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
-                Span::styled(" t ", kbg), Span::raw(format!(" {}   ", toggle_label)),
-                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", world_label)),
-            ]
+            ];
+            if app.net_world != NetWorld::NetworkPolicy {
+                let toggle_label = if app.net_group {
+                    st.k_net_flat
+                } else if app.net_world == NetWorld::Services {
+                    "endpoints"
+                } else {
+                    st.k_net_byclass
+                };
+                spans.push(Span::styled(" t ", kbg));
+                spans.push(Span::raw(format!(" {}   ", toggle_label)));
+            }
+            spans.push(Span::styled(" g ", kbg));
+            spans.push(Span::raw(format!(" {}   ", world_label)));
+            spans
         }
         Mode::ServicesFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -13678,6 +13702,26 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
             host: String::new(),
             count: 1,
         },
+        NetRow::NetPol(p) => EventRecord {
+            uid: format!("net|{}", p.uid),
+            time: now,
+            severity: Severity::Normal,
+            reason: p.kind.clone(),
+            api_version: p.api_version.clone(),
+            kind: p.kind.clone(),
+            namespace: p.namespace.clone(),
+            name: p.name.clone(),
+            message: format!(
+                "[{}] target={} ingress={} egress={}",
+                p.engine.label(),
+                p.target,
+                p.ingress,
+                p.egress
+            ),
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        },
     }
 }
 
@@ -14161,6 +14205,7 @@ fn draw_net_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     match app.net_world {
         NetWorld::Services => draw_services_table(f, app, area),
         NetWorld::Ingress => draw_ingress_table(f, app, area),
+        NetWorld::NetworkPolicy => draw_netpol_table(f, app, area),
     }
 }
 
@@ -14362,6 +14407,113 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(14), Constraint::Length(name_w), Constraint::Length(20),
         Constraint::Length(24), Constraint::Min(20), Constraint::Length(4),
         Constraint::Length(18), Constraint::Length(5),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// Color for a native direction verdict: a default-deny reads as hardening (green), an allow-all as a
+// permissive note (yellow); an unaffected/CRD direction stays dim. No verdict is a claim of a problem —
+// the coloring characterizes the posture, it does not judge it.
+fn dir_effect_style(effect: DirEffect) -> Style {
+    match effect {
+        DirEffect::Deny => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        DirEffect::AllowAll => Style::default().fg(Color::Yellow),
+        DirEffect::Selective => Style::default(),
+        DirEffect::Unaffected | DirEffect::Unknown => Style::default().fg(DIM),
+    }
+}
+
+fn netpol_engine_style(engine: NetPolEngine) -> Style {
+    match engine {
+        NetPolEngine::K8s => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        NetPolEngine::Cilium => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        NetPolEngine::Calico => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+    }
+}
+
+// NetworkPolicy table: native policies (with a real ingress/egress posture verdict) and any discovered
+// Cilium/Calico CRD policies (shown factually, no verdict). Cluster-scoped policies show "(cluster)".
+fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, netpols_len, n_k8s, n_cil, n_cal) = {
+        let s = app.network_state.lock().expect("network poisoned");
+        let n_k8s = s.netpols.iter().filter(|p| p.engine == NetPolEngine::K8s).count();
+        let n_cil = s.netpols.iter().filter(|p| p.engine == NetPolEngine::Cilium).count();
+        let n_cal = s.netpols.iter().filter(|p| p.engine == NetPolEngine::Calico).count();
+        (s.loading, s.netpol_error.clone(), s.netpols.len(), n_k8s, n_cil, n_cal)
+    };
+    let src = &app.net_rows;
+
+    let title = if let Some(e) = &error {
+        format!("netpol (erreur: {})", e)
+    } else if loading && src.is_empty() {
+        "netpol (chargement...)".to_string()
+    } else {
+        let mut engines = format!("k8s {}", n_k8s);
+        if n_cil > 0 {
+            engines.push_str(&format!(" · cilium {}", n_cil));
+        }
+        if n_cal > 0 {
+            engines.push_str(&format!(" · calico {}", n_cal));
+        }
+        format!(
+            "netpol ({} · {}) · ns={} · [g] services",
+            netpols_len, engines, app.namespace_label
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("ENGINE"), Cell::from("TARGET"),
+        Cell::from("TYPES"), Cell::from("INGRESS"), Cell::from("EGRESS"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = src
+        .iter()
+        .map(|row| match row {
+            NetRow::NetPol(p) => {
+                let ns = if p.namespace.is_empty() {
+                    "(cluster)".to_string()
+                } else {
+                    p.namespace.clone()
+                };
+                Row::new(vec![
+                    Cell::from(ns).style(Style::default().fg(DIM)),
+                    Cell::from(p.name.clone())
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(p.engine.label()).style(netpol_engine_style(p.engine)),
+                    Cell::from(p.target.clone()),
+                    Cell::from(p.types.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(p.ingress.clone()).style(dir_effect_style(p.ingress_effect)),
+                    Cell::from(p.egress.clone()).style(dir_effect_style(p.egress_effect)),
+                    Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
+            _ => Row::new(vec![Cell::from("")]),
+        })
+        .collect();
+
+    let ns_values = src.iter().map(|r| match r {
+        NetRow::NetPol(p) if !p.namespace.is_empty() => p.namespace.as_str(),
+        NetRow::NetPol(_) => "(cluster)",
+        _ => "",
+    });
+    let names = src.iter().map(|r| match r {
+        NetRow::NetPol(p) => p.name.as_str(),
+        _ => "",
+    });
+    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
+    let name_w = col_width(names, "NAME", 14, 40);
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(7),
+        Constraint::Length(24), Constraint::Length(14), Constraint::Min(18),
+        Constraint::Length(26), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
