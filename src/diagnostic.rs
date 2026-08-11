@@ -21,6 +21,15 @@ use kube::{discovery, Api, Client};
 
 use crate::events::LineColor;
 
+use crate::certmanager::{fetch_certs, new_certs_state, CmKind, CmReady};
+use crate::flux::{fetch_flux, new_flux_state, FluxReady};
+use crate::kyverno::{fetch_kyverno, new_kyverno_state};
+use crate::velero::{age_of, fetch_velero, new_velero_state};
+use crate::storage::{fetch_storage, new_storage_state};
+use crate::capacity::{fetch_capacity, new_capacity_state};
+use crate::rbac::{critical_namespaces, fetch_rbac, new_rbac_state, Severity};
+use crate::reflector::{fetch_reflector, new_reflector_state};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagStatus {
     Running,
@@ -127,6 +136,14 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     check_rancher(&client, &state, run_id).await;
     check_problem_pods(&client, &state, run_id).await;
     check_persistent_volumes(&client, &state, run_id).await;
+    check_storage(&client, &state, run_id).await;
+    check_capacity(&client, &state, run_id).await;
+    check_flux(&client, &state, run_id).await;
+    check_cert_manager(&client, &state, run_id).await;
+    check_kyverno(&client, &state, run_id).await;
+    check_velero(&client, &state, run_id).await;
+    check_reflector(&client, &state, run_id).await;
+    check_rbac(&client, &state, run_id).await;
     check_recent_warnings(&client, &state, run_id).await;
 
     let mut s = state.lock().expect("diagnostic poisoned");
@@ -1263,6 +1280,466 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
         Err(e) => {
             lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
+        }
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+// The worst of two statuses, so a step's headline reflects its most severe finding.
+fn worse(a: DiagStatus, b: DiagStatus) -> DiagStatus {
+    fn rank(s: DiagStatus) -> u8 {
+        match s {
+            DiagStatus::Ok => 0,
+            DiagStatus::Running | DiagStatus::Info => 1,
+            DiagStatus::Warn => 2,
+            DiagStatus::Err => 3,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+// Render a storage-family hint (shared by storage, velero and capacity) and fold its level into the
+// running step status, so the modules' own verdicts drive the diagnostic instead of being re-derived.
+fn push_storage_hints(
+    lines: &mut Vec<(LineColor, String)>,
+    hints: &[crate::storage::Hint],
+    status: &mut DiagStatus,
+) {
+    use crate::storage::HintLevel;
+    for h in hints {
+        let (color, sev) = match h.level {
+            HintLevel::Info => (LineColor::Info, DiagStatus::Info),
+            HintLevel::Warn => (LineColor::Warn, DiagStatus::Warn),
+            HintLevel::Danger => (LineColor::Err, DiagStatus::Err),
+        };
+        lines.push((color, h.text.clone()));
+        *status = worse(*status, sev);
+    }
+}
+
+fn push_reflector_hints(
+    lines: &mut Vec<(LineColor, String)>,
+    hints: &[crate::reflector::Hint],
+    status: &mut DiagStatus,
+) {
+    use crate::reflector::HintLevel;
+    for h in hints {
+        let (color, sev) = match h.level {
+            HintLevel::Info => (LineColor::Info, DiagStatus::Info),
+            HintLevel::Warn => (LineColor::Warn, DiagStatus::Warn),
+            HintLevel::Danger => (LineColor::Err, DiagStatus::Err),
+        };
+        lines.push((color, h.text.clone()));
+        *status = worse(*status, sev);
+    }
+}
+
+async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_storage, "kubectl get pvc,pv,sc -A") else {
+        return;
+    };
+    let store = new_storage_state();
+    fetch_storage(client.clone(), None, store.clone()).await;
+    let s = store.lock().expect("storage poisoned");
+    let mut lines = Vec::new();
+    let status = if let Some(e) = &s.error {
+        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        DiagStatus::Err
+    } else {
+        let mut status = DiagStatus::Ok;
+        let pending = s.pvcs.iter().filter(|p| p.phase == "Pending").count();
+        lines.push((
+            LineColor::Info,
+            fill(
+                active().diag_storage_summary,
+                &[
+                    ("pvcs", &s.pvcs.len().to_string()),
+                    ("pvs", &s.pvs.len().to_string()),
+                    ("classes", &s.classes.len().to_string()),
+                ],
+            ),
+        ));
+        status = worse(status, DiagStatus::Info);
+        if s.released_bytes > 0 {
+            lines.push((
+                LineColor::Warn,
+                fill(
+                    active().diag_storage_released,
+                    &[("size", &crate::events::format_memory_bytes(s.released_bytes))],
+                ),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        for p in s.pvcs.iter().filter(|p| p.phase == "Pending").take(6) {
+            lines.push((LineColor::Warn, format!("PVC Pending: {}/{}", p.namespace, p.name)));
+        }
+        if pending > 6 {
+            lines.push((
+                LineColor::Dim,
+                fill(active().diag_more_items, &[("n", &(pending - 6).to_string())]),
+            ));
+        }
+        if pending > 0 {
+            status = worse(status, DiagStatus::Warn);
+        }
+        push_storage_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_capacity, "kubectl get nodes,resourcequota -A") else {
+        return;
+    };
+    let cap = new_capacity_state();
+    fetch_capacity(client.clone(), cap.clone()).await;
+    let s = cap.lock().expect("capacity poisoned");
+    let mut lines = Vec::new();
+    let status = if let Some(e) = &s.error {
+        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        DiagStatus::Err
+    } else {
+        let mut status = DiagStatus::Info;
+        let tight = s.quotas.iter().filter(|q| q.worst_pct() >= 90).count();
+        lines.push((
+            if tight > 0 { LineColor::Warn } else { LineColor::Info },
+            fill(
+                active().diag_capacity_summary,
+                &[("nodes", &s.nodes.len().to_string()), ("quotas", &tight.to_string())],
+            ),
+        ));
+        for q in s.quotas.iter().filter(|q| q.worst_pct() >= 90).take(6) {
+            lines.push((
+                if q.worst_pct() >= 100 { LineColor::Err } else { LineColor::Warn },
+                format!("{}/{}: {}%", q.namespace, q.name, q.worst_pct()),
+            ));
+            status = worse(status, if q.worst_pct() >= 100 { DiagStatus::Err } else { DiagStatus::Warn });
+        }
+        push_storage_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(
+        state,
+        run_id,
+        active().diag_step_flux,
+        "kubectl get kustomizations,helmreleases,gitrepositories -A",
+    ) else {
+        return;
+    };
+    let fx = new_flux_state();
+    fetch_flux(client.clone(), fx.clone()).await;
+    let s = fx.lock().expect("flux poisoned");
+    let mut lines = Vec::new();
+    let status = if s.resources.is_empty() {
+        lines.push((LineColor::Info, active().diag_flux_absent.into()));
+        DiagStatus::Info
+    } else {
+        let (ready, failed, unknown, suspended, reconciling) = s.counts();
+        lines.push((
+            if failed > 0 {
+                LineColor::Err
+            } else if unknown > 0 {
+                LineColor::Warn
+            } else {
+                LineColor::Ok
+            },
+            fill(
+                active().diag_flux_summary,
+                &[
+                    ("total", &s.resources.len().to_string()),
+                    ("failed", &failed.to_string()),
+                    ("suspended", &suspended.to_string()),
+                    ("reconciling", &reconciling.to_string()),
+                    ("ready", &ready.to_string()),
+                ],
+            ),
+        ));
+        for r in s.resources.iter().filter(|r| !r.suspended && r.ready == FluxReady::Failed).take(8) {
+            lines.push((
+                LineColor::Err,
+                format!("{} {}/{}: {}", r.kind, r.namespace, r.name, truncate(&r.message, 160)),
+            ));
+        }
+        if failed > 0 {
+            DiagStatus::Err
+        } else if unknown > 0 {
+            DiagStatus::Warn
+        } else {
+            DiagStatus::Ok
+        }
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_certs, "kubectl get certificates -A") else {
+        return;
+    };
+    let cs = new_certs_state();
+    fetch_certs(client.clone(), cs.clone()).await;
+    let s = cs.lock().expect("certs poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.installed {
+        lines.push((LineColor::Info, active().diag_certs_absent.into()));
+        DiagStatus::Info
+    } else {
+        let (total, ready, failed, inflight, expiring) = s.counts();
+        lines.push((
+            if failed > 0 {
+                LineColor::Err
+            } else if expiring > 0 {
+                LineColor::Warn
+            } else {
+                LineColor::Ok
+            },
+            fill(
+                active().diag_certs_summary,
+                &[
+                    ("total", &total.to_string()),
+                    ("failed", &failed.to_string()),
+                    ("inflight", &inflight.to_string()),
+                    ("expiring", &expiring.to_string()),
+                    ("ready", &ready.to_string()),
+                ],
+            ),
+        ));
+        for r in s
+            .resources
+            .iter()
+            .filter(|r| r.kind == CmKind::Certificate && r.ready == CmReady::Failed)
+            .take(8)
+        {
+            lines.push((
+                LineColor::Err,
+                format!("{}/{}: {}", r.namespace, r.name, truncate(&r.message, 160)),
+            ));
+        }
+        if failed > 0 {
+            DiagStatus::Err
+        } else if expiring > 0 {
+            DiagStatus::Warn
+        } else {
+            DiagStatus::Ok
+        }
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_kyverno, "kubectl get clusterpolicies,polr -A") else {
+        return;
+    };
+    let ky = new_kyverno_state();
+    fetch_kyverno(client.clone(), ky.clone()).await;
+    let s = ky.lock().expect("kyverno poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.installed {
+        lines.push((LineColor::Info, active().diag_kyverno_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Ok;
+        let (policies, enforcing, _notready, fail, warn, error) = s.counts();
+        lines.push((
+            if fail > 0 || error > 0 {
+                LineColor::Warn
+            } else {
+                LineColor::Ok
+            },
+            fill(
+                active().diag_kyverno_summary,
+                &[
+                    ("policies", &policies.to_string()),
+                    ("enforcing", &enforcing.to_string()),
+                    ("fail", &fail.to_string()),
+                    ("warn", &warn.to_string()),
+                    ("error", &error.to_string()),
+                ],
+            ),
+        ));
+        status = worse(status, DiagStatus::Info);
+        if fail > 0 || error > 0 {
+            status = worse(status, DiagStatus::Warn);
+        }
+        if !s.health.controllers_ok() {
+            lines.push((LineColor::Err, active().diag_kyverno_ctrl_down.into()));
+            status = worse(status, DiagStatus::Err);
+        }
+        if s.health.silently_inactive() {
+            lines.push((LineColor::Warn, active().diag_kyverno_silent.into()));
+            status = worse(status, DiagStatus::Warn);
+        }
+        if s.backlog.stuck() > 0 {
+            lines.push((
+                if s.backlog.has_pileup() { LineColor::Err } else { LineColor::Warn },
+                fill(
+                    active().diag_kyverno_backlog,
+                    &[
+                        ("stuck", &s.backlog.stuck().to_string()),
+                        ("pending", &s.backlog.pending.to_string()),
+                        ("failed", &s.backlog.failed.to_string()),
+                    ],
+                ),
+            ));
+            status = worse(status, if s.backlog.has_pileup() { DiagStatus::Err } else { DiagStatus::Warn });
+            if let Some(age) = &s.backlog.oldest_stuck {
+                lines.push((LineColor::Dim, fill(active().diag_kyverno_oldest, &[("age", age)])));
+            }
+        } else if s.backlog.known {
+            lines.push((
+                LineColor::Ok,
+                fill(active().diag_kyverno_ur_ok, &[("total", &s.backlog.total.to_string())]),
+            ));
+        }
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_velero, "kubectl get backups,schedules -A") else {
+        return;
+    };
+    let vel = new_velero_state();
+    fetch_velero(client.clone(), vel.clone()).await;
+    let s = vel.lock().expect("velero poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.installed {
+        lines.push((LineColor::Info, active().diag_velero_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Info;
+        let problems = s.problems();
+        lines.push((
+            if problems > 0 { LineColor::Warn } else { LineColor::Ok },
+            fill(
+                active().diag_velero_summary,
+                &[
+                    ("schedules", &s.schedules.len().to_string()),
+                    ("backups", &s.backups.len().to_string()),
+                    ("restores", &s.restores.len().to_string()),
+                    ("problems", &problems.to_string()),
+                ],
+            ),
+        ));
+        if !s.server.running() {
+            lines.push((LineColor::Err, active().diag_velero_server_down.into()));
+            status = worse(status, DiagStatus::Err);
+        }
+        match s.last_success {
+            Some(ts) => {
+                let now = chrono::Utc::now().timestamp();
+                lines.push((
+                    LineColor::Ok,
+                    fill(active().diag_velero_last_success, &[("age", &age_of(ts, now))]),
+                ));
+            }
+            None => {
+                lines.push((LineColor::Warn, active().diag_velero_no_success.into()));
+                status = worse(status, DiagStatus::Warn);
+            }
+        }
+        for b in s.backups.iter().filter(|b| b.failed() || b.partially_failed()).take(6) {
+            lines.push((LineColor::Err, format!("{}/{}: {}", b.namespace, b.name, b.phase)));
+            status = worse(status, DiagStatus::Err);
+        }
+        if !s.uncovered.is_empty() {
+            lines.push((
+                LineColor::Warn,
+                fill(active().diag_velero_uncovered, &[("n", &s.uncovered.len().to_string())]),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        push_storage_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_reflector, "kubectl get deploy -A -l app.kubernetes.io/name=reflector") else {
+        return;
+    };
+    let refl = new_reflector_state();
+    fetch_reflector(client.clone(), refl.clone()).await;
+    let s = refl.lock().expect("reflector poisoned");
+    let mut lines = Vec::new();
+    let status = if s.controller_present == Some(false) && s.sources.is_empty() && s.orphans.is_empty() {
+        lines.push((LineColor::Info, active().diag_reflector_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Info;
+        let (sources, mirrors, problems) = s.summary();
+        lines.push((
+            if problems > 0 { LineColor::Warn } else { LineColor::Ok },
+            fill(
+                active().diag_reflector_summary,
+                &[
+                    ("sources", &sources.to_string()),
+                    ("mirrors", &mirrors.to_string()),
+                    ("problems", &problems.to_string()),
+                ],
+            ),
+        ));
+        push_reflector_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_rbac, "kubectl get clusterrolebindings,rolebindings -A") else {
+        return;
+    };
+    let rb = new_rbac_state();
+    fetch_rbac(client.clone(), critical_namespaces(&[]), rb.clone()).await;
+    let s = rb.lock().expect("rbac poisoned");
+    let mut lines = Vec::new();
+    let status = if let Some(e) = &s.error {
+        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        DiagStatus::Err
+    } else {
+        let crit = s.bindings.iter().filter(|b| b.severity == Severity::Critical).count();
+        let high = s.bindings.iter().filter(|b| b.severity == Severity::High).count();
+        lines.push((
+            if crit > 0 {
+                LineColor::Err
+            } else if high > 0 {
+                LineColor::Warn
+            } else {
+                LineColor::Ok
+            },
+            fill(
+                active().diag_rbac_summary,
+                &[
+                    ("bindings", &s.bindings.len().to_string()),
+                    ("roles", &s.roles.len().to_string()),
+                    ("crit", &crit.to_string()),
+                    ("high", &high.to_string()),
+                ],
+            ),
+        ));
+        for b in s
+            .bindings
+            .iter()
+            .filter(|b| b.severity == Severity::Critical)
+            .take(8)
+        {
+            lines.push((
+                LineColor::Err,
+                format!("{} {}: {}", b.binding_kind, b.binding_name, b.role_ref.label()),
+            ));
+        }
+        if crit > 0 {
+            DiagStatus::Err
+        } else if high > 0 {
+            DiagStatus::Warn
+        } else {
+            DiagStatus::Ok
         }
     };
     finish_step(state, run_id, idx, status, lines);
