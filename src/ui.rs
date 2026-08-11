@@ -1351,8 +1351,9 @@ pub struct App {
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
-    // Sources the user folded (`Espace`), keyed by "ns/name".
-    refl_collapsed: std::collections::HashSet<String>,
+    // Sources the user unfolded (`Espace`), keyed by "ns/name". The tree is collapsed by default —
+    // one line per source — because a busy source hides every other source under its mirrors.
+    refl_expanded: std::collections::HashSet<String>,
     refl_rows: Vec<ReflRow>,
     // The filtered sources and orphans the current rows index into. Snapshotted once per refresh so
     // the draw pass never re-locks, and so a row index can never point past a list that moved
@@ -1601,7 +1602,7 @@ impl App {
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
-            refl_collapsed: std::collections::HashSet::new(),
+            refl_expanded: std::collections::HashSet::new(),
             refl_rows: Vec::new(),
             refl_view_sources: Vec::new(),
             refl_view_orphans: Vec::new(),
@@ -7369,7 +7370,7 @@ impl App {
         match self.refl_world {
             ReflWorld::Sources => {
                 for (i, src) in sources.iter().enumerate() {
-                    let collapsed = self.refl_collapsed.contains(&refl_source_key(src));
+                    let collapsed = !self.refl_expanded.contains(&refl_source_key(src));
                     recs.push(synthetic_refl_source_record(src, st));
                     rows.push(ReflRow::Source { idx: i, collapsed });
                     if collapsed { continue; }
@@ -7462,10 +7463,10 @@ impl App {
             _ => None,
         };
         let Some(key) = key else { return };
-        if self.refl_collapsed.contains(&key) {
-            self.refl_collapsed.remove(&key);
+        if self.refl_expanded.contains(&key) {
+            self.refl_expanded.remove(&key);
         } else {
-            self.refl_collapsed.insert(key);
+            self.refl_expanded.insert(key);
         }
         self.refresh_reflector_snapshot();
     }
@@ -7509,7 +7510,8 @@ impl App {
         let Some((ns, name)) = target else { return };
         self.refl_world = ReflWorld::Sources;
         self.refl_filter = ReflFilter::All;
-        self.refl_collapsed.clear();
+        self.refl_expanded.clear();
+        self.refl_expanded.insert(format!("{ns}/{name}"));
         self.refresh_reflector_snapshot();
         let uid = format!("refl|src|{ns}/{name}");
         match self.snapshot.iter().position(|r| r.uid == uid) {
@@ -15761,7 +15763,12 @@ fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let visible = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(visible);
+    // Wrapping instead of clipping: a long value (an allowed-namespaces list, a banner, a blocker)
+    // used to run off the right edge with no way to see its tail. Scroll is counted in wrapped rows
+    // so the bottom stays reachable — a plain `lines.len()` under-counts once a line spills.
+    let wrap_w = area.width.saturating_sub(2) as usize;
+    let total: usize = lines.iter().map(|l| wrapped_rows(l, wrap_w).max(1)).sum();
+    let max_scroll = total.saturating_sub(visible);
     if app.refl_detail_scroll > max_scroll {
         app.refl_detail_scroll = max_scroll;
     }
@@ -15769,6 +15776,7 @@ fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app, Mode::ReflectorFull, &mut lines, visible, app.refl_detail_scroll, max_scroll,
     );
     let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .scroll((app.refl_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);

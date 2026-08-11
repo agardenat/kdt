@@ -886,6 +886,11 @@ fn diagnose_source(
 
     // The scope, resolved against the namespaces that exist right now.
     if let (Some(allowed_sel), Some(auto_sel)) = (&allowed_sel, &auto_sel) {
+        // Whether `allowed` names its namespaces at all, or is the empty = cluster-wide catch-all.
+        // An explicit list or selector expresses intent, so its not-yet-declared entries are worth
+        // listing; an empty `allowed` would otherwise materialise one "declare a mirror by hand" row
+        // per namespace — hundreds of them, burying the real mirrors.
+        let allowed_explicit = !p.allowed_ns.is_empty() || !p.allowed_selector.is_empty();
         for ns in namespaces {
             // Upstream never reflects into the source's own namespace.
             if ns.name == obj.namespace {
@@ -895,7 +900,13 @@ fn diagnose_source(
                 continue;
             }
             let auto = p.auto_enabled && match_scope(&p.auto_ns, auto_sel, ns);
-            targets.push(build_target(obj, ns, auto, by_id, consumers, consumers_known, st));
+            let t = build_target(obj, ns, auto, by_id, consumers, consumers_known, st);
+            // A namespace that is only permitted — no auto pass fills it and no mirror of this source
+            // sits there — is permission surface, not a destination. Keep it only when the allowed
+            // scope was declared explicitly.
+            if auto || t.mirror.is_some() || allowed_explicit {
+                targets.push(t);
+            }
         }
         targets.sort_by(|a, b| a.namespace.cmp(&b.namespace));
 
@@ -913,8 +924,12 @@ fn diagnose_source(
 
     // Scope-shape rules. These read the annotations only, so they hold even when a selector failed
     // to parse.
+    // `allowed` everywhere is a permission, not an action: nothing is copied until a mirror is
+    // declared by hand, and cluster-wide `allowed` is reflector's own recommended way to share into
+    // namespaces one cannot label-select. So this is context, not a fault — Info, not Danger. The
+    // aggressive twin is `auto` everywhere below, which really does flood the cluster.
     if p.allowed && p.allowed_ns.is_empty() && p.allowed_selector.is_empty() {
-        hints.push(danger(st.plural(
+        hints.push(info(st.plural(
             namespaces.len().saturating_sub(1),
             st.refl_allowed_everywhere_one,
             st.refl_allowed_everywhere_many,
@@ -1702,14 +1717,17 @@ mod tests {
     // --- scope-shape rules ---
 
     #[test]
-    fn an_empty_allowed_list_is_flagged_as_cluster_wide() {
+    fn an_empty_allowed_list_is_noted_as_cluster_wide_but_not_alarmed() {
         let props = MirroringProps { allowed: true, ..Default::default() };
         let src = obj(ReflKind::Secret, "kube-system", "s", "100", props);
         let d = diagnose(vec![src], &[ns("kube-system"), ns("qpool")], &HashMap::new(), true, &FR);
+        // A permission, not an action: reported as Info, never Danger — the cluster-wide `auto`
+        // twin is the one that actually floods.
         assert!(d.sources[0]
             .hints
             .iter()
-            .any(|h| h.level == HintLevel::Danger && h.text.contains("tous les namespaces")));
+            .any(|h| h.level == HintLevel::Info && h.text.contains("tous les namespaces")));
+        assert!(!d.sources[0].hints.iter().any(|h| h.level == HintLevel::Danger));
     }
 
     #[test]
