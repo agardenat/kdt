@@ -463,6 +463,9 @@ use crate::secrets::{
 use crate::configmaps::{
     fetch_configmaps, human_size, new_configmaps_state, ConfigMapInfo, SharedConfigMaps,
 };
+use crate::namespaces::{
+    fetch_namespaces_view, new_namespaces_state, NamespaceInfo, SharedNamespaces,
+};
 use crate::svc::{
     endpoint_belongs_to, fetch_network, new_network_state, EndpointRow, IngressClassResource,
     IngressResource, ServiceResource, SharedNetwork,
@@ -781,7 +784,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, NsPicker, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -1150,7 +1153,6 @@ pub struct App {
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
     pub ns_pick_state: SharedNsList,
-    pub ns_cursor: usize,
     pub watcher_handle: JoinHandle<()>,
     pub buffer_capacity: usize,
     pub ai_state: SharedAi,
@@ -1256,8 +1258,6 @@ pub struct App {
     pub cap_refresh_handle: Option<JoinHandle<()>>,
     last_cap_sel_uid: Option<String>,
     cap_detail_scroll: usize,
-    // When the namespace picker was opened from the pods view, return to it (not the events view).
-    pub ns_return_pods: bool,
     pub rbac_state: SharedRbac,
     pub rbac_min_sev: RbacSeverity,
     pub rbac_detail_scroll: usize,
@@ -1363,6 +1363,11 @@ pub struct App {
     pub configmaps_detail_scroll: usize,
     pub configmaps_h_scroll: usize,
     pub configmaps_refresh_handle: Option<JoinHandle<()>>,
+    pub namespaces_state: SharedNamespaces,
+    pub namespaces_cursor: usize,
+    pub namespaces_detail_scroll: usize,
+    pub namespaces_h_scroll: usize,
+    pub namespaces_refresh_handle: Option<JoinHandle<()>>,
     // Built-in critical namespaces merged with the user's config overrides.
     pub critical_ns: Vec<String>,
     // Active action-menu overlay (rescale/recycle/restart or reconcile scopes). `None` when closed.
@@ -1451,7 +1456,6 @@ impl App {
             h_scroll: 0,
             detail_h_scroll: 0,
             ns_pick_state: new_ns_list_state(),
-            ns_cursor: 0,
             watcher_handle,
             buffer_capacity,
             ai_state,
@@ -1529,7 +1533,6 @@ impl App {
             pods_saved_replicas: std::collections::HashMap::new(),
             pods_refresh_handle: None,
             last_pods_sel_uid: None,
-            ns_return_pods: false,
             rbac_state: new_rbac_state(),
             rbac_min_sev: RbacSeverity::Info,
             rbac_detail_scroll: 0,
@@ -1606,6 +1609,11 @@ impl App {
             configmaps_detail_scroll: 0,
             configmaps_h_scroll: 0,
             configmaps_refresh_handle: None,
+            namespaces_state: new_namespaces_state(),
+            namespaces_cursor: 0,
+            namespaces_detail_scroll: 0,
+            namespaces_h_scroll: 0,
+            namespaces_refresh_handle: None,
             critical_ns: critical_namespaces(&file_config.critical_namespaces),
             action_menu: None,
             yaml_view: None,
@@ -1940,32 +1948,6 @@ impl App {
         });
     }
 
-    fn enter_ns_picker(&mut self) {
-        {
-            let mut s = self.ns_pick_state.lock().expect("ns list poisoned");
-            s.loading = true;
-            s.namespaces.clear();
-            s.error = None;
-        }
-        self.ns_return_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
-        self.ns_cursor = 0;
-        self.mode = Mode::NsPicker;
-        let client = self.client.clone();
-        let state = self.ns_pick_state.clone();
-        tokio::spawn(async move {
-            fetch_namespaces(client, state).await;
-        });
-    }
-
-    fn exit_ns_picker(&mut self) {
-        if self.ns_return_pods {
-            self.ns_return_pods = false;
-            self.mode = Mode::Pods;
-        } else {
-            self.mode = Mode::Selection;
-        }
-    }
-
     fn current_ai_config(&self) -> Result<AiConfig, String> {
         match self.ai_providers.get(self.ai_provider_idx) {
             Some(p) => AiConfig::from_resolved(p),
@@ -2021,6 +2003,10 @@ impl App {
                 None => return,
             },
             Mode::Configmaps | Mode::ConfigmapsFull => match self.synthetic_configmaps_record() {
+                Some(r) => r,
+                None => return,
+            },
+            Mode::Namespaces => match self.synthetic_namespaces_record() {
                 Some(r) => r,
                 None => return,
             },
@@ -2337,6 +2323,10 @@ impl App {
             Mode::Configmaps | Mode::ConfigmapsFull => {
                 let cm = self.configmap_selected()?;
                 Some(("v1".to_string(), "ConfigMap".to_string(), cm.namespace, cm.name))
+            }
+            Mode::Namespaces => {
+                let ns = self.namespace_selected()?;
+                Some(("v1".to_string(), "Namespace".to_string(), String::new(), ns.name))
             }
             Mode::Selection
             | Mode::DetailFull
@@ -3275,6 +3265,7 @@ impl App {
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
+            Mode::Namespaces => self.refresh_namespaces(),
             _ => {}
         }
     }
@@ -3556,6 +3547,7 @@ impl App {
             Mode::Vuln | Mode::VulnFull => self.vuln_rows().len(),
             Mode::Secrets | Mode::SecretsFull => self.secret_rows().len(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.configmap_rows().len(),
+            Mode::Namespaces => self.namespace_rows().len(),
             _ => self.snapshot.len(),
         }
     }
@@ -3695,7 +3687,7 @@ impl App {
                         self.apply_namespace(ns_opt);
                         self.mode = Mode::Selection;
                     }
-                    None => self.enter_ns_picker(),
+                    None => self.enter_namespaces_mode(),
                 }
             }
             "nodes" => {
@@ -3851,6 +3843,9 @@ impl App {
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
                 self.stop_configmaps_auto_refresh();
+            }
+            Mode::Namespaces => {
+                self.stop_namespaces_auto_refresh();
             }
             Mode::Services | Mode::ServicesFull => {
                 self.stop_network_auto_refresh();
@@ -7366,7 +7361,7 @@ impl App {
                     for (j, t) in src.targets.iter().enumerate() {
                         // In the Problems filter a clean target under a flagged source is noise.
                         if self.refl_filter == ReflFilter::Problems
-                            && !t.worst().is_some_and(|l| l >= ReflHintLevel::Warn)
+                            && t.worst().is_none_or(|l| l < ReflHintLevel::Warn)
                         {
                             continue;
                         }
@@ -8005,6 +8000,90 @@ impl App {
         self.configmaps_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
         self.configmaps_detail_scroll = 0;
         self.configmaps_h_scroll = 0;
+    }
+
+    // --- Namespaces view ----------------------------------------------------------------------
+
+    fn enter_namespaces_mode(&mut self) {
+        self.mode = Mode::Namespaces;
+        self.namespaces_cursor = 0;
+        self.namespaces_detail_scroll = 0;
+        self.namespaces_h_scroll = 0;
+        self.refresh_namespaces();
+        self.start_namespaces_auto_refresh();
+    }
+
+    fn exit_namespaces_mode(&mut self) {
+        self.stop_namespaces_auto_refresh();
+        self.mode = Mode::Selection;
+        self.reset_to_follow();
+    }
+
+    fn refresh_namespaces(&self) {
+        {
+            let mut s = self.namespaces_state.lock().expect("namespaces poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.namespaces_state.clone();
+        tokio::spawn(async move { fetch_namespaces_view(client, state).await; });
+    }
+
+    fn start_namespaces_auto_refresh(&mut self) {
+        self.stop_namespaces_auto_refresh();
+        let client = self.client.clone();
+        let state = self.namespaces_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_namespaces_view(client.clone(), state.clone()).await;
+            }
+        });
+        self.namespaces_refresh_handle = Some(handle);
+    }
+
+    fn stop_namespaces_auto_refresh(&mut self) {
+        if let Some(h) = self.namespaces_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    fn namespace_rows(&self) -> Vec<NamespaceInfo> {
+        let items = self.namespaces_state.lock().expect("namespaces poisoned").items.clone();
+        let Some(q) = self.search_query.as_deref() else { return items };
+        items
+            .into_iter()
+            .filter(|n| {
+                fields_match_search(&[&n.name, &n.phase], q)
+                    || n.labels.iter().any(|(k, v)| k.to_lowercase().contains(q) || v.to_lowercase().contains(q))
+            })
+            .collect()
+    }
+
+    fn namespace_selected(&self) -> Option<NamespaceInfo> {
+        self.namespace_rows().into_iter().nth(self.namespaces_cursor)
+    }
+
+    fn move_namespace_selection(&mut self, delta: i32) {
+        let len = self.namespace_rows().len();
+        if len == 0 { return; }
+        let cur = self.namespaces_cursor as i32;
+        self.namespaces_cursor = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.namespaces_detail_scroll = 0;
+        self.namespaces_h_scroll = 0;
+    }
+
+    // `Enter` on a namespace row: scope the event watcher to it and drop into the events view — the
+    // same drill-in the old modal picker did, now reachable per-row like every other object action.
+    fn enter_selected_namespace(&mut self) {
+        let Some(ns) = self.namespace_selected() else { return; };
+        self.stop_namespaces_auto_refresh();
+        self.apply_namespace(Some(ns.name));
+        self.mode = Mode::Selection;
     }
 
     fn open_configmaps_copy_menu(&mut self) {
@@ -8924,6 +9003,38 @@ impl App {
         })
     }
 
+    fn synthetic_namespaces_record(&self) -> Option<EventRecord> {
+        let ns = self.namespace_selected()?;
+        let labels = if ns.labels.is_empty() {
+            "-".to_string()
+        } else {
+            ns.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
+        };
+        let msg = lang::fill(
+            lang::t(self.ai_language).rec_namespace,
+            &[
+                ("name", &ns.name),
+                ("phase", &ns.phase),
+                ("origin", &ns.provenance.label()),
+                ("labels", &labels),
+            ],
+        );
+        Some(EventRecord {
+            uid: format!("namespace|{}", ns.name),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: Severity::Normal,
+            reason: "Namespace".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+            namespace: String::new(),
+            name: ns.name.clone(),
+            message: msg,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        })
+    }
+
     fn synthetic_node_record(&self) -> Option<EventRecord> {
         let n = self.selected_node()?;
         let abnormal = if n.abnormal.is_empty() {
@@ -9047,24 +9158,6 @@ impl App {
         }
     }
 
-    fn confirm_ns(&mut self) {
-        let ns_opt: Option<String> = {
-            let s = self.ns_pick_state.lock().expect("ns list poisoned");
-            if self.ns_cursor == 0 {
-                None
-            } else {
-                s.namespaces.get(self.ns_cursor - 1).cloned()
-            }
-        };
-        self.apply_namespace(ns_opt);
-        if self.ns_return_pods {
-            // Re-enter the pods view scoped to the freshly selected namespace.
-            self.ns_return_pods = false;
-            self.enter_pods_mode();
-        } else {
-            self.mode = Mode::Selection;
-        }
-    }
 }
 
 pub async fn run(mut app: App) -> Result<()> {
@@ -9433,7 +9526,7 @@ fn handle_event(app: &mut App, ev: Event) {
         // user added to the view, so it is the first thing Esc should take away. The prompt modes
         // are excluded — there Esc still means "close this prompt".
         (KeyCode::Esc, _, _)
-            if !matches!(app.mode, Mode::Search | Mode::Command | Mode::NsPicker)
+            if !matches!(app.mode, Mode::Search | Mode::Command)
                 && app.active_query().is_some() =>
         {
             app.clear_search();
@@ -9464,13 +9557,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_search();
         }
 
@@ -9493,12 +9586,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_edit_view();
         }
 
@@ -9511,12 +9604,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_delete_view();
         }
 
@@ -9524,26 +9617,14 @@ fn handle_event(app: &mut App, ev: Event) {
             app.cycle_ai_provider();
             app.enter_ai_panel();
         }
-        (KeyCode::Char('m'), _, Mode::NsPicker) => {}
         (KeyCode::Char('m'), _, _) => app.cycle_ai_provider(),
 
         // Language toggle, available from every view. The prompt modes never get here (the arms
         // above feed every character to the query being typed); these three swallow `L` instead of
         // switching language, as they always have. Lowercase `l` is reserved for logs everywhere,
         // so this arm must stay uppercase — it precedes every per-mode arm and would shadow them.
-        (KeyCode::Char('L'), _, Mode::NsPicker | Mode::Extract | Mode::FluxLogs) => {}
+        (KeyCode::Char('L'), _, Mode::Extract | Mode::FluxLogs) => {}
         (KeyCode::Char('L'), _, _) => app.toggle_language(),
-
-        (KeyCode::Up, _, Mode::NsPicker) => {
-            if app.ns_cursor > 0 { app.ns_cursor -= 1; }
-        }
-        (KeyCode::Down, _, Mode::NsPicker) => {
-            let max = app.ns_pick_state.lock().expect("ns list poisoned").namespaces.len();
-            if app.ns_cursor < max { app.ns_cursor += 1; }
-        }
-        (KeyCode::Enter, _, Mode::NsPicker) => app.confirm_ns(),
-        (KeyCode::Esc, _, Mode::NsPicker) => app.exit_ns_picker(),
-        (_, _, Mode::NsPicker) => {}
 
         (KeyCode::Esc, _, Mode::AiPanel) => app.exit_ai_panel(),
         (KeyCode::Char('i'), _, Mode::AiPanel) => app.exit_ai_panel(),
@@ -9912,6 +9993,21 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::ConfigmapsFull) => app.enter_ai_panel(),
         (_, _, Mode::ConfigmapsFull) => {}
 
+        (KeyCode::Up, m, Mode::Namespaces) if m.contains(KeyModifiers::SHIFT) => app.namespaces_detail_scroll = app.namespaces_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::Namespaces) if m.contains(KeyModifiers::SHIFT) => app.namespaces_detail_scroll = app.namespaces_detail_scroll.saturating_add(1),
+        (KeyCode::Up, _, Mode::Namespaces) => app.move_namespace_selection(-1),
+        (KeyCode::Down, _, Mode::Namespaces) => app.move_namespace_selection(1),
+        (KeyCode::PageUp, _, Mode::Namespaces) => app.move_namespace_selection(-10),
+        (KeyCode::PageDown, _, Mode::Namespaces) => app.move_namespace_selection(10),
+        (KeyCode::Enter, _, Mode::Namespaces) => app.enter_selected_namespace(),
+        (KeyCode::Char('c'), _, Mode::Namespaces) => {
+            if let Some(ns) = app.namespace_selected() { app.copy_text(ns.manifest); }
+        }
+        (KeyCode::F(5), _, Mode::Namespaces) => app.refresh_namespaces(),
+        (KeyCode::Esc, _, Mode::Namespaces) => app.exit_namespaces_mode(),
+        (KeyCode::Char('i'), _, Mode::Namespaces) => app.enter_ai_panel(),
+        (_, _, Mode::Namespaces) => {}
+
         (KeyCode::Up, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
         (KeyCode::Left, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
@@ -10186,7 +10282,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         return draw_flux_logs(f, app);
     }
     let draw_mode = match base_mode {
-        Mode::NsPicker => Mode::Selection,
         Mode::AiPanel => match app.return_mode {
             Mode::NodeUsage => Mode::Nodes,
             Mode::Diagnostic => Mode::Selection,
@@ -10197,7 +10292,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -10232,7 +10327,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -10241,7 +10336,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
+        Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
     let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
@@ -10249,14 +10344,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
     let st = lang::t(app.ai_language);
     let mode_label = match app.mode {
         Mode::Selection => st.mode_selection,
-        Mode::NsPicker => st.mode_ns,
         Mode::AiPanel => st.mode_ai,
         Mode::DetailFull => st.mode_detail,
         Mode::Nodes => st.mode_nodes,
@@ -10277,6 +10371,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
         Mode::Velero | Mode::VeleroFull => st.mode_velero,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
+        Mode::Namespaces => st.mode_ns,
         Mode::Services | Mode::ServicesFull => st.mode_services,
         Mode::Storage | Mode::StorageFull => st.mode_storage,
         Mode::Capacity | Mode::CapacityFull => st.mode_capacity,
@@ -10348,6 +10443,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_velero_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
+        } else if draw_mode == Mode::Namespaces {
+            draw_namespaces_table(f, app, ta);
         } else if draw_mode == Mode::Services {
             draw_net_tree(f, app, ta);
         } else if draw_mode == Mode::Storage {
@@ -10357,7 +10454,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::NsPicker | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -10652,6 +10749,15 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
             Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
         ],
+        Mode::Namespaces => vec![
+            Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+            Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+            footer_sep(),
+            Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+        ],
         Mode::Services => {
             // `t` shows the opposite of the current grouping; `g` names the other world to switch to.
             let toggle_label = if app.net_group {
@@ -10797,7 +10903,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
         ],
-        Mode::NsPicker | Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
+        Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
     // Second line: the tool bar available in every view, always grouped at the same place.
     let has_copy = !matches!(
@@ -10875,9 +10981,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
 
     // These popups are the body of their mode, not decorations on top of it: they are keyed on
     // `base_mode` so opening the search prompt over one does not make it vanish.
-    if base_mode == Mode::NsPicker {
-        draw_ns_picker_popup(f, app, area);
-    }
     if base_mode == Mode::NodeUsage
         || (base_mode == Mode::AiPanel && app.return_mode == Mode::NodeUsage)
     {
@@ -13141,54 +13244,6 @@ fn draw_ai_panel_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .scroll((app.ai_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(border_color)));
     f.render_widget(p, popup_area);
-}
-
-fn draw_ns_picker_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let (namespaces, loading, error) = {
-        let s = app.ns_pick_state.lock().expect("ns list poisoned");
-        (s.namespaces.clone(), s.loading, s.error.clone())
-    };
-
-    let popup_width = (area.width * 55 / 100).max(40).min(area.width);
-    let items_count = namespaces.len() + 1;
-    let popup_height = (items_count as u16 + 4).min(area.height.saturating_sub(4)).max(5);
-    let popup_area = centered_rect(popup_width, popup_height, area);
-
-    f.render_widget(Clear, popup_area);
-
-    let st = lang::t(app.ai_language);
-    let title = format!(" {} ", st.lbl_select_namespace);
-
-    if loading {
-        let p = Paragraph::new(st.lbl_loading)
-            .block(Block::default().borders(Borders::ALL).title(title.clone()).border_style(Style::default().fg(Color::Cyan)));
-        f.render_widget(p, popup_area);
-        return;
-    }
-
-    if let Some(e) = error {
-        let p = Paragraph::new(Span::styled(e, Style::default().fg(Color::Red)))
-            .block(Block::default().borders(Borders::ALL).title(title.clone()).border_style(Style::default().fg(Color::Red)));
-        f.render_widget(p, popup_area);
-        return;
-    }
-
-    let mut items: Vec<ListItem> = vec![
-        ListItem::new(format!(" {}", st.lbl_all_namespaces)).style(Style::default().fg(Color::Cyan)),
-    ];
-    for ns in &namespaces {
-        items.push(ListItem::new(format!(" {}", ns)));
-    }
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(app.ns_cursor));
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Cyan)))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -19737,6 +19792,127 @@ fn configmap_detail_lines(cm: &ConfigMapInfo) -> (Line<'static>, Vec<Line<'stati
     (title, lines)
 }
 
+fn draw_namespaces_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, total) = {
+        let s = app.namespaces_state.lock().expect("namespaces poisoned");
+        (s.loading, s.error.clone(), s.items.len())
+    };
+    let rows_data = app.namespace_rows();
+    if !rows_data.is_empty() {
+        app.namespaces_cursor = app.namespaces_cursor.min(rows_data.len() - 1);
+    }
+
+    let title = if let Some(e) = &error {
+        format!("namespaces (erreur: {})", e)
+    } else if loading && total == 0 {
+        "namespaces (chargement...)".to_string()
+    } else {
+        format!("namespaces ({})", total)
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAME"), Cell::from("STATUS"), Cell::from("ORIGIN"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = rows_data.iter().map(|ns| {
+        let phase_style = match ns.phase.as_str() {
+            "Active" => Style::default().fg(Color::Green),
+            "Terminating" => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(DIM),
+        };
+        Row::new(vec![
+            Cell::from(ns.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(ns.phase.clone()).style(phase_style),
+            Cell::from(ns.provenance.label()).style(Style::default().fg(DIM)),
+            Cell::from(ns.age.clone()).style(Style::default().fg(DIM)),
+        ])
+    }).collect();
+
+    let name_w = col_width(rows_data.iter().map(|ns| ns.name.as_str()), "NAME", 16, 60);
+    let origin_w = col_width(rows_data.iter().map(|ns| ns.provenance.label()).collect::<Vec<_>>().iter().map(|s| s.as_str()), "ORIGIN", 8, 36);
+    let widths = [
+        Constraint::Length(name_w), Constraint::Length(12),
+        Constraint::Length(origin_w), Constraint::Length(6),
+    ];
+
+    let mut ts = TableState::default();
+    if !rows_data.is_empty() {
+        ts.select(Some(app.namespaces_cursor));
+    }
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut ts);
+}
+
+// Detail panel (split top): the selected Namespace's phase, origin and age, then its labels and
+// annotations. The object is cluster-scoped, so there is no namespace/name pair — just the name.
+fn draw_namespaces_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(ns) = app.namespace_selected() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            lang::t(app.ai_language).ns_empty_select, Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" namespaces "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, mut lines) = namespace_detail_lines(&ns);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.namespaces_detail_scroll > max_scroll {
+        app.namespaces_detail_scroll = max_scroll;
+    }
+    app.namespaces_detail_scroll = text_search_top(app, Mode::Namespaces, &mut lines, visible, app.namespaces_detail_scroll, max_scroll);
+    let p = Paragraph::new(lines)
+        .scroll((app.namespaces_detail_scroll as u16, app.namespaces_h_scroll as u16))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn namespace_detail_lines(ns: &NamespaceInfo) -> (Line<'static>, Vec<Line<'static>>) {
+    let st = lang::active();
+    let title = Line::from(Span::styled(
+        format!(" {} ", ns.name),
+        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<12}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = vec![
+        label(st.lbl_phase, ns.phase.clone()),
+        label(st.lbl_origin, ns.provenance.label()),
+        label(st.lbl_age, ns.age.clone()),
+    ];
+
+    let section = |lines: &mut Vec<Line<'static>>, header: &str, kv: &[(String, String)]| {
+        if kv.is_empty() { return; }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            header.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for (k, v) in kv {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {k}="), Style::default().fg(Color::Cyan)),
+                Span::raw(v.clone()),
+            ]));
+        }
+    };
+    section(&mut lines, st.lbl_labels, &ns.labels);
+    section(&mut lines, st.lbl_annotations, &ns.annotations);
+
+    (title, lines)
+}
+
 fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (resources, loading, error, counts) = {
         let s = app.flux_state.lock().expect("flux poisoned");
@@ -20352,6 +20528,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
     if is_configmaps_mode {
         draw_configmaps_detail(f, app, area);
+        return;
+    }
+    let is_namespaces_mode = matches!(view_mode(app), Mode::Namespaces);
+    if is_namespaces_mode {
+        draw_namespaces_detail(f, app, area);
         return;
     }
     let is_node_mode = matches!(view_mode(app), Mode::Nodes | Mode::NodesFull | Mode::NodeUsage);

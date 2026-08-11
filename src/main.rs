@@ -21,6 +21,7 @@ mod flux;
 mod glyphs;
 mod kyverno;
 mod lang;
+mod namespaces;
 mod nodeops;
 mod pdf;
 mod pods;
