@@ -57,6 +57,17 @@ pub enum Reason {
     // is restarted. A `Queued`/`New` backup has not started and is the safe one to clear, so it does
     // not raise this.
     VeleroBackupRunning,
+    // A CassandraDatacenter or K8ssandraCluster: deleting it takes the StatefulSet and, with it, the
+    // PersistentVolumeClaims holding the database. There is no undo short of a Medusa restore, and
+    // the whole point of the `:k8ssandra` view is that the restore may not exist.
+    CassandraData,
+    // A MedusaBackup: the same trap as `VeleroBackup`, one API group over. Deleting the object does
+    // not delete the backup — the files stay in the bucket, and the `sync` MedusaTask recreates the
+    // object from the bucket index at the next run. Removing the data takes a `purge` MedusaTask.
+    MedusaBackup,
+    // A Medusa run still in flight. Deleting it abandons the operation mid-transfer, leaving partial
+    // files in the bucket that the next differential backup will build on.
+    MedusaRunning,
     Finalizers,
 }
 
@@ -67,12 +78,15 @@ impl Reason {
             | Reason::GitOpsRoot { .. }
             | Reason::NamespaceCascade
             | Reason::VeleroBackupRunning
+            | Reason::CassandraData
             | Reason::CrdCascade => Level::Danger,
             Reason::OwnedBy { .. }
             | Reason::SystemNamespace { .. }
             | Reason::NodeDrain
             | Reason::PersistentData
-            | Reason::VeleroBackup => Level::Warn,
+            | Reason::VeleroBackup
+            | Reason::MedusaBackup
+            | Reason::MedusaRunning => Level::Warn,
             Reason::Finalizers => Level::Info,
         }
     }
@@ -237,6 +251,15 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
                 out.push(Reason::VeleroBackupRunning);
             }
         }
+        "CassandraDatacenter" | "K8ssandraCluster" => out.push(Reason::CassandraData),
+        "MedusaBackup" if api_version.starts_with("medusa.k8ssandra.io/") => {
+            out.push(Reason::MedusaBackup);
+        }
+        "MedusaBackupJob" | "MedusaRestoreJob" | "MedusaTask"
+            if api_version.starts_with("medusa.k8ssandra.io/") && medusa_in_progress(obj) =>
+        {
+            out.push(Reason::MedusaRunning);
+        }
         _ => {}
     }
     if let Some((kind, name)) = controller_owner(meta) {
@@ -257,6 +280,15 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
 
     out.sort_by_key(|r| std::cmp::Reverse(r.level()));
     out
+}
+
+// Whether a Medusa run has nodes still working. `status.inProgress` is the only field that says so:
+// there is no phase, and a finish time is absent both while it runs and when it never started.
+fn medusa_in_progress(obj: &Value) -> bool {
+    obj.get("status")
+        .and_then(|s| s.get("inProgress"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
 }
 
 // Object-level entry points for the two ownership checks, shared with the edit guard-rails

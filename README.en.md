@@ -78,6 +78,9 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `velero` | `vel`, `backup`, `backups`, `schedules` | Velero, backups and schedules |
 | `restores` | `restore`, `restauration` | Velero, restores |
 | `bsl` | `backupstoragelocation`, `backuprepositories` | Velero, storage and repositories |
+| `k8ssandra` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, ring side |
+| `medusa` | `med`, `medusabackup`, `cassbackup` | K8ssandra, Medusa backup side |
+| `reaper` | `rea`, `repair`, `repairs` | K8ssandra, operations and Reaper |
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
@@ -120,6 +123,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
+| K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `o` actions |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
@@ -210,6 +214,25 @@ shows the query and its effect (`/coredns  (3)`).
   a filter by kind and by label, and the choice between stepping around what already exists and
   overwriting it. Velero cannot target an object by name, so the view stops where the API stops
   rather than promising a tick box per object.
+- **K8ssandra / Cassandra** (`:k8ssandra`, `:medusa`, `:reaper`) — on a database only one question
+  matters, and none of the surfaces that ought to answer it do. A `MedusaBackupSchedule` keeps a
+  fresh `lastExecution` and a clean `nextSchedule` whether the run it fired succeeded or failed; the
+  purge CronJob completes green while purging nothing; and the `MedusaBackup` objects, the catalogue
+  itself, simply stop appearing — no event, no condition, no status field. So a cluster can run for
+  months with everything green and not one restorable backup. This view puts that number in the
+  title: **the age of the last backup that covers every node** of the datacenter, a partial run
+  counting as a failure because it restores as if it were whole. It also reports successful runs
+  missing from the catalogue (the `sync` MedusaTask never ran), and that a restore **stops the
+  datacenter** — before you start it, not after.
+
+  The ring comes from no CRD but from the `cassandra` container's management API, reached through
+  the apiserver proxy: no port-forward, no `kubectl`, no exec. `nodetool status` and
+  `describecluster` come out of it as typed data (UN/DN state, load, tokens, schema agreement), and
+  `s` fetches `tpstats`, `compactionstats` and `netstats` for the selected node. A pod is joined to
+  its ring entry on the **address**, not on the `hostID` in `status.nodeStatuses`: that field is the
+  operator's memory and it goes stale — the view says so when the two disagree. `o` opens the
+  operations: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask`
+  jobs (cleanup, upgradesstables, compaction, scrub, rolling restart).
 - **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
   missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
   with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message
@@ -357,6 +380,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | Scored RBAC, Secrets/TLS, cert-manager chain |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVEs |
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
+| `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, and the Cassandra management API through the apiserver proxy |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |
 | `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, Typst rendering |

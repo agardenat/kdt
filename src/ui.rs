@@ -592,6 +592,103 @@ impl VelRow {
     }
 }
 
+use crate::k8ssandra::{
+    apply_k8c_write, fetch_k8ssandra, fetch_k8c_logs, fetch_k8c_metrics, fetch_k8c_repairs,
+    format_load, new_k8c_panel,
+    new_k8c_state, CassTask, K8cCluster, K8cDatacenter, K8cNode, K8cWrite, MedBackup, MedJob,
+    MedRestore, MedSchedule, MedTask, PanelKind, ReaperRec, SharedK8c, SharedK8cPanel,
+};
+
+// The three questions the k8ssandra view answers, cycled with `g` off a single fetch: is the ring
+// healthy (Cluster), is anything restorable (Backups), and what maintenance is running or has run
+// (Ops). Backups is where the view earns its keep, so `:medusa` opens straight on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K8cWorld {
+    Cluster,
+    Backups,
+    Ops,
+}
+
+// One visual row of the k8ssandra view, index-aligned with `App::snapshot` like every other tree
+// view here. The records that carry hint vectors are boxed: this vector holds one line per visible
+// row, and a datacenter is several times the size of a task row.
+#[derive(Debug, Clone)]
+enum K8cRow {
+    Cluster(Box<K8cCluster>),
+    Datacenter(Box<K8cDatacenter>),
+    Node(Box<K8cNode>),
+    Schedule(Box<MedSchedule>),
+    Job(Box<MedJob>),
+    Backup(Box<MedBackup>),
+    Restore(Box<MedRestore>),
+    Task(Box<MedTask>),
+    CassTask(Box<CassTask>),
+    Reaper(Box<ReaperRec>),
+    // Parent rows for what hangs off no schedule: the Medusa catalogue itself, the runs whose
+    // schedule is gone, and the restores. They group, they are not objects.
+    Group { key: &'static str, namespace: String, label: String, count: usize },
+}
+
+impl K8cRow {
+    fn hints(&self) -> &[crate::storage::Hint] {
+        match self {
+            K8cRow::Cluster(c) => &c.hints,
+            K8cRow::Datacenter(d) => &d.hints,
+            K8cRow::Node(n) => &n.hints,
+            K8cRow::Schedule(s) => &s.hints,
+            K8cRow::Job(j) => &j.hints,
+            K8cRow::Backup(b) => &b.hints,
+            K8cRow::Restore(r) => &r.hints,
+            K8cRow::Task(t) => &t.hints,
+            K8cRow::CassTask(t) => &t.hints,
+            K8cRow::Reaper(r) => &r.hints,
+            K8cRow::Group { .. } => &[],
+        }
+    }
+
+    fn uid(&self) -> String {
+        match self {
+            K8cRow::Cluster(c) => c.uid.clone(),
+            K8cRow::Datacenter(d) => d.uid.clone(),
+            K8cRow::Node(n) => n.uid.clone(),
+            K8cRow::Schedule(s) => s.uid.clone(),
+            K8cRow::Job(j) => j.uid.clone(),
+            K8cRow::Backup(b) => b.uid.clone(),
+            K8cRow::Restore(r) => r.uid.clone(),
+            K8cRow::Task(t) => t.uid.clone(),
+            K8cRow::CassTask(t) => t.uid.clone(),
+            K8cRow::Reaper(r) => r.uid.clone(),
+            K8cRow::Group { key, namespace, .. } => format!("k8c|group|{namespace}|{key}"),
+        }
+    }
+
+    fn namespace(&self) -> &str {
+        match self {
+            K8cRow::Cluster(c) => &c.namespace,
+            K8cRow::Datacenter(d) => &d.namespace,
+            K8cRow::Node(n) => &n.namespace,
+            K8cRow::Schedule(s) => &s.namespace,
+            K8cRow::Job(j) => &j.namespace,
+            K8cRow::Backup(b) => &b.namespace,
+            K8cRow::Restore(r) => &r.namespace,
+            K8cRow::Task(t) => &t.namespace,
+            K8cRow::CassTask(t) => &t.namespace,
+            K8cRow::Reaper(r) => &r.namespace,
+            K8cRow::Group { namespace, .. } => namespace,
+        }
+    }
+
+    // The fold key of a row that has children, `None` for a leaf.
+    fn fold_key(&self) -> Option<String> {
+        match self {
+            K8cRow::Cluster(_) | K8cRow::Datacenter(_) | K8cRow::Schedule(_)
+            | K8cRow::Group { .. } => Some(self.uid()),
+            _ => None,
+        }
+    }
+
+}
+
 // The three ways to look at reflector's work (`g`). Sources is the tree everything hangs from;
 // Mirrors flattens the copies so one can scan versions side by side; Orphans isolates the copies no
 // source claims any more, which is where the surprises live.
@@ -787,7 +884,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull }
 
 // One visual line in the merged workloads view: either a workload (parent/group row) or one of its
 // pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
@@ -823,6 +920,12 @@ enum MenuAction {
     VelDeleteBackup,
     // Kyverno: delete every stuck (Pending/Failed) UpdateRequest to unjam the generate queue.
     KyPurgeRequests,
+    // K8ssandra: run a schedule now, restore a catalogue entry, run a Medusa maintenance task, or
+    // hand cass-operator a job to run across the datacenter.
+    K8cBackupNow,
+    K8cRestore,
+    K8cMedusaTask(&'static str),
+    K8cCassandraTask(&'static str),
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
@@ -882,6 +985,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::KyvernoFull
             | Mode::ReflectorFull
             | Mode::VeleroFull
+            | Mode::K8ssandraFull
             | Mode::ConfigmapsFull
             | Mode::ServicesFull
             | Mode::StorageFull
@@ -969,6 +1073,35 @@ fn vel_keep_ancestors(rows: &[VelRow], keep: &mut [bool]) {
     }
 }
 
+// Indentation depth of a k8ssandra row, and the same ancestor-keeping rule the velero view uses:
+// a node that matches `/sts-3` keeps the datacenter and cluster above it, or the hit lands in a
+// table with nothing to read it against.
+fn k8c_depth(row: &K8cRow) -> usize {
+    match row {
+        K8cRow::Cluster(_) | K8cRow::Schedule(_) | K8cRow::Group { .. } => 0,
+        K8cRow::Reaper(_) | K8cRow::CassTask(_) | K8cRow::Task(_) => 0,
+        K8cRow::Datacenter(_) | K8cRow::Job(_) | K8cRow::Backup(_) | K8cRow::Restore(_) => 1,
+        K8cRow::Node(_) => 2,
+    }
+}
+
+fn k8c_keep_ancestors(rows: &[K8cRow], keep: &mut [bool]) {
+    const DEPTHS: usize = 3;
+    let mut last_at: [Option<usize>; DEPTHS] = [None; DEPTHS];
+    for (i, row) in rows.iter().enumerate() {
+        let d = k8c_depth(row).min(DEPTHS - 1);
+        if keep.get(i).copied().unwrap_or(false) {
+            for ancestor in last_at.iter().take(d).flatten() {
+                keep[*ancestor] = true;
+            }
+        }
+        last_at[d] = Some(i);
+        for slot in last_at.iter_mut().skip(d + 1) {
+            *slot = None;
+        }
+    }
+}
+
 // Which rows of a freshly rebuilt snapshot survive the active query, or `None` when there is
 // nothing to drop. Five views keep a display-row vector index-aligned with `snapshot`, so callers
 // feed the *same* keep-set to both: filtering one alone silently desyncs the rendering from the
@@ -1015,6 +1148,9 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("velero", &["vel", "backup", "backups", "sauvegarde", "sauvegardes", "schedule", "schedules"]),
     ("restores", &["restore", "restauration", "restaurations"]),
     ("bsl", &["backupstoragelocation", "backuplocation", "backuplocations", "backuprepository", "backuprepositories"]),
+    ("k8ssandra", &["k8c", "cassandra", "cass", "cassandradatacenter", "cassandradatacenters", "dc", "datacenter", "datacenters"]),
+    ("medusa", &["med", "medusabackup", "medusabackups", "cassbackup", "cassbackups"]),
+    ("reaper", &["rea", "repair", "repairs", "reparation", "reparations"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -1348,6 +1484,22 @@ pub struct App {
     // choices and the confirmation state; nothing it needs is fetched while it is open except the
     // resource-kind resolution, which lands in `vel_ro_resolved`.
     vel_restore_view: Option<VelRestoreView>,
+    pub k8c_state: SharedK8c,
+    // The container log or the node metrics, shown under the detail of the selected row. Its own
+    // state because neither is ever fetched by the ticker: a log tail is a streamed request and the
+    // metrics exposition is tens of thousands of lines.
+    pub k8c_panel: SharedK8cPanel,
+    k8c_world: K8cWorld,
+    k8c_filter: StoFilter,
+    // Rows the user folded (`Espace`), keyed by uid. Unlike the velero view this one starts folded
+    // at the run level: a fortnight of nightly runs under each schedule buries everything else.
+    k8c_collapsed: std::collections::HashSet<String>,
+    // Whether the initial fold of the run lists has been applied. Seeding on every rebuild would
+    // slam shut a schedule the user had just opened.
+    k8c_folds_seeded: bool,
+    k8c_rows: Vec<K8cRow>,
+    pub k8c_detail_scroll: usize,
+    pub k8c_refresh_handle: Option<JoinHandle<()>>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -1599,6 +1751,15 @@ impl App {
             vel_detail_scroll: 0,
             vel_refresh_handle: None,
             vel_restore_view: None,
+            k8c_state: new_k8c_state(),
+            k8c_panel: new_k8c_panel(),
+            k8c_world: K8cWorld::Cluster,
+            k8c_filter: StoFilter::All,
+            k8c_collapsed: std::collections::HashSet::new(),
+            k8c_folds_seeded: false,
+            k8c_rows: Vec::new(),
+            k8c_detail_scroll: 0,
+            k8c_refresh_handle: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -2351,7 +2512,9 @@ impl App {
             | Mode::Kyverno
             | Mode::KyvernoFull
             | Mode::Velero
-            | Mode::VeleroFull => {
+            | Mode::VeleroFull
+            | Mode::K8ssandra
+            | Mode::K8ssandraFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -3270,6 +3433,7 @@ impl App {
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
+            Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             Mode::Namespaces => self.refresh_namespaces(),
             _ => {}
@@ -3647,6 +3811,7 @@ impl App {
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac_snapshot(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
+            Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c_snapshot(),
             _ => {}
         }
     }
@@ -3769,6 +3934,21 @@ impl App {
                 self.leave_special_modes();
                 self.enter_velero_mode(VelWorld::Infra);
             }
+            "k8ssandra" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_k8c_mode(K8cWorld::Cluster);
+            }
+            "medusa" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_k8c_mode(K8cWorld::Backups);
+            }
+            "reaper" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_k8c_mode(K8cWorld::Ops);
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -3850,6 +4030,10 @@ impl App {
             }
             Mode::Velero | Mode::VeleroFull => {
                 self.stop_velero_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::K8ssandra | Mode::K8ssandraFull => {
+                self.stop_k8c_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -7270,6 +7454,644 @@ impl App {
         self.vel_run_write(write, st.msg_vel_delete_requested, st.msg_vel_delete_failed);
     }
 
+    // --- K8ssandra view -------------------------------------------------------------------------
+
+    // Open the k8ssandra view on the given world. Like velero, the three worlds share one fetch and
+    // one snapshot; `g` moves between them without refetching.
+    fn enter_k8c_mode(&mut self, world: K8cWorld) {
+        self.mode = Mode::K8ssandra;
+        self.k8c_world = world;
+        self.k8c_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_k8c();
+        self.start_k8c_auto_refresh();
+        self.refresh_k8c_snapshot();
+    }
+
+    fn exit_k8c_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_k8c_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_k8c_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.k8c_detail_scroll = 0;
+        self.mode = Mode::K8ssandraFull;
+    }
+
+    fn exit_k8c_full(&mut self) {
+        self.mode = Mode::K8ssandra;
+    }
+
+    fn refresh_k8c(&self) {
+        {
+            let mut s = self.k8c_state.lock().expect("k8ssandra poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.k8c_state.clone();
+        tokio::spawn(async move { fetch_k8ssandra(client, state).await; });
+    }
+
+    // 20s, for the same reason velero uses it: a backup run takes minutes, a schedule fires at best
+    // hourly, and each pass costs eleven discovery probes plus a ring read per datacenter.
+    fn start_k8c_auto_refresh(&mut self) {
+        self.stop_k8c_auto_refresh();
+        let client = self.client.clone();
+        let state = self.k8c_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_k8ssandra(client.clone(), state.clone()).await;
+            }
+        });
+        self.k8c_refresh_handle = Some(handle);
+    }
+
+    fn stop_k8c_auto_refresh(&mut self) {
+        if let Some(h) = self.k8c_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `k8c_rows` and `App::snapshot` in lockstep, so a selected index means the same row in
+    // both. That alignment is what gives this view `y`, `Ctrl-D`, the search and the AI panel
+    // without any code of its own.
+    fn refresh_k8c_snapshot(&mut self) {
+        let s = self.k8c_state.lock().expect("k8ssandra poisoned").clone();
+        if !self.k8c_folds_seeded && !s.schedules.is_empty() {
+            self.k8c_folds_seeded = true;
+            for sched in &s.schedules {
+                self.k8c_collapsed.insert(sched.uid.clone());
+            }
+        }
+        let st = lang::t(self.ai_language);
+        let ns_filter = self.current_ns_opt();
+        let ns_ok = |ns: &str| ns_filter.as_deref().is_none_or(|f| f == ns);
+        let mut rows: Vec<K8cRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+        let problems_only = self.k8c_filter == StoFilter::Problems;
+        let worse = |hints: &[crate::storage::Hint]| {
+            hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+        };
+
+        match self.k8c_world {
+            K8cWorld::Cluster => {
+                for c in s.clusters.iter().filter(|c| ns_ok(&c.namespace)) {
+                    let dcs: Vec<&K8cDatacenter> = s
+                        .datacenters
+                        .iter()
+                        .filter(|d| d.namespace == c.namespace)
+                        .collect();
+                    // The Problems filter never hides a cluster above a failing datacenter:
+                    // dropping it would strand the datacenter and lose the context one came for.
+                    let keep = !problems_only
+                        || worse(&c.hints)
+                        || dcs.iter().any(|d| worse(&d.hints))
+                        || s.nodes
+                            .iter()
+                            .any(|n| n.namespace == c.namespace && worse(&n.hints));
+                    if !keep { continue; }
+                    recs.push(synthetic_k8c_cluster_record(c, dcs.len(), st));
+                    rows.push(K8cRow::Cluster(Box::new(c.clone())));
+                    if self.k8c_collapsed.contains(&c.uid) { continue; }
+                    for d in dcs {
+                        let nodes: Vec<&K8cNode> = s
+                            .nodes
+                            .iter()
+                            .filter(|n| n.namespace == d.namespace && n.datacenter == d.name)
+                            .collect();
+                        if problems_only
+                            && !worse(&d.hints)
+                            && !nodes.iter().any(|n| worse(&n.hints))
+                        {
+                            continue;
+                        }
+                        recs.push(synthetic_k8c_dc_record(d, nodes.len(), st));
+                        rows.push(K8cRow::Datacenter(Box::new(d.clone())));
+                        if self.k8c_collapsed.contains(&d.uid) { continue; }
+                        for n in nodes {
+                            if problems_only && !worse(&n.hints) { continue; }
+                            recs.push(synthetic_k8c_node_record(n, st));
+                            rows.push(K8cRow::Node(Box::new(n.clone())));
+                        }
+                    }
+                }
+            }
+            K8cWorld::Backups => {
+                for sched in s.schedules.iter().filter(|x| ns_ok(&x.namespace)) {
+                    let runs: Vec<&MedJob> = sched
+                        .runs
+                        .iter()
+                        .filter_map(|uid| s.jobs.iter().find(|j| &j.uid == uid))
+                        .collect();
+                    let keep = !problems_only
+                        || worse(&sched.hints)
+                        || runs.iter().any(|j| worse(&j.hints));
+                    if !keep { continue; }
+                    recs.push(synthetic_k8c_sched_record(sched, runs.len(), st));
+                    rows.push(K8cRow::Schedule(Box::new(sched.clone())));
+                    // Runs start folded: a fortnight of nightly runs under each schedule buries the
+                    // catalogue and the restores, which is the rest of the answer.
+                    if self.k8c_collapsed.contains(&sched.uid) { continue; }
+                    for j in runs {
+                        if problems_only && !worse(&j.hints) { continue; }
+                        recs.push(synthetic_k8c_job_record(j, st));
+                        rows.push(K8cRow::Job(Box::new(j.clone())));
+                    }
+                }
+
+                // Runs no schedule claims: fired by hand, or by a schedule since deleted. They would
+                // otherwise simply not be in the view.
+                let claimed: std::collections::HashSet<&str> = s
+                    .schedules
+                    .iter()
+                    .flat_map(|x| x.runs.iter().map(String::as_str))
+                    .collect();
+                let orphans: Vec<&MedJob> = s
+                    .jobs
+                    .iter()
+                    .filter(|j| ns_ok(&j.namespace) && !claimed.contains(j.uid.as_str()))
+                    .filter(|j| !problems_only || worse(&j.hints))
+                    .collect();
+                self.push_k8c_group(
+                    "runs",
+                    st.k8c_grp_orphan_runs,
+                    orphans.len(),
+                    &orphans,
+                    &mut rows,
+                    &mut recs,
+                    st,
+                    |j| K8cRow::Job(Box::new((*j).clone())),
+                    synthetic_k8c_job_record,
+                );
+
+                let catalogue: Vec<&MedBackup> = s
+                    .backups
+                    .iter()
+                    .filter(|b| ns_ok(&b.namespace))
+                    .filter(|b| !problems_only || worse(&b.hints))
+                    .collect();
+                self.push_k8c_group(
+                    "catalogue",
+                    st.k8c_grp_catalogue,
+                    catalogue.len(),
+                    &catalogue,
+                    &mut rows,
+                    &mut recs,
+                    st,
+                    |b| K8cRow::Backup(Box::new((*b).clone())),
+                    synthetic_k8c_backup_record,
+                );
+
+                let restores: Vec<&MedRestore> = s
+                    .restores
+                    .iter()
+                    .filter(|r| ns_ok(&r.namespace))
+                    .filter(|r| !problems_only || worse(&r.hints))
+                    .collect();
+                self.push_k8c_group(
+                    "restores",
+                    st.k8c_grp_restores,
+                    restores.len(),
+                    &restores,
+                    &mut rows,
+                    &mut recs,
+                    st,
+                    |r| K8cRow::Restore(Box::new((*r).clone())),
+                    synthetic_k8c_restore_record,
+                );
+            }
+            K8cWorld::Ops => {
+                for r in s.reapers.iter().filter(|r| ns_ok(&r.namespace)) {
+                    if problems_only && !worse(&r.hints) { continue; }
+                    recs.push(synthetic_k8c_reaper_record(r, st));
+                    rows.push(K8cRow::Reaper(Box::new(r.clone())));
+                }
+                for t in s.cass_tasks.iter().filter(|t| ns_ok(&t.namespace)) {
+                    if problems_only && !worse(&t.hints) { continue; }
+                    recs.push(synthetic_k8c_ctask_record(t, st));
+                    rows.push(K8cRow::CassTask(Box::new(t.clone())));
+                }
+                for t in s.tasks.iter().filter(|t| ns_ok(&t.namespace)) {
+                    if problems_only && !worse(&t.hints) { continue; }
+                    recs.push(synthetic_k8c_task_record(t, st));
+                    rows.push(K8cRow::Task(Box::new(t.clone())));
+                }
+            }
+        }
+
+        self.k8c_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(mut keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            k8c_keep_ancestors(&self.k8c_rows, &mut keep);
+            retain_aligned(&mut self.k8c_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    // A heading over a flat list, plus the list itself when unfolded. Three of the Backups world's
+    // sections have this shape, and inlining it three times is how they drift apart.
+    #[allow(clippy::too_many_arguments)]
+    fn push_k8c_group<T>(
+        &self,
+        key: &'static str,
+        label: &'static str,
+        count: usize,
+        items: &[&T],
+        rows: &mut Vec<K8cRow>,
+        recs: &mut Vec<EventRecord>,
+        st: &'static Strings,
+        to_row: impl Fn(&T) -> K8cRow,
+        to_rec: impl Fn(&T, &'static Strings) -> EventRecord,
+    ) {
+        if items.is_empty() { return; }
+        // A heading carries no namespace: it stands for a section of the view, not for anything on
+        // the cluster, and the namespace filter has already been applied to what it collects.
+        let row = K8cRow::Group {
+            key,
+            namespace: String::new(),
+            label: label.to_string(),
+            count,
+        };
+        let uid = row.uid();
+        recs.push(synthetic_k8c_group_record(&uid, label, count, st));
+        rows.push(row);
+        if self.k8c_collapsed.contains(&uid) { return; }
+        for item in items {
+            recs.push(to_rec(item, st));
+            rows.push(to_row(item));
+        }
+    }
+
+    // The operations available on the row under the cursor. A row with none says so rather than
+    // opening an empty menu — the same rule the velero and reflector views follow.
+    fn open_k8c_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let mut note: Option<String> = None;
+        let items: Vec<ActionItem> = match self.k8c_selected() {
+            Some(K8cRow::Schedule(_)) => vec![ActionItem {
+                label: st.k_k8c_backup_now,
+                desc: st.desc_k8c_backup_now,
+                action: MenuAction::K8cBackupNow,
+            }],
+            // Restoring is only offered from a capture that covered every node. A partial one would
+            // be replayed as if it were whole, which is the failure mode this whole view exists to
+            // make visible — offering it here would undo that.
+            Some(K8cRow::Backup(b)) => {
+                if b.complete == Some(true) {
+                    note = Some(st.k8c_note_restore.to_string());
+                    vec![ActionItem {
+                        label: st.k_k8c_restore,
+                        desc: st.desc_k8c_restore,
+                        action: MenuAction::K8cRestore,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            Some(K8cRow::Job(j)) => {
+                if j.complete() == Some(true) {
+                    note = Some(st.k8c_note_restore.to_string());
+                    vec![ActionItem {
+                        label: st.k_k8c_restore,
+                        desc: st.desc_k8c_restore,
+                        action: MenuAction::K8cRestore,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            // Everything cass-operator and Medusa can be asked to do against a whole datacenter.
+            //
+            // The command list is deliberately short. `CassandraTask.spec.jobs[].command` is a free
+            // string in the CRD — no enum — so an unknown value produces a task that is accepted and
+            // never runs. Only the commands the CRD's own `args` documentation attests are offered
+            // (`keyspace_name` for the sstable ones, `pod_name`/`rack` for the restart), and each
+            // task lands in the Ops world where its active/succeeded/failed counters are visible.
+            Some(K8cRow::Datacenter(_)) => {
+                note = Some(st.k8c_note_datacenter.to_string());
+                vec![
+                    ActionItem {
+                        label: st.k_k8c_purge,
+                        desc: st.desc_k8c_purge,
+                        action: MenuAction::K8cMedusaTask("purge"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_sync,
+                        desc: st.desc_k8c_sync,
+                        action: MenuAction::K8cMedusaTask("sync"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_cleanup,
+                        desc: st.desc_k8c_cleanup,
+                        action: MenuAction::K8cCassandraTask("cleanup"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_upgradesstables,
+                        desc: st.desc_k8c_upgradesstables,
+                        action: MenuAction::K8cCassandraTask("upgradesstables"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_compaction,
+                        desc: st.desc_k8c_compaction,
+                        action: MenuAction::K8cCassandraTask("compaction"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_scrub,
+                        desc: st.desc_k8c_scrub,
+                        action: MenuAction::K8cCassandraTask("scrub"),
+                    },
+                    ActionItem {
+                        label: st.k_k8c_restart,
+                        desc: st.desc_k8c_restart,
+                        action: MenuAction::K8cCassandraTask("restart"),
+                    },
+                ]
+            }
+            // Re-running a finished maintenance task is the one thing worth doing from its row: a
+            // `sync` is how the catalogue catches up after a run the operator never recorded.
+            Some(K8cRow::Task(t)) if !t.operation.is_empty() => {
+                let op: &'static str = if t.operation == "purge" { "purge" } else { "sync" };
+                vec![ActionItem {
+                    label: if op == "purge" { st.k_k8c_purge } else { st.k_k8c_sync },
+                    desc: if op == "purge" { st.desc_k8c_purge } else { st.desc_k8c_sync },
+                    action: MenuAction::K8cMedusaTask(op),
+                }]
+            }
+            _ => Vec::new(),
+        };
+        if items.is_empty() {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.k8c_no_action.to_string()));
+            return;
+        }
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_k8c_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note,
+        });
+    }
+
+    // The datacenter a row belongs to, which every write here is addressed to. A row that names no
+    // datacenter has no write available, so this returning `None` cancels the action.
+    fn k8c_write_target(&self) -> Option<(String, String)> {
+        let row = self.k8c_selected()?;
+        let dc = match row {
+            K8cRow::Datacenter(d) => d.name.clone(),
+            K8cRow::Schedule(s) => s.datacenter.clone(),
+            K8cRow::Job(j) => j.datacenter.clone(),
+            K8cRow::Backup(b) => b.datacenter.clone(),
+            K8cRow::Restore(r) => r.datacenter.clone(),
+            K8cRow::Task(t) => t.datacenter.clone(),
+            _ => return None,
+        };
+        if dc.is_empty() { return None; }
+        Some((row.namespace().to_string(), dc))
+    }
+
+    fn k8c_backup_now(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(K8cRow::Schedule(sched)) = self.k8c_selected() else { return };
+        let write = K8cWrite::BackupNow {
+            namespace: sched.namespace.clone(),
+            datacenter: sched.datacenter.clone(),
+            backup_type: sched.backup_type.clone(),
+            prefix: sched.name.clone(),
+        };
+        self.k8c_run_write(write, st.msg_k8c_backup_started, st.msg_k8c_write_failed);
+    }
+
+    fn k8c_restore(&mut self) {
+        let st = lang::t(self.ai_language);
+        let (namespace, datacenter, backup) = match self.k8c_selected() {
+            Some(K8cRow::Backup(b)) => (b.namespace.clone(), b.datacenter.clone(), b.name.clone()),
+            Some(K8cRow::Job(j)) => (j.namespace.clone(), j.datacenter.clone(), j.name.clone()),
+            _ => return,
+        };
+        let write = K8cWrite::Restore { namespace, datacenter, backup };
+        self.k8c_run_write(write, st.msg_k8c_restore_started, st.msg_k8c_write_failed);
+    }
+
+    fn k8c_medusa_task(&mut self, operation: &str) {
+        let st = lang::t(self.ai_language);
+        let Some((namespace, datacenter)) = self.k8c_write_target() else { return };
+        let write = K8cWrite::Task {
+            namespace,
+            datacenter,
+            operation: operation.to_string(),
+        };
+        self.k8c_run_write(write, st.msg_k8c_task_started, st.msg_k8c_write_failed);
+    }
+
+    fn k8c_cassandra_task(&mut self, command: &str) {
+        let st = lang::t(self.ai_language);
+        let Some((namespace, datacenter)) = self.k8c_write_target() else { return };
+        let write = K8cWrite::CassandraTask {
+            namespace,
+            datacenter,
+            command: command.to_string(),
+        };
+        self.k8c_run_write(write, st.msg_k8c_task_started, st.msg_k8c_write_failed);
+    }
+
+    fn k8c_run_write(&mut self, write: K8cWrite, ok: &'static str, failed: &'static str) {
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.k8c_state.clone();
+        let kind = write.kind().to_string();
+        tokio::spawn(async move {
+            let message = match apply_k8c_write(client.clone(), write).await {
+                Ok(name) => {
+                    let name = if name.is_empty() { kind } else { name };
+                    lang::fill(ok, &[("name", &name)])
+                }
+                Err(e) => lang::fill(failed, &[("e", &e)]),
+            };
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((std::time::Instant::now(), message));
+            }
+            // Refetch straight away rather than waiting up to twenty seconds for the ticker: the
+            // object the write just created is the thing the user is looking for.
+            fetch_k8ssandra(client, state).await;
+        });
+    }
+
+    // `l`: the log of the container that would explain the row. On a node that is `cassandra`; on
+    // anything Medusa it is `medusa`, on the pod that actually failed — the reason a run failed is
+    // never in the Cassandra log, and picking the wrong container is picking the wrong answer.
+    fn k8c_toggle_log(&mut self) {
+        let st = lang::t(self.ai_language);
+        let target = match self.k8c_selected() {
+            Some(K8cRow::Node(n)) => {
+                Some((n.namespace.clone(), n.name.clone(), "cassandra".to_string()))
+            }
+            Some(K8cRow::Job(j)) => k8c_medusa_pod(&j.failed, &j.in_progress, &j.finished)
+                .map(|pod| (j.namespace.clone(), pod, "medusa".to_string())),
+            Some(K8cRow::Restore(r)) => k8c_medusa_pod(&r.failed, &r.in_progress, &[])
+                .map(|pod| (r.namespace.clone(), pod, "medusa".to_string())),
+            Some(K8cRow::Task(t)) => k8c_medusa_pod(&t.failed, &t.in_progress, &t.finished)
+                .map(|pod| (t.namespace.clone(), pod, "medusa".to_string())),
+            _ => None,
+        };
+        let Some((namespace, pod, container)) = target else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.k8c_no_log.to_string()));
+            return;
+        };
+        let key = format!("log|{namespace}/{pod}/{container}");
+        {
+            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
+            // Second press on the same row closes the panel rather than fetching it again.
+            if s.key == key {
+                *s = crate::k8ssandra::K8cPanel::default();
+                return;
+            }
+        }
+        self.k8c_detail_scroll = 0;
+        let client = self.client.clone();
+        let state = self.k8c_panel.clone();
+        tokio::spawn(async move {
+            fetch_k8c_logs(client, namespace, pod, container, key, state).await;
+        });
+    }
+
+    // `m`: `nodetool tpstats` and `nodetool compactionstats` for the node under the cursor, read
+    // through the management API. Only a node has them — they are per-process counters.
+    fn k8c_toggle_metrics(&mut self) {
+        let st = lang::t(self.ai_language);
+        if let Some(K8cRow::Reaper(r)) = self.k8c_selected() {
+            let (namespace, service, secret) =
+                (r.namespace.clone(), r.service.clone(), r.ui_secret.clone());
+            let key = format!("repairs|{namespace}/{service}");
+            {
+                let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
+                if s.key == key {
+                    *s = crate::k8ssandra::K8cPanel::default();
+                    return;
+                }
+            }
+            self.k8c_detail_scroll = 0;
+            let client = self.client.clone();
+            let state = self.k8c_panel.clone();
+            tokio::spawn(async move {
+                fetch_k8c_repairs(client, namespace, service, secret, key, state).await;
+            });
+            return;
+        }
+        let Some(K8cRow::Node(n)) = self.k8c_selected() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.k8c_no_metrics.to_string()));
+            return;
+        };
+        let (namespace, pod) = (n.namespace.clone(), n.name.clone());
+        let key = format!("metrics|{namespace}/{pod}");
+        {
+            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
+            if s.key == key {
+                *s = crate::k8ssandra::K8cPanel::default();
+                return;
+            }
+        }
+        self.k8c_detail_scroll = 0;
+        let client = self.client.clone();
+        let state = self.k8c_panel.clone();
+        tokio::spawn(async move {
+            fetch_k8c_metrics(client, namespace, pod, key, state).await;
+        });
+    }
+
+    fn move_k8c_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.k8c_detail_scroll = 0;
+    }
+
+    fn k8c_selected(&self) -> Option<&K8cRow> {
+        self.k8c_rows.get(self.table_state.selected()?)
+    }
+
+    fn cycle_k8c_world(&mut self) {
+        self.k8c_world = match self.k8c_world {
+            K8cWorld::Cluster => K8cWorld::Backups,
+            K8cWorld::Backups => K8cWorld::Ops,
+            K8cWorld::Ops => K8cWorld::Cluster,
+        };
+        self.k8c_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_k8c_snapshot();
+    }
+
+    fn cycle_k8c_filter(&mut self) {
+        self.k8c_filter = match self.k8c_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_k8c_snapshot();
+    }
+
+    // Fold or unfold the row under the cursor. A leaf folds its parent instead of doing nothing,
+    // which is what makes `Space` usable while walking a tree with the arrows.
+    fn toggle_k8c_fold(&mut self) {
+        let Some(sel) = self.table_state.selected() else { return };
+        let key = match self.k8c_rows.get(sel) {
+            Some(row) if row.fold_key().is_some() => row.fold_key(),
+            _ => self.k8c_rows[..sel]
+                .iter()
+                .rev()
+                .find_map(|r| r.fold_key()),
+        };
+        let Some(key) = key else { return };
+        if !self.k8c_collapsed.remove(&key) {
+            self.k8c_collapsed.insert(key);
+        }
+        self.refresh_k8c_snapshot();
+    }
+
     // --- Reflector view -------------------------------------------------------------------------
 
     fn enter_reflector_mode(&mut self) {
@@ -8619,6 +9441,10 @@ impl App {
             Some(MenuAction::VelRestoreOptions) => self.open_vel_restore_view(),
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
             Some(MenuAction::KyPurgeRequests) => self.ky_purge_requests(),
+            Some(MenuAction::K8cBackupNow) => self.k8c_backup_now(),
+            Some(MenuAction::K8cRestore) => self.k8c_restore(),
+            Some(MenuAction::K8cMedusaTask(op)) => self.k8c_medusa_task(op),
+            Some(MenuAction::K8cCassandraTask(cmd)) => self.k8c_cassandra_task(cmd),
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
@@ -9271,6 +10097,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // The velero operations report through the same channel as the Flux reconciles.
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::K8ssandra | Mode::K8ssandraFull) {
+            app.refresh_k8c_snapshot();
+            // The k8ssandra operations report through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -9574,13 +10405,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.enter_search();
         }
 
@@ -9603,12 +10434,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_edit_view();
         }
 
@@ -9621,12 +10452,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
             app.open_delete_view();
         }
 
@@ -10127,6 +10958,23 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('0'), _, Mode::Velero) => app.clear_namespace_filter(),
         (KeyCode::Char('i'), _, Mode::Velero) => app.enter_ai_panel(),
         (_, _, Mode::Velero) => {}
+        (KeyCode::Up, _, Mode::K8ssandra) => app.move_k8c_selection(-1),
+        (KeyCode::Down, _, Mode::K8ssandra) => app.move_k8c_selection(1),
+        (KeyCode::PageUp, _, Mode::K8ssandra) => app.move_k8c_selection(-10),
+        (KeyCode::PageDown, _, Mode::K8ssandra) => app.move_k8c_selection(10),
+        (KeyCode::Char(' '), _, Mode::K8ssandra) => app.toggle_k8c_fold(),
+        (KeyCode::Char('g'), _, Mode::K8ssandra) => app.cycle_k8c_world(),
+        (KeyCode::Char('f'), _, Mode::K8ssandra) => app.cycle_k8c_filter(),
+        (KeyCode::Enter, _, Mode::K8ssandra) => app.enter_k8c_full(),
+        (KeyCode::F(5), _, Mode::K8ssandra) => app.refresh_k8c(),
+        (KeyCode::Esc, _, Mode::K8ssandra) => app.exit_k8c_mode(),
+        (KeyCode::Char('n'), _, Mode::K8ssandra) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::K8ssandra) => app.clear_namespace_filter(),
+        (KeyCode::Char('o'), _, Mode::K8ssandra) => app.open_k8c_action_menu(),
+        (KeyCode::Char('l'), _, Mode::K8ssandra) => app.k8c_toggle_log(),
+        (KeyCode::Char('s'), _, Mode::K8ssandra) => app.k8c_toggle_metrics(),
+        (KeyCode::Char('i'), _, Mode::K8ssandra) => app.enter_ai_panel(),
+        (_, _, Mode::K8ssandra) => {}
 
         (KeyCode::Up, m, Mode::VeleroFull) if !m.contains(KeyModifiers::SHIFT) => {
             app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
@@ -10148,6 +10996,27 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::VeleroFull) => app.vel_toggle_log(),
         (KeyCode::Char('i'), _, Mode::VeleroFull) => app.enter_ai_panel(),
         (_, _, Mode::VeleroFull) => {}
+        (KeyCode::Up, m, Mode::K8ssandraFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.k8c_detail_scroll = app.k8c_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::K8ssandraFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.k8c_detail_scroll = app.k8c_detail_scroll.saturating_add(1)
+        }
+        (KeyCode::PageUp, _, Mode::K8ssandraFull) => {
+            app.k8c_detail_scroll = app.k8c_detail_scroll.saturating_sub(10)
+        }
+        (KeyCode::PageDown, _, Mode::K8ssandraFull) => {
+            app.k8c_detail_scroll = app.k8c_detail_scroll.saturating_add(10)
+        }
+        (KeyCode::Enter, _, Mode::K8ssandraFull) => app.exit_k8c_full(),
+        (KeyCode::Esc, _, Mode::K8ssandraFull) => app.exit_k8c_full(),
+        (KeyCode::Char('g'), _, Mode::K8ssandraFull) => app.k8c_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::K8ssandraFull) => app.k8c_detail_scroll = usize::MAX,
+        (KeyCode::Char('o'), _, Mode::K8ssandraFull) => app.open_k8c_action_menu(),
+        (KeyCode::Char('l'), _, Mode::K8ssandraFull) => app.k8c_toggle_log(),
+        (KeyCode::Char('s'), _, Mode::K8ssandraFull) => app.k8c_toggle_metrics(),
+        (KeyCode::Char('i'), _, Mode::K8ssandraFull) => app.enter_ai_panel(),
+        (_, _, Mode::K8ssandraFull) => {}
 
         (KeyCode::Up, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
         (KeyCode::Down, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(1),
@@ -10309,7 +11178,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -10340,11 +11209,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -10360,8 +11229,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -10387,6 +11256,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
         Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
         Mode::Velero | Mode::VeleroFull => st.mode_velero,
+        Mode::K8ssandra | Mode::K8ssandraFull => st.mode_k8ssandra,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Namespaces => st.mode_ns,
         Mode::Services | Mode::ServicesFull => st.mode_services,
@@ -10458,6 +11328,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_reflector_table(f, app, ta);
         } else if draw_mode == Mode::Velero {
             draw_velero_table(f, app, ta);
+        } else if draw_mode == Mode::K8ssandra {
+            draw_k8ssandra_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Namespaces {
@@ -10471,7 +11343,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -10929,6 +11801,42 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_vel_log)),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_vel_ops)),
         ],
+        Mode::K8ssandra => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.k8c_world {
+                K8cWorld::Cluster => st.k_k8c_backups,
+                K8cWorld::Backups => st.k_k8c_ops,
+                K8cWorld::Ops => st.k_k8c_cluster,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_k8c_fold)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_k8c_filter, app.k8c_filter.label())),
+                footer_sep(),
+                Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
+                Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::K8ssandraFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            footer_sep(),
+            Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
+            Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
+        ],
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
     // Second line: the tool bar available in every view, always grouped at the same place.
@@ -11294,6 +12202,9 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
         DelReason::PersistentData => st.del_persistent.to_string(),
         DelReason::VeleroBackup => st.del_velero_backup.to_string(),
         DelReason::VeleroBackupRunning => st.del_velero_backup_running.to_string(),
+        DelReason::CassandraData => st.del_cassandra_data.to_string(),
+        DelReason::MedusaBackup => st.del_medusa_backup.to_string(),
+        DelReason::MedusaRunning => st.del_medusa_running.to_string(),
         DelReason::Finalizers => st.del_finalizers.to_string(),
     }
 }
@@ -14563,6 +15474,304 @@ fn vel_record(
     }
 }
 
+// --- K8ssandra records ----------------------------------------------------------------------------
+
+// The GVK a row carries is what `y`, `e` and `Ctrl-D` act on, so each record is stamped with the
+// real API version of its object rather than with one group for the whole view: a MedusaBackup and
+// a CassandraDatacenter live in different groups and resolve through different discovery entries.
+#[allow(clippy::too_many_arguments)]
+fn k8c_record(
+    uid: &str,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[crate::storage::Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: vel_severity(hints),
+        reason: reason.to_string(),
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+fn synthetic_k8c_cluster_record(
+    c: &K8cCluster,
+    dcs: usize,
+    st: &'static Strings,
+) -> EventRecord {
+    let version = if c.server_version.is_empty() { "?" } else { &c.server_version };
+    let server = if c.server_type.is_empty() { "cassandra" } else { &c.server_type };
+    k8c_record(
+        &c.uid,
+        "k8ssandra.io/v1alpha1",
+        "K8ssandraCluster",
+        &c.namespace,
+        &c.name,
+        "Cluster",
+        lang::fill(
+            st.k8c_msg_cluster,
+            &[("server", server), ("version", version), ("n", &dcs.to_string())],
+        ),
+        &c.hints,
+    )
+}
+
+fn synthetic_k8c_dc_record(d: &K8cDatacenter, nodes: usize, st: &'static Strings) -> EventRecord {
+    k8c_record(
+        &d.uid,
+        "cassandra.datastax.com/v1beta1",
+        "CassandraDatacenter",
+        &d.namespace,
+        &d.name,
+        if d.progress.is_empty() { "Datacenter" } else { &d.progress },
+        lang::fill(
+            st.k8c_msg_dc,
+            &[
+                ("nodes", &nodes.to_string()),
+                ("size", &d.size.to_string()),
+                ("storage", if d.declared_storage.is_empty() { "?" } else { &d.declared_storage }),
+            ],
+        ),
+        &d.hints,
+    )
+}
+
+fn synthetic_k8c_node_record(n: &K8cNode, st: &'static Strings) -> EventRecord {
+    // The ring's own word for the node when it answered, the pod phase when it did not. Never a
+    // fabricated "UN": an unread ring is unknown, not up.
+    let state = match &n.ring {
+        Some(r) => r.status_code.clone(),
+        None => st.k8c_unknown.to_string(),
+    };
+    let load = n
+        .ring
+        .as_ref()
+        .and_then(|r| r.load_bytes)
+        .map(format_load)
+        .unwrap_or_else(|| "—".to_string());
+    k8c_record(
+        &n.uid,
+        "v1",
+        "Pod",
+        &n.namespace,
+        &n.name,
+        &state,
+        lang::fill(
+            st.k8c_msg_node,
+            &[("rack", if n.rack.is_empty() { "—" } else { &n.rack }), ("load", &load)],
+        ),
+        &n.hints,
+    )
+}
+
+fn synthetic_k8c_sched_record(s: &MedSchedule, runs: usize, st: &'static Strings) -> EventRecord {
+    let last = match s.last_execution {
+        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now_secs()))]),
+        None => st.k8c_never.to_string(),
+    };
+    k8c_record(
+        &s.uid,
+        "medusa.k8ssandra.io/v1alpha1",
+        "MedusaBackupSchedule",
+        &s.namespace,
+        &s.name,
+        if s.backup_type.is_empty() { "Schedule" } else { &s.backup_type },
+        lang::fill(
+            st.k8c_msg_sched,
+            &[("cron", &s.cron), ("last", &last), ("n", &runs.to_string())],
+        ),
+        &s.hints,
+    )
+}
+
+fn synthetic_k8c_job_record(j: &MedJob, st: &'static Strings) -> EventRecord {
+    // The outcome as coverage, not as a phase: "6/6" and "0/6" are the whole story, and Medusa
+    // never writes either of them anywhere.
+    let total = j
+        .expected
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let reason = match j.complete() {
+        _ if j.running() => st.k8c_state_running,
+        Some(true) => st.k8c_state_complete,
+        Some(false) => st.k8c_state_failed,
+        None => st.k8c_unknown,
+    };
+    k8c_record(
+        &j.uid,
+        "medusa.k8ssandra.io/v1alpha1",
+        "MedusaBackupJob",
+        &j.namespace,
+        &j.name,
+        reason,
+        lang::fill(
+            st.k8c_msg_job,
+            &[
+                ("ok", &j.finished.len().to_string()),
+                ("total", &total),
+                ("ko", &j.failed.len().to_string()),
+                ("type", if j.backup_type.is_empty() { "—" } else { &j.backup_type }),
+            ],
+        ),
+        &j.hints,
+    )
+}
+
+fn synthetic_k8c_backup_record(b: &MedBackup, st: &'static Strings) -> EventRecord {
+    let reason = match b.complete {
+        Some(true) => st.k8c_state_complete,
+        Some(false) => st.k8c_state_failed,
+        None => st.k8c_unknown,
+    };
+    let finished = match b.finish {
+        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now_secs()))]),
+        None => st.k8c_never.to_string(),
+    };
+    k8c_record(
+        &b.uid,
+        "medusa.k8ssandra.io/v1alpha1",
+        "MedusaBackup",
+        &b.namespace,
+        &b.name,
+        reason,
+        lang::fill(
+            st.k8c_msg_backup,
+            &[
+                ("type", if b.backup_type.is_empty() { "—" } else { &b.backup_type }),
+                ("finished", &finished),
+            ],
+        ),
+        &b.hints,
+    )
+}
+
+fn synthetic_k8c_restore_record(r: &MedRestore, st: &'static Strings) -> EventRecord {
+    let reason = if !r.failed.is_empty() {
+        st.k8c_state_failed
+    } else if r.finish.is_some() {
+        st.k8c_state_complete
+    } else {
+        st.k8c_state_running
+    };
+    k8c_record(
+        &r.uid,
+        "medusa.k8ssandra.io/v1alpha1",
+        "MedusaRestoreJob",
+        &r.namespace,
+        &r.name,
+        reason,
+        lang::fill(st.k8c_msg_restore, &[("backup", &r.backup)]),
+        &r.hints,
+    )
+}
+
+fn synthetic_k8c_task_record(t: &MedTask, st: &'static Strings) -> EventRecord {
+    let reason = if !t.failed.is_empty() {
+        st.k8c_state_failed
+    } else if t.finish.is_some() {
+        st.k8c_state_complete
+    } else {
+        st.k8c_state_running
+    };
+    k8c_record(
+        &t.uid,
+        "medusa.k8ssandra.io/v1alpha1",
+        "MedusaTask",
+        &t.namespace,
+        &t.name,
+        reason,
+        lang::fill(
+            st.k8c_msg_task,
+            &[
+                ("op", if t.operation.is_empty() { "—" } else { &t.operation }),
+                ("n", &t.finished.len().to_string()),
+            ],
+        ),
+        &t.hints,
+    )
+}
+
+fn synthetic_k8c_ctask_record(t: &CassTask, st: &'static Strings) -> EventRecord {
+    let reason = if t.failed > 0 {
+        st.k8c_state_failed
+    } else if t.active > 0 {
+        st.k8c_state_running
+    } else if t.finish.is_some() {
+        st.k8c_state_complete
+    } else {
+        st.k8c_state_pending
+    };
+    k8c_record(
+        &t.uid,
+        "control.k8ssandra.io/v1alpha1",
+        "CassandraTask",
+        &t.namespace,
+        &t.name,
+        reason,
+        lang::fill(
+            st.k8c_msg_ctask,
+            &[
+                ("cmd", &t.commands.join(", ")),
+                ("ok", &t.succeeded.to_string()),
+                ("ko", &t.failed.to_string()),
+            ],
+        ),
+        &t.hints,
+    )
+}
+
+fn synthetic_k8c_reaper_record(r: &ReaperRec, st: &'static Strings) -> EventRecord {
+    k8c_record(
+        &r.uid,
+        "reaper.k8ssandra.io/v1alpha1",
+        "Reaper",
+        &r.namespace,
+        &r.name,
+        if r.progress.is_empty() { st.k8c_unknown } else { &r.progress },
+        lang::fill(
+            st.k8c_msg_reaper,
+            &[("dc", if r.datacenter.is_empty() { "—" } else { &r.datacenter })],
+        ),
+        &r.hints,
+    )
+}
+
+// A section heading. It stands for no object, so it carries no kind: `y`, `e` and `Ctrl-D`
+// correctly find nothing to act on — the same contract as the velero orphan header.
+fn synthetic_k8c_group_record(
+    uid: &str,
+    label: &str,
+    count: usize,
+    st: &'static Strings,
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Group".to_string(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: label.to_string(),
+        message: st.plural(count, st.k8c_objects_one, st.k8c_objects_many),
+        component: "k8ssandra".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 fn synthetic_vel_schedule_record(
     s: &VelSchedule,
     backups: usize,
@@ -15532,6 +16741,318 @@ fn refl_status_cell(status: TargetStatus, st: &'static Strings) -> Cell<'static>
 // One shape for all three worlds, because the columns answer the same questions whichever object
 // owns the row: where it is, what it is, what state the copy is in, against which version, since
 // when. The last column is a fixed length, never `Min`, so the right border holds at every width.
+// --- K8ssandra view rendering ---------------------------------------------------------------------
+
+// The short label a row shows in the KIND column. The full kind is in the detail panel and in `y`;
+// here it only has to tell the rows apart.
+fn k8c_kind_label(row: &K8cRow, st: &'static Strings) -> &'static str {
+    match row {
+        K8cRow::Cluster(_) => "cluster",
+        K8cRow::Datacenter(_) => "dc",
+        K8cRow::Node(_) => "node",
+        K8cRow::Schedule(_) => "schedule",
+        K8cRow::Job(_) => "run",
+        K8cRow::Backup(_) => "backup",
+        K8cRow::Restore(_) => "restore",
+        K8cRow::Task(_) => "task",
+        K8cRow::CassTask(_) => "cass-task",
+        K8cRow::Reaper(_) => "reaper",
+        K8cRow::Group { .. } => st.k8c_kind_group,
+    }
+}
+
+// The state cell, coloured by what the state costs. A run that covered every node is green, one that
+// covered some is red rather than orange: a partial capture restores as if it were whole, which is
+// worse than an outright failure that nobody would restore from.
+fn k8c_state_cell(row: &K8cRow, st: &'static Strings) -> Cell<'static> {
+    let (text, color) = match row {
+        K8cRow::Cluster(c) => (
+            if c.error.is_empty() || c.error == "None" { st.k8c_state_ok } else { st.k8c_state_failed },
+            if c.error.is_empty() || c.error == "None" { Color::Green } else { Color::Red },
+        ),
+        K8cRow::Datacenter(d) => {
+            if d.stopped {
+                (st.k8c_state_stopped, Color::Red)
+            } else if d.ready() {
+                (st.k8c_state_ready, Color::Green)
+            } else {
+                (st.k8c_state_not_ready, Color::Red)
+            }
+        }
+        K8cRow::Node(n) => {
+            // The ring's word when it answered, the pod's readiness when it did not. An unread ring
+            // is dim and unknown, never a green UN we did not observe.
+            return match &n.ring {
+                Some(r) => Cell::from(r.status_code.clone()).style(Style::default().fg(
+                    if r.alive && r.state == "NORMAL" { Color::Green } else { Color::Red },
+                )),
+                None => Cell::from(st.k8c_unknown).style(Style::default().fg(DIM)),
+            };
+        }
+        K8cRow::Schedule(s) => {
+            if s.disabled {
+                (st.k8c_state_disabled, DIM)
+            } else {
+                (st.k8c_state_enabled, Color::Green)
+            }
+        }
+        K8cRow::Job(j) => match j.complete() {
+            _ if j.running() => (st.k8c_state_running, Color::Cyan),
+            Some(true) => (st.k8c_state_complete, Color::Green),
+            Some(false) => (st.k8c_state_failed, Color::Red),
+            None => (st.k8c_unknown, DIM),
+        },
+        K8cRow::Backup(b) => match b.complete {
+            Some(true) => (st.k8c_state_complete, Color::Green),
+            Some(false) => (st.k8c_state_failed, Color::Red),
+            None => (st.k8c_unknown, DIM),
+        },
+        K8cRow::Restore(r) => {
+            if !r.failed.is_empty() {
+                (st.k8c_state_failed, Color::Red)
+            } else if r.finish.is_some() {
+                (st.k8c_state_complete, Color::Green)
+            } else {
+                (st.k8c_state_running, Color::Cyan)
+            }
+        }
+        K8cRow::Task(t) => {
+            if !t.failed.is_empty() {
+                (st.k8c_state_failed, Color::Red)
+            } else if t.finish.is_some() {
+                (st.k8c_state_complete, Color::Green)
+            } else {
+                (st.k8c_state_running, Color::Cyan)
+            }
+        }
+        K8cRow::CassTask(t) => {
+            if t.failed > 0 {
+                (st.k8c_state_failed, Color::Red)
+            } else if t.active > 0 {
+                (st.k8c_state_running, Color::Cyan)
+            } else if t.finish.is_some() {
+                (st.k8c_state_complete, Color::Green)
+            } else {
+                (st.k8c_state_pending, DIM)
+            }
+        }
+        K8cRow::Reaper(r) => {
+            if r.ready {
+                (st.k8c_state_ready, Color::Green)
+            } else {
+                (st.k8c_state_not_ready, Color::Rgb(255, 140, 0))
+            }
+        }
+        K8cRow::Group { .. } => ("", DIM),
+    };
+    Cell::from(text).style(Style::default().fg(color))
+}
+
+// The one number each row owes at a glance. For a run that is its coverage — the fact Medusa never
+// writes down anywhere and the whole reason this view exists.
+fn k8c_info_text(row: &K8cRow, st: &'static Strings) -> String {
+    let now = now_secs();
+    match row {
+        K8cRow::Cluster(c) => {
+            let version = if c.server_version.is_empty() { "?" } else { &c.server_version };
+            match &c.medusa {
+                Some(m) => format!("{version} · {}", m.bucket),
+                None => format!("{version} · {}", st.k8c_no_medusa_short),
+            }
+        }
+        K8cRow::Datacenter(d) => format!(
+            "{}/{} · {}",
+            d.node_statuses.len(),
+            d.size,
+            if d.declared_storage.is_empty() { "—" } else { &d.declared_storage }
+        ),
+        K8cRow::Node(n) => {
+            let load = n
+                .ring
+                .as_ref()
+                .and_then(|r| r.load_bytes)
+                .map(format_load)
+                .unwrap_or_else(|| "—".to_string());
+            format!("{} · {load}", if n.rack.is_empty() { "—" } else { &n.rack })
+        }
+        K8cRow::Schedule(s) => s.cron.clone(),
+        K8cRow::Job(j) => {
+            let total = j.expected.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+            format!("{}/{total}", j.finished.len())
+        }
+        K8cRow::Backup(b) => match b.finish {
+            Some(t) => crate::velero::age_of(t, now),
+            None => st.k8c_never.to_string(),
+        },
+        K8cRow::Restore(r) => r.backup.clone(),
+        K8cRow::Task(t) => t.operation.clone(),
+        K8cRow::CassTask(t) => t.commands.join(", "),
+        K8cRow::Reaper(r) => r.datacenter.clone(),
+        K8cRow::Group { count, .. } => st.plural(*count, st.k8c_objects_one, st.k8c_objects_many),
+    }
+}
+
+fn k8c_row_created(row: &K8cRow) -> i64 {
+    match row {
+        K8cRow::Cluster(c) => c.created,
+        K8cRow::Datacenter(d) => d.created,
+        K8cRow::Node(n) => n.created,
+        K8cRow::Schedule(s) => s.last_execution.unwrap_or(0),
+        K8cRow::Job(j) => j.created,
+        K8cRow::Backup(b) => b.created,
+        K8cRow::Restore(r) => r.created,
+        K8cRow::Task(t) => t.created,
+        K8cRow::CassTask(t) => t.created,
+        K8cRow::Reaper(r) => r.created,
+        K8cRow::Group { .. } => 0,
+    }
+}
+
+fn k8c_row_name(row: &K8cRow) -> String {
+    match row {
+        K8cRow::Cluster(c) => c.name.clone(),
+        K8cRow::Datacenter(d) => d.name.clone(),
+        K8cRow::Node(n) => n.name.clone(),
+        K8cRow::Schedule(s) => s.name.clone(),
+        K8cRow::Job(j) => j.name.clone(),
+        K8cRow::Backup(b) => b.name.clone(),
+        K8cRow::Restore(r) => r.name.clone(),
+        K8cRow::Task(t) => t.name.clone(),
+        K8cRow::CassTask(t) => t.name.clone(),
+        K8cRow::Reaper(r) => r.name.clone(),
+        K8cRow::Group { label, .. } => label.clone(),
+    }
+}
+
+// The name exactly as it is drawn — marker and indentation included. `col_width` measures this, not
+// the bare name: measuring the name alone leaves the column two characters short and truncates
+// every row that carries a fold marker.
+fn k8c_row_names(app: &App) -> Vec<String> {
+    app.k8c_rows
+        .iter()
+        .map(|row| {
+            let name = k8c_row_name(row);
+            let indent = "  ".repeat(k8c_depth(row));
+            match row.fold_key() {
+                Some(key) => {
+                    let marker = if app.k8c_collapsed.contains(&key) { "▸" } else { "▾" };
+                    format!("{indent}{marker} {name}")
+                }
+                None => format!("{indent}{name}"),
+            }
+        })
+        .collect()
+}
+
+fn k8c_medusa_pod(failed: &[String], in_progress: &[String], finished: &[String]) -> Option<String> {
+    failed
+        .first()
+        .or_else(|| in_progress.first())
+        .or_else(|| finished.first())
+        .cloned()
+}
+
+fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let (loading, error, installed, problems, last_restorable, ring_known) = {
+        let s = app.k8c_state.lock().expect("k8ssandra poisoned");
+        (s.loading, s.error.clone(), s.installed, s.problems(), s.last_restorable, s.ring_known)
+    };
+
+    let world = match app.k8c_world {
+        K8cWorld::Cluster => st.k_k8c_cluster,
+        K8cWorld::Backups => st.k_k8c_backups,
+        K8cWorld::Ops => st.k_k8c_ops,
+    };
+    // The age of the last restorable backup goes in the title: it is the answer the view exists to
+    // give, and it has to be legible without selecting anything.
+    let rpo = match last_restorable {
+        Some(t) => crate::velero::age_of(t, now_secs()),
+        None if installed => st.k8c_never.to_string(),
+        None => "?".to_string(),
+    };
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "k8ssandra"), ("e", e)])
+    } else if loading && app.k8c_rows.is_empty() {
+        lang::fill(st.ui_title_loading, &[("view", "k8ssandra")])
+    } else {
+        lang::fill(
+            st.k8c_title,
+            &[
+                ("world", world),
+                ("rpo", &rpo),
+                ("problems", &problems.to_string()),
+                ("ring", if ring_known { "" } else { st.k8c_ring_absent_tag }),
+                ("ns", &app.namespace_label),
+                ("filter", app.k8c_filter.label()),
+            ],
+        )
+    };
+
+    let header_row = Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("STATE"),
+        Cell::from("INFO"), Cell::from("AGE"), Cell::from("ALERT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let names = k8c_row_names(app);
+    let alert = |hints: &[crate::storage::Hint]| match hints.first() {
+        Some(h) => Cell::from(h.text.clone())
+            .style(Style::default().fg(sto_hint_color(std::slice::from_ref(h)).unwrap_or(DIM))),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
+    };
+
+    let rows: Vec<Row> = app
+        .k8c_rows
+        .iter()
+        .zip(names.iter())
+        .map(|(row, drawn_name)| {
+            let name_style = match sto_hint_color(row.hints()) {
+                Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+                None if row.fold_key().is_some() => {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                }
+                None => Style::default(),
+            };
+            let created = k8c_row_created(row);
+            let age = if created > 0 {
+                crate::velero::age_of(created, now_secs())
+            } else {
+                "—".to_string()
+            };
+            Row::new(vec![
+                Cell::from(row.namespace().to_string()).style(Style::default().fg(DIM)),
+                Cell::from(drawn_name.clone()).style(name_style),
+                Cell::from(k8c_kind_label(row, st)).style(Style::default().fg(DIM)),
+                k8c_state_cell(row, st),
+                Cell::from(k8c_info_text(row, st)),
+                Cell::from(age).style(Style::default().fg(DIM)),
+                alert(row.hints()),
+            ])
+        })
+        .collect();
+
+    let ns_values: Vec<String> = app.k8c_rows.iter().map(|r| r.namespace().to_string()).collect();
+    let info_values: Vec<String> = app.k8c_rows.iter().map(|r| k8c_info_text(r, st)).collect();
+    let ns_w = col_width(ns_values.iter().map(|s| s.as_str()), "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 52);
+    let info_w = col_width(info_values.iter().map(|s| s.as_str()), "INFO", 6, 22);
+    // The alert column takes what is left, as a percentage rather than `Min`: a `Min` last column
+    // eats the right border as soon as the terminal is narrower than the sum of the fixed widths.
+    let widths = [
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(10),
+        Constraint::Length(10), Constraint::Length(info_w), Constraint::Length(5),
+        Constraint::Percentage(100),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
 fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let st = lang::t(app.ai_language);
     let (loading, error, n_src, n_mirror, n_problem, controller) = {
@@ -15747,6 +17268,479 @@ fn refl_short_version(v: &str) -> String {
 // The facts of the selected row, then what the rules make of them — the same shape as the storage
 // and cert-manager panels, so the three read alike. The annotations are shown verbatim: they are
 // the input to every verdict above, and a reader has to be able to check the reasoning.
+fn draw_k8ssandra_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let cluster_hints = {
+        let s = app.k8c_state.lock().expect("k8ssandra poisoned");
+        s.cluster_hints.clone()
+    };
+    let Some((title, mut lines)) = k8ssandra_detail_lines(app, &cluster_hints) else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            lang::t(app.ai_language).k8c_empty_select,
+            Style::default().fg(DIM),
+        )))
+        .block(Block::default().borders(Borders::ALL).title(" k8ssandra "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    // Wrapped, and the scroll counted in wrapped rows: a hint sentence here runs well past the panel
+    // width, and counting raw lines would leave the last one unreachable.
+    let wrap_w = area.width.saturating_sub(2) as usize;
+    let total: usize = lines.iter().map(|l| wrapped_rows(l, wrap_w).max(1)).sum();
+    let max_scroll = total.saturating_sub(visible);
+    if app.k8c_detail_scroll > max_scroll {
+        app.k8c_detail_scroll = max_scroll;
+    }
+    app.k8c_detail_scroll = text_search_top(
+        app, Mode::K8ssandraFull, &mut lines, visible, app.k8c_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.k8c_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// The facts of the selected row, then what the rules make of them — the same shape as the storage,
+// cert-manager and reflector panels, so the four read alike. The cluster-wide hints are repeated
+// under every row on purpose: they are the context the row has to be read in.
+fn k8ssandra_detail_lines(
+    app: &App,
+    cluster_hints: &[crate::storage::Hint],
+) -> Option<(Line<'static>, Vec<Line<'static>>)> {
+    let st = lang::t(app.ai_language);
+    // 22, not 20: `CassandraInitialized` and `cassandraDatacenter` are 20 and 19 characters, and at
+    // a width of 20 the longest one ran straight into its own value with no gap. The pad is a
+    // minimum rather than a column: a StatefulSet claim name is twice that and `{:<22}` widens
+    // nothing, so a key that overruns still gets its two spaces.
+    let label = |k: &str, v: String| {
+        let key = if k.chars().count() >= 22 {
+            format!("  {k}  ")
+        } else {
+            format!("  {k:<22}")
+        };
+        Line::from(vec![
+            Span::styled(key, Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+    let header = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let stamp = |t: Option<i64>| match t {
+        Some(v) if v > now_secs() => {
+            lang::fill(st.k8c_in, &[("age", &crate::velero::age_of(now_secs(), v))])
+        }
+        Some(v) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(v, now_secs()))]),
+        None => st.k8c_never.to_string(),
+    };
+    // A per-node outcome list, truncated: six pod names fit, thirty do not, and the count is the
+    // part that matters once the list is longer than the panel.
+    let nodes = |names: &[String]| {
+        if names.is_empty() {
+            return "—".to_string();
+        }
+        if names.len() <= 4 {
+            return names.join(", ");
+        }
+        format!("{}, … (+{})", names[..4].join(", "), names.len() - 4)
+    };
+
+    let sel = app.table_state.selected()?;
+    let row = app.k8c_rows.get(sel)?;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let title = match row {
+        K8cRow::Cluster(c) => {
+            lines.push(label("serverType", dash(&c.server_type)));
+            lines.push(label("serverVersion", dash(&c.server_version)));
+            lines.push(label(
+                "auth",
+                match c.auth {
+                    Some(v) => v.to_string(),
+                    None => st.k8c_unknown.to_string(),
+                },
+            ));
+            lines.push(label("datacenters", nodes(&c.datacenters)));
+            lines.push(label("reaper", c.reaper_enabled.to_string()));
+            lines.push(label("stargate", c.stargate_enabled.to_string()));
+            match &c.medusa {
+                Some(m) => {
+                    lines.push(Line::from(""));
+                    lines.push(header(st.k8c_lbl_medusa));
+                    lines.push(label("storageProvider", dash(&m.provider)));
+                    lines.push(label("bucketName", dash(&m.bucket)));
+                    // Medusa keys the bucket by the Cassandra cluster name when no prefix is set,
+                    // which is what keeps two clusters sharing one bucket from colliding.
+                    lines.push(label("prefix", dash(&m.prefix)));
+                    lines.push(label("region", dash(&m.region)));
+                    lines.push(label("storageSecretRef", dash(&m.secret)));
+                    lines.push(label(
+                        "maxBackupAge",
+                        m.max_backup_age.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                    ));
+                    lines.push(label(
+                        "maxBackupCount",
+                        m.max_backup_count.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                    ));
+                }
+                None => {
+                    lines.push(Line::from(""));
+                    lines.push(header(st.k8c_lbl_medusa));
+                    lines.push(label("medusa", st.k8c_no_medusa_short.to_string()));
+                }
+            }
+            if !c.conditions.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(header(st.k8c_lbl_conditions));
+                for (k, v) in &c.conditions {
+                    lines.push(label(k, v.clone()));
+                }
+            }
+            format!(" {} ", c.name)
+        }
+        K8cRow::Datacenter(d) => {
+            lines.push(label("clusterName", dash(&d.cluster_name)));
+            lines.push(label("serverType", dash(&d.server_type)));
+            lines.push(label("serverVersion", dash(&d.server_version)));
+            lines.push(label("size", d.size.to_string()));
+            lines.push(label("racks", nodes(&d.racks)));
+            lines.push(label("stopped", d.stopped.to_string()));
+            lines.push(label("operatorProgress", dash(&d.progress)));
+            lines.push(label("storageClassName", dash(&d.storage_class)));
+            lines.push(label("declaredStorage", dash(&d.declared_storage)));
+            lines.push(Line::from(""));
+            lines.push(header(st.k8c_lbl_conditions));
+            for (k, v) in &d.conditions {
+                lines.push(label(k, v.clone()));
+            }
+            format!(" {} ", d.name)
+        }
+        K8cRow::Node(n) => {
+            lines.push(label("cluster", dash(&n.cluster)));
+            lines.push(label("datacenter", dash(&n.datacenter)));
+            lines.push(label("rack", dash(&n.rack)));
+            lines.push(label("phase", dash(&n.phase)));
+            lines.push(label("ready", n.ready.to_string()));
+            lines.push(label("restarts", n.restarts.to_string()));
+            lines.push(label("nodeName", dash(&n.node_name)));
+            lines.push(label("hostID", dash(&n.host_id)));
+            lines.push(label("node-state", dash(&n.node_state)));
+            lines.push(Line::from(""));
+            lines.push(header(st.k8c_lbl_ring));
+            match &n.ring {
+                Some(r) => {
+                    lines.push(label("status", r.status_code.clone()));
+                    lines.push(label("state", dash(&r.state)));
+                    lines.push(label("address", dash(&r.ip)));
+                    lines.push(label("podIP", dash(&n.pod_ip)));
+                    lines.push(label(
+                        "load",
+                        r.load_bytes.map(format_load).unwrap_or_else(|| "—".into()),
+                    ));
+                    lines.push(label("tokens", r.tokens.to_string()));
+                    lines.push(label("schema", dash(&r.schema)));
+                }
+                // Not "down": the management API is what was not reached, and saying so is the
+                // difference between a node that is gone and a port we could not open.
+                None => lines.push(label("ring", st.k8c_ring_unread.to_string())),
+            }
+            if !n.claims.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(header(st.k8c_lbl_volumes));
+                for (claim, size) in &n.claims {
+                    lines.push(label(claim, dash(size)));
+                }
+            }
+            format!(" {} ", n.name)
+        }
+        K8cRow::Schedule(s) => {
+            lines.push(label("cronSchedule", dash(&s.cron)));
+            lines.push(label("backupType", dash(&s.backup_type)));
+            lines.push(label("cassandraDatacenter", dash(&s.datacenter)));
+            lines.push(label("disabled", s.disabled.to_string()));
+            lines.push(label("lastExecution", stamp(s.last_execution)));
+            lines.push(label("nextSchedule", stamp(s.next_schedule)));
+            lines.push(label(st.k8c_lbl_runs, s.runs.len().to_string()));
+            format!(" {} ", s.name)
+        }
+        K8cRow::Job(j) => {
+            lines.push(label("backupType", dash(&j.backup_type)));
+            lines.push(label("cassandraDatacenter", dash(&j.datacenter)));
+            lines.push(label("startTime", stamp(j.start)));
+            lines.push(label("finishTime", stamp(j.finish)));
+            lines.push(Line::from(""));
+            lines.push(header(st.k8c_lbl_coverage));
+            lines.push(label(
+                st.k8c_lbl_expected,
+                j.expected.map(|n| n.to_string()).unwrap_or_else(|| st.k8c_unknown.to_string()),
+            ));
+            lines.push(label(
+                st.k8c_lbl_finished,
+                format!("{} · {}", j.finished.len(), nodes(&j.finished)),
+            ));
+            lines.push(label(
+                st.k8c_lbl_failed,
+                format!("{} · {}", j.failed.len(), nodes(&j.failed)),
+            ));
+            if !j.in_progress.is_empty() {
+                lines.push(label(st.k8c_lbl_in_progress, nodes(&j.in_progress)));
+            }
+            lines.push(label(st.k8c_lbl_catalogued, j.in_catalogue.to_string()));
+            format!(" {} ", j.name)
+        }
+        K8cRow::Backup(b) => {
+            lines.push(label("backupType", dash(&b.backup_type)));
+            lines.push(label("cassandraDatacenter", dash(&b.datacenter)));
+            lines.push(label("startTime", stamp(b.start)));
+            lines.push(label("finishTime", stamp(b.finish)));
+            // Only shown when the API actually carries them. On operators up to 1.9 they do not
+            // exist, and a printed "0/0" would be a fact we invented.
+            if let Some(total) = b.total_nodes {
+                lines.push(label(
+                    st.k8c_lbl_coverage,
+                    format!("{}/{}", b.finished_nodes.unwrap_or(0), total),
+                ));
+            }
+            if let Some(size) = b.total_size {
+                lines.push(label("totalSize", format_load(size as f64)));
+            }
+            if !b.status.is_empty() {
+                lines.push(label("status", b.status.clone()));
+            }
+            format!(" {} ", b.name)
+        }
+        K8cRow::Restore(r) => {
+            lines.push(label("backup", dash(&r.backup)));
+            lines.push(label("cassandraDatacenter", dash(&r.datacenter)));
+            lines.push(label("startTime", stamp(r.start)));
+            lines.push(label("finishTime", stamp(r.finish)));
+            lines.push(label("restoreKey", dash(&r.restore_key)));
+            lines.push(label("restorePrepared", r.restore_prepared.to_string()));
+            // The field that turns a restore into an outage: the datacenter was taken down to do it.
+            lines.push(label("datacenterStopped", stamp(r.datacenter_stopped)));
+            if !r.failed.is_empty() {
+                lines.push(label(st.k8c_lbl_failed, nodes(&r.failed)));
+            }
+            if !r.in_progress.is_empty() {
+                lines.push(label(st.k8c_lbl_in_progress, nodes(&r.in_progress)));
+            }
+            format!(" {} ", r.name)
+        }
+        K8cRow::Task(t) => {
+            lines.push(label("operation", dash(&t.operation)));
+            lines.push(label("cassandraDatacenter", dash(&t.datacenter)));
+            lines.push(label("startTime", stamp(t.start)));
+            lines.push(label("finishTime", stamp(t.finish)));
+            lines.push(label(st.k8c_lbl_finished, nodes(&t.finished)));
+            if !t.failed.is_empty() {
+                lines.push(label(st.k8c_lbl_failed, nodes(&t.failed)));
+            }
+            if !t.in_progress.is_empty() {
+                lines.push(label(st.k8c_lbl_in_progress, nodes(&t.in_progress)));
+            }
+            format!(" {} ", t.name)
+        }
+        K8cRow::CassTask(t) => {
+            lines.push(label("commands", nodes(&t.commands)));
+            lines.push(label("datacenter", dash(&t.datacenter)));
+            lines.push(label("startTime", stamp(t.start)));
+            lines.push(label("completionTime", stamp(t.finish)));
+            lines.push(label("active", t.active.to_string()));
+            lines.push(label("succeeded", t.succeeded.to_string()));
+            lines.push(label("failed", t.failed.to_string()));
+            format!(" {} ", t.name)
+        }
+        K8cRow::Reaper(r) => {
+            lines.push(label("datacenterRef", dash(&r.datacenter)));
+            lines.push(label("progress", dash(&r.progress)));
+            lines.push(label("ready", r.ready.to_string()));
+            lines.push(label("uiUserSecretRef", dash(&r.ui_secret)));
+            lines.push(label(st.k8c_lbl_service, dash(&r.service)));
+            format!(" {} ", r.name)
+        }
+        // A heading stands for a section of the view, not for an object: it has nothing of its own
+        // to show beyond the count already in the table.
+        K8cRow::Group { label: text, count, .. } => {
+            lines.push(label(
+                st.k8c_lbl_objects,
+                st.plural(*count, st.k8c_objects_one, st.k8c_objects_many),
+            ));
+            format!(" {} ", text)
+        }
+    };
+
+    push_storage_hints(&mut lines, st.lbl_diagnostic, row.hints());
+    push_storage_hints(&mut lines, st.lbl_cluster, cluster_hints);
+    push_k8c_panel(app, &mut lines, st);
+    Some((Line::from(title), lines))
+}
+
+// The `l` / `m` panel, appended under the row's own detail rather than given a mode of its own: the
+// log of a failed run only means anything next to the run's coverage, and the thread pools next to
+// the node they belong to.
+fn push_k8c_panel(app: &App, lines: &mut Vec<Line<'static>>, st: &'static Strings) {
+    let panel = app.k8c_panel.lock().expect("k8ssandra panel poisoned").clone();
+    let Some(kind) = panel.kind else { return };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(" {} ", panel.title),
+        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    if panel.loading {
+        lines.push(Line::from(Span::styled(
+            st.k8c_panel_loading.to_string(),
+            Style::default().fg(DIM),
+        )));
+        return;
+    }
+    if let Some(e) = &panel.error {
+        lines.push(Line::from(Span::styled(e.clone(), Style::default().fg(Color::Red))));
+        return;
+    }
+    match kind {
+        PanelKind::Logs => {
+            if panel.lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", st.k8c_panel_empty),
+                    Style::default().fg(DIM),
+                )));
+            }
+            for l in &panel.lines {
+                lines.push(Line::from(Span::raw(l.clone())));
+            }
+        }
+        PanelKind::Metrics => {
+            let Some(m) = &panel.metrics else { return };
+            let cell = |k: &str, v: String| {
+                Line::from(vec![
+                    Span::styled(format!("  {:<26}", k), Style::default().fg(DIM)),
+                    Span::raw(v),
+                ])
+            };
+            lines.push(Line::from(Span::styled(
+                st.k8c_lbl_pools.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            if m.pools.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    st.k8c_panel_empty.to_string(),
+                    Style::default().fg(DIM),
+                )));
+            }
+            // Only the pools with something in flight, plus a handful of context: a node has ~40
+            // thread pools and 35 of them are permanently at zero.
+            let busy: Vec<&crate::mgmtapi::ThreadPool> =
+                m.pools.iter().filter(|p| p.pending > 0.0 || p.active > 0.0 || p.blocked > 0.0).collect();
+            let shown: Vec<&crate::mgmtapi::ThreadPool> = if busy.is_empty() {
+                m.pools.iter().take(6).collect()
+            } else {
+                busy
+            };
+            for p in shown {
+                // The three numbers `nodetool tpstats` is read for: what is running, what is queued
+                // behind it, and what the pool has had to block on.
+                let style = if p.pending > 0.0 || p.blocked > 0.0 {
+                    Style::default().fg(Color::Rgb(255, 140, 0))
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<26}", p.name), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!(
+                            "active {:.0} · pending {:.0} · blocked {:.0}",
+                            p.active, p.pending, p.blocked
+                        ),
+                        style,
+                    ),
+                ]));
+            }
+            if !m.dropped.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    st.k8c_lbl_dropped.to_string(),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+                for (kind, n) in &m.dropped {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<26}", kind), Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("{n:.0}"),
+                            Style::default().fg(Color::Rgb(255, 140, 0)),
+                        ),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                st.k8c_lbl_compactions.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(cell(
+                "pending",
+                m.pending_compactions.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+            ));
+            lines.push(cell(
+                "completed",
+                m.completed_compactions.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into()),
+            ));
+            lines.push(cell(
+                "bytes compacted",
+                m.bytes_compacted.map(format_load).unwrap_or_else(|| "—".into()),
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                st.k8c_lbl_streams.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            if panel.streams.is_empty() {
+                // An empty session list is an answer, not a failure: nothing is streaming.
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", st.k8c_no_streams),
+                    Style::default().fg(DIM),
+                )));
+            }
+            // The per-session shape is whatever the node reports: it is rendered as the pairs it
+            // sent rather than mapped onto fields this code has never seen.
+            for session in &panel.streams {
+                lines.push(Line::from(""));
+                for (k, v) in session {
+                    lines.push(cell(k, v.clone()));
+                }
+            }
+        }
+        PanelKind::Repairs => {
+            lines.push(Line::from(Span::styled(
+                st.k8c_lbl_repairs.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            if panel.repairs.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    st.k8c_panel_empty.to_string(),
+                    Style::default().fg(DIM),
+                )));
+            }
+            for (keyspace, tables, state, interval) in &panel.repairs {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<26}", keyspace), Style::default().fg(DIM)),
+                    Span::raw(format!(
+                        "{} · {} · {}",
+                        if state.is_empty() { "—" } else { state },
+                        if interval.is_empty() { "—" } else { interval },
+                        if tables.is_empty() { "—" } else { tables },
+                    )),
+                ]));
+            }
+        }
+    }
+}
+
 fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let cluster_hints = {
         let s = app.reflector_state.lock().expect("reflector poisoned");
@@ -20683,6 +22677,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let is_velero_mode = matches!(view_mode(app), Mode::Velero | Mode::VeleroFull);
     if is_velero_mode {
         draw_velero_detail(f, app, area);
+        return;
+    }
+    let is_k8c_mode = matches!(view_mode(app), Mode::K8ssandra | Mode::K8ssandraFull);
+    if is_k8c_mode {
+        draw_k8ssandra_detail(f, app, area);
         return;
     }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);

@@ -29,6 +29,7 @@ use crate::storage::{fetch_storage, new_storage_state};
 use crate::capacity::{fetch_capacity, new_capacity_state};
 use crate::rbac::{critical_namespaces, fetch_rbac, new_rbac_state, Severity};
 use crate::reflector::{fetch_reflector, new_reflector_state};
+use crate::k8ssandra::{fetch_k8ssandra, new_k8c_state};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagStatus {
@@ -143,6 +144,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     check_kyverno(&client, &state, run_id).await;
     check_velero(&client, &state, run_id).await;
     check_reflector(&client, &state, run_id).await;
+    check_k8ssandra(&client, &state, run_id).await;
     check_rbac(&client, &state, run_id).await;
     check_recent_warnings(&client, &state, run_id).await;
 
@@ -1653,6 +1655,74 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 fill(active().diag_velero_uncovered, &[("n", &s.uncovered.len().to_string())]),
             ));
             status = worse(status, DiagStatus::Warn);
+        }
+        push_storage_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+// Cassandra's own question, which no other step asks: is anything restorable. A cluster whose
+// schedules all fire on time and whose runs all fail reads as healthy everywhere else.
+async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_k8ssandra, "kubectl get k8ssandraclusters,medusabackupjobs -A") else {
+        return;
+    };
+    let k8c = new_k8c_state();
+    fetch_k8ssandra(client.clone(), k8c.clone()).await;
+    let s = k8c.lock().expect("k8ssandra poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.installed {
+        // Absence is never a fault: most clusters do not run k8ssandra.
+        lines.push((LineColor::Info, active().diag_k8ssandra_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Info;
+        let problems = s.problems();
+        lines.push((
+            if problems > 0 { LineColor::Warn } else { LineColor::Ok },
+            fill(
+                active().diag_k8ssandra_summary,
+                &[
+                    ("clusters", &s.clusters.len().to_string()),
+                    ("nodes", &s.nodes.len().to_string()),
+                    ("backups", &s.jobs.len().to_string()),
+                    ("problems", &problems.to_string()),
+                ],
+            ),
+        ));
+        match s.last_restorable {
+            Some(ts) => {
+                let now = chrono::Utc::now().timestamp();
+                lines.push((
+                    LineColor::Ok,
+                    fill(active().diag_k8ssandra_last_backup, &[("age", &age_of(ts, now))]),
+                ));
+            }
+            // Not a warning: a database with no restore point is the worst state this step can find.
+            None if !s.schedules.is_empty() => {
+                lines.push((LineColor::Err, active().diag_k8ssandra_no_backup.into()));
+                status = worse(status, DiagStatus::Err);
+            }
+            None => {}
+        }
+        for d in s.datacenters.iter().filter(|d| d.stopped || !d.ready()).take(6) {
+            lines.push((LineColor::Err, format!("{}/{}", d.namespace, d.name)));
+            status = worse(status, DiagStatus::Err);
+        }
+        for n in s.nodes.iter().filter(|n| !n.ready).take(6) {
+            lines.push((LineColor::Err, format!("{}/{}", n.namespace, n.name)));
+            status = worse(status, DiagStatus::Err);
+        }
+        // The schedules whose every recent run failed: the finding this whole view exists for.
+        for sched in s
+            .schedules
+            .iter()
+            .filter(|x| x.hints.iter().any(|h| h.level >= crate::k8ssandra::HintLevel::Danger))
+            .take(6)
+        {
+            lines.push((LineColor::Err, format!("{}/{}", sched.namespace, sched.name)));
+            status = worse(status, DiagStatus::Err);
         }
         push_storage_hints(&mut lines, &s.cluster_hints, &mut status);
         status
