@@ -201,6 +201,93 @@ fn scalar_text(v: &Value) -> String {
     }
 }
 
+// --- Snapshots ----------------------------------------------------------------------------------
+
+/// One line of `nodetool listsnapshots`: one table, under one tag, on one node.
+///
+/// Cassandra reports this as a JMX `TabularData` whose columns changed with the server version — 3.11
+/// has five, 4.1 added `Creation time` and `Expiration time` — so every field is read by name and
+/// missing ones stay empty rather than being invented.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    pub tag: String,
+    pub keyspace: String,
+    pub table: String,
+    /// What clearing the snapshot would actually give back: the files it no longer shares with the
+    /// live sstables. `nodetool` calls it "True size" and it is the only number worth a decision.
+    pub true_bytes: Option<f64>,
+    /// Everything the snapshot links to, shared files included. Always the larger of the two.
+    pub disk_bytes: Option<f64>,
+    /// Cassandra 4.1 and later only. `None` on 3.11, which does not report it at all.
+    pub created: Option<i64>,
+    pub expires: Option<i64>,
+}
+
+/// The snapshots of one node, as `nodetool listsnapshots` would print them.
+pub async fn snapshots(client: &Client, namespace: &str, pod: &str) -> Result<Vec<Snapshot>, String> {
+    let body = get_text(client, &pod_proxy(namespace, pod, MGMT_PORT, "/api/v0/ops/node/snapshots")).await?;
+    parse_snapshots(&body)
+}
+
+pub fn parse_snapshots(body: &str) -> Result<Vec<Snapshot>, String> {
+    let root: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let entity = root
+        .get("entity")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "entity absent".to_string())?;
+    let mut out: Vec<Snapshot> = entity.iter().map(parse_snapshot).collect();
+    out.sort_by(|a, b| {
+        (&a.tag, &a.keyspace, &a.table).cmp(&(&b.tag, &b.keyspace, &b.table))
+    });
+    Ok(out)
+}
+
+fn parse_snapshot(v: &Value) -> Snapshot {
+    // The agent stringifies every cell, and a JMX column that was null arrives as the four letters
+    // `null` rather than as an absent key.
+    let s = |k: &str| match v.get(k).and_then(Value::as_str) {
+        Some("null") | None => String::new(),
+        Some(text) => text.to_string(),
+    };
+    Snapshot {
+        tag: s("Snapshot name"),
+        keyspace: s("Keyspace name"),
+        table: s("Column family name"),
+        true_bytes: parse_size(&s("True size")),
+        disk_bytes: parse_size(&s("Size on disk")),
+        created: parse_instant(&s("Creation time")),
+        expires: parse_instant(&s("Expiration time")),
+    }
+}
+
+/// `12.34 GiB` back into bytes.
+///
+/// Cassandra formats these with a `DecimalFormat`, which follows the JVM's locale for the decimal
+/// separator — hence the comma. Anything else (a grouped thousand, a unit this code has never seen)
+/// is left unknown, because a size read wrong is worse here than a size not read: the whole point of
+/// the panel is how much disk a snapshot is holding.
+pub fn parse_size(raw: &str) -> Option<f64> {
+    let (number, unit) = raw.trim().rsplit_once(' ')?;
+    let value: f64 = number.trim().replace(',', ".").parse().ok()?;
+    let scale = match unit.trim() {
+        "bytes" | "byte" | "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0_f64.powi(2),
+        "GiB" => 1024.0_f64.powi(3),
+        "TiB" => 1024.0_f64.powi(4),
+        _ => return None,
+    };
+    Some(value * scale)
+}
+
+// `Instant.toString()`, which is RFC 3339 in UTC.
+fn parse_instant(raw: &str) -> Option<i64> {
+    if raw.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| t.timestamp())
+}
+
 // --- Metrics ------------------------------------------------------------------------------------
 
 /// One thread pool line of `nodetool tpstats`.
@@ -522,6 +609,51 @@ mod tests {
         let by_cluster = schema_versions_by_cluster(&eps);
         assert_eq!(by_cluster.len(), 2);
         assert!(by_cluster.values().all(|v| v.len() == 1), "each cluster agrees with itself");
+    }
+
+    // A 3.11 node (five columns, no creation time) and a 4.1 one (seven) answering the same call.
+    const SNAPSHOTS: &str = r#"{"entity":[
+      {"Snapshot name":"truncated-1754308800000-events","Keyspace name":"app","Column family name":"events",
+       "True size":"1,05 GiB","Size on disk":"1.2 GiB"},
+      {"Snapshot name":"medusa-2026-08-12","Keyspace name":"app","Column family name":"events",
+       "True size":"0 bytes","Size on disk":"940.5 MiB","Creation time":"2026-08-12T01:00:00Z",
+       "Expiration time":"null"},
+      {"Snapshot name":"medusa-2026-08-12","Keyspace name":"system","Column family name":"local",
+       "True size":"12.5 KiB","Size on disk":"quelques octets"}
+    ],"variant":null}"#;
+
+    #[test]
+    fn a_snapshot_line_is_read_column_by_column() {
+        let snaps = parse_snapshots(SNAPSHOTS).expect("parse");
+        assert_eq!(snaps.len(), 3);
+        // Sorted by tag then keyspace then table.
+        assert_eq!(snaps[0].tag, "medusa-2026-08-12");
+        assert_eq!(snaps[0].keyspace, "app");
+        assert_eq!(snaps[0].true_bytes, Some(0.0));
+        assert_eq!(snaps[0].created, Some(1_786_496_400));
+        // `null` is what a JMX column that was never set arrives as, not a date.
+        assert_eq!(snaps[0].expires, None);
+        // 3.11 reports no creation time at all.
+        assert_eq!(snaps[2].tag, "truncated-1754308800000-events");
+        assert_eq!(snaps[2].created, None);
+    }
+
+    #[test]
+    fn a_size_this_code_cannot_read_stays_unknown() {
+        // Zero would read as a snapshot holding nothing, which is the opposite decision.
+        let snaps = parse_snapshots(SNAPSHOTS).expect("parse");
+        assert_eq!(snaps[1].disk_bytes, None, "'quelques octets' is not a size");
+        assert_eq!(snaps[1].true_bytes, Some(12.5 * 1024.0));
+    }
+
+    #[test]
+    fn the_decimal_separator_follows_the_jvm_locale() {
+        let snaps = parse_snapshots(SNAPSHOTS).expect("parse");
+        assert_eq!(snaps[2].true_bytes, Some(1.05 * 1024.0_f64.powi(3)));
+        assert_eq!(parse_size("2.5 TiB"), Some(2.5 * 1024.0_f64.powi(4)));
+        assert_eq!(parse_size("512 bytes"), Some(512.0));
+        assert_eq!(parse_size("1 234.5 MiB"), None, "a grouped thousand is not decoded");
+        assert_eq!(parse_size(""), None);
     }
 
     const METRICS: &str = concat!(

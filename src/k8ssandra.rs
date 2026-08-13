@@ -87,6 +87,23 @@ const KINDS: &[(&str, &[&str], &str)] = &[
 // between a red RPO and a green one.
 const EPOCH_GUARD: i64 = 86_400;
 
+/// What `MedusaBackupJob.spec.backupType` falls back to when nobody sets one.
+///
+/// The CRD defaults the field to `differential` and constrains it to an enum of exactly
+/// `differential` and `full` — the empty string is **not** in that enum. So "unset" has to be
+/// expressed by leaving the key out of the payload entirely: sending `backupType: ""` is not an
+/// absent field, it is an invalid value, and the apiserver rejects the whole create.
+pub const DEFAULT_BACKUP_TYPE: &str = "differential";
+
+/// The backup type a run started from this schedule will really carry, and whether that is the CRD's
+/// default rather than something the schedule asked for.
+pub fn effective_backup_type(raw: &str) -> (&str, bool) {
+    match raw.trim() {
+        "" => (DEFAULT_BACKUP_TYPE, true),
+        set => (set, false),
+    }
+}
+
 /// A timestamp that is actually a timestamp — see [`EPOCH_GUARD`].
 pub fn real_ts(t: Option<i64>) -> Option<i64> {
     t.filter(|v| *v > EPOCH_GUARD)
@@ -1502,12 +1519,21 @@ pub fn write_payload(write: &K8cWrite) -> Value {
         })
     };
     match write {
-        K8cWrite::BackupNow { datacenter, backup_type, prefix, .. } => json!({
-            "apiVersion": write.api_version(),
-            "kind": write.kind(),
-            "metadata": meta(prefix),
-            "spec": { "cassandraDatacenter": datacenter, "backupType": backup_type },
-        }),
+        K8cWrite::BackupNow { datacenter, backup_type, prefix, .. } => {
+            let mut spec = json!({ "cassandraDatacenter": datacenter });
+            // Omitted rather than sent empty when the schedule names no type — see
+            // [`DEFAULT_BACKUP_TYPE`]: an empty string is outside the CRD's enum and costs the whole
+            // create, where an absent key gets defaulted to `differential`.
+            if !backup_type.trim().is_empty() {
+                spec["backupType"] = json!(backup_type);
+            }
+            json!({
+                "apiVersion": write.api_version(),
+                "kind": write.kind(),
+                "metadata": meta(prefix),
+                "spec": spec,
+            })
+        }
         K8cWrite::Restore { datacenter, backup, .. } => json!({
             "apiVersion": write.api_version(),
             "kind": write.kind(),
@@ -1642,6 +1668,7 @@ pub enum PanelKind {
     Logs,
     Metrics,
     Repairs,
+    Snapshots,
 }
 
 /// The panel appended under the detail of the selected row, on `l` or `m`.
@@ -1660,6 +1687,8 @@ pub struct K8cPanel {
     pub streams: Vec<Vec<(String, String)>>,
     /// Reaper's repair schedules, as (keyspace, tables, state, interval) read from its REST API.
     pub repairs: Vec<(String, String, String, String)>,
+    /// The node's snapshots (`nodetool listsnapshots`), one row per tag.
+    pub snapshots: Vec<SnapshotTag>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -1751,6 +1780,42 @@ pub async fn fetch_k8c_metrics(
     }
 }
 
+/// The snapshots sitting on one node's data volume — `nodetool listsnapshots`, through the
+/// management API.
+///
+/// Nothing in Kubernetes carries this: a snapshot is a directory of hard links inside the PVC, and it
+/// is what turns a volume that should be half empty into one at 90%. A failed Medusa run leaves its
+/// tag behind, and a `TRUNCATE` leaves one forever unless someone clears it. Listing them makes the
+/// node walk its snapshot directories, so this is never fetched by the refresh ticker.
+pub async fn fetch_k8c_snapshots(
+    client: Client,
+    namespace: String,
+    pod: String,
+    key: String,
+    state: SharedK8cPanel,
+) {
+    {
+        let mut s = state.lock().expect("k8ssandra panel poisoned");
+        *s = K8cPanel {
+            key: key.clone(),
+            kind: Some(PanelKind::Snapshots),
+            title: pod.clone(),
+            loading: true,
+            ..K8cPanel::default()
+        };
+    }
+    let result = mgmtapi::snapshots(&client, &namespace, &pod).await;
+    let mut s = state.lock().expect("k8ssandra panel poisoned");
+    if s.key != key {
+        return;
+    }
+    s.loading = false;
+    match result {
+        Ok(rows) => s.snapshots = group_snapshots(&rows),
+        Err(e) => s.error = Some(e),
+    }
+}
+
 /// Reaper's repair schedules for one datacenter, read through its REST API.
 ///
 /// Reaper 3.x has authentication on by default, so this logs in first with the UI credentials — read
@@ -1833,6 +1898,122 @@ async fn reaper_schedules(
     Ok(rows)
 }
 
+// --- Snapshots -----------------------------------------------------------------------------------
+
+/// Where a snapshot tag came from, when Cassandra itself named it.
+///
+/// Only the two prefixes the server generates are recognised. Everything else — a Medusa run, a
+/// `nodetool snapshot` typed by hand, an operator's backup hook — chooses its own name, and guessing
+/// an origin from a name nobody guarantees would be exactly the invention this view refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapOrigin {
+    /// `truncated-<millis>-<table>`: what `TRUNCATE` left behind, kept forever unless cleared.
+    Truncate,
+    /// `dropped-<millis>-<table>`: the same, for a dropped table.
+    Drop,
+    /// `medusa-<backup name>`: Medusa's own `SNAPSHOT_PREFIX`. The name after it is the backup's and
+    /// says nothing, but the prefix is Medusa's own constant — and Medusa clears its snapshot at the
+    /// end of a run, inside the `with snapshot:` that survives an exception. One still standing is
+    /// therefore a run in flight, a run killed outright, or an explicit `--keep-snapshot`.
+    Medusa,
+    Named,
+}
+
+/// One snapshot tag on one node, with its tables folded together.
+///
+/// A node has one line per table per tag — a few hundred lines for a single `truncate` — and the
+/// operational question is per tag: what is this snapshot holding, and since when.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SnapshotTag {
+    pub tag: String,
+    pub keyspaces: Vec<String>,
+    pub tables: usize,
+    /// Sum of the per-table `True size`: what clearing the tag would give back.
+    pub true_bytes: Option<f64>,
+    pub disk_bytes: Option<f64>,
+    /// Set when at least one line's size could not be read: the two sums are floors, not totals, and
+    /// the panel says so rather than showing a number that is quietly short.
+    pub partial: bool,
+    pub created: Option<i64>,
+}
+
+impl SnapshotTag {
+    pub fn origin(&self) -> SnapOrigin {
+        match self.tag.split('-').next() {
+            Some("truncated") => SnapOrigin::Truncate,
+            Some("dropped") => SnapOrigin::Drop,
+            Some("medusa") => SnapOrigin::Medusa,
+            _ => SnapOrigin::Named,
+        }
+    }
+}
+
+/// Fold the per-table lines of one node into one row per tag, biggest first.
+pub fn group_snapshots(rows: &[mgmtapi::Snapshot]) -> Vec<SnapshotTag> {
+    let mut by_tag: BTreeMap<String, SnapshotTag> = BTreeMap::new();
+    for row in rows {
+        let group = by_tag.entry(row.tag.clone()).or_insert_with(|| SnapshotTag {
+            tag: row.tag.clone(),
+            ..SnapshotTag::default()
+        });
+        group.tables += 1;
+        if !row.keyspace.is_empty() && !group.keyspaces.contains(&row.keyspace) {
+            group.keyspaces.push(row.keyspace.clone());
+        }
+        add_size(&mut group.true_bytes, row.true_bytes, &mut group.partial);
+        add_size(&mut group.disk_bytes, row.disk_bytes, &mut group.partial);
+        // The tables of one tag are snapshotted in one pass, so the earliest stamp is the tag's.
+        if let Some(t) = row.created {
+            group.created = Some(group.created.map_or(t, |cur| cur.min(t)));
+        }
+    }
+    let mut out: Vec<SnapshotTag> = by_tag.into_values().collect();
+    for group in &mut out {
+        group.keyspaces.sort();
+        if group.created.is_none() {
+            group.created = created_from_tag(&group.tag);
+        }
+    }
+    // What is holding the most disk first: the panel is opened because a volume is filling up.
+    out.sort_by(|a, b| {
+        b.true_bytes
+            .unwrap_or(-1.0)
+            .total_cmp(&a.true_bytes.unwrap_or(-1.0))
+            .then(a.tag.cmp(&b.tag))
+    });
+    out
+}
+
+fn add_size(total: &mut Option<f64>, value: Option<f64>, partial: &mut bool) {
+    match value {
+        Some(v) => *total = Some(total.unwrap_or(0.0) + v),
+        None => *partial = true,
+    }
+}
+
+// `truncated-1754308800000-events`: Cassandra stamps the tag with `System.currentTimeMillis()` right
+// after the prefix. On a 3.11 node, where no creation time is reported at all, this is the only date
+// there is — and it is the server's own, not one this code made up.
+fn created_from_tag(tag: &str) -> Option<i64> {
+    let mut parts = tag.split('-');
+    match parts.next() {
+        Some("truncated") | Some("dropped") => {}
+        _ => return None,
+    }
+    let millis: i64 = parts.next()?.parse().ok()?;
+    real_ts(Some(millis / 1000))
+}
+
+/// What every tag on the node adds up to, and whether that sum is complete.
+pub fn snapshot_total(tags: &[SnapshotTag]) -> (Option<f64>, bool) {
+    let mut total = None;
+    let mut partial = tags.iter().any(|t| t.partial);
+    for tag in tags {
+        add_size(&mut total, tag.true_bytes, &mut partial);
+    }
+    (total, partial)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,6 +2072,82 @@ mod tests {
             pods_known: false,
             claims_known: false,
         }
+    }
+
+    fn snap(tag: &str, keyspace: &str, table: &str, size: Option<f64>) -> mgmtapi::Snapshot {
+        mgmtapi::Snapshot {
+            tag: tag.to_string(),
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            true_bytes: size,
+            disk_bytes: size,
+            ..mgmtapi::Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn the_tables_of_one_tag_are_one_row() {
+        // A truncate snapshots every table of the keyspace: two hundred lines, one decision.
+        let rows = vec![
+            snap("medusa-1", "app", "events", Some(1024.0)),
+            snap("medusa-1", "app", "users", Some(1024.0)),
+            snap("truncated-1700000000000-events", "app", "events", Some(4096.0)),
+        ];
+        let tags = group_snapshots(&rows);
+        assert_eq!(tags.len(), 2);
+        // Biggest first: the tag holding the disk is the reason the panel is open.
+        assert_eq!(tags[0].tag, "truncated-1700000000000-events");
+        assert_eq!(tags[1].tables, 2);
+        assert_eq!(tags[1].true_bytes, Some(2048.0));
+        assert_eq!(tags[1].keyspaces, vec!["app".to_string()]);
+        assert_eq!(snapshot_total(&tags), (Some(6144.0), false));
+    }
+
+    #[test]
+    fn a_total_missing_a_line_is_announced_as_partial() {
+        let rows = vec![
+            snap("medusa-1", "app", "events", Some(1024.0)),
+            snap("medusa-1", "app", "users", None),
+        ];
+        let tags = group_snapshots(&rows);
+        assert!(tags[0].partial, "one line could not be sized");
+        assert_eq!(tags[0].true_bytes, Some(1024.0), "the sum is a floor, not a total");
+        assert_eq!(snapshot_total(&tags), (Some(1024.0), true));
+    }
+
+    #[test]
+    fn only_a_prefix_its_author_writes_itself_names_an_origin() {
+        let rows = vec![
+            snap("truncated-1700000000000-events", "app", "events", None),
+            snap("dropped-1700000000000-old", "app", "old", None),
+            snap("medusa-medusa-daily-1786575600", "app", "events", None),
+            snap("avant-migration", "app", "events", None),
+        ];
+        let tags = group_snapshots(&rows);
+        let origin = |tag: &str| tags.iter().find(|t| t.tag == tag).expect("tag").origin();
+        assert_eq!(origin("truncated-1700000000000-events"), SnapOrigin::Truncate);
+        assert_eq!(origin("dropped-1700000000000-old"), SnapOrigin::Drop);
+        // `medusa-` is Medusa's own SNAPSHOT_PREFIX; what follows is the backup name and is
+        // user-chosen, so the prefix is read and the rest is left alone.
+        assert_eq!(origin("medusa-medusa-daily-1786575600"), SnapOrigin::Medusa);
+        // A tag someone typed by hand: nothing to conclude from a name nobody guarantees.
+        assert_eq!(origin("avant-migration"), SnapOrigin::Named);
+    }
+
+    #[test]
+    fn a_truncate_tag_carries_the_date_a_311_node_never_reports() {
+        let tags = group_snapshots(&[snap("truncated-1700000000000-events", "app", "events", None)]);
+        assert_eq!(tags[0].created, Some(NOW));
+        // A named tag that looks like a date is not one: no stamp is invented for it.
+        let named = group_snapshots(&[snap("medusa-2026-08-12", "app", "events", None)]);
+        assert_eq!(named[0].created, None);
+    }
+
+    #[test]
+    fn a_reported_creation_time_wins_over_the_tag() {
+        let mut row = snap("truncated-1700000000000-events", "app", "events", None);
+        row.created = Some(NOW + DAY);
+        assert_eq!(group_snapshots(&[row])[0].created, Some(NOW + DAY));
     }
 
     #[test]
@@ -2066,6 +2323,33 @@ mod tests {
         assert_eq!(task["apiVersion"], "control.k8ssandra.io/v1alpha1");
         assert_eq!(task["spec"]["datacenter"]["name"], "dc1");
         assert_eq!(task["spec"]["jobs"][0]["command"], "cleanup");
+    }
+
+    #[test]
+    fn a_schedule_without_a_backup_type_leaves_the_key_out_rather_than_sending_it_empty() {
+        // `backupType` is an enum of exactly `differential` and `full`, defaulted to the former by
+        // the CRD. The empty string is not "unset", it is a value outside the enum: sending it makes
+        // the apiserver refuse the create, so the whole backup never happens.
+        let backup = write_payload(&K8cWrite::BackupNow {
+            namespace: "ns".to_string(),
+            datacenter: "dc1".to_string(),
+            backup_type: String::new(),
+            prefix: "nightly".to_string(),
+        });
+        assert_eq!(backup["spec"]["cassandraDatacenter"], "dc1");
+        assert!(
+            backup["spec"].get("backupType").is_none(),
+            "the key is absent so the CRD default applies: {}",
+            backup["spec"]
+        );
+    }
+
+    #[test]
+    fn the_type_announced_is_the_type_that_will_apply() {
+        assert_eq!(effective_backup_type("full"), ("full", false));
+        assert_eq!(effective_backup_type(""), (DEFAULT_BACKUP_TYPE, true));
+        // Whitespace is not a type either, and it would be refused just like the empty string.
+        assert_eq!(effective_backup_type("  "), (DEFAULT_BACKUP_TYPE, true));
     }
 
     #[test]

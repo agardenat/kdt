@@ -594,7 +594,7 @@ impl VelRow {
 
 use crate::k8ssandra::{
     apply_k8c_write, fetch_k8ssandra, fetch_k8c_logs, fetch_k8c_metrics, fetch_k8c_repairs,
-    format_load, new_k8c_panel,
+    fetch_k8c_snapshots, format_load, new_k8c_panel,
     new_k8c_state, CassTask, K8cCluster, K8cDatacenter, K8cNode, K8cWrite, MedBackup, MedJob,
     MedRestore, MedSchedule, MedTask, PanelKind, ReaperRec, SharedK8c, SharedK8cPanel,
 };
@@ -934,7 +934,7 @@ enum MenuAction {
 // One labelled choice in the action menu overlay, with an explanatory line shown under the list.
 struct ActionItem {
     label: &'static str,
-    desc: &'static str,
+    desc: String,
     action: MenuAction,
 }
 
@@ -2918,9 +2918,9 @@ impl App {
         self.action_menu = Some(ActionMenu {
             title: st.menu_node_title,
             items: vec![
-                ActionItem { label: st.k_cordon, desc: st.desc_cordon, action: MenuAction::NodeCordon(true) },
-                ActionItem { label: st.k_uncordon, desc: st.desc_uncordon, action: MenuAction::NodeCordon(false) },
-                ActionItem { label: st.k_drain, desc: st.desc_drain, action: MenuAction::NodeDrain },
+                ActionItem { label: st.k_cordon, desc: st.desc_cordon.to_string(), action: MenuAction::NodeCordon(true) },
+                ActionItem { label: st.k_uncordon, desc: st.desc_uncordon.to_string(), action: MenuAction::NodeCordon(false) },
+                ActionItem { label: st.k_drain, desc: st.desc_drain.to_string(), action: MenuAction::NodeDrain },
             ],
             cursor: 0,
             confirm: false,
@@ -7148,19 +7148,19 @@ impl App {
             Some(VelRow::Schedule(s)) => {
                 let mut items = vec![ActionItem {
                     label: st.k_vel_backup_now,
-                    desc: st.desc_vel_backup_now,
+                    desc: st.desc_vel_backup_now.to_string(),
                     action: MenuAction::VelBackupNow,
                 }];
                 items.push(if s.paused {
                     ActionItem {
                         label: st.k_vel_unpause,
-                        desc: st.desc_vel_unpause,
+                        desc: st.desc_vel_unpause.to_string(),
                         action: MenuAction::VelPause(false),
                     }
                 } else {
                     ActionItem {
                         label: st.k_vel_pause,
-                        desc: st.desc_vel_pause,
+                        desc: st.desc_vel_pause.to_string(),
                         action: MenuAction::VelPause(true),
                     }
                 });
@@ -7173,19 +7173,19 @@ impl App {
                 if b.usable() || b.partially_failed() {
                     items.push(ActionItem {
                         label: st.k_vel_restore,
-                        desc: st.desc_vel_restore,
+                        desc: st.desc_vel_restore.to_string(),
                         action: MenuAction::VelRestore,
                     });
                     items.push(ActionItem {
                         label: st.k_vel_restore_opts,
-                        desc: st.desc_vel_restore_opts,
+                        desc: st.desc_vel_restore_opts.to_string(),
                         action: MenuAction::VelRestoreOptions,
                     });
                 }
                 if !b.deleting && b.phase != "Deleting" {
                     items.push(ActionItem {
                         label: st.k_vel_delete,
-                        desc: st.desc_vel_delete,
+                        desc: st.desc_vel_delete.to_string(),
                         action: MenuAction::VelDeleteBackup,
                     });
                 }
@@ -7829,11 +7829,26 @@ impl App {
         let st = lang::t(self.ai_language);
         let mut note: Option<String> = None;
         let items: Vec<ActionItem> = match self.k8c_selected() {
-            Some(K8cRow::Schedule(_)) => vec![ActionItem {
-                label: st.k_k8c_backup_now,
-                desc: st.desc_k8c_backup_now,
-                action: MenuAction::K8cBackupNow,
-            }],
+            // Named, not described: "with this schedule's datacenter and type" tells the reader
+            // nothing they can check. What they are about to write is a datacenter and a backup
+            // type, so those are what the line shows — including when the type is the CRD's default
+            // because the schedule sets none.
+            Some(K8cRow::Schedule(s)) => {
+                let (backup_type, defaulted) = crate::k8ssandra::effective_backup_type(&s.backup_type);
+                let desc = lang::fill(
+                    if defaulted {
+                        st.desc_k8c_backup_now_default
+                    } else {
+                        st.desc_k8c_backup_now
+                    },
+                    &[("dc", &s.datacenter), ("type", backup_type)],
+                );
+                vec![ActionItem {
+                    label: st.k_k8c_backup_now,
+                    desc,
+                    action: MenuAction::K8cBackupNow,
+                }]
+            }
             // Restoring is only offered from a capture that covered every node. A partial one would
             // be replayed as if it were whole, which is the failure mode this whole view exists to
             // make visible — offering it here would undo that.
@@ -7842,7 +7857,7 @@ impl App {
                     note = Some(st.k8c_note_restore.to_string());
                     vec![ActionItem {
                         label: st.k_k8c_restore,
-                        desc: st.desc_k8c_restore,
+                        desc: st.desc_k8c_restore.to_string(),
                         action: MenuAction::K8cRestore,
                     }]
                 } else {
@@ -7854,7 +7869,7 @@ impl App {
                     note = Some(st.k8c_note_restore.to_string());
                     vec![ActionItem {
                         label: st.k_k8c_restore,
-                        desc: st.desc_k8c_restore,
+                        desc: st.desc_k8c_restore.to_string(),
                         action: MenuAction::K8cRestore,
                     }]
                 } else {
@@ -7873,37 +7888,37 @@ impl App {
                 vec![
                     ActionItem {
                         label: st.k_k8c_purge,
-                        desc: st.desc_k8c_purge,
+                        desc: st.desc_k8c_purge.to_string(),
                         action: MenuAction::K8cMedusaTask("purge"),
                     },
                     ActionItem {
                         label: st.k_k8c_sync,
-                        desc: st.desc_k8c_sync,
+                        desc: st.desc_k8c_sync.to_string(),
                         action: MenuAction::K8cMedusaTask("sync"),
                     },
                     ActionItem {
                         label: st.k_k8c_cleanup,
-                        desc: st.desc_k8c_cleanup,
+                        desc: st.desc_k8c_cleanup.to_string(),
                         action: MenuAction::K8cCassandraTask("cleanup"),
                     },
                     ActionItem {
                         label: st.k_k8c_upgradesstables,
-                        desc: st.desc_k8c_upgradesstables,
+                        desc: st.desc_k8c_upgradesstables.to_string(),
                         action: MenuAction::K8cCassandraTask("upgradesstables"),
                     },
                     ActionItem {
                         label: st.k_k8c_compaction,
-                        desc: st.desc_k8c_compaction,
+                        desc: st.desc_k8c_compaction.to_string(),
                         action: MenuAction::K8cCassandraTask("compaction"),
                     },
                     ActionItem {
                         label: st.k_k8c_scrub,
-                        desc: st.desc_k8c_scrub,
+                        desc: st.desc_k8c_scrub.to_string(),
                         action: MenuAction::K8cCassandraTask("scrub"),
                     },
                     ActionItem {
                         label: st.k_k8c_restart,
-                        desc: st.desc_k8c_restart,
+                        desc: st.desc_k8c_restart.to_string(),
                         action: MenuAction::K8cCassandraTask("restart"),
                     },
                 ]
@@ -7914,7 +7929,11 @@ impl App {
                 let op: &'static str = if t.operation == "purge" { "purge" } else { "sync" };
                 vec![ActionItem {
                     label: if op == "purge" { st.k_k8c_purge } else { st.k_k8c_sync },
-                    desc: if op == "purge" { st.desc_k8c_purge } else { st.desc_k8c_sync },
+                    desc: if op == "purge" {
+                        st.desc_k8c_purge.to_string()
+                    } else {
+                        st.desc_k8c_sync.to_string()
+                    },
                     action: MenuAction::K8cMedusaTask(op),
                 }]
             }
@@ -8102,6 +8121,33 @@ impl App {
         let state = self.k8c_panel.clone();
         tokio::spawn(async move {
             fetch_k8c_metrics(client, namespace, pod, key, state).await;
+        });
+    }
+
+    // `S`: what `nodetool listsnapshots` would print for the node under the cursor. Like the metrics
+    // it is per node — a snapshot is a directory inside that pod's PVC — and it is the one thing that
+    // explains a data volume filling up while the tables are not growing.
+    fn k8c_toggle_snapshots(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(K8cRow::Node(n)) = self.k8c_selected() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.k8c_no_snapshots_target.to_string()));
+            return;
+        };
+        let (namespace, pod) = (n.namespace.clone(), n.name.clone());
+        let key = format!("snapshots|{namespace}/{pod}");
+        {
+            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
+            if s.key == key {
+                *s = crate::k8ssandra::K8cPanel::default();
+                return;
+            }
+        }
+        self.k8c_detail_scroll = 0;
+        let client = self.client.clone();
+        let state = self.k8c_panel.clone();
+        tokio::spawn(async move {
+            fetch_k8c_snapshots(client, namespace, pod, key, state).await;
         });
     }
 
@@ -8509,7 +8555,7 @@ impl App {
         }
         let items = vec![ActionItem {
             label: st.k_refl_force,
-            desc: st.desc_refl_force,
+            desc: st.desc_refl_force.to_string(),
             action: MenuAction::ReflForce,
         }];
         self.action_menu = Some(ActionMenu {
@@ -8587,7 +8633,7 @@ impl App {
         }
         let items = vec![ActionItem {
             label: st.k_ky_purge,
-            desc: st.desc_ky_purge,
+            desc: st.desc_ky_purge.to_string(),
             action: MenuAction::KyPurgeRequests,
         }];
         self.action_menu = Some(ActionMenu {
@@ -8688,14 +8734,14 @@ impl App {
         };
         let mut items = vec![ActionItem {
             label: st.k_renew,
-            desc: st.desc_renew,
+            desc: st.desc_renew.to_string(),
             action: MenuAction::CertRenew,
         }];
         // Only offer the retry when there is actually a live request to restart.
         if in_flight_request(cert_idx, &s.resources).is_some() {
             items.push(ActionItem {
                 label: st.k_acme_retry,
-                desc: st.desc_acme_retry,
+                desc: st.desc_acme_retry.to_string(),
                 action: MenuAction::CertAcmeRetry,
             });
         }
@@ -9376,9 +9422,9 @@ impl App {
         self.action_menu = Some(ActionMenu {
             title: st.menu_pods_title,
             items: vec![
-                ActionItem { label: st.k_rescale, desc: st.desc_rescale, action: MenuAction::Rescale },
-                ActionItem { label: st.k_force, desc: st.desc_recycle, action: MenuAction::Recycle },
-                ActionItem { label: st.k_restart, desc: st.desc_restart, action: MenuAction::Restart },
+                ActionItem { label: st.k_rescale, desc: st.desc_rescale.to_string(), action: MenuAction::Rescale },
+                ActionItem { label: st.k_force, desc: st.desc_recycle.to_string(), action: MenuAction::Recycle },
+                ActionItem { label: st.k_restart, desc: st.desc_restart.to_string(), action: MenuAction::Restart },
             ],
             cursor: 0,
             confirm: true,
@@ -9398,10 +9444,10 @@ impl App {
         self.action_menu = Some(ActionMenu {
             title: st.menu_scale_title,
             items: vec![
-                ActionItem { label: st.k_scale_up, desc: st.desc_scale_up, action: MenuAction::ScaleDelta(1) },
-                ActionItem { label: st.k_scale_down, desc: st.desc_scale_down, action: MenuAction::ScaleDelta(-1) },
-                ActionItem { label: st.k_scale_zero, desc: st.desc_scale_zero, action: MenuAction::ScaleZero },
-                ActionItem { label: st.k_scale_set, desc: st.desc_scale_set, action: MenuAction::ScaleSet },
+                ActionItem { label: st.k_scale_up, desc: st.desc_scale_up.to_string(), action: MenuAction::ScaleDelta(1) },
+                ActionItem { label: st.k_scale_down, desc: st.desc_scale_down.to_string(), action: MenuAction::ScaleDelta(-1) },
+                ActionItem { label: st.k_scale_zero, desc: st.desc_scale_zero.to_string(), action: MenuAction::ScaleZero },
+                ActionItem { label: st.k_scale_set, desc: st.desc_scale_set.to_string(), action: MenuAction::ScaleSet },
             ],
             cursor: 0,
             confirm: false,
@@ -9415,8 +9461,8 @@ impl App {
     fn open_flux_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
         let mut items = vec![
-            ActionItem { label: st.k_reconcile, desc: st.desc_reconcile, action: MenuAction::Reconcile(ReconcileScope::Resource) },
-            ActionItem { label: st.k_reconcile_src, desc: st.desc_reconcile_src, action: MenuAction::Reconcile(ReconcileScope::WithSource) },
+            ActionItem { label: st.k_reconcile, desc: st.desc_reconcile.to_string(), action: MenuAction::Reconcile(ReconcileScope::Resource) },
+            ActionItem { label: st.k_reconcile_src, desc: st.desc_reconcile_src.to_string(), action: MenuAction::Reconcile(ReconcileScope::WithSource) },
         ];
         // Force and reset are helm-controller levers: `forceAt` replays an upgrade the controller
         // sees no reason to run, `resetAt` clears the counters behind "retries exhausted". They are
@@ -9428,10 +9474,10 @@ impl App {
             .and_then(|i| self.snapshot.get(i))
             .is_some_and(|r| r.kind == "HelmRelease");
         if on_helm_release {
-            items.push(ActionItem { label: st.k_force_upgrade, desc: st.desc_force_upgrade, action: MenuAction::Reconcile(ReconcileScope::Force) });
-            items.push(ActionItem { label: st.k_reset_failures, desc: st.desc_reset_failures, action: MenuAction::Reconcile(ReconcileScope::Reset) });
+            items.push(ActionItem { label: st.k_force_upgrade, desc: st.desc_force_upgrade.to_string(), action: MenuAction::Reconcile(ReconcileScope::Force) });
+            items.push(ActionItem { label: st.k_reset_failures, desc: st.desc_reset_failures.to_string(), action: MenuAction::Reconcile(ReconcileScope::Reset) });
         }
-        items.push(ActionItem { label: st.k_sync_root, desc: st.desc_sync_root, action: MenuAction::Reconcile(ReconcileScope::RootSync) });
+        items.push(ActionItem { label: st.k_sync_root, desc: st.desc_sync_root.to_string(), action: MenuAction::Reconcile(ReconcileScope::RootSync) });
         self.action_menu = Some(ActionMenu {
             title: st.menu_flux_title,
             items,
@@ -11011,6 +11057,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('o'), _, Mode::K8ssandra) => app.open_k8c_action_menu(),
         (KeyCode::Char('l'), _, Mode::K8ssandra) => app.k8c_toggle_log(),
         (KeyCode::Char('s'), _, Mode::K8ssandra) => app.k8c_toggle_metrics(),
+        (KeyCode::Char('S'), _, Mode::K8ssandra) => app.k8c_toggle_snapshots(),
         (KeyCode::Char('i'), _, Mode::K8ssandra) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandra) => {}
 
@@ -11053,6 +11100,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('o'), _, Mode::K8ssandraFull) => app.open_k8c_action_menu(),
         (KeyCode::Char('l'), _, Mode::K8ssandraFull) => app.k8c_toggle_log(),
         (KeyCode::Char('s'), _, Mode::K8ssandraFull) => app.k8c_toggle_metrics(),
+        (KeyCode::Char('S'), _, Mode::K8ssandraFull) => app.k8c_toggle_snapshots(),
         (KeyCode::Char('i'), _, Mode::K8ssandraFull) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandraFull) => {}
 
@@ -11847,6 +11895,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 footer_sep(),
                 Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
                 Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
+                Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_k8c_snapshots)),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
@@ -11859,6 +11908,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
+            Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_k8c_snapshots)),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
         ],
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
@@ -13329,7 +13379,7 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     // footer at a fixed three rows pushed that prompt out of the frame as soon as the description
     // took two lines — so the action looked like it did nothing when Enter armed it. Measure the
     // wrap, and give the popup the rows it actually needs.
-    let desc = menu.items.get(menu.cursor).map(|it| it.desc).unwrap_or("");
+    let desc = menu.items.get(menu.cursor).map(|it| it.desc.as_str()).unwrap_or("");
     let desc_rows = wrapped_rows(
         &Line::from(desc),
         popup_w.saturating_sub(2) as usize,
@@ -17739,6 +17789,9 @@ fn push_k8c_panel(app: &App, lines: &mut Vec<Line<'static>>, st: &'static String
                 }
             }
         }
+        PanelKind::Snapshots => {
+            lines.extend(k8c_snapshot_lines(&panel.snapshots, now_secs(), st))
+        }
         PanelKind::Repairs => {
             lines.push(Line::from(Span::styled(
                 st.k8c_lbl_repairs.to_string(),
@@ -17763,6 +17816,90 @@ fn push_k8c_panel(app: &App, lines: &mut Vec<Line<'static>>, st: &'static String
             }
         }
     }
+}
+
+// The snapshots of one node, one block per tag. Two short lines rather than one wide one: a tag is
+// `truncated-1754308800000-events` and its keyspaces are a list, and both on a single line would
+// wrap into a shape nobody can scan.
+fn k8c_snapshot_lines(
+    tags: &[crate::k8ssandra::SnapshotTag],
+    now: i64,
+    st: &'static Strings,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        st.k8c_lbl_snapshots.to_string(),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    ))];
+    if tags.is_empty() {
+        // Nothing on disk is an answer, and a good one: no truncate residue, and no run that died
+        // between the snapshot and the upload.
+        lines.push(Line::from(Span::styled(
+            format!("  {}", st.k8c_no_snapshots),
+            Style::default().fg(DIM),
+        )));
+        return lines;
+    }
+    // A size that could not be read makes the sum a floor, and it is shown as one rather than as a
+    // total that is quietly short of a few files.
+    let sized = |bytes: Option<f64>, partial: bool| match bytes {
+        Some(b) if partial => format!("≥ {}", format_load(b)),
+        Some(b) => format_load(b),
+        None => "—".to_string(),
+    };
+    for tag in tags {
+        lines.push(Line::from(Span::raw(format!("  {}", tag.tag))));
+        // The two sizes side by side, because they answer two different questions and one of them
+        // reads as the other: a snapshot is a directory of hard links, so most of what it weighs is
+        // still shared with the live sstables and frees nothing. Only `True size` — the files no
+        // live sstable references any more — comes back when the tag is cleared.
+        let mut parts = vec![
+            format!("{} {}", sized(tag.true_bytes, tag.partial), st.k8c_snap_reclaimable_short),
+            format!("{} {}", sized(tag.disk_bytes, tag.partial), st.k8c_snap_shared),
+            format!("{} {}", tag.tables, st.k8c_snap_tables),
+        ];
+        parts.push(match tag.created {
+            Some(t) => crate::velero::age_of(t, now),
+            None => st.k8c_snap_no_date.to_string(),
+        });
+        lines.push(Line::from(Span::styled(
+            format!("    {}", parts.join(" · ")),
+            Style::default().fg(DIM),
+        )));
+        if !tag.keyspaces.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", tag.keyspaces.join(", ")),
+                Style::default().fg(DIM),
+            )));
+        }
+        // Only the prefixes their authors write themselves. A TRUNCATE or a DROP leaves data nobody
+        // asked to keep and nothing will ever clear it; a Medusa tag should have been cleared by the
+        // run that took it. What is *after* the prefix is a free-form name and says nothing.
+        let origin = match tag.origin() {
+            crate::k8ssandra::SnapOrigin::Truncate => Some(st.k8c_snap_origin_truncate),
+            crate::k8ssandra::SnapOrigin::Drop => Some(st.k8c_snap_origin_drop),
+            crate::k8ssandra::SnapOrigin::Medusa => Some(st.k8c_snap_origin_medusa),
+            crate::k8ssandra::SnapOrigin::Named => None,
+        };
+        if let Some(text) = origin {
+            lines.push(Line::from(Span::styled(
+                format!("    {text}"),
+                Style::default().fg(Color::Rgb(255, 140, 0)),
+            )));
+        }
+    }
+    let (total, partial) = crate::k8ssandra::snapshot_total(tags);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(format!("  {:<14}", sized(total, partial))),
+        Span::styled(st.k8c_snap_reclaimable.to_string(), Style::default().fg(DIM)),
+    ]));
+    if partial {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", st.k8c_snap_partial),
+            Style::default().fg(DIM),
+        )));
+    }
+    lines
 }
 
 fn draw_reflector_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -24375,6 +24512,101 @@ mod velero_view_tests {
                 ("tier".to_string(), "front".to_string())
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod k8c_snapshot_panel_tests {
+    use super::*;
+    use crate::k8ssandra::SnapshotTag;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn tags() -> Vec<SnapshotTag> {
+        vec![
+            SnapshotTag {
+                tag: "truncated-1699913600000-events_by_device_and_a_long_table".to_string(),
+                keyspaces: vec!["app".to_string(), "app_history".to_string()],
+                tables: 214,
+                true_bytes: Some(12.0 * 1024.0_f64.powi(3)),
+                disk_bytes: Some(13.0 * 1024.0_f64.powi(3)),
+                partial: true,
+                created: Some(NOW - 86_400),
+            },
+            SnapshotTag {
+                tag: "medusa-2026-08-12".to_string(),
+                keyspaces: vec!["app".to_string()],
+                tables: 12,
+                true_bytes: Some(1024.0),
+                disk_bytes: Some(2048.0),
+                partial: false,
+                created: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_tag_says_what_it_holds_since_when_and_where_it_came_from() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let text: Vec<String> = k8c_snapshot_lines(&tags(), NOW, st)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let joined = text.join("\n");
+        assert!(joined.contains("214 tables"), "{joined}");
+        assert!(joined.contains("app, app_history"), "{joined}");
+        assert!(joined.contains("1d"), "the age of the tag: {joined}");
+        assert!(joined.contains(st.k8c_snap_origin_truncate), "{joined}");
+        // The two sizes together, never the on-disk one alone: a snapshot is hard links, and most of
+        // what it weighs is still shared with the live sstables and frees nothing.
+        assert!(joined.contains(st.k8c_snap_reclaimable_short), "{joined}");
+        assert!(joined.contains("13.0 GiB"), "the on-disk size is shown too: {joined}");
+        assert!(joined.contains(st.k8c_snap_shared), "{joined}");
+        // A Medusa tag standing after its run is a fact worth naming: Medusa clears its own.
+        assert!(joined.contains(st.k8c_snap_origin_medusa), "{joined}");
+        // A sum missing a file is a floor, said out loud rather than passed off as a total.
+        assert!(joined.contains("≥ 12.0 GiB"), "{joined}");
+        assert!(joined.contains(st.k8c_snap_partial), "{joined}");
+        // Nothing is invented for the tag Cassandra did not name and did not date.
+        assert!(joined.contains(st.k8c_snap_no_date), "{joined}");
+    }
+
+    // The rule this view has been bitten by: a detail line that runs past the frame eats the right
+    // border. Rendered here at the widths a real terminal produces, including the narrow one.
+    #[test]
+    fn the_right_border_survives_every_width() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        for width in [40_u16, 60, 100, 196] {
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+            terminal
+                .draw(|f| {
+                    let p = Paragraph::new(k8c_snapshot_lines(&tags(), NOW, st))
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default().borders(Borders::ALL).title(" k8ssandra "));
+                    f.render_widget(p, f.area());
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            // Compared against ratatui's own border set rather than against glyphs typed here: the
+            // corners are not part of this codebase's approved iconography.
+            let border = ratatui::symbols::border::PLAIN;
+            for y in 0..24 {
+                let cell = buffer.cell((width - 1, y)).expect("right column");
+                let expected = match y {
+                    0 => border.top_right,
+                    23 => border.bottom_right,
+                    _ => border.vertical_right,
+                };
+                assert_eq!(
+                    cell.symbol(),
+                    expected,
+                    "right border eaten at width {width}, row {y}"
+                );
+            }
+        }
     }
 }
 

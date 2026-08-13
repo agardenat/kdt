@@ -123,7 +123,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME |
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `f` ALL/PROBLEMS/ENFORCE |
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
-| K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `o` actions |
+| K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
@@ -230,7 +230,14 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   Le ring ne vient d'aucune CRD mais de l'API de management du container `cassandra`, atteinte par
   le proxy de l'apiserver : ni port-forward, ni `kubectl`, ni exec. `nodetool status` et
   `describecluster` en sortent en données typées (état UN/DN, load, tokens, accord de schéma), et
-  `s` va chercher `tpstats`, `compactionstats` et `netstats` du node sélectionné. La jointure entre
+  `s` va chercher `tpstats`, `compactionstats` et `netstats` du node sélectionné, `S` ses snapshots
+  (`listsnapshots`) — la seule chose qui explique un volume de données qui se remplit alors que les
+  tables ne grossissent pas : un run Medusa mort avant l'upload laisse son tag, un `TRUNCATE` laisse
+  le sien pour toujours. Les lignes sont repliées par tag, et les **deux** tailles sont montrées :
+  un snapshot est un répertoire de hard links, donc l'essentiel de son poids reste partagé avec les
+  SSTables vivantes et ne rend rien — seul `True size`, les fichiers que plus aucune SSTable vivante
+  ne référence, revient quand on efface le tag. Sur un node 3.11, qui ne date aucun snapshot, la date
+  des tags `truncated-`/`dropped-` est lue dans le tag lui-même. La jointure entre
   un pod et son entrée de ring se fait sur l'**adresse**, pas sur le `hostID` de
   `status.nodeStatuses` : ce champ est la mémoire de l'operator et il périme — la vue le dit quand
   les deux divergent. `o` ouvre les opérations : sauvegarder maintenant, restaurer, purger ou
