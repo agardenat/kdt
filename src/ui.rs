@@ -3419,6 +3419,70 @@ impl App {
 
     // Re-run the fetch backing whichever view is on screen. Resolved through `view_mode` so an open
     // overlay (AI panel, palette, search prompt) refreshes the view underneath it.
+    // Every split view shows a panel on top and a table below: the bare arrows drive the table,
+    // Shift+arrows drive the panel. That contract used to be written out once per mode — sixteen
+    // near-identical arm pairs spread over six hundred lines — which is exactly how a new view
+    // shipped without them and the gesture silently did nothing. One arm, one list, one place to
+    // add a view.
+    fn has_top_panel(&self) -> bool {
+        matches!(
+            view_mode(self),
+            Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux
+                | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull
+                | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs
+                | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector
+                | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra
+                | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces
+                | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
+                | Mode::Capacity | Mode::CapacityFull
+        )
+    }
+
+    // `delta` is in screen terms: negative scrolls towards the top of the panel.
+    fn scroll_top_panel(&mut self, delta: i32) {
+        // The oldest views share one offset through `scroll_detail`, whose sign is inverted (it
+        // counts lines of history, not screen rows); the later ones each carry their own counter.
+        let step = |v: &mut usize, delta: i32| {
+            *v = if delta < 0 { v.saturating_sub(1) } else { v.saturating_add(1) };
+        };
+        match view_mode(self) {
+            Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux
+            | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Services | Mode::ServicesFull => {
+                self.scroll_detail(-delta)
+            }
+            Mode::Rbac | Mode::RbacFull => step(&mut self.rbac_detail_scroll, delta),
+            Mode::Vuln | Mode::VulnFull => step(&mut self.vuln_detail_scroll, delta),
+            Mode::Secrets | Mode::SecretsFull => step(&mut self.secrets_detail_scroll, delta),
+            Mode::Certs | Mode::CertsFull => step(&mut self.certs_detail_scroll, delta),
+            Mode::Kyverno | Mode::KyvernoFull => step(&mut self.ky_detail_scroll, delta),
+            Mode::Reflector | Mode::ReflectorFull => step(&mut self.refl_detail_scroll, delta),
+            Mode::Velero | Mode::VeleroFull => step(&mut self.vel_detail_scroll, delta),
+            Mode::K8ssandra | Mode::K8ssandraFull => step(&mut self.k8c_detail_scroll, delta),
+            Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_detail_scroll, delta),
+            Mode::Namespaces => step(&mut self.namespaces_detail_scroll, delta),
+            Mode::Storage | Mode::StorageFull => step(&mut self.sto_detail_scroll, delta),
+            Mode::Capacity | Mode::CapacityFull => step(&mut self.cap_detail_scroll, delta),
+            _ => {}
+        }
+    }
+
+    // Five columns at a time, as the h-scroll of the events panel already moves.
+    //
+    // The reflector and k8ssandra panels wrap their text instead of clipping it, so there is nothing
+    // to the right to reach: they deliberately do nothing here rather than offer a key that only
+    // hides the left edge.
+    fn hscroll_top_panel(&mut self, delta: i32) {
+        let step = |v: &mut usize, delta: i32| {
+            *v = if delta < 0 { v.saturating_sub(5) } else { v.saturating_add(5) };
+        };
+        match view_mode(self) {
+            Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull => {}
+            Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
+            Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
+            _ => step(&mut self.detail_h_scroll, delta),
+        }
+    }
+
     fn refresh_current_view(&self) {
         match view_mode(self) {
             Mode::Nodes | Mode::NodesFull => self.refresh_nodes(),
@@ -10474,6 +10538,22 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('L'), _, Mode::Extract | Mode::FluxLogs) => {}
         (KeyCode::Char('L'), _, _) => app.toggle_language(),
 
+        // Shift+arrows drive the top panel in every view that has one. Guarded on `has_top_panel`
+        // rather than on a mode list so the panel-less views (diagnostic, extraction, AI, flux
+        // logs) still reach their own arrow handling below.
+        (KeyCode::Up, m, _) if m.contains(KeyModifiers::SHIFT) && app.has_top_panel() => {
+            app.scroll_top_panel(-1)
+        }
+        (KeyCode::Down, m, _) if m.contains(KeyModifiers::SHIFT) && app.has_top_panel() => {
+            app.scroll_top_panel(1)
+        }
+        (KeyCode::Left, m, _) if m.contains(KeyModifiers::SHIFT) && app.has_top_panel() => {
+            app.hscroll_top_panel(-1)
+        }
+        (KeyCode::Right, m, _) if m.contains(KeyModifiers::SHIFT) && app.has_top_panel() => {
+            app.hscroll_top_panel(1)
+        }
+
         (KeyCode::Esc, _, Mode::AiPanel) => app.exit_ai_panel(),
         (KeyCode::Char('i'), _, Mode::AiPanel) => app.exit_ai_panel(),
         (KeyCode::Char('q'), _, Mode::AiPanel) => app.exit_ai_panel(),
@@ -10516,10 +10596,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::DetailFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('s'), _, Mode::DetailFull) => app.scroll_frozen = !app.scroll_frozen,
 
-        (KeyCode::Up, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
-        (KeyCode::Left, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
-        (KeyCode::Right, m, Mode::Nodes) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Nodes) => app.move_node_selection(-1),
         (KeyCode::Down, _, Mode::Nodes) => app.move_node_selection(1),
         (KeyCode::PageUp, _, Mode::Nodes) => app.move_node_selection(-10),
@@ -10570,10 +10646,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::NodesFull) => app.scroll_detail_bottom(),
         (KeyCode::Char('i'), _, Mode::NodesFull) => app.enter_ai_panel(),
 
-        (KeyCode::Up, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
-        (KeyCode::Left, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
-        (KeyCode::Right, m, Mode::Flux) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Flux) => app.move_flux_selection(-1),
         (KeyCode::Down, _, Mode::Flux) => app.move_flux_selection(1),
         (KeyCode::PageUp, _, Mode::Flux) => app.move_flux_selection(-10),
@@ -10633,10 +10705,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::FluxLogs) => app.exit_flux_logs(),
         (_, _, Mode::FluxLogs) => {}
 
-        (KeyCode::Up, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
-        (KeyCode::Left, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
-        (KeyCode::Right, m, Mode::Pods) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Pods) => app.move_pods_selection(-1),
         (KeyCode::Down, _, Mode::Pods) => app.move_pods_selection(1),
         (KeyCode::PageUp, _, Mode::Pods) => app.move_pods_selection(-10),
@@ -10675,8 +10743,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::PodsFull) => app.enter_ai_panel(),
         (_, _, Mode::PodsFull) => {}
 
-        (KeyCode::Up, m, Mode::Rbac) if m.contains(KeyModifiers::SHIFT) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Rbac) if m.contains(KeyModifiers::SHIFT) => app.rbac_detail_scroll = app.rbac_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Rbac) => app.move_rbac_selection(-1),
         (KeyCode::Down, _, Mode::Rbac) => app.move_rbac_selection(1),
         (KeyCode::PageUp, _, Mode::Rbac) => app.move_rbac_selection(-10),
@@ -10702,8 +10768,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::RbacFull) => app.enter_ai_panel(),
         (_, _, Mode::RbacFull) => {}
 
-        (KeyCode::Up, m, Mode::Vuln) if m.contains(KeyModifiers::SHIFT) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Vuln) if m.contains(KeyModifiers::SHIFT) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Vuln) => app.move_vuln_selection(-1),
         (KeyCode::Down, _, Mode::Vuln) => app.move_vuln_selection(1),
         (KeyCode::PageUp, _, Mode::Vuln) => app.move_vuln_selection(-10),
@@ -10725,8 +10789,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::VulnFull) => app.enter_ai_panel(),
         (_, _, Mode::VulnFull) => {}
 
-        (KeyCode::Up, m, Mode::Secrets) if m.contains(KeyModifiers::SHIFT) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Secrets) if m.contains(KeyModifiers::SHIFT) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Secrets) => app.move_secret_selection(-1),
         (KeyCode::Down, _, Mode::Secrets) => app.move_secret_selection(1),
         (KeyCode::PageUp, _, Mode::Secrets) => app.move_secret_selection(-10),
@@ -10756,8 +10818,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::SecretsFull) => app.enter_ai_panel(),
         (_, _, Mode::SecretsFull) => {}
 
-        (KeyCode::Up, m, Mode::Certs) if m.contains(KeyModifiers::SHIFT) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Certs) if m.contains(KeyModifiers::SHIFT) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Certs) => app.move_cert_selection(-1),
         (KeyCode::Down, _, Mode::Certs) => app.move_cert_selection(1),
         (KeyCode::PageUp, _, Mode::Certs) => app.move_cert_selection(-10),
@@ -10785,8 +10845,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::CertsFull) => app.enter_ai_panel(),
         (_, _, Mode::CertsFull) => {}
 
-        (KeyCode::Up, m, Mode::Kyverno) if m.contains(KeyModifiers::SHIFT) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Kyverno) if m.contains(KeyModifiers::SHIFT) => app.ky_detail_scroll = app.ky_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Kyverno) => app.move_ky_selection(-1),
         (KeyCode::Down, _, Mode::Kyverno) => app.move_ky_selection(1),
         (KeyCode::PageUp, _, Mode::Kyverno) => app.move_ky_selection(-10),
@@ -10813,8 +10871,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('P'), _, Mode::KyvernoFull) => app.open_kyverno_action_menu(),
         (_, _, Mode::KyvernoFull) => {}
 
-        (KeyCode::Up, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Configmaps) if m.contains(KeyModifiers::SHIFT) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Configmaps) => app.move_configmap_selection(-1),
         (KeyCode::Down, _, Mode::Configmaps) => app.move_configmap_selection(1),
         (KeyCode::PageUp, _, Mode::Configmaps) => app.move_configmap_selection(-10),
@@ -10841,8 +10897,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::ConfigmapsFull) => app.enter_ai_panel(),
         (_, _, Mode::ConfigmapsFull) => {}
 
-        (KeyCode::Up, m, Mode::Namespaces) if m.contains(KeyModifiers::SHIFT) => app.namespaces_detail_scroll = app.namespaces_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Namespaces) if m.contains(KeyModifiers::SHIFT) => app.namespaces_detail_scroll = app.namespaces_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Namespaces) => app.move_namespace_selection(-1),
         (KeyCode::Down, _, Mode::Namespaces) => app.move_namespace_selection(1),
         (KeyCode::PageUp, _, Mode::Namespaces) => app.move_namespace_selection(-10),
@@ -10856,10 +10910,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::Namespaces) => app.enter_ai_panel(),
         (_, _, Mode::Namespaces) => {}
 
-        (KeyCode::Up, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
-        (KeyCode::Left, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
-        (KeyCode::Right, m, Mode::Services) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Services) => app.move_net_selection(-1),
         (KeyCode::Down, _, Mode::Services) => app.move_net_selection(1),
         (KeyCode::PageUp, _, Mode::Services) => app.move_net_selection(-10),
@@ -10896,12 +10946,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::ServicesFull) => app.enter_ai_panel(),
         (_, _, Mode::ServicesFull) => {}
 
-        (KeyCode::Up, m, Mode::Capacity) if m.contains(KeyModifiers::SHIFT) => {
-            app.cap_detail_scroll = app.cap_detail_scroll.saturating_sub(1);
-        }
-        (KeyCode::Down, m, Mode::Capacity) if m.contains(KeyModifiers::SHIFT) => {
-            app.cap_detail_scroll = app.cap_detail_scroll.saturating_add(1);
-        }
         (KeyCode::Up, _, Mode::Capacity) => app.move_capacity_selection(-1),
         (KeyCode::Down, _, Mode::Capacity) => app.move_capacity_selection(1),
         (KeyCode::PageUp, _, Mode::Capacity) => app.move_capacity_selection(-10),
@@ -10933,12 +10977,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::CapacityFull) => app.enter_ai_panel(),
         (_, _, Mode::CapacityFull) => {}
 
-        (KeyCode::Up, m, Mode::Velero) if m.contains(KeyModifiers::SHIFT) => {
-            app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
-        }
-        (KeyCode::Down, m, Mode::Velero) if m.contains(KeyModifiers::SHIFT) => {
-            app.vel_detail_scroll = app.vel_detail_scroll.saturating_add(1)
-        }
         (KeyCode::Up, _, Mode::Velero) => app.move_vel_selection(-1),
         (KeyCode::Down, _, Mode::Velero) => app.move_vel_selection(1),
         (KeyCode::PageUp, _, Mode::Velero) => app.move_vel_selection(-10),
@@ -11018,8 +11056,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::K8ssandraFull) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandraFull) => {}
 
-        (KeyCode::Up, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_sub(1),
-        (KeyCode::Down, m, Mode::Reflector) if m.contains(KeyModifiers::SHIFT) => app.refl_detail_scroll = app.refl_detail_scroll.saturating_add(1),
         (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
         (KeyCode::Down, _, Mode::Reflector) => app.move_refl_selection(1),
         (KeyCode::PageUp, _, Mode::Reflector) => app.move_refl_selection(-10),
@@ -11049,10 +11085,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::ReflectorFull) => app.enter_ai_panel(),
         (_, _, Mode::ReflectorFull) => {}
 
-        (KeyCode::Up, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
-        (KeyCode::Left, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5),
-        (KeyCode::Right, m, Mode::Storage) if m.contains(KeyModifiers::SHIFT) => app.detail_h_scroll = app.detail_h_scroll.saturating_add(5),
         (KeyCode::Up, _, Mode::Storage) => app.move_storage_selection(-1),
         (KeyCode::Down, _, Mode::Storage) => app.move_storage_selection(1),
         (KeyCode::PageUp, _, Mode::Storage) => app.move_storage_selection(-10),
@@ -11096,12 +11128,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Right, m, _) if !m.contains(KeyModifiers::SHIFT) => {
             app.h_scroll = app.h_scroll.saturating_add(5);
         }
-        (KeyCode::Left, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => {
-            app.detail_h_scroll = app.detail_h_scroll.saturating_sub(5);
-        }
-        (KeyCode::Right, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => {
-            app.detail_h_scroll = app.detail_h_scroll.saturating_add(5);
-        }
         (KeyCode::Home, _, _) => app.h_scroll = 0,
         (KeyCode::Char('q'), _, _) => app.should_quit = true,
 
@@ -11139,8 +11165,6 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('N'), _, Mode::DetailFull) => app.enter_nodes_mode_for_selected_event(),
         (KeyCode::Char('i'), _, Mode::Selection) => app.enter_ai_panel(),
         (KeyCode::Enter, _, Mode::Selection) => app.enter_detail_full(),
-        (KeyCode::Up, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
-        (KeyCode::Down, m, Mode::Selection) if m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
         (KeyCode::Up, _, Mode::Selection) => app.move_selection(-1),
         (KeyCode::Down, _, Mode::Selection) => app.move_selection(1),
         (KeyCode::PageUp, _, Mode::Selection) => app.move_selection(-10),
@@ -16352,7 +16376,7 @@ fn draw_velero_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app, Mode::VeleroFull, &mut lines, visible, app.vel_detail_scroll, max_scroll,
     );
     let p = Paragraph::new(lines)
-        .scroll((app.vel_detail_scroll as u16, 0))
+        .scroll((app.vel_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -18899,7 +18923,7 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     app.rbac_detail_scroll = text_search_top(app, Mode::RbacFull, &mut lines, visible, app.rbac_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
-        .scroll((app.rbac_detail_scroll as u16, 0))
+        .scroll((app.rbac_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -19359,7 +19383,7 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     app.vuln_detail_scroll = text_search_top(app, Mode::VulnFull, &mut lines, visible, app.vuln_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
-        .scroll((app.vuln_detail_scroll as u16, 0))
+        .scroll((app.vuln_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -19611,7 +19635,7 @@ fn draw_secrets_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     app.secrets_detail_scroll = text_search_top(app, Mode::SecretsFull, &mut lines, visible, app.secrets_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
-        .scroll((app.secrets_detail_scroll as u16, 0))
+        .scroll((app.secrets_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -20063,7 +20087,7 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     app.certs_detail_scroll = text_search_top(app, Mode::CertsFull, &mut lines, visible, app.certs_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
-        .scroll((app.certs_detail_scroll as u16, 0))
+        .scroll((app.certs_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -20314,7 +20338,7 @@ fn draw_capacity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app, Mode::CapacityFull, &mut lines, visible, app.cap_detail_scroll, max_scroll,
     );
     let p = Paragraph::new(lines)
-        .scroll((app.cap_detail_scroll as u16, 0))
+        .scroll((app.cap_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -20574,7 +20598,7 @@ fn draw_storage_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app, Mode::StorageFull, &mut lines, visible, app.sto_detail_scroll, max_scroll,
     );
     let p = Paragraph::new(lines)
-        .scroll((app.sto_detail_scroll as u16, 0))
+        .scroll((app.sto_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -21360,7 +21384,7 @@ fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
     app.ky_detail_scroll = text_search_top(app, Mode::KyvernoFull, &mut lines, visible, app.ky_detail_scroll, max_scroll);
     let p = Paragraph::new(lines)
-        .scroll((app.ky_detail_scroll as u16, 0))
+        .scroll((app.ky_detail_scroll as u16, app.detail_h_scroll as u16))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
