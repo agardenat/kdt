@@ -10927,9 +10927,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
         (KeyCode::Char('t'), _, Mode::Pods) => app.toggle_pods_workloads(),
-        // `x` unfolds the focused pod into its containers; →/← do the same as tree motions. From a
-        // container row, `E` opens a shell in *that* container and the Logs tab follows it.
-        (KeyCode::Char('x'), _, Mode::Pods) => app.toggle_pod_containers(),
+        // `Space` unfolds the focused pod into its containers — the local fold of every other tree
+        // view, and it fetches nothing: the containers came with the pod. →/← do the same as tree
+        // motions. From a container row, `E` opens a shell in *that* container and Logs follows it.
+        (KeyCode::Char(' '), _, Mode::Pods) => app.toggle_pod_containers(),
         (KeyCode::Right, m, Mode::Pods) if !m.contains(KeyModifiers::SHIFT) => {
             app.expand_pod_containers()
         }
@@ -11731,7 +11732,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", if app.pods_show_workloads { "pods" } else { st.k_toggle_wl })),
-            Span::styled(" x ", kbg), Span::raw(format!(" {}   ", st.k_containers)),
+            Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_containers)),
             footer_sep(),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
@@ -15256,12 +15257,12 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         format!("{} (chargement...)", view_label)
     } else if app.pods_show_workloads {
         format!(
-            "workloads ({} workloads · {} pods) · ns={} · [t] pods · [x] containers",
+            "workloads ({} workloads · {} pods) · ns={} · [t] pods · [Space] containers",
             n_workloads, n_pods, app.namespace_label
         )
     } else {
         format!(
-            "pods ({} pods) · ns={} · [t] workloads · [x] containers",
+            "pods ({} pods) · ns={} · [t] workloads · [Space] containers",
             n_pods, app.namespace_label
         )
     };

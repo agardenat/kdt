@@ -115,7 +115,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | Vue | Touches |
 |---|---|
 | Évènements | `s` geler le défilement · `Tab` onglet Logs/Status/Related · `a`/`w`/`x` filtre All/Warnings/Errors · `p`/`C`/`f` logs run précédent/container/suivi · `n`/`0` filtre namespace · `N` nodes du pod · `E` shell · `D` diagnostic · `X` export PDF |
-| Workloads | `t` liste ↔ arbre · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
+| Workloads | `t` liste ↔ arbre · `Space` (ou `→`/`←`) déplier le pod en containers · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` vue usage · `s` tri · `o` cordon/uncordon/drain · `p`/`P` export PDF |
 | Capacité | `g` monde (nœuds → workloads → quotas) · `f` problèmes seulement |
 | FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `l` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
@@ -149,6 +149,9 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   ce qui a tué le pod n'est que là.
 - **Workloads** — liste plate des pods ou arbre workloads → pods (`t`, qui montre aussi les
   workloads scalés à 0). Les actions visent le workload, même depuis la ligne d'un de ses pods.
+  `Space` déplie un pod en ses containers (init, réguliers, éphémères) : chacun avec son état, sa
+  part de la consommation face à *ses* requests/limits, et l'âge de son dernier démarrage. Sur une
+  ligne container, `E` ouvre un shell dedans et l'onglet Logs s'y restreint tout seul.
 - **Nodes** — liste, détail, usage CPU/mémoire, et opérations `o` : cordon/uncordon (un patch
   réversible) et **drain avec rapport préalable** — pods qu'aucun contrôleur ne recréera, PDB qui
   refusera, place inexistante ailleurs, `emptyDir` perdus, pods statiques.

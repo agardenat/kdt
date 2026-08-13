@@ -115,7 +115,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | View | Keys |
 |---|---|
 | Events | `s` freeze scrolling · `Tab` Logs/Status/Related tab · `a`/`w`/`x` All/Warnings/Errors filter · `p`/`C`/`f` logs previous run/container/follow · `n`/`0` namespace filter · `N` nodes of the pod · `E` shell · `D` diagnostic · `X` PDF export |
-| Workloads | `t` list ↔ tree · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
+| Workloads | `t` list ↔ tree · `Space` (or `→`/`←`) unfold the pod into its containers · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` usage view · `s` sort · `o` cordon/uncordon/drain · `p`/`P` PDF export |
 | Capacity | `g` world (nodes → workloads → quotas) · `f` problems only |
 | FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
@@ -148,7 +148,10 @@ shows the query and its effect (`/coredns  (3)`).
   pane (Logs / Status / Related). `p` reads the container's **previous run**: on a
   `CrashLoopBackOff`, what killed the pod only lives there.
 - **Workloads** — flat pod list or workload → pod tree (`t`, which also shows workloads scaled to
-  0). Actions target the workload, even from one of its pod rows.
+  0). Actions target the workload, even from one of its pod rows. `Space` unfolds a pod into its
+  containers (init, regular, ephemeral): each with its own state, its share of the usage against
+  *its* requests/limits, and the age of its last start. On a container row, `E` opens a shell in
+  that container and the Logs tab narrows to it on its own.
 - **Nodes** — list, detail, CPU/memory usage, and `o` operations: cordon/uncordon (one reversible
   patch) and a **drain that reports first** — pods no controller will recreate, PDBs that will
   refuse, no room elsewhere, `emptyDir` data lost, static pods left behind.
