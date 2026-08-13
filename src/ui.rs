@@ -58,7 +58,7 @@ pub enum TreeRow {
 use crate::certmanager::{
     build_cert_tree, cert_tree_uid, chain_hints, chain_path, chain_subtree, fetch_certs,
     in_flight_request, is_rate_limited, new_certs_state, owning_certificate, renew, retry_acme,
-    CertState, CmKind, CmReady, CmResource, HintLevel, SecretFacts, SharedCerts,
+    CertState, CmKind, CmReady, CmResource, HintLevel, PasswordRef, SecretFacts, SharedCerts,
 };
 
 // A rendered row of the cert-manager chain: either a cert-manager object, or the TLS Secret a
@@ -19836,6 +19836,33 @@ fn cert_target(r: &CmResource) -> String {
     }
 }
 
+// Keystore formats a Certificate asks cert-manager to add to its Secret, as a row suffix. Empty for
+// everything else, which is the vast majority of rows — the badge is only there to make the handful
+// of Java-facing certificates findable without opening each one.
+fn cert_keystore_badge(r: &CmResource) -> String {
+    if r.keystores.is_empty() {
+        return String::new();
+    }
+    format!(
+        " [{}]",
+        r.keystores.iter().map(|k| k.format.as_str()).collect::<Vec<_>>().join("+")
+    )
+}
+
+// Splits the badge back off the pre-measured label so it can be dimmed without changing the column
+// width the label was measured for. The badge is ASCII, so slicing by byte length is safe.
+fn cert_label_cell(label: String, r: &CmResource) -> Cell<'static> {
+    let badge = cert_keystore_badge(r);
+    if badge.is_empty() || !label.ends_with(&badge) {
+        return Cell::from(label);
+    }
+    let base = label[..label.len() - badge.len()].to_string();
+    Cell::from(Line::from(vec![
+        Span::raw(base),
+        Span::styled(badge, Style::default().fg(Color::Cyan)),
+    ]))
+}
+
 // Counts are taken from the rows actually on screen, so a filter that hides everything cannot leave
 // the title claiming eight certificates over an empty table.
 fn certs_panel_title(app: &App, tree: bool, rows: &[CmResource]) -> String {
@@ -19896,7 +19923,14 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 } else {
                     " "
                 };
-                format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind.short(), r.name)
+                format!(
+                    "{}{} {} {}{}",
+                    "  ".repeat(n.depth),
+                    marker,
+                    r.kind.short(),
+                    r.name,
+                    cert_keystore_badge(r)
+                )
             }
             CertRow::Secret { depth, name, .. } => {
                 format!("{}→ Secret {}", "  ".repeat(*depth), name)
@@ -19952,7 +19986,7 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         (Cell::from(r.message.clone()).style(Style::default().fg(msg_color)), 1)
                     };
                     Row::new(vec![
-                        Cell::from(label),
+                        cert_label_cell(label, r),
                         Cell::from(format!("{} {}", cert_glyph(r.ready), ready_txt))
                             .style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
                         Cell::from(cert_target(r)).style(Style::default().fg(DIM)),
@@ -20013,16 +20047,21 @@ fn draw_certs_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    let name_col = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 20, 50);
+    // The keystore badge rides in the NAME column, so it has to be part of what that column is sized
+    // on — otherwise it is the badge that gets truncated away.
+    let names: Vec<String> =
+        resources.iter().map(|r| format!("{}{}", r.name, cert_keystore_badge(r))).collect();
+    let name_col = col_width(names.iter().map(|s| s.as_str()), "NAME", 20, 50);
     let rows: Vec<Row> = resources
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
             let (ready_txt, ready_color) = cert_ready_cell(r.ready);
             let msg_color = if r.ready == CmReady::Failed { Color::Red } else { DIM };
             Row::new(vec![
                 Cell::from(r.kind.short()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(r.namespace.clone()).style(Style::default().fg(DIM)),
-                Cell::from(r.name.clone()),
+                cert_label_cell(names[i].clone(), r),
                 Cell::from(format!("{} {}", cert_glyph(r.ready), ready_txt))
                     .style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
                 Cell::from(cert_target(r)).style(Style::default().fg(DIM)),
@@ -20726,13 +20765,35 @@ fn cert_secret_facts(app: &App, resources: &[CmResource], idx: usize) -> Option<
     if s.secrets.is_empty() {
         return None;
     }
+    // Keystore passwords live in a *different* Secret of the same namespace, resolved here so the
+    // rules stay pure. Order matches `CmResource::keystores`, and a keystore with an inline password
+    // still takes a slot so the zip below never shifts.
+    let password_refs = resources[cert]
+        .keystores
+        .iter()
+        .map(|ks| match &ks.password_ref {
+            Some((name, key)) => {
+                match s.secrets.iter().find(|x| &x.namespace == ns && &x.name == name) {
+                    Some(sec) => PasswordRef {
+                        secret_found: true,
+                        key_found: sec.data_keys.iter().any(|k| k == key),
+                    },
+                    None => PasswordRef::default(),
+                }
+            }
+            None => PasswordRef { secret_found: true, key_found: true },
+        })
+        .collect();
+
     Some(match s.secrets.iter().find(|x| &x.namespace == ns && &x.name == sn) {
         Some(found) => SecretFacts {
             found: true,
             days_remaining: found.tls.as_ref().map(|c| c.days_remaining),
             ingress_refs: found.ingress_refs.len(),
+            data_keys: found.data_keys.clone(),
+            password_refs,
         },
-        None => SecretFacts::default(),
+        None => SecretFacts { password_refs, ..SecretFacts::default() },
     })
 }
 
@@ -20872,6 +20933,69 @@ fn cert_chain_lines(
                 ))),
             }
         }
+        // Keystores are what a Java consumer actually mounts, and nothing else in the view mentions
+        // them. Each requested format is listed with the files cert-manager is meant to write, ticked
+        // against the Secret's real keys — and left unticked when those keys are not known, rather
+        // than shown as absent.
+        if !cert.keystores.is_empty() {
+            let keys = secret.map(|f| f.data_keys.as_slice()).unwrap_or(&[]);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                st.cert_keystores_title,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            for (n, ks) in cert.keystores.iter().enumerate() {
+                let mut spans = vec![
+                    Span::styled("  → ", Style::default().fg(DIM)),
+                    Span::styled(
+                        ks.format.as_str(),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                for file in [ks.format.keystore_key(), ks.format.truststore_key()] {
+                    spans.push(Span::raw("  "));
+                    if keys.is_empty() {
+                        spans.push(Span::styled(file.to_string(), Style::default().fg(DIM)));
+                    } else if keys.iter().any(|k| k == file) {
+                        spans.push(Span::styled(
+                            format!("{file} ✓"),
+                            Style::default().fg(Color::Green),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            format!("{file} ✗"),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                lines.push(Line::from(spans));
+
+                let mut detail: Vec<String> = Vec::new();
+                if let Some(a) = &ks.alias {
+                    detail.push(lang::fill(st.cert_keystore_alias, &[("alias", a)]));
+                }
+                match &ks.password_ref {
+                    Some((name, key)) => {
+                        let mark = match secret.and_then(|f| f.password_refs.get(n)) {
+                            Some(p) if !p.secret_found || !p.key_found => " ✗",
+                            Some(_) => " ✓",
+                            None => "",
+                        };
+                        detail.push(format!(
+                            "{}{}",
+                            lang::fill(st.cert_keystore_pw_ref, &[("name", name), ("key", key)]),
+                            mark
+                        ));
+                    }
+                    None => detail.push(st.cert_keystore_pw_inline.to_string()),
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("     {}", detail.join(" · ")),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+
         if let Some(rt) = &cert.renewal_time {
             lines.push(label(st.cert_lbl_renewal, rt[..rt.len().min(10)].to_string()));
         }

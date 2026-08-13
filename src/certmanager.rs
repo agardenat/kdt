@@ -124,6 +124,53 @@ pub struct ChallengeInfo {
     pub presented: bool,
 }
 
+// Keystore formats cert-manager can add to the produced Secret, alongside `tls.crt`/`tls.key`.
+// The file names are fixed by the controller (see the CRD documentation of `spec.keystores`), which
+// is what makes "requested but absent" a checkable fact rather than a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreFormat {
+    Jks,
+    Pkcs12,
+}
+
+impl KeystoreFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeystoreFormat::Jks => "JKS",
+            KeystoreFormat::Pkcs12 => "PKCS12",
+        }
+    }
+
+    // The key holding the certificate + private key. Always written when `create: true`.
+    pub fn keystore_key(self) -> &'static str {
+        match self {
+            KeystoreFormat::Jks => "keystore.jks",
+            KeystoreFormat::Pkcs12 => "keystore.p12",
+        }
+    }
+
+    // The key holding the issuing CA. Written *only* when the issuer returned a CA certificate, i.e.
+    // its absence is a finding only when the Secret itself carries a `ca.crt`.
+    pub fn truststore_key(self) -> &'static str {
+        match self {
+            KeystoreFormat::Jks => "truststore.jks",
+            KeystoreFormat::Pkcs12 => "truststore.p12",
+        }
+    }
+}
+
+// One requested keystore, from `spec.keystores.{jks,pkcs12}` with `create: true`.
+#[derive(Debug, Clone)]
+pub struct KeystoreSpec {
+    pub format: KeystoreFormat,
+    // `passwordSecretRef` as (secret name, key). Namespace-local, like every cert-manager secret ref.
+    // None when the password is given literally in `spec.keystores.*.password`, which is mutually
+    // exclusive with the ref — nothing to resolve in that case, so nothing to report either.
+    pub password_ref: Option<(String, String)>,
+    // JKS only: `spec.keystores.jks.alias`, defaulting to `certificate` controller-side.
+    pub alias: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CmResource {
     pub kind: CmKind,
@@ -150,6 +197,8 @@ pub struct CmResource {
     // For issuers: acme | ca | selfSigned | vault | venafi.
     pub issuer_type: Option<String>,
     pub challenge: Option<ChallengeInfo>,
+    // Certificates only: keystores the spec asks cert-manager to add to the produced Secret.
+    pub keystores: Vec<KeystoreSpec>,
 }
 
 impl CmResource {
@@ -376,6 +425,12 @@ fn parse_cm(
         None
     };
 
+    let keystores = if cm_kind == CmKind::Certificate {
+        parse_keystores(spec.and_then(|s| s.get("keystores")))
+    } else {
+        Vec::new()
+    };
+
     let (age, age_secs) = match obj.metadata.creation_timestamp.as_ref() {
         Some(t) => (
             format_age(&t.0),
@@ -402,7 +457,34 @@ fn parse_cm(
         renewal_time,
         issuer_type,
         challenge,
+        keystores,
     })
+}
+
+// `spec.keystores` → the formats actually requested. `create` is required by the CRD but explicitly
+// settable to false, so only a true value counts: a `create: false` block asks for nothing and must
+// not produce a badge, let alone a "missing file" finding.
+fn parse_keystores(keystores: Option<&serde_json::Value>) -> Vec<KeystoreSpec> {
+    let mut out = Vec::new();
+    let Some(k) = keystores else { return out };
+    for (field, format) in [("jks", KeystoreFormat::Jks), ("pkcs12", KeystoreFormat::Pkcs12)] {
+        let Some(block) = k.get(field) else { continue };
+        if block.get("create").and_then(|v| v.as_bool()) != Some(true) {
+            continue;
+        }
+        let password_ref = block.get("passwordSecretRef").and_then(|r| {
+            let name = r.get("name").and_then(|v| v.as_str())?.to_string();
+            let key = r.get("key").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            Some((name, key))
+        });
+        let alias = block
+            .get("alias")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        out.push(KeystoreSpec { format, password_ref, alias });
+    }
+    out
 }
 
 // The ownerReference that actually describes the lineage.
@@ -773,6 +855,20 @@ pub struct SecretFacts {
     pub found: bool,
     pub days_remaining: Option<i64>,
     pub ingress_refs: usize,
+    // Data keys of the produced Secret. Empty means "not known", never "the Secret is empty": the
+    // keystore rules stay silent on an empty list rather than claim a file is missing.
+    pub data_keys: Vec<String>,
+    // Resolution of each `passwordSecretRef`, in `CmResource::keystores` order. Absent entries mean
+    // the reference could not be looked up.
+    pub password_refs: Vec<PasswordRef>,
+}
+
+// Whether a keystore password reference actually resolves. Both flags false is the common failure:
+// the Secret named by `passwordSecretRef` does not exist in the Certificate's namespace.
+#[derive(Debug, Clone, Default)]
+pub struct PasswordRef {
+    pub secret_found: bool,
+    pub key_found: bool,
 }
 
 // True when the failure is an ACME rate limit. Retrying here does not help and actively burns the
@@ -890,6 +986,69 @@ pub fn chain_hints(
                     )));
                 }
             }
+            // 8. A keystore that was asked for but never landed in the Secret: cert-manager keeps the
+            //    Certificate Ready, so nothing else in the cluster says the Java consumers have no
+            //    keystore to mount. Only checked once the Secret's keys are actually known.
+            if facts.found && !facts.data_keys.is_empty() {
+                let has = |k: &str| facts.data_keys.iter().any(|d| d == k);
+                for ks in &cert.keystores {
+                    if !has(ks.format.keystore_key()) {
+                        out.push(danger(fill(
+                            st.cert_keystore_missing,
+                            &[("format", ks.format.as_str()), ("key", ks.format.keystore_key())],
+                        )));
+                    } else if !has(ks.format.truststore_key()) {
+                        // The truststore is written only when the issuer returned a CA. With a
+                        // `ca.crt` in hand and no truststore, the omission is real; without one it is
+                        // the documented behaviour, and saying so beats saying nothing.
+                        if has("ca.crt") {
+                            out.push(danger(fill(
+                                st.cert_truststore_missing,
+                                &[
+                                    ("format", ks.format.as_str()),
+                                    ("key", ks.format.truststore_key()),
+                                ],
+                            )));
+                        } else {
+                            out.push(Hint {
+                                level: HintLevel::Info,
+                                text: fill(
+                                    st.cert_truststore_no_ca,
+                                    &[
+                                        ("format", ks.format.as_str()),
+                                        ("key", ks.format.truststore_key()),
+                                    ],
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 9. The password reference is the usual reason a requested keystore never appears.
+            for (ks, pw) in cert.keystores.iter().zip(facts.password_refs.iter()) {
+                let Some((sname, skey)) = &ks.password_ref else { continue };
+                if !pw.secret_found {
+                    out.push(warn(fill(
+                        st.cert_keystore_pw_secret_missing,
+                        &[
+                            ("format", ks.format.as_str()),
+                            ("ns", &cert.namespace),
+                            ("name", sname),
+                        ],
+                    )));
+                } else if !pw.key_found && !skey.is_empty() {
+                    out.push(warn(fill(
+                        st.cert_keystore_pw_key_missing,
+                        &[
+                            ("format", ks.format.as_str()),
+                            ("key", skey),
+                            ("name", sname),
+                        ],
+                    )));
+                }
+            }
+
             if facts.found && facts.ingress_refs == 0 && cert.ready == CmReady::Ready {
                 out.push(Hint {
                     level: HintLevel::Info,
@@ -1060,6 +1219,7 @@ mod tests {
             renewal_time: None,
             issuer_type: None,
             challenge: None,
+            keystores: vec![],
         }
     }
 
@@ -1312,19 +1472,131 @@ mod tests {
     #[test]
     fn missing_and_desynced_secrets_are_reported() {
         let all = full_chain();
-        let missing = SecretFacts { found: false, days_remaining: None, ingress_refs: 0 };
+        let missing = SecretFacts { found: false, ..SecretFacts::default() };
         let hints = chain_hints(1, &all, Some(&missing), &FR);
         assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_missing) && h.level == HintLevel::Danger));
 
         let mut synced = full_chain();
         synced[1].days_remaining = Some(60);
-        let facts = SecretFacts { found: true, days_remaining: Some(12), ingress_refs: 1 };
+        let facts = SecretFacts {
+            found: true,
+            days_remaining: Some(12),
+            ingress_refs: 1,
+            ..SecretFacts::default()
+        };
         let hints = chain_hints(1, &synced, Some(&facts), &FR);
         assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_desynced)));
 
-        let facts = SecretFacts { found: true, days_remaining: Some(60), ingress_refs: 1 };
+        let facts = SecretFacts {
+            found: true,
+            days_remaining: Some(60),
+            ingress_refs: 1,
+            ..SecretFacts::default()
+        };
         let hints = chain_hints(1, &synced, Some(&facts), &FR);
         assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_secret_desynced)));
+    }
+
+    fn jks_chain(password_ref: Option<(&str, &str)>) -> Vec<CmResource> {
+        let mut all = full_chain();
+        all[1].keystores = vec![KeystoreSpec {
+            format: KeystoreFormat::Jks,
+            password_ref: password_ref.map(|(n, k)| (n.to_string(), k.to_string())),
+            alias: None,
+        }];
+        all
+    }
+
+    fn keys(list: &[&str]) -> SecretFacts {
+        SecretFacts {
+            found: true,
+            data_keys: list.iter().map(|s| s.to_string()).collect(),
+            ..SecretFacts::default()
+        }
+    }
+
+    #[test]
+    fn requested_keystore_absent_from_the_secret_is_reported() {
+        let all = jks_chain(None);
+        let facts = keys(&["tls.crt", "tls.key", "ca.crt"]);
+        let hints = chain_hints(1, &all, Some(&facts), &FR);
+        assert!(hints
+            .iter()
+            .any(|h| reads_as(&h.text, FR.cert_keystore_missing) && h.level == HintLevel::Danger));
+
+        let complete = keys(&["tls.crt", "tls.key", "ca.crt", "keystore.jks", "truststore.jks"]);
+        let hints = chain_hints(1, &all, Some(&complete), &FR);
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_missing)));
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_truststore_missing)));
+    }
+
+    // A missing truststore means two different things depending on whether the issuer returned a CA,
+    // and only one of them is a problem.
+    #[test]
+    fn missing_truststore_is_a_finding_only_when_a_ca_is_present() {
+        let all = jks_chain(None);
+        let with_ca = keys(&["tls.crt", "tls.key", "ca.crt", "keystore.jks"]);
+        let hints = chain_hints(1, &all, Some(&with_ca), &FR);
+        assert!(hints
+            .iter()
+            .any(|h| reads_as(&h.text, FR.cert_truststore_missing) && h.level == HintLevel::Danger));
+
+        let without_ca = keys(&["tls.crt", "tls.key", "keystore.jks"]);
+        let hints = chain_hints(1, &all, Some(&without_ca), &FR);
+        assert!(hints
+            .iter()
+            .any(|h| reads_as(&h.text, FR.cert_truststore_no_ca) && h.level == HintLevel::Info));
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_truststore_missing)));
+    }
+
+    // An unknown key list must stay silent: "we did not read the Secret" is not "the file is gone".
+    #[test]
+    fn unknown_secret_keys_report_nothing() {
+        let all = jks_chain(None);
+        let facts = SecretFacts { found: true, ..SecretFacts::default() };
+        let hints = chain_hints(1, &all, Some(&facts), &FR);
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_missing)));
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_truststore_no_ca)));
+    }
+
+    #[test]
+    fn unresolvable_keystore_password_is_reported() {
+        let all = jks_chain(Some(("jks-password", "keystore-pass")));
+        let mut facts = keys(&["tls.crt", "tls.key", "ca.crt", "keystore.jks", "truststore.jks"]);
+
+        facts.password_refs = vec![PasswordRef { secret_found: false, key_found: false }];
+        let hints = chain_hints(1, &all, Some(&facts), &FR);
+        assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_pw_secret_missing)));
+
+        facts.password_refs = vec![PasswordRef { secret_found: true, key_found: false }];
+        let hints = chain_hints(1, &all, Some(&facts), &FR);
+        assert!(hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_pw_key_missing)));
+
+        facts.password_refs = vec![PasswordRef { secret_found: true, key_found: true }];
+        let hints = chain_hints(1, &all, Some(&facts), &FR);
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_pw_secret_missing)));
+        assert!(!hints.iter().any(|h| reads_as(&h.text, FR.cert_keystore_pw_key_missing)));
+    }
+
+    #[test]
+    fn keystores_are_parsed_only_when_creation_is_enabled() {
+        let spec = serde_json::json!({
+            "jks": {
+                "create": true,
+                "alias": "cassandra",
+                "passwordSecretRef": { "name": "jks-password", "key": "keystore-pass" }
+            },
+            "pkcs12": { "create": false }
+        });
+        let parsed = parse_keystores(Some(&spec));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].format, KeystoreFormat::Jks);
+        assert_eq!(parsed[0].alias.as_deref(), Some("cassandra"));
+        assert_eq!(
+            parsed[0].password_ref,
+            Some(("jks-password".to_string(), "keystore-pass".to_string()))
+        );
+        assert!(parse_keystores(None).is_empty());
     }
 
     #[test]
