@@ -8,14 +8,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::apps::v1::ReplicaSet;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{ContainerStatus, Pod, ResourceRequirements};
 use crate::lang::{active, fill};
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 
 use crate::events::{
-    fetch_pod_usage, format_age, parse_quantity_cpu_milli, parse_quantity_memory_bytes,
+    fetch_container_usage, format_age, parse_quantity_cpu_milli, parse_quantity_memory_bytes,
+    ContainerUsageMap,
 };
 use crate::flux::SharedReconcile;
 
@@ -29,6 +30,65 @@ pub struct OwnerRef {
     pub name: String,
     pub namespace: String,
     pub api_version: String,
+}
+
+// Where a container sits in the pod's lifecycle. It decides how a row reads more than how it is
+// fetched: an init container that says "Completed" did its job, a regular one that says the same is
+// gone, and only a running one can be exec'd into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind { Init, Regular, Ephemeral }
+
+impl ContainerKind {
+    // Prefix shown in front of the container name, so the three families never read alike.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ContainerKind::Init => "init:",
+            ContainerKind::Ephemeral => "eph:",
+            ContainerKind::Regular => "",
+        }
+    }
+}
+
+// One container of a pod, as the pods view shows it: the spec side (name, image, requests/limits)
+// joined with the status side (ready, state, restarts) and its own slice of the metrics-server read.
+// It is a display row, not an API object — a container has no manifest of its own, so `y`/`e`/delete
+// on such a row keep acting on the owning pod.
+#[derive(Debug, Clone)]
+pub struct ContainerResource {
+    pub namespace: String,
+    pub pod: String,
+    pub name: String,
+    pub image: String,
+    pub kind: ContainerKind,
+    pub ready: bool,
+    // Running / a waiting reason (CrashLoopBackOff…) / a terminated reason (Completed, OOMKilled…).
+    pub state: String,
+    pub restarts: i32,
+    // Time since this container last started (or finished), not since the pod was created.
+    pub age: String,
+    pub cpu_milli: Option<i64>,
+    pub mem_bytes: Option<i64>,
+    pub cpu_req: Option<i64>,
+    pub cpu_lim: Option<i64>,
+    pub mem_req: Option<i64>,
+    pub mem_lim: Option<i64>,
+    pub uid: String,
+}
+
+impl ContainerResource {
+    pub fn uid(ns: &str, pod: &str, name: &str) -> String {
+        format!("ctr|{}/{}/{}", ns, pod, name)
+    }
+
+    // The only state `kubectl exec` can land in. Checked before the terminal is handed over, since
+    // afterwards the failure scrolls past on a screen kdt is about to repaint.
+    pub fn is_running(&self) -> bool {
+        self.state == "Running"
+    }
+
+    pub fn display_name(&self) -> String {
+        format!("{}{}", self.kind.tag(), self.name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +110,8 @@ pub struct PodResource {
     pub cpu_lim: Option<i64>,
     pub mem_req: Option<i64>,
     pub mem_lim: Option<i64>,
+    // Init, regular and ephemeral containers in spec order, shown when the pod row is expanded.
+    pub containers: Vec<ContainerResource>,
 }
 
 impl PodResource {
@@ -134,12 +196,20 @@ pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: S
         }
     };
 
-    let usage = fetch_pod_usage(&client).await;
+    // One metrics read serves both levels: the container rows use it as it comes, the pod rows use
+    // the sum of it, so expanding a pod costs no extra API call.
+    let cusage = fetch_container_usage(&client).await;
+    let mut usage: UsageMap = HashMap::new();
+    for ((ns, pod, _c), (cpu, mem)) in &cusage {
+        let e = usage.entry((ns.clone(), pod.clone())).or_insert((0, 0));
+        e.0 += cpu;
+        e.1 += mem;
+    }
     let mut rs_cache: HashMap<String, Option<OwnerRef>> = HashMap::new();
     let mut pods: Vec<PodResource> = Vec::with_capacity(list.items.len());
     for p in &list.items {
         let owner = resolve_owner(&client, p, &mut rs_cache).await;
-        pods.push(pod_resource(p, owner, &usage));
+        pods.push(pod_resource(p, owner, &usage, &cusage));
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
@@ -260,7 +330,12 @@ async fn replicaset_owner(client: &Client, ns: &str, name: &str) -> Option<Owner
     })
 }
 
-fn pod_resource(p: &Pod, owner: Option<OwnerRef>, usage: &UsageMap) -> PodResource {
+fn pod_resource(
+    p: &Pod,
+    owner: Option<OwnerRef>,
+    usage: &UsageMap,
+    cusage: &ContainerUsageMap,
+) -> PodResource {
     let namespace = p.metadata.namespace.clone().unwrap_or_default();
     let name = p.metadata.name.clone().unwrap_or_default();
     let node = p.spec.as_ref().and_then(|s| s.node_name.clone()).unwrap_or_default();
@@ -288,6 +363,8 @@ fn pod_resource(p: &Pod, owner: Option<OwnerRef>, usage: &UsageMap) -> PodResour
         None => (None, None),
     };
 
+    let containers = pod_containers(p, &namespace, &name, cusage);
+
     PodResource {
         uid: format!("pod|{}/{}", namespace, name),
         status: pod_status(p),
@@ -303,9 +380,126 @@ fn pod_resource(p: &Pod, owner: Option<OwnerRef>, usage: &UsageMap) -> PodResour
         cpu_lim,
         mem_req,
         mem_lim,
+        containers,
         namespace,
         name,
     }
+}
+
+// The pod's containers in the order they run: init first, then the regular ones, then any ephemeral
+// debug container. Spec and status are joined by name — a container declared but not yet started has
+// no status at all, and reads "Pending" rather than being dropped from the list.
+fn pod_containers(
+    p: &Pod,
+    namespace: &str,
+    pod: &str,
+    cusage: &ContainerUsageMap,
+) -> Vec<ContainerResource> {
+    let Some(spec) = p.spec.as_ref() else { return Vec::new() };
+    let status = p.status.as_ref();
+    let find = |statuses: Option<&Vec<ContainerStatus>>, name: &str| {
+        statuses.and_then(|v| v.iter().find(|s| s.name == name)).cloned()
+    };
+
+    let mut out = Vec::new();
+    for c in spec.init_containers.iter().flatten() {
+        let st = find(status.and_then(|s| s.init_container_statuses.as_ref()), &c.name);
+        out.push(container_resource(
+            namespace, pod, ContainerKind::Init, &c.name, &c.image, c.resources.as_ref(), st.as_ref(), cusage,
+        ));
+    }
+    for c in &spec.containers {
+        let st = find(status.and_then(|s| s.container_statuses.as_ref()), &c.name);
+        out.push(container_resource(
+            namespace, pod, ContainerKind::Regular, &c.name, &c.image, c.resources.as_ref(), st.as_ref(), cusage,
+        ));
+    }
+    for c in spec.ephemeral_containers.iter().flatten() {
+        let st = find(status.and_then(|s| s.ephemeral_container_statuses.as_ref()), &c.name);
+        out.push(container_resource(
+            namespace, pod, ContainerKind::Ephemeral, &c.name, &c.image, c.resources.as_ref(), st.as_ref(), cusage,
+        ));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn container_resource(
+    namespace: &str,
+    pod: &str,
+    kind: ContainerKind,
+    name: &str,
+    spec_image: &Option<String>,
+    resources: Option<&ResourceRequirements>,
+    st: Option<&ContainerStatus>,
+    cusage: &ContainerUsageMap,
+) -> ContainerResource {
+    let (state, age) = container_state(st);
+    // What actually runs beats what was asked for: status.image is the image the kubelet resolved,
+    // which is the whole question when a rollout is half-done. Falls back to the spec before it is.
+    let image = st
+        .map(|s| s.image.clone())
+        .filter(|i| !i.is_empty())
+        .or_else(|| spec_image.clone())
+        .unwrap_or_default();
+    let q = |m: Option<&std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>, key: &str, cpu: bool| {
+        m.and_then(|m| m.get(key)).and_then(|v| {
+            if cpu { parse_quantity_cpu_milli(&v.0) } else { parse_quantity_memory_bytes(&v.0) }
+        })
+    };
+    let (req, lim) = match resources {
+        Some(r) => (r.requests.as_ref(), r.limits.as_ref()),
+        None => (None, None),
+    };
+    let (cpu_milli, mem_bytes) = match cusage.get(&(namespace.to_string(), pod.to_string(), name.to_string())) {
+        Some((c, m)) => (Some(*c), Some(*m)),
+        None => (None, None),
+    };
+    ContainerResource {
+        namespace: namespace.to_string(),
+        pod: pod.to_string(),
+        name: name.to_string(),
+        image,
+        kind,
+        ready: st.map(|s| s.ready).unwrap_or(false),
+        state,
+        restarts: st.map(|s| s.restart_count).unwrap_or(0),
+        age,
+        cpu_milli,
+        mem_bytes,
+        cpu_req: q(req, "cpu", true),
+        cpu_lim: q(lim, "cpu", true),
+        mem_req: q(req, "memory", false),
+        mem_lim: q(lim, "memory", false),
+        uid: ContainerResource::uid(namespace, pod, name),
+    }
+}
+
+// The container's state and the age that goes with it. The age is deliberately not the pod's: on a
+// restarting container the only figure that answers "when did this last blow up" is its own
+// startedAt (or, once it is dead, its finishedAt).
+fn container_state(st: Option<&ContainerStatus>) -> (String, String) {
+    let Some(state) = st.and_then(|s| s.state.as_ref()) else {
+        return ("Pending".to_string(), String::new());
+    };
+    if let Some(r) = &state.running {
+        let age = r.started_at.as_ref().map(|t| format_age(&t.0)).unwrap_or_default();
+        return ("Running".to_string(), age);
+    }
+    if let Some(w) = &state.waiting {
+        return (w.reason.clone().unwrap_or_else(|| "Waiting".to_string()), String::new());
+    }
+    if let Some(t) = &state.terminated {
+        let age = t.finished_at.as_ref().map(|x| format_age(&x.0)).unwrap_or_default();
+        // A reasonless exit still says something: the code is the only thing left to report.
+        let reason = t
+            .reason
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| format!("Exit {}", t.exit_code));
+        return (reason, age);
+    }
+    ("Unknown".to_string(), String::new())
 }
 
 // Sum CPU (millicores) and memory (bytes) requests/limits across a pod's regular containers.
@@ -462,5 +656,186 @@ async fn patch_restart(client: &Client, owner: &OwnerRef) -> Result<(), String> 
 fn publish(status: &SharedReconcile, msg: String) {
     if let Ok(mut s) = status.lock() {
         *s = Some((std::time::Instant::now(), msg));
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{
+        Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+        ContainerStateWaiting, PodSpec, PodStatus,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+    fn now() -> Time {
+        Time(k8s_openapi::jiff::Timestamp::now() - std::time::Duration::from_secs(4 * 3600))
+    }
+
+    fn status_of(name: &str, state: ContainerState, ready: bool, restarts: i32) -> ContainerStatus {
+        ContainerStatus {
+            name: name.to_string(),
+            image: format!("registry.example.com/{}:v2", name),
+            ready,
+            restart_count: restarts,
+            state: Some(state),
+            ..Default::default()
+        }
+    }
+
+    fn pod_with(spec: PodSpec, status: PodStatus) -> Pod {
+        Pod { spec: Some(spec), status: Some(status), ..Default::default() }
+    }
+
+    #[test]
+    fn init_regular_and_ephemeral_containers_come_back_in_running_order() {
+        let p = pod_with(
+            PodSpec {
+                init_containers: Some(vec![Container {
+                    name: "wait-db".to_string(),
+                    image: Some("busybox:1.36".to_string()),
+                    ..Default::default()
+                }]),
+                containers: vec![Container {
+                    name: "app".to_string(),
+                    image: Some("app:1.0".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            PodStatus::default(),
+        );
+        let out = pod_containers(&p, "apps", "web-0", &ContainerUsageMap::new());
+        let names: Vec<String> = out.iter().map(|c| c.display_name()).collect();
+        assert_eq!(names, vec!["init:wait-db", "app"]);
+        // No status yet is not "gone": the container is declared and waiting for the kubelet.
+        assert!(out.iter().all(|c| c.state == "Pending" && !c.is_running()));
+    }
+
+    #[test]
+    fn a_container_is_judged_on_its_own_state_not_the_pods() {
+        let p = pod_with(
+            PodSpec {
+                init_containers: Some(vec![Container {
+                    name: "wait-db".to_string(),
+                    image: Some("busybox:1.36".to_string()),
+                    ..Default::default()
+                }]),
+                containers: vec![
+                    Container { name: "app".to_string(), image: Some("app:1.0".to_string()), ..Default::default() },
+                    Container { name: "sidecar".to_string(), image: Some("proxy:2.0".to_string()), ..Default::default() },
+                ],
+                ..Default::default()
+            },
+            PodStatus {
+                init_container_statuses: Some(vec![status_of(
+                    "wait-db",
+                    ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            reason: Some("Completed".to_string()),
+                            finished_at: Some(now()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    false,
+                    0,
+                )]),
+                container_statuses: Some(vec![
+                    status_of(
+                        "app",
+                        ContainerState {
+                            running: Some(ContainerStateRunning { started_at: Some(now()) }),
+                            ..Default::default()
+                        },
+                        true,
+                        0,
+                    ),
+                    status_of(
+                        "sidecar",
+                        ContainerState {
+                            waiting: Some(ContainerStateWaiting {
+                                reason: Some("CrashLoopBackOff".to_string()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        false,
+                        7,
+                    ),
+                ]),
+                ..Default::default()
+            },
+        );
+        let out = pod_containers(&p, "apps", "web-0", &ContainerUsageMap::new());
+        let by = |n: &str| out.iter().find(|c| c.name == n).expect("container").clone();
+
+        // A finished init container is not a failure, and it is not exec'able either.
+        let init = by("wait-db");
+        assert_eq!(init.state, "Completed");
+        assert!(!init.is_running());
+        // Its age is its own finishedAt, not the pod's creation.
+        assert_eq!(init.age, "4h");
+
+        assert!(by("app").is_running());
+        assert_eq!(by("sidecar").state, "CrashLoopBackOff");
+        assert_eq!(by("sidecar").restarts, 7);
+        // What actually runs beats what was asked for.
+        assert_eq!(by("app").image, "registry.example.com/app:v2");
+    }
+
+    #[test]
+    fn a_reasonless_exit_still_reports_its_code() {
+        let p = pod_with(
+            PodSpec {
+                containers: vec![Container {
+                    name: "job".to_string(),
+                    image: Some("runner:1".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            PodStatus {
+                container_statuses: Some(vec![status_of(
+                    "job",
+                    ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 137,
+                            reason: None,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    false,
+                    0,
+                )]),
+                ..Default::default()
+            },
+        );
+        let out = pod_containers(&p, "apps", "job-0", &ContainerUsageMap::new());
+        assert_eq!(out[0].state, "Exit 137");
+    }
+
+    #[test]
+    fn each_container_takes_its_own_slice_of_the_metrics_read() {
+        let mut usage = ContainerUsageMap::new();
+        usage.insert(("apps".to_string(), "web-0".to_string(), "app".to_string()), (250, 1024));
+        let p = pod_with(
+            PodSpec {
+                containers: vec![
+                    Container { name: "app".to_string(), image: Some("app:1".to_string()), ..Default::default() },
+                    Container { name: "sidecar".to_string(), image: Some("proxy:1".to_string()), ..Default::default() },
+                ],
+                ..Default::default()
+            },
+            PodStatus::default(),
+        );
+        let out = pod_containers(&p, "apps", "web-0", &usage);
+        assert_eq!(out[0].cpu_milli, Some(250));
+        assert_eq!(out[0].mem_bytes, Some(1024));
+        // Nothing is invented for the container metrics-server did not report.
+        assert_eq!(out[1].cpu_milli, None);
+        assert_eq!(out[1].mem_bytes, None);
     }
 }

@@ -141,8 +141,8 @@ use crate::lang;
 use crate::lang::Strings;
 use crate::pdf;
 use crate::pods::{
-    fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, PodResource,
-    SharedPods, WorkloadResource,
+    fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, ContainerKind,
+    ContainerResource, PodResource, SharedPods, WorkloadResource,
 };
 use crate::rbac::{
     critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, PolicyRule as RbacRule,
@@ -886,15 +886,17 @@ fn is_critical_reason(reason: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull }
 
-// One visual line in the merged workloads view: either a workload (parent/group row) or one of its
-// pods (child row). The order of `App::pods_rows` is the on-screen order and stays aligned with
-// `App::snapshot` (and thus `table_state`), so a selected index maps to the same row in both.
+// One visual line in the merged workloads view: a workload (parent/group row), one of its pods
+// (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
+// The order of `App::pods_rows` is the on-screen order and stays aligned with `App::snapshot` (and
+// thus `table_state`), so a selected index maps to the same row in both.
 #[derive(Clone)]
 // `Pod` is boxed: a PodResource is ~2.5× the size of a WorkloadResource, and this vector holds one
 // entry per visible line, so the unboxed enum would pad every workload row up to the pod size.
 pub enum PodRow {
     Workload(WorkloadResource),
     Pod(Box<PodResource>),
+    Container(Box<ContainerResource>),
 }
 
 // The operation a menu entry runs once confirmed. Maps directly onto the existing App methods.
@@ -1369,6 +1371,13 @@ pub struct App {
     // When true, the workloads view shows parent workload rows with their pods nested under them;
     // when false (default) only pods are listed flat. Toggled with `t`.
     pub pods_show_workloads: bool,
+    // Pods (by uid) whose containers are unfolded under them, toggled with `x`. Per-pod rather than
+    // global: a namespace-wide expansion would triple the row count for the one pod being looked at.
+    pods_expanded: std::collections::HashSet<String>,
+    // True while `log_opts.container` is kdt's doing — set because a container row is selected, not
+    // because the reader narrowed the Logs tab with `C`. Only an automatic narrowing is undone when
+    // the selection leaves the container, so a manual one survives moving around the table.
+    pods_log_container_auto: bool,
     pub pods_saved_replicas: std::collections::HashMap<String, i32>,
     pub pods_refresh_handle: Option<JoinHandle<()>>,
     pub last_pods_sel_uid: Option<String>,
@@ -1667,6 +1676,8 @@ impl App {
             pods_state: new_pods_state(),
             pods_rows: Vec::new(),
             pods_show_workloads: false,
+            pods_expanded: std::collections::HashSet::new(),
+            pods_log_container_auto: false,
             network_state: new_network_state(),
             net_rows: Vec::new(),
             net_world: NetWorld::Services,
@@ -3113,9 +3124,17 @@ impl App {
         self.pending_exec = Some(target);
     }
 
-    // The pod to open a shell in: the selected object when it is a pod, and otherwise — on a
-    // workload row — the first pod it owns, which is what one means by "a shell in this deployment".
+    // The pod to open a shell in: the container under the cursor when there is one — that is the
+    // whole point of unfolding a pod — then the selected object when it is a pod, and otherwise, on
+    // a workload row, the first pod it owns, which is what one means by "a shell in this deployment".
     fn exec_target(&self) -> Option<crate::exec::Target> {
+        if let Some(c) = self.selected_container() {
+            return Some(crate::exec::Target {
+                namespace: c.namespace,
+                pod: c.pod,
+                container: Some(c.name),
+            });
+        }
         let container = self.log_opts.container.clone();
         if let Some((_, kind, namespace, name)) = self.current_object_ref() {
             if kind == "Pod" && !namespace.is_empty() {
@@ -3129,9 +3148,14 @@ impl App {
 
     // Why the shell would not open, when the view knows enough to say so. `kubectl exec` on a
     // finished pod fails with an exit code and a message on a screen kdt is about to wipe, so the
-    // one case the pods view can name from what it already has is named here instead.
+    // cases the pods view can name from what it already has are named here instead. A container row
+    // is judged on its own state: an init container that says Completed is not the pod being down.
     fn exec_blocked(&self, target: &crate::exec::Target) -> Option<String> {
         let st = lang::t(self.ai_language);
+        if let Some(c) = self.selected_container() {
+            return (!c.is_running())
+                .then(|| st.exec_ctr_not_running.replace("{c}", &c.name).replace("{d}", &c.state));
+        }
         let s = self.pods_state.lock().expect("pods poisoned");
         let p = s
             .pods
@@ -3145,7 +3169,10 @@ impl App {
     // what happened in there.
     fn exec_returned(&mut self, target: &crate::exec::Target, outcome: Result<(), String>) {
         let st = lang::t(self.ai_language);
-        let label = format!("{}/{}", target.namespace, target.pod);
+        let label = match &target.container {
+            Some(c) => format!("{}/{} [{}]", target.namespace, target.pod, c),
+            None => format!("{}/{}", target.namespace, target.pod),
+        };
         let msg = match outcome {
             Ok(()) => st.exec_ok.replace("{d}", &label),
             Err(e) => st.exec_failed.replace("{d}", &label).replace("{e}", &e),
@@ -9159,21 +9186,40 @@ impl App {
                     self.pods_saved_replicas.entry(w.uid.clone()).or_insert(r);
                 }
             }
+            // A pod that is gone takes its unfolded state with it, so a churning namespace does not
+            // grow the set forever — and a pod that comes back under the same name comes back folded.
+            if !s.pods.is_empty() {
+                self.pods_expanded.retain(|uid| s.pods.iter().any(|p| &p.uid == uid));
+            }
+            // Pushes a pod row and, when it is unfolded, its containers right under it.
+            let expanded = &self.pods_expanded;
+            let push_pod = |rows: &mut Vec<PodRow>, p: &PodResource| {
+                rows.push(PodRow::Pod(Box::new(p.clone())));
+                if expanded.contains(&p.uid) {
+                    for c in &p.containers {
+                        rows.push(PodRow::Container(Box::new(c.clone())));
+                    }
+                }
+            };
             if self.pods_show_workloads {
                 let mut rows: Vec<PodRow> = Vec::with_capacity(s.pods.len() + s.workloads.len());
                 for w in &s.workloads {
                     rows.push(PodRow::Workload(w.clone()));
                     for p in s.pods.iter().filter(|p| pod_belongs_to(p, w)) {
-                        rows.push(PodRow::Pod(Box::new(p.clone())));
+                        push_pod(&mut rows, p);
                     }
                 }
                 for p in s.pods.iter().filter(|p| !s.workloads.iter().any(|w| pod_belongs_to(p, w))) {
-                    rows.push(PodRow::Pod(Box::new(p.clone())));
+                    push_pod(&mut rows, p);
                 }
                 rows
             } else {
                 // Pods-only view: flat list of every pod, no parent workload rows.
-                s.pods.iter().map(|p| PodRow::Pod(Box::new(p.clone()))).collect()
+                let mut rows: Vec<PodRow> = Vec::with_capacity(s.pods.len());
+                for p in &s.pods {
+                    push_pod(&mut rows, p);
+                }
+                rows
             }
         };
         let recs: Vec<EventRecord> = rows
@@ -9181,6 +9227,7 @@ impl App {
             .map(|r| match r {
                 PodRow::Workload(w) => synthetic_workload_record(w),
                 PodRow::Pod(p) => synthetic_pod_record(p),
+                PodRow::Container(c) => synthetic_container_record(c),
             })
             .collect();
         self.pods_rows = rows;
@@ -9210,6 +9257,7 @@ impl App {
         let cur_uid = self.snapshot[idx].uid.clone();
         if self.last_pods_sel_uid.as_deref() != Some(cur_uid.as_str()) {
             self.last_pods_sel_uid = Some(cur_uid);
+            self.sync_pods_log_container();
             self.maybe_fetch_logs();
             self.maybe_fetch_status();
             self.maybe_fetch_related();
@@ -9223,6 +9271,114 @@ impl App {
         self.refresh_pods_snapshot();
     }
 
+    // The container row under the cursor, when there is one. Everything container-level (the shell,
+    // the Logs narrowing, the row's own diagnosis) goes through it.
+    fn selected_container(&self) -> Option<ContainerResource> {
+        let i = self.table_state.selected()?;
+        match self.pods_rows.get(i)? {
+            PodRow::Container(c) => Some((**c).clone()),
+            _ => None,
+        }
+    }
+
+    // The pod row the cursor sits on or under: the pod itself, or the pod owning the selected
+    // container. `x` and the shell both need it, and neither should care which of the two is focused.
+    fn selected_pod(&self) -> Option<PodResource> {
+        let i = self.table_state.selected()?;
+        match self.pods_rows.get(i)? {
+            PodRow::Pod(p) => Some((**p).clone()),
+            PodRow::Container(c) => self.pods_rows[..i].iter().rev().find_map(|r| match r {
+                PodRow::Pod(p) if p.namespace == c.namespace && p.name == c.pod => {
+                    Some((**p).clone())
+                }
+                _ => None,
+            }),
+            PodRow::Workload(_) => None,
+        }
+    }
+
+    // `x`: unfold the focused pod into its containers, or fold it back. On a container row it folds
+    // the pod it belongs to, so the key always undoes what it just did without moving the cursor
+    // first. A workload row has no containers of its own and says so rather than doing nothing.
+    fn toggle_pod_containers(&mut self) {
+        let Some(p) = self.selected_pod() else {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                lang::t(self.ai_language).ctr_pick_pod.to_string(),
+            ));
+            return;
+        };
+        let folding = self.pods_expanded.contains(&p.uid);
+        if folding {
+            self.pods_expanded.remove(&p.uid);
+            // Folding from a container row would leave the cursor on a line that no longer exists;
+            // put it back on the pod, which is what the reader is looking at anyway.
+            if self.selected_container().is_some() {
+                // The rebuild restores the selection from the *current* row under the cursor first,
+                // and that row is one of the containers about to disappear. Dropping the index makes
+                // it fall back on `selected_uid` — the pod — instead of resetting to the first row.
+                self.table_state.select(None);
+                self.selected_uid = Some(p.uid.clone());
+                self.last_pods_sel_uid = None;
+            }
+        } else if p.containers.is_empty() {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                lang::t(self.ai_language).ctr_none.to_string(),
+            ));
+            return;
+        } else {
+            self.pods_expanded.insert(p.uid.clone());
+        }
+        self.refresh_pods_snapshot();
+        self.sync_pods_log_container();
+    }
+
+    // Unfold (`→`) and fold (`←`) as tree motions: same state as `x`, only never a no-op message.
+    fn expand_pod_containers(&mut self) {
+        let Some(p) = self.selected_pod() else { return };
+        if p.containers.is_empty() || self.pods_expanded.contains(&p.uid) { return; }
+        self.pods_expanded.insert(p.uid);
+        self.refresh_pods_snapshot();
+    }
+
+    fn collapse_pod_containers(&mut self) {
+        let Some(p) = self.selected_pod() else { return };
+        if !self.pods_expanded.remove(&p.uid) { return; }
+        if self.selected_container().is_some() {
+            self.table_state.select(None);
+            self.selected_uid = Some(p.uid.clone());
+            self.last_pods_sel_uid = None;
+        }
+        self.refresh_pods_snapshot();
+        self.sync_pods_log_container();
+    }
+
+    // Keep the Logs tab pointed at whatever the cursor means: a container row narrows it to that
+    // container, and leaving the row widens it back — but only if the narrowing was ours. A reader
+    // who picked a container with `C` keeps it while walking the table.
+    fn sync_pods_log_container(&mut self) {
+        if !matches!(self.mode, Mode::Pods | Mode::PodsFull) { return; }
+        match self.selected_container() {
+            Some(c) => {
+                if self.log_opts.container.as_deref() != Some(c.name.as_str()) {
+                    self.log_opts.container = Some(c.name);
+                    self.last_pod_key = None;
+                }
+                self.pods_log_container_auto = true;
+            }
+            None => {
+                if self.pods_log_container_auto {
+                    self.pods_log_container_auto = false;
+                    if self.log_opts.container.is_some() {
+                        self.log_opts.container = None;
+                        self.last_pod_key = None;
+                    }
+                }
+            }
+        }
+    }
+
     fn move_pods_selection(&mut self, delta: i32) {
         if self.snapshot.is_empty() { return; }
         let last = self.snapshot.len() - 1;
@@ -9232,6 +9388,7 @@ impl App {
         self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
         self.last_pods_sel_uid = self.selected_uid.clone();
         self.reset_scroll();
+        self.sync_pods_log_container();
         self.maybe_fetch_logs();
         self.maybe_fetch_status();
         self.maybe_fetch_related();
@@ -9239,22 +9396,25 @@ impl App {
 
     // The workload that scale/restart actions target: the selected row when it is a workload, or the
     // owning workload of the selected pod row (so actions work whether a parent or child is selected).
+    // A container row answers with its pod's workload too: scale and restart are the same question
+    // one level down, and refusing them because the cursor is on a container would be a surprise.
     fn selected_workload(&self) -> Option<WorkloadResource> {
         let i = self.table_state.selected()?;
-        match self.pods_rows.get(i)? {
-            PodRow::Workload(w) => Some(w.clone()),
-            PodRow::Pod(p) => {
-                let o = p.owner.as_ref()?;
-                self.pods_rows.iter().find_map(|r| match r {
-                    PodRow::Workload(w)
-                        if w.kind == o.kind && w.name == o.name && w.namespace == o.namespace =>
-                    {
-                        Some(w.clone())
-                    }
-                    _ => None,
-                })
+        let owner = match self.pods_rows.get(i)? {
+            PodRow::Workload(w) => return Some(w.clone()),
+            PodRow::Pod(p) => p.owner.clone()?,
+            PodRow::Container(_) => self.selected_pod()?.owner?,
+        };
+        self.pods_rows.iter().find_map(|r| match r {
+            PodRow::Workload(w)
+                if w.kind == owner.kind
+                    && w.name == owner.name
+                    && w.namespace == owner.namespace =>
+            {
+                Some(w.clone())
             }
-        }
+            _ => None,
+        })
     }
 
     // (namespace, pod names) of the selected workload row, for aggregated log fetching. None when the
@@ -10767,6 +10927,15 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::Pods) => app.scroll_detail_top(),
         (KeyCode::Char('G'), _, Mode::Pods) => app.scroll_detail_bottom(),
         (KeyCode::Char('t'), _, Mode::Pods) => app.toggle_pods_workloads(),
+        // `x` unfolds the focused pod into its containers; →/← do the same as tree motions. From a
+        // container row, `E` opens a shell in *that* container and the Logs tab follows it.
+        (KeyCode::Char('x'), _, Mode::Pods) => app.toggle_pod_containers(),
+        (KeyCode::Right, m, Mode::Pods) if !m.contains(KeyModifiers::SHIFT) => {
+            app.expand_pod_containers()
+        }
+        (KeyCode::Left, m, Mode::Pods) if !m.contains(KeyModifiers::SHIFT) => {
+            app.collapse_pod_containers()
+        }
         (_, _, Mode::Pods) => {}
 
         (KeyCode::Up, m, Mode::PodsFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
@@ -11562,6 +11731,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", if app.pods_show_workloads { "pods" } else { st.k_toggle_wl })),
+            Span::styled(" x ", kbg), Span::raw(format!(" {}   ", st.k_containers)),
             footer_sep(),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_scale)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_actions)),
@@ -14595,6 +14765,47 @@ fn synthetic_pod_record(p: &PodResource) -> EventRecord {
     }
 }
 
+// A container's state, judged the way the pod status column is: waiting/terminated reasons that mean
+// trouble are red, a finished init container is faded, a running one is green.
+fn container_state_color(c: &ContainerResource) -> Color {
+    match c.state.as_str() {
+        "Running" => if c.ready || c.kind == ContainerKind::Init { Color::Green } else { Color::Yellow },
+        "Completed" => DIM,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Waiting" => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
+// Adapt a ContainerResource into an EventRecord. The identity stays the *pod*: a container has no
+// object of its own, so `y`, `e`, Ctrl-D, Status and Related keep acting on the pod that holds it,
+// while the uid and the message are the container's — which is what the search and the AI panel read.
+fn synthetic_container_record(c: &ContainerResource) -> EventRecord {
+    let severity = match container_state_color(c) {
+        Color::Green | DIM => Severity::Normal,
+        _ => Severity::Warning,
+    };
+    EventRecord {
+        uid: c.uid.clone(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: c.state.clone(),
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: c.namespace.clone(),
+        name: c.pod.clone(),
+        message: format!(
+            "container {} · ready={} restarts={} image={}",
+            c.display_name(),
+            c.ready,
+            c.restarts,
+            c.image
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 // Adapt a WorkloadResource (the focused object) into an EventRecord. Status/Related tabs work via the
 // real kind/apiVersion; Logs shows "n/a" for non-Pod kinds, which is the existing behaviour.
 fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
@@ -15045,16 +15256,44 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         format!("{} (chargement...)", view_label)
     } else if app.pods_show_workloads {
         format!(
-            "workloads ({} workloads · {} pods) · ns={} · [t] pods",
+            "workloads ({} workloads · {} pods) · ns={} · [t] pods · [x] containers",
             n_workloads, n_pods, app.namespace_label
         )
     } else {
         format!(
-            "pods ({} pods) · ns={} · [t] workloads",
+            "pods ({} pods) · ns={} · [t] workloads · [x] containers",
             n_pods, app.namespace_label
         )
     };
 
+    let (rows, widths) = pods_table_parts(src, app.pods_show_workloads, &app.pods_expanded);
+
+    let table = Table::new(rows, widths)
+        .header(header_row())
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn header_row() -> Row<'static> {
+    Row::new(vec![
+        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
+        Cell::from("STATUS"), Cell::from("RST"), Cell::from("CPU"), Cell::from("MEM"),
+        Cell::from("%CPU/R"), Cell::from("%CPU/L"), Cell::from("%MEM/R"), Cell::from("%MEM/L"),
+        Cell::from("IP"), Cell::from("NODE"), Cell::from("AGE"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+}
+
+// The rows and column widths of the workloads table, split out of the drawing so the three depths
+// can be rendered — and their column alignment checked — without standing up an App.
+fn pods_table_parts<'a>(
+    src: &'a [PodRow],
+    show_workloads: bool,
+    expanded: &std::collections::HashSet<String>,
+) -> (Vec<Row<'a>>, [Constraint; 14]) {
     // A pod row nests under the workload row it immediately follows when its owner matches; otherwise
     // it is an orphan. `parent[i]` is the index of the owning workload row (None for orphans), used
     // both to aggregate child CPU/MEM onto the workload row and to decide indentation/namespace.
@@ -15070,6 +15309,8 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     }
                 }
             }
+            // Container rows never aggregate anywhere: their usage is already inside their pod's.
+            PodRow::Container(_) => {}
         }
     }
     let mut agg: Vec<(i64, i64, bool, bool)> = vec![(0, 0, false, false); src.len()];
@@ -15086,17 +15327,22 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let header_row = Row::new(vec![
-        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("READY"),
-        Cell::from("STATUS"), Cell::from("RST"), Cell::from("CPU"), Cell::from("MEM"),
-        Cell::from("%CPU/R"), Cell::from("%CPU/L"), Cell::from("%MEM/R"), Cell::from("%MEM/L"),
-        Cell::from("IP"), Cell::from("NODE"), Cell::from("AGE"),
-    ])
-    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-
     // In the flat pods-only view there are no parent workload rows, so pod names are not indented.
-    let pod_indent = if app.pods_show_workloads { "    " } else { "" };
+    let pod_indent = if show_workloads { "    " } else { "" };
     let blank = || Cell::from("");
+    // Fold marker on the pod row, so the containers are visibly one keypress away rather than a
+    // feature one has to know about.
+    let pod_label = |p: &PodResource| {
+        let marker = if p.containers.is_empty() {
+            "  "
+        } else if expanded.contains(&p.uid) {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        format!("{}{}{}", pod_indent, marker, p.name)
+    };
+    let ctr_label = |c: &ContainerResource| format!("{}  · {}", pod_indent, c.display_name());
     let rows: Vec<Row> = src
         .iter()
         .enumerate()
@@ -15138,7 +15384,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 };
                 Row::new(vec![
                     ns_cell,
-                    Cell::from(format!("{}{}", pod_indent, p.name)),
+                    Cell::from(pod_label(p)),
                     Cell::from(p.ready.clone()),
                     Cell::from(p.status.clone()).style(Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
                     Cell::from(p.restarts.to_string()).style(Style::default().fg(restart_color)),
@@ -15154,18 +15400,45 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 ])
                 .style(pod_row_style(status_color))
             }
+            // A container inherits its pod's namespace, IP and node — repeating them would only add
+            // noise — so those cells stay empty and the row says what is its own: readiness, state,
+            // its share of the pod's usage against *its* requests/limits, and its own restart age.
+            PodRow::Container(c) => {
+                let state_color = container_state_color(c);
+                let restart_color = if c.restarts > 0 { Color::Yellow } else { DIM };
+                let (ready_txt, ready_color) =
+                    if c.ready { ("✓", Color::Green) } else { ("✗", DIM) };
+                Row::new(vec![
+                    blank(),
+                    Cell::from(ctr_label(c)).style(Style::default().fg(DIM)),
+                    Cell::from(ready_txt).style(Style::default().fg(ready_color)),
+                    Cell::from(c.state.clone()).style(Style::default().fg(state_color)),
+                    Cell::from(c.restarts.to_string()).style(Style::default().fg(restart_color)),
+                    usage_cell(c.cpu_milli, format_cpu_milli),
+                    usage_cell(c.mem_bytes, format_memory_bytes),
+                    pct_cell(c.cpu_milli, c.cpu_req),
+                    pct_cell(c.cpu_milli, c.cpu_lim),
+                    pct_cell(c.mem_bytes, c.mem_req),
+                    pct_cell(c.mem_bytes, c.mem_lim),
+                    blank(),
+                    blank(),
+                    Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                ])
+            }
         })
         .collect();
 
     let ns_values = src.iter().map(|r| match r {
         PodRow::Workload(w) => w.namespace.as_str(),
         PodRow::Pod(p) => p.namespace.as_str(),
+        PodRow::Container(c) => c.namespace.as_str(),
     });
     let names: Vec<String> = src
         .iter()
         .map(|r| match r {
             PodRow::Workload(w) => format!("▾ {} {}", w.kind, w.name),
-            PodRow::Pod(p) => format!("{}{}", pod_indent, p.name),
+            PodRow::Pod(p) => pod_label(p),
+            PodRow::Container(c) => ctr_label(c),
         })
         .collect();
     let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
@@ -15176,14 +15449,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
         Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
     ];
-
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(table, area, &mut app.table_state);
+    (rows, widths)
 }
 
 // Services/Ingress view: dispatches to the per-world table. Rendered straight from `app.net_rows`,
@@ -24512,6 +24778,178 @@ mod velero_view_tests {
                 ("tier".to_string(), "front".to_string())
             ]
         );
+    }
+}
+
+// The three depths of the workloads view, rendered for real: a container row must line its columns
+// up under the pod's and must not push the table past its own frame.
+#[cfg(test)]
+mod pods_container_rows_tests {
+    use super::*;
+    use crate::pods::OwnerRef;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn pod(name: &str, containers: Vec<ContainerResource>) -> PodResource {
+        PodResource {
+            namespace: "kube-system".to_string(),
+            name: name.to_string(),
+            ready: "1/2".to_string(),
+            status: "Running".to_string(),
+            restarts: 3,
+            age: "12d".to_string(),
+            node: "aks-pool-000000".to_string(),
+            ip: "10.244.3.17".to_string(),
+            owner: Some(OwnerRef {
+                kind: "Deployment".to_string(),
+                name: "konnectivity-agent".to_string(),
+                namespace: "kube-system".to_string(),
+                api_version: "apps/v1".to_string(),
+            }),
+            uid: format!("pod|kube-system/{}", name),
+            cpu_milli: Some(120),
+            mem_bytes: Some(300 * 1024 * 1024),
+            cpu_req: Some(100),
+            cpu_lim: Some(500),
+            mem_req: Some(256 * 1024 * 1024),
+            mem_lim: Some(512 * 1024 * 1024),
+            containers,
+        }
+    }
+
+    fn ctr(name: &str, kind: ContainerKind, state: &str, ready: bool) -> ContainerResource {
+        ContainerResource {
+            namespace: "kube-system".to_string(),
+            pod: "konnectivity-agent-7d9f".to_string(),
+            name: name.to_string(),
+            image: "mcr.microsoft.com/oss/kubernetes/apiserver-network-proxy/agent:v0.30.3".to_string(),
+            kind,
+            ready,
+            state: state.to_string(),
+            restarts: 2,
+            age: "4h".to_string(),
+            cpu_milli: Some(60),
+            mem_bytes: Some(150 * 1024 * 1024),
+            cpu_req: Some(60),
+            cpu_lim: Some(120),
+            mem_req: Some(300 * 1024 * 1024),
+            mem_lim: Some(600 * 1024 * 1024),
+            uid: ContainerResource::uid("kube-system", "konnectivity-agent-7d9f", name),
+        }
+    }
+
+    fn workload() -> WorkloadResource {
+        WorkloadResource {
+            kind: "Deployment".to_string(),
+            api_version: "apps/v1".to_string(),
+            namespace: "kube-system".to_string(),
+            name: "konnectivity-agent".to_string(),
+            replicas: Some(2),
+            ready_replicas: 2,
+            age: "30d".to_string(),
+            uid: WorkloadResource::uid("Deployment", "kube-system", "konnectivity-agent"),
+        }
+    }
+
+    fn expanded_rows() -> Vec<PodRow> {
+        let containers = vec![
+            ctr("init-certs", ContainerKind::Init, "Completed", false),
+            ctr("agent", ContainerKind::Regular, "Running", true),
+            ctr("debugger", ContainerKind::Ephemeral, "CrashLoopBackOff", false),
+        ];
+        let p = pod("konnectivity-agent-7d9f", containers.clone());
+        let mut rows = vec![PodRow::Workload(workload()), PodRow::Pod(Box::new(p))];
+        rows.extend(containers.into_iter().map(|c| PodRow::Container(Box::new(c))));
+        rows
+    }
+
+    fn render(rows: &[PodRow], expanded: &std::collections::HashSet<String>, width: u16) -> Vec<String> {
+        let (table_rows, widths) = pods_table_parts(rows, true, expanded);
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let t = Table::new(table_rows, widths)
+                    .header(header_row())
+                    .block(Block::default().borders(Borders::ALL).title("workloads"));
+                f.render_widget(t, f.area());
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..12)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).expect("cell").symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_container_row_shows_its_own_state_readiness_and_restart_age() {
+        let rows = expanded_rows();
+        let expanded: std::collections::HashSet<String> =
+            std::iter::once("pod|kube-system/konnectivity-agent-7d9f".to_string()).collect();
+        let text = render(&rows, &expanded, 190).join("\n");
+        // Unfolded, the pod says so; the three families are told apart by their prefix.
+        assert!(text.contains("▾ konnectivity-agent-7d9f"), "{text}");
+        assert!(text.contains("· init:init-certs"), "{text}");
+        assert!(text.contains("· agent"), "{text}");
+        assert!(text.contains("· eph:debugger"), "{text}");
+        // Each container carries its own state, not the pod's. STATUS is 12 cells wide, as it has
+        // always been for pods, so the long reasons read truncated here too.
+        assert!(text.contains("Completed"), "{text}");
+        assert!(text.contains("CrashLoopBac"), "{text}");
+        // The percentages are the container's own usage against the container's own requests and
+        // limits — 60m of a 60m request and a 120m limit — not a copy of the pod's line.
+        let ctr_line = text
+            .lines()
+            .find(|l| l.contains("· agent"))
+            .expect("the container line");
+        assert!(ctr_line.contains("100%") && ctr_line.contains("50%"), "{ctr_line}");
+        assert!(ctr_line.contains("25%"), "{ctr_line}");
+        // The pod's node and IP are not repeated on the container lines.
+        assert_eq!(text.matches("10.244.3.17").count(), 1, "{text}");
+        assert_eq!(text.matches("aks-pool-000000").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_folded_pod_advertises_the_containers_without_listing_them() {
+        let rows = vec![
+            PodRow::Workload(workload()),
+            PodRow::Pod(Box::new(pod(
+                "konnectivity-agent-7d9f",
+                vec![ctr("agent", ContainerKind::Regular, "Running", true)],
+            ))),
+        ];
+        let text = render(&rows, &std::collections::HashSet::new(), 190).join("\n");
+        assert!(text.contains("▸ konnectivity-agent-7d9f"), "{text}");
+        assert!(!text.contains("· agent"), "folded, so no container line: {text}");
+    }
+
+    // The rule this codebase has been bitten by: a wider NAME column (the fold marker adds two
+    // cells, the container prefix four) must not push the table through its own right border.
+    #[test]
+    fn the_right_border_survives_every_width() {
+        let rows = expanded_rows();
+        let expanded: std::collections::HashSet<String> =
+            std::iter::once("pod|kube-system/konnectivity-agent-7d9f".to_string()).collect();
+        let border = ratatui::symbols::border::PLAIN;
+        for width in [60_u16, 100, 140, 190, 196] {
+            let lines = render(&rows, &expanded, width);
+            for (y, line) in lines.iter().enumerate() {
+                let last = line.chars().last().expect("a rendered line");
+                let expected = match y {
+                    0 => border.top_right,
+                    11 => border.bottom_right,
+                    _ => border.vertical_right,
+                };
+                assert_eq!(
+                    last.to_string(),
+                    expected,
+                    "right border eaten at width {width}, row {y}: {line}"
+                );
+            }
+        }
     }
 }
 

@@ -1531,6 +1531,15 @@ async fn fetch_node_metrics_total(client: &Client) -> Option<(i64, i64)> {
     Some((cpu, mem))
 }
 
+// Live usage keyed by (namespace, pod, container), as metrics-server reports it.
+pub type ContainerUsageMap = std::collections::HashMap<(String, String, String), (i64, i64)>;
+
+// Same read as `fetch_pod_usage`, kept at container granularity. The pods view expands a pod into
+// its containers off this map, and sums it itself for the pod row, so one list serves both levels.
+pub async fn fetch_container_usage(client: &Client) -> ContainerUsageMap {
+    fetch_pod_metrics_map(client).await.unwrap_or_default()
+}
+
 async fn fetch_pod_metrics_map(client: &Client) -> Option<std::collections::HashMap<(String, String, String), (i64, i64)>> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
     let (ar, _) = discovery::pinned_kind(client, &gvk).await.ok()?;
