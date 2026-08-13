@@ -10228,20 +10228,23 @@ impl App {
             ));
             return;
         }
-        let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
-        let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
-        let was_sto = matches!(self.mode, Mode::Storage | Mode::StorageFull);
-        let net_world = self.net_world;
-        let sto_world = self.sto_world;
+        let prev = self.mode;
         self.apply_namespace(Some(ns));
-        if was_pods {
-            self.enter_pods_mode();
-        } else if was_net {
-            self.enter_network_mode(net_world);
-        } else if was_sto {
-            self.enter_storage_mode(sto_world);
-        } else {
-            self.mode = Mode::Selection;
+        self.reenter_after_namespace_change(prev);
+    }
+
+    // `n` and `0` change the scope, not the view: whichever ns-aware view was open re-enters through
+    // its own constructor so its rows are refetched under the new scope. Only a view that has no
+    // namespace scope of its own falls back to the events list.
+    fn reenter_after_namespace_change(&mut self, prev: Mode) {
+        match prev {
+            Mode::Pods | Mode::PodsFull => self.enter_pods_mode(),
+            Mode::Services | Mode::ServicesFull => self.enter_network_mode(self.net_world),
+            Mode::Storage | Mode::StorageFull => self.enter_storage_mode(self.sto_world),
+            Mode::Velero | Mode::VeleroFull => self.enter_velero_mode(self.vel_world),
+            Mode::K8ssandra | Mode::K8ssandraFull => self.enter_k8c_mode(self.k8c_world),
+            Mode::Reflector | Mode::ReflectorFull => self.enter_reflector_mode(),
+            _ => self.mode = Mode::Selection,
         }
     }
 
@@ -10254,21 +10257,9 @@ impl App {
             ));
             return;
         }
-        let was_pods = matches!(self.mode, Mode::Pods | Mode::PodsFull);
-        let was_net = matches!(self.mode, Mode::Services | Mode::ServicesFull);
-        let was_sto = matches!(self.mode, Mode::Storage | Mode::StorageFull);
-        let net_world = self.net_world;
-        let sto_world = self.sto_world;
+        let prev = self.mode;
         self.apply_namespace(None);
-        if was_pods {
-            self.enter_pods_mode();
-        } else if was_net {
-            self.enter_network_mode(net_world);
-        } else if was_sto {
-            self.enter_storage_mode(sto_world);
-        } else {
-            self.mode = Mode::Selection;
-        }
+        self.reenter_after_namespace_change(prev);
     }
 
 }
