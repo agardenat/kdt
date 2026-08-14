@@ -472,8 +472,10 @@ use crate::svc::{
 };
 use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
 use crate::rancher::{
-    fetch_rancher, format_refresh, format_ttl, new_rancher_state, BindScope, ClusterRole,
-    PrincipalKind, RancherBinding, RancherProject, RancherToken, RancherUser, SharedRancher,
+    apply_rancher_write, fetch_rancher, format_minutes, format_refresh, format_ttl,
+    new_rancher_state, BindScope, ClusterRole, IssuedToken, PrincipalKind, RancherBinding,
+    RancherProject, RancherToken, RancherUser, RancherWrite, SettingUnit, SharedRancher,
+    TokenSetting,
 };
 
 // The four worlds of the Rancher view. They share one fetch and one snapshot; `g` moves between
@@ -494,6 +496,10 @@ enum RancRow {
     Binding(Box<RancherBinding>),
     Project(Box<RancherProject>),
     Token(Box<RancherToken>),
+    /// A token-lifetime setting, listed above the tokens it governs: the TTL column means the same
+    /// thing on both, and a token that never expires is only readable next to the setting that made
+    /// it so.
+    Setting(Box<TokenSetting>),
 }
 
 // The two object worlds the Services/Ingress view toggles between (palette `svc` vs `ingress`).
@@ -955,6 +961,24 @@ enum MenuAction {
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
+    // Rancher: issue a token for the selected account, retune or revoke an existing one, and set a
+    // token-lifetime setting. The three that take a value open the numeric entry, like `ScaleSet`.
+    RanchIssueToken,
+    RanchSetTokenTtl,
+    RanchRevokeToken,
+    RanchSetSetting,
+}
+
+// The menu actions that ask for a typed value before they run. Each names the unit it expects, and
+// the entry line shows it: a prompt with no stated unit is how a 90-day token gets a 90-minute one.
+fn menu_action_takes_input(action: Option<&MenuAction>) -> bool {
+    matches!(
+        action,
+        Some(MenuAction::ScaleSet)
+            | Some(MenuAction::RanchIssueToken)
+            | Some(MenuAction::RanchSetTokenTtl)
+            | Some(MenuAction::RanchSetSetting)
+    )
 }
 
 // One labelled choice in the action menu overlay, with an explanatory line shown under the list.
@@ -1545,6 +1569,9 @@ pub struct App {
     ranch_rows: Vec<RancRow>,
     pub ranch_detail_scroll: usize,
     pub ranch_refresh_handle: Option<JoinHandle<()>>,
+    // The one copy of a freshly issued token's secret. Shared because the write that produces it
+    // runs off-thread; cleared as soon as the overlay is dismissed, and never persisted.
+    ranch_issued: std::sync::Arc<std::sync::Mutex<Option<IssuedToken>>>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -1813,6 +1840,7 @@ impl App {
             ranch_rows: Vec::new(),
             ranch_detail_scroll: 0,
             ranch_refresh_handle: None,
+            ranch_issued: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -8409,6 +8437,12 @@ impl App {
                 }
             }
             RancWorld::Tokens => {
+                // The settings first: they are the reason the TTL column reads the way it does, and
+                // on a cluster whose kubeconfig default is 0 that is the headline, not a footnote.
+                for st_row in s.settings.iter().filter(|x| !problems_only || worse(&x.hints)) {
+                    recs.push(ranch_setting_record(st_row));
+                    rows.push(RancRow::Setting(Box::new(st_row.clone())));
+                }
                 for t in s.tokens.iter().filter(|t| !problems_only || worse(&t.hints)) {
                     recs.push(ranch_token_record(t));
                     rows.push(RancRow::Token(Box::new(t.clone())));
@@ -8468,6 +8502,184 @@ impl App {
         self.table_state.select(None);
         self.selected_uid = None;
         self.refresh_rancher_snapshot();
+    }
+
+    // `o`: what can be done to the row under the cursor. Every write here needs an admin kubeconfig
+    // on the *local* cluster and lands on the same objects an operator would apply by hand — so on a
+    // downstream, where those objects are replicas, the menu says why rather than offering an action
+    // that changes nothing upstream.
+    fn open_rancher_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let (role, hashing, ceiling) = {
+            let s = self.ranch_state.lock().expect("rancher poisoned");
+            let ceiling = s
+                .settings
+                .iter()
+                .find(|x| x.ceiling)
+                .and_then(|x| x.minutes());
+            (s.server.role, s.token_hashing, ceiling)
+        };
+        if role != ClusterRole::Local {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ranch_write_downstream.to_string()));
+            return;
+        }
+        let Some(row) = self.ranch_selected().cloned() else { return };
+
+        let (title, items) = match &row {
+            RancRow::User(u) => {
+                let mut note = lang::fill(
+                    st.desc_ranch_issue,
+                    &[
+                        ("user", &crate::rancher::user_label(u)),
+                        ("max", &ceiling.map(|m| format_minutes(m, st)).unwrap_or_else(|| "—".to_string())),
+                    ],
+                );
+                // With hashing on, Rancher stores a digest: the secret shown here is not promised to
+                // be the one that authenticates. Said before the write, not after.
+                if hashing {
+                    note.push(' ');
+                    note.push_str(st.ranch_issue_hashing);
+                }
+                (
+                    st.menu_ranch_user_title,
+                    vec![ActionItem {
+                        label: st.k_ranch_issue,
+                        desc: note,
+                        action: MenuAction::RanchIssueToken,
+                    }],
+                )
+            }
+            RancRow::Token(t) => (
+                st.menu_ranch_token_title,
+                vec![
+                    ActionItem {
+                        label: st.k_ranch_set_ttl,
+                        desc: lang::fill(
+                            st.desc_ranch_set_ttl,
+                            &[("current", &format_ttl(t.ttl_ms, st))],
+                        ),
+                        action: MenuAction::RanchSetTokenTtl,
+                    },
+                    ActionItem {
+                        label: st.k_ranch_revoke,
+                        desc: st.desc_ranch_revoke.to_string(),
+                        action: MenuAction::RanchRevokeToken,
+                    },
+                ],
+            ),
+            RancRow::Setting(s) => (
+                st.menu_ranch_setting_title,
+                vec![ActionItem {
+                    label: st.k_ranch_set_setting,
+                    desc: lang::fill(
+                        st.desc_ranch_set_setting,
+                        &[("name", &s.name), ("current", &ranch_setting_value(s))],
+                    ),
+                    action: MenuAction::RanchSetSetting,
+                }],
+            ),
+            // A binding or a project is changed in Rancher, where the approval that goes with it
+            // lives. Nothing to offer here.
+            _ => {
+                self.clipboard_status =
+                    Some((std::time::Instant::now(), st.ranch_no_action.to_string()));
+                return;
+            }
+        };
+
+        self.action_menu = Some(ActionMenu {
+            title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note: None,
+        });
+    }
+
+    // Issue a token for the selected account. The secret comes back once, is shown once, and is
+    // never written to the state or anywhere else.
+    fn ranch_issue_token(&mut self, minutes: i64) {
+        let st = lang::t(self.ai_language);
+        let Some(RancRow::User(user)) = self.ranch_selected().cloned() else { return };
+        let write = RancherWrite::IssueToken { user, ttl_minutes: minutes.max(0) };
+        self.ranch_run_write(write, st.msg_ranch_issued, st.msg_ranch_issue_failed);
+    }
+
+    fn ranch_set_token_ttl(&mut self, minutes: i64) {
+        let st = lang::t(self.ai_language);
+        let Some(RancRow::Token(t)) = self.ranch_selected().cloned() else { return };
+        let write = RancherWrite::SetTokenTtl { name: t.name.clone(), ttl_minutes: minutes.max(0) };
+        self.ranch_run_write(write, st.msg_ranch_ttl_set, st.msg_ranch_write_failed);
+    }
+
+    fn ranch_revoke_token(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(RancRow::Token(t)) = self.ranch_selected().cloned() else { return };
+        let write = RancherWrite::RevokeToken { name: t.name.clone() };
+        self.ranch_run_write(write, st.msg_ranch_revoked, st.msg_ranch_write_failed);
+    }
+
+    fn ranch_set_setting(&mut self, value: String) {
+        let st = lang::t(self.ai_language);
+        let Some(RancRow::Setting(s)) = self.ranch_selected().cloned() else { return };
+        let write = RancherWrite::SetSetting { name: s.name.clone(), value: value.trim().to_string() };
+        self.ranch_run_write(write, st.msg_ranch_setting_set, st.msg_ranch_write_failed);
+    }
+
+    // One write, reported through the same channel as the Flux reconciles, then a refresh so the
+    // outcome shows without waiting on the 60s ticker. An issued token lands in its own overlay
+    // rather than in the toast: a secret does not belong in a line that scrolls past.
+    fn ranch_run_write(
+        &mut self,
+        write: RancherWrite,
+        ok_msg: &'static str,
+        err_msg: &'static str,
+    ) {
+        let target = write.target();
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let issued = self.ranch_issued.clone();
+        tokio::spawn(async move {
+            let outcome = apply_rancher_write(client, write).await;
+            let text = match outcome {
+                Ok(token) => {
+                    if let Some(token) = token {
+                        *issued.lock().expect("issued token poisoned") = Some(token);
+                    }
+                    lang::fill(ok_msg, &[("name", &target)])
+                }
+                Err(e) => lang::fill(err_msg, &[("name", &target), ("e", &e)]),
+            };
+            let mut s = status.lock().expect("reconcile status poisoned");
+            *s = Some((std::time::Instant::now(), text));
+        });
+        self.refresh_rancher();
+    }
+
+    fn ranch_issued_present(&self) -> bool {
+        self.ranch_issued.lock().expect("issued token poisoned").is_some()
+    }
+
+    // Copy the bearer credential, not the secret alone: `name:secret` is the only form a client
+    // accepts, and half of it is unusable.
+    fn ranch_copy_issued(&mut self) {
+        let bearer = {
+            let guard = self.ranch_issued.lock().expect("issued token poisoned");
+            guard.as_ref().map(|t| t.bearer())
+        };
+        let Some(bearer) = bearer else { return };
+        let _ = crate::clip::copy_to_clipboard(&bearer);
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            lang::t(self.ai_language).msg_ranch_token_copied.to_string(),
+        ));
+    }
+
+    fn ranch_clear_issued(&mut self) {
+        *self.ranch_issued.lock().expect("issued token poisoned") = None;
     }
 
     fn cycle_ranch_filter(&mut self) {
@@ -9912,20 +10124,50 @@ impl App {
     fn action_menu_activate(&mut self) {
         let action = match self.action_menu.as_mut() {
             None => return,
-            // Confirm numeric entry: parse the typed replica count and apply it.
+            // Confirm typed entry: what the value means depends on the action that asked for it.
+            // An empty or unparsable buffer leaves the prompt open — closing the menu on a stray
+            // Enter looks exactly like an action that silently did nothing.
             Some(menu) if menu.input.is_some() => {
-                let target = menu.input.as_ref().and_then(|s| s.parse::<i32>().ok());
-                let Some(target) = target else { return; };
-                self.action_menu = None;
-                self.pods_scale_set(target);
+                let raw = menu.input.clone().unwrap_or_default();
+                let action = menu.items.get(menu.cursor).map(|it| it.action.clone());
+                match action {
+                    Some(MenuAction::ScaleSet) => {
+                        let Ok(target) = raw.parse::<i32>() else { return };
+                        self.action_menu = None;
+                        self.pods_scale_set(target);
+                    }
+                    Some(MenuAction::RanchIssueToken) => {
+                        let Ok(minutes) = raw.parse::<i64>() else { return };
+                        self.action_menu = None;
+                        self.ranch_issue_token(minutes);
+                    }
+                    Some(MenuAction::RanchSetTokenTtl) => {
+                        let Ok(minutes) = raw.parse::<i64>() else { return };
+                        self.action_menu = None;
+                        self.ranch_set_token_ttl(minutes);
+                    }
+                    Some(MenuAction::RanchSetSetting) => {
+                        if raw.trim().is_empty() { return; }
+                        self.action_menu = None;
+                        self.ranch_set_setting(raw);
+                    }
+                    _ => self.action_menu = None,
+                }
                 return;
             }
+            // The confirmation comes *before* the entry, not after: "are you sure" is about the
+            // action, and asking it once a value has been typed reads as a question about the value.
+            // Menus with `confirm: false` (the scale menu) go straight to their entry as before.
             Some(menu)
-                if matches!(
-                    menu.items.get(menu.cursor).map(|it| &it.action),
-                    Some(MenuAction::ScaleSet)
-                ) =>
+                if menu.confirm
+                    && !menu.confirming
+                    && menu_action_takes_input(menu.items.get(menu.cursor).map(|it| &it.action)) =>
             {
+                menu.confirming = true;
+                return;
+            }
+            Some(menu) if menu_action_takes_input(menu.items.get(menu.cursor).map(|it| &it.action)) => {
+                menu.confirming = false;
                 menu.input = Some(String::new());
                 return;
             }
@@ -9968,7 +10210,12 @@ impl App {
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
             Some(MenuAction::NodeDrain) => self.open_node_drain(),
-            Some(MenuAction::ScaleSet) | None => {}
+            Some(MenuAction::RanchRevokeToken) => self.ranch_revoke_token(),
+            Some(MenuAction::ScaleSet)
+            | Some(MenuAction::RanchIssueToken)
+            | Some(MenuAction::RanchSetTokenTtl)
+            | Some(MenuAction::RanchSetSetting)
+            | None => {}
         }
     }
 
@@ -9983,12 +10230,21 @@ impl App {
 
     // Digit/backspace handling while the numeric replica entry is open. No-op otherwise.
     fn action_menu_input(&mut self, c: char) {
-        if let Some(menu) = self.action_menu.as_mut() {
-            if let Some(buf) = menu.input.as_mut() {
-                if c.is_ascii_digit() && buf.len() < 5 {
-                    buf.push(c);
-                }
-            }
+        let Some(menu) = self.action_menu.as_mut() else { return };
+        // Only the setting entry takes anything but digits: `kubeconfig-generate-token` is a bool
+        // and the inactive-user settings are Go durations.
+        let free_text = matches!(
+            menu.items.get(menu.cursor).map(|it| &it.action),
+            Some(MenuAction::RanchSetSetting)
+        );
+        let Some(buf) = menu.input.as_mut() else { return };
+        let (ok, max) = if free_text {
+            (c.is_ascii_alphanumeric(), 16)
+        } else {
+            (c.is_ascii_digit(), 5)
+        };
+        if ok && buf.len() < max {
+            buf.push(c);
         }
     }
 
@@ -10614,6 +10870,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if matches!(app.mode, Mode::Rancher | Mode::RancherFull) {
             app.refresh_rancher_snapshot();
+            // Token writes report through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
         }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
@@ -10838,6 +11096,17 @@ fn handle_event(app: &mut App, ev: Event) {
             (KeyCode::Char('k'), _) => app.vel_restore_move(-1),
             (KeyCode::Char('j'), _) => app.vel_restore_move(1),
             (KeyCode::Char('q'), _) => app.vel_restore_cancel(),
+            _ => {}
+        }
+        return;
+    }
+    // The issued token grabs all input while shown. It is the only place that secret ever appears,
+    // so nothing may scroll it away or act underneath it.
+    if app.ranch_issued_present() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('c'), _) => app.ranch_copy_issued(),
+            (KeyCode::Esc | KeyCode::Enter, _) => app.ranch_clear_issued(),
             _ => {}
         }
         return;
@@ -11482,6 +11751,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::Rancher) => app.enter_rancher_full(),
         (KeyCode::F(5), _, Mode::Rancher) => app.refresh_rancher(),
         (KeyCode::Esc, _, Mode::Rancher) => app.exit_rancher_mode(),
+        (KeyCode::Char('o'), _, Mode::Rancher) => app.open_rancher_action_menu(),
         (KeyCode::Char('i'), _, Mode::Rancher) => app.enter_ai_panel(),
         (_, _, Mode::Rancher) => {}
 
@@ -12363,6 +12633,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 footer_sep(),
                 Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_k8c_filter, app.ranch_filter.label())),
+                footer_sep(),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_ranch_actions)),
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
         }
@@ -12489,6 +12761,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.action_menu.is_some() {
         draw_action_menu_popup(f, app, area);
+    }
+    if app.ranch_issued_present() {
+        draw_ranch_issued_popup(f, app, area);
     }
     // Above the menu it was opened from, and grabbing keys ahead of it too: the draw order is the
     // z-order, and the two have to agree.
@@ -13849,6 +14124,62 @@ fn copy_menu_items(keys: &[String]) -> Vec<ListItem<'static>> {
 
 // Renders the action menu overlay: a highlighted list of choices with the selected entry's
 // description, then a confirmation prompt once an entry is armed.
+// The one and only display of a freshly issued token. Deliberately loud, deliberately modal, and
+// deliberately the only copy: kdt never writes this secret to its state, a log, or a file.
+fn draw_ranch_issued_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let guard = app.ranch_issued.lock().expect("issued token poisoned");
+    let Some(token) = guard.as_ref() else { return };
+    let st = lang::t(app.ai_language);
+
+    let popup_w = (area.width * 80 / 100).max(52).min(area.width);
+    let inner_w = popup_w.saturating_sub(4) as usize;
+    let warning_rows = wrapped_rows(&Line::from(st.ranch_issued_warning), inner_w).max(1) as u16;
+    // The bearer string is 54 characters plus the token name: on a narrow terminal it wraps, and a
+    // credential clipped at the frame edge is a credential nobody can use.
+    let bearer = token.bearer();
+    let bearer_rows = wrapped_rows(&Line::from(bearer.as_str()), inner_w).max(1) as u16;
+    let popup_h = (warning_rows + bearer_rows + 8).min(area.height.saturating_sub(2)).max(10);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", st.ranch_issued_title))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<9}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines = vec![
+        label(st.ranch_lbl_user, format!("{} ({})", token.user_label, token.user_id)),
+        label(st.ranch_lbl_ttl, format_minutes(token.ttl_minutes, st)),
+        Line::from(""),
+        Line::from(Span::styled(
+            st.ranch_lbl_bearer,
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            bearer,
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    lines.push(Line::from(Span::styled(
+        st.ranch_issued_warning,
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(st.ranch_issued_hint, Style::default().fg(DIM))));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
 fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(menu) = app.action_menu.as_ref() else { return; };
     let st = lang::t(app.ai_language);
@@ -13904,8 +14235,15 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
     let footer = if let Some(buf) = menu.input.as_ref() {
+        let tpl = match menu.items.get(menu.cursor).map(|it| &it.action) {
+            Some(MenuAction::RanchIssueToken) | Some(MenuAction::RanchSetTokenTtl) => {
+                st.menu_input_minutes
+            }
+            Some(MenuAction::RanchSetSetting) => st.menu_input_value,
+            _ => st.menu_input_prompt,
+        };
         Line::from(Span::styled(
-            st.menu_input_prompt.replace("{n}", buf),
+            tpl.replace("{n}", buf),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ))
     } else if menu.confirming {
@@ -16143,6 +16481,11 @@ fn ranch_user_record(u: &RancherUser) -> EventRecord {
     if !u.groups.is_empty() {
         parts.push(format!("{}={}", st.ranch_lbl_groups, u.groups.join(",")));
     }
+    // The raw principal goes in the message so `/` finds the account from a GUID copied out of a
+    // log or an audit line — which is the whole reason one comes to this view.
+    if !u.principal.is_empty() {
+        parts.push(u.principal.clone());
+    }
     ranch_record(
         &u.uid,
         crate::rancher::API_MGMT,
@@ -16196,6 +16539,31 @@ fn ranch_project_record(p: &RancherProject) -> EventRecord {
         message,
         &p.hints,
     )
+}
+
+fn ranch_setting_record(s: &TokenSetting) -> EventRecord {
+    let st = lang::active();
+    let source = if s.is_default { st.ranch_setting_default } else { st.ranch_setting_set };
+    ranch_record(
+        &s.uid,
+        crate::rancher::API_MGMT,
+        "Setting",
+        "",
+        &s.name,
+        "Setting",
+        format!("{} = {} ({})", s.name, ranch_setting_value(s), source),
+        &s.hints,
+    )
+}
+
+// A setting's value as a human reads it: a duration for the minute-based TTLs, the raw string
+// otherwise. `0` stays "never", which is what Rancher means by it.
+fn ranch_setting_value(s: &TokenSetting) -> String {
+    match (s.unit, s.minutes()) {
+        (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, lang::active()),
+        _ if s.effective.is_empty() => "—".to_string(),
+        _ => s.effective.clone(),
+    }
 }
 
 fn ranch_token_record(t: &RancherToken) -> EventRecord {
@@ -16574,12 +16942,43 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Cell::from(t.age.clone()).style(Style::default().fg(DIM)),
                         ])
                     }
+                    RancRow::Setting(s) => {
+                        // A setting an operator changed is worth seeing as changed: the default is
+                        // background, a deliberate value is not.
+                        let name_style = if s.is_default {
+                            Style::default().fg(DIM)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        };
+                        let value = ranch_setting_value(s);
+                        let value_style = if s.minutes() == Some(0) {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        let source = if s.is_default {
+                            Cell::from(st.ranch_setting_default).style(Style::default().fg(DIM))
+                        } else {
+                            Cell::from(st.ranch_setting_set).style(Style::default().fg(Color::Cyan))
+                        };
+                        Row::new(vec![
+                            Cell::from(s.name.clone()).style(name_style),
+                            Cell::from(if s.ceiling { st.ranch_setting_ceiling } else { "" })
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(""),
+                            Cell::from("setting").style(Style::default().fg(Color::Magenta)),
+                            Cell::from(value).style(value_style),
+                            source,
+                            Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
                     _ => Row::new(vec![Cell::from("")]),
                 })
                 .collect();
             let token_w = col_width(
                 src.iter().map(|r| match r {
                     RancRow::Token(t) => t.name.as_str(),
+                    RancRow::Setting(s) => s.name.as_str(),
                     _ => "",
                 }),
                 "TOKEN",
@@ -16882,6 +17281,32 @@ fn ranch_detail_lines(
                 lines.extend(hint_lines(&t.hints, width));
             }
             banner(format!(" {} ", t.name))
+        }
+        RancRow::Setting(s) => {
+            lines.push(label(st.ranch_lbl_value, ranch_setting_value(s)));
+            // The shipped default sits next to the value in force: "someone changed this, and this
+            // is what it was" is the whole question one asks of a setting.
+            lines.push(label(
+                st.ranch_lbl_default,
+                match (s.unit, s.default.trim().parse::<i64>().ok()) {
+                    (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, st),
+                    _ if s.default.is_empty() => "—".to_string(),
+                    _ => s.default.clone(),
+                },
+            ));
+            lines.push(label(
+                st.ranch_lbl_origin_setting,
+                if s.is_default { st.ranch_setting_default.to_string() } else { st.ranch_setting_set.to_string() },
+            ));
+            if s.ceiling {
+                lines.push(label(st.ranch_lbl_scope_setting, st.ranch_setting_ceiling_desc.to_string()));
+            }
+            lines.push(label(st.lbl_age, s.age.clone()));
+            if !s.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(hint_lines(&s.hints, width));
+            }
+            banner(format!(" {} ", s.name))
         }
     };
 

@@ -93,7 +93,28 @@ const KINDS: &[&str] = &[
     "Token",
     "AuthConfig",
     "Setting",
+    "Feature",
 ];
+
+/// The settings that decide how long a credential lives, in the order an operator reasons about
+/// them: the ceiling first, then what each kind of token gets by default.
+///
+/// `(name, unit, is_ceiling)`. Rancher stores these as plain strings — minutes for the four TTLs,
+/// a bool for `kubeconfig-generate-token` — and an empty `value` means the shipped `default` is in
+/// force, which is why both are read and the effective one is what the view shows.
+const TTL_SETTINGS: &[(&str, SettingUnit, bool)] = &[
+    ("auth-token-max-ttl-minutes", SettingUnit::Minutes, true),
+    ("kubeconfig-default-token-ttl-minutes", SettingUnit::Minutes, false),
+    ("kubeconfig-token-ttl-minutes", SettingUnit::Minutes, false),
+    ("auth-user-session-ttl-minutes", SettingUnit::Minutes, false),
+    ("kubeconfig-generate-token", SettingUnit::Bool, false),
+    ("disable-inactive-user-after", SettingUnit::Duration, false),
+    ("delete-inactive-user-after", SettingUnit::Duration, false),
+];
+
+/// Whether hashing is on. With it off, `Token.token` holds the secret in clear — which is what
+/// makes a token issued by hand usable as-is, and what the issue flow checks before promising one.
+const F_TOKEN_HASHING: &str = "token-hashing";
 
 // --- Identity ------------------------------------------------------------------------------------
 
@@ -352,6 +373,46 @@ pub struct RancherProject {
     pub name: String,
 }
 
+/// How a setting's value is written down, which decides how it is rendered and what a new value is
+/// checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingUnit {
+    /// A count of minutes. `0` means "no expiry" for every TTL Rancher has.
+    Minutes,
+    /// `true` / `false`.
+    Bool,
+    /// A Go duration (`720h`), used by the inactive-user settings.
+    Duration,
+}
+
+/// One token-lifetime setting, with the value actually in force and where it comes from.
+#[derive(Debug, Clone, Default)]
+pub struct TokenSetting {
+    pub name: String,
+    /// The value in force: `value` when an operator set one, `default` otherwise.
+    pub effective: String,
+    /// True when nobody set `value` and the shipped default is what applies.
+    pub is_default: bool,
+    /// The shipped default, always — so "someone changed this" is visible next to what it was.
+    pub default: String,
+    pub unit: Option<SettingUnit>,
+    /// True for `auth-token-max-ttl-minutes`, the ceiling every other TTL is clamped to.
+    pub ceiling: bool,
+    pub age: String,
+    pub hints: Vec<Hint>,
+    pub uid: String,
+}
+
+impl TokenSetting {
+    /// The value as a count of minutes, when it is one.
+    pub fn minutes(&self) -> Option<i64> {
+        if self.unit != Some(SettingUnit::Minutes) {
+            return None;
+        }
+        self.effective.trim().parse::<i64>().ok()
+    }
+}
+
 /// A Rancher API token. Read for what it says about access, never for its secret — the `token` field
 /// is not carried into the row.
 #[derive(Debug, Clone, Default)]
@@ -384,6 +445,11 @@ pub struct RancherState {
     pub bindings: Vec<RancherBinding>,
     pub projects: Vec<RancherProject>,
     pub tokens: Vec<RancherToken>,
+    /// The settings that decide how long a token lives, shown above the tokens they govern.
+    pub settings: Vec<TokenSetting>,
+    /// True when `token-hashing` is on, in which case the secret of a token issued from here cannot
+    /// be promised to be usable as displayed.
+    pub token_hashing: bool,
     /// Namespaces carrying no `field.cattle.io/projectId`. Counted, not listed as rows: they have no
     /// Rancher object to stand in for.
     pub orphan_namespaces: usize,
@@ -585,6 +651,7 @@ fn build_local(st: &'static Strings, listed: &Listed, namespaces: &[Namespace]) 
         &project_labels,
         &role_labels,
         &global_role_labels,
+        &group_names(get("UserAttribute")),
     );
 
     // A project's owner list needs the resolved user labels, so it is filled once both exist.
@@ -609,6 +676,8 @@ fn build_local(st: &'static Strings, listed: &Listed, namespaces: &[Namespace]) 
         bindings,
         projects,
         tokens,
+        settings: token_settings(st, get("Setting")),
+        token_hashing: token_hashing_on(get("Feature")),
         orphan_namespaces: namespaces
             .iter()
             .filter(|n| project_of_namespace(n).is_none())
@@ -616,6 +685,98 @@ fn build_local(st: &'static Strings, listed: &Listed, namespaces: &[Namespace]) 
         error: None,
         loading: false,
     }
+}
+
+// The token-lifetime settings, in the fixed order of `TTL_SETTINGS` — a setting the cluster does not
+// serve is simply absent, never invented with a default this build happens to know.
+fn token_settings(st: &'static Strings, objs: &[DynamicObject]) -> Vec<TokenSetting> {
+    let mut ceiling: Option<i64> = None;
+    let mut out: Vec<TokenSetting> = Vec::new();
+
+    for (name, unit, is_ceiling) in TTL_SETTINGS {
+        let Some(o) = objs.iter().find(|o| o.metadata.name.as_deref() == Some(*name)) else {
+            continue;
+        };
+        let value = str_at(&o.data, "value").unwrap_or_default();
+        let default = str_at(&o.data, "default").unwrap_or_default();
+        let is_default = value.is_empty();
+        let effective = if is_default { default.clone() } else { value };
+        let age = o
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| format_age(&t.0))
+            .unwrap_or_default();
+
+        let mut s = TokenSetting {
+            uid: format!("ranch|setting|{}", name),
+            name: (*name).to_string(),
+            effective,
+            is_default,
+            default,
+            unit: Some(*unit),
+            ceiling: *is_ceiling,
+            age,
+            hints: Vec::new(),
+        };
+        if *is_ceiling {
+            ceiling = s.minutes();
+        }
+        setting_hints(st, &mut s, ceiling);
+        out.push(s);
+    }
+    out
+}
+
+fn setting_hints(st: &'static Strings, s: &mut TokenSetting, ceiling: Option<i64>) {
+    let Some(minutes) = s.minutes() else { return };
+    // Rancher reads 0 as "no expiry" for every one of these, which is a decision rather than an
+    // oversight — but a token that never expires is exactly the credential an offboarding misses.
+    if minutes == 0 {
+        s.hints.push(warn(st.ranch_setting_zero_ttl.to_string()));
+        return;
+    }
+    // A default above the ceiling is not what will be handed out: Rancher clamps it.
+    if !s.ceiling {
+        if let Some(max) = ceiling {
+            if max > 0 && minutes > max {
+                s.hints.push(info(fill(
+                    st.ranch_setting_above_ceiling,
+                    &[("max", &format_minutes(max, st))],
+                )));
+            }
+        }
+    }
+}
+
+/// A count of minutes as a human duration. `0` is Rancher's "never expires", not "already expired".
+///
+/// Takes its table like [`format_ttl`] rather than reaching for the active language: it renders
+/// inside a draw pass, where the caller already knows which language the frame is in.
+pub fn format_minutes(minutes: i64, st: &'static Strings) -> String {
+    if minutes <= 0 {
+        return st.ranch_ttl_never.to_string();
+    }
+    if minutes < 60 {
+        format!("{}m", minutes)
+    } else if minutes < 1440 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}d", minutes / 1440)
+    }
+}
+
+// A feature is on when its `spec.value` says so, and otherwise when its `status.default` does — the
+// order Rancher resolves it in. A `status.lockedValue` overrides both.
+fn token_hashing_on(objs: &[DynamicObject]) -> bool {
+    let Some(o) = objs.iter().find(|o| o.metadata.name.as_deref() == Some(F_TOKEN_HASHING)) else {
+        return false;
+    };
+    let at = |a: &str, b: &str| o.data.get(a).and_then(|v| v.get(b)).and_then(Value::as_bool);
+    at("status", "lockedValue")
+        .or_else(|| at("spec", "value"))
+        .or_else(|| at("status", "default"))
+        .unwrap_or(false)
 }
 
 fn index_settings(objs: &[DynamicObject]) -> BTreeMap<String, String> {
@@ -696,6 +857,51 @@ struct Attributes {
     extra_identity: Option<String>,
 }
 
+// The name a group entry should be shown under. A GUID principal — Entra, OIDC, SAML — says nothing;
+// `displayName` is what the directory reported at login and is the only readable name that exists.
+fn group_display(item: &Value, p: &Principal) -> String {
+    item.get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| p.display.clone())
+}
+
+/// Group principal id → the name the directory gave it, gathered across every UserAttribute.
+///
+/// A ClusterRoleTemplateBinding names a group by principal and nothing else, so without this table
+/// a whole cluster's group grants read as a column of GUIDs. Any account that has ever logged in
+/// while a member contributes the name, which is why it is built from every attribute at once.
+fn group_names(objs: &[DynamicObject]) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for o in objs {
+        let Some(map) = o.data.get("GroupPrincipals").and_then(Value::as_object) else {
+            continue;
+        };
+        for entry in map.values() {
+            for key in ["items", "Items"] {
+                let Some(items) = entry.get(key).and_then(Value::as_array) else { continue };
+                for item in items {
+                    let Some(name) = item
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(p) = parse_principal(name) else { continue };
+                    let display = group_display(item, &p);
+                    if display != p.id {
+                        out.entry(p.id).or_insert(display);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn index_attributes(objs: &[DynamicObject]) -> BTreeMap<String, Attributes> {
     objs.iter()
         .filter_map(|o| {
@@ -719,7 +925,7 @@ fn index_attributes(objs: &[DynamicObject]) -> BTreeMap<String, Attributes> {
                             };
                             if let Some(p) = parse_principal(name) {
                                 if seen.insert(p.id.clone()) {
-                                    groups.push(p.display.clone());
+                                    groups.push(group_display(item, &p));
                                 }
                             }
                         }
@@ -1040,13 +1246,37 @@ fn build_users(
                 .map(|t| format_age(&t.0))
                 .unwrap_or_default();
 
+            // The most readable name this account has, in the order of how much it says about the
+            // person. A directory that hands out GUIDs — Entra/Azure AD, OIDC, SAML — puts nothing
+            // legible in the principal, and the whole point of the column is to answer "who is
+            // this": `displayName` is where Rancher kept the answer.
+            let external_display = external.as_ref().map(|p| p.display.clone());
+            let external_opaque = external.as_ref().map(|p| p.opaque).unwrap_or(false);
+            let identity = match (&external_display, external_opaque) {
+                // A DN gave us a real name.
+                (Some(d), false) => d.clone(),
+                // A GUID did not: fall through to what the provider told Rancher at login.
+                (Some(d), true) => {
+                    if !display_name.is_empty() {
+                        display_name.clone()
+                    } else if !username.is_empty() {
+                        username.clone()
+                    } else {
+                        d.clone()
+                    }
+                }
+                (None, _) => {
+                    if !display_name.is_empty() { display_name.clone() } else { username.clone() }
+                }
+            };
+            // Opaque now means "nothing legible anywhere", which is what the view renders as a dash.
+            let identity_opaque =
+                external_opaque && display_name.is_empty() && username.is_empty();
+
             let mut user = RancherUser {
                 uid: format!("ranch|user|{}", id),
-                identity: external
-                    .as_ref()
-                    .map(|p| p.display.clone())
-                    .unwrap_or_else(|| username.clone()),
-                identity_opaque: external.as_ref().map(|p| p.opaque).unwrap_or(false),
+                identity,
+                identity_opaque,
                 provider: external
                     .as_ref()
                     .map(|p| p.provider.clone())
@@ -1145,6 +1375,7 @@ fn build_bindings(
     project_labels: &BTreeMap<String, String>,
     role_labels: &BTreeMap<String, String>,
     global_role_labels: &BTreeMap<String, String>,
+    group_names: &BTreeMap<String, String>,
 ) -> Vec<RancherBinding> {
     let mut out: Vec<RancherBinding> = Vec::new();
 
@@ -1161,6 +1392,7 @@ fn build_bindings(
             role,
             global_role_labels,
             user_labels,
+            group_names,
         );
         row.automatic = automatic;
         out.push(row);
@@ -1178,6 +1410,7 @@ fn build_bindings(
             role,
             role_labels,
             user_labels,
+            group_names,
         ));
     }
     for b in prtbs {
@@ -1198,6 +1431,7 @@ fn build_bindings(
             role,
             role_labels,
             user_labels,
+            group_names,
         ));
     }
 
@@ -1222,6 +1456,7 @@ fn one_binding(
     role: String,
     role_labels: &BTreeMap<String, String>,
     user_labels: &BTreeMap<String, String>,
+    group_names: &BTreeMap<String, String>,
 ) -> RancherBinding {
     let name = o.metadata.name.clone().unwrap_or_default();
     let namespace = o.metadata.namespace.clone().unwrap_or_default();
@@ -1241,7 +1476,12 @@ fn one_binding(
         (Some(PrincipalKind::User), user, label, provider)
     } else if !group.is_empty() {
         match parse_principal(&group) {
-            Some(p) => (Some(PrincipalKind::Group), p.id.clone(), p.display, p.provider),
+            Some(p) => {
+                // The binding names the group by principal only; the readable name comes from the
+                // table built out of the UserAttributes.
+                let label = group_names.get(&p.id).cloned().unwrap_or_else(|| p.display.clone());
+                (Some(PrincipalKind::Group), p.id.clone(), label, p.provider)
+            }
             None => (Some(PrincipalKind::Group), group.clone(), group, String::new()),
         }
     } else {
@@ -1552,6 +1792,10 @@ fn build_downstream(
         bindings,
         projects,
         tokens: Vec::new(),
+        // Replicated from upstream and read-only here: editing them on a downstream changes nothing
+        // the Rancher server will honour.
+        settings: token_settings(st, get("Setting")),
+        token_hashing: token_hashing_on(get("Feature")),
         orphan_namespaces: namespaces
             .iter()
             .filter(|n| project_of_namespace(n).is_none())
@@ -1612,6 +1856,213 @@ fn note_subject(
         provider: provider.to_string(),
         ..RancherUser::default()
     });
+}
+
+// --- Writes ---------------------------------------------------------------------------------------
+
+/// The four things this view is allowed to write. Everything else about an identity — creating an
+/// account, granting a role — stays in Rancher, where the audit trail and the approval live.
+///
+/// All of them require an admin kubeconfig on the *local* cluster: these are the same objects an
+/// operator would `kubectl apply` by hand, and kdt adds no privilege of its own.
+#[derive(Debug, Clone)]
+pub enum RancherWrite {
+    /// Create a `Token` for an account, with a chosen TTL. The secret is returned once and is never
+    /// stored anywhere by kdt.
+    IssueToken { user: Box<RancherUser>, ttl_minutes: i64 },
+    /// Change `.ttl` on an existing token. Shortening it is how a credential handed out too
+    /// generously is reined in without breaking the session outright.
+    SetTokenTtl { name: String, ttl_minutes: i64 },
+    /// Delete the Token object — the one thing that actually revokes a credential.
+    RevokeToken { name: String },
+    /// Set a token-lifetime setting. Cluster-wide: it governs every credential issued afterwards.
+    SetSetting { name: String, value: String },
+}
+
+impl RancherWrite {
+    /// What the confirmation line names.
+    pub fn target(&self) -> String {
+        match self {
+            RancherWrite::IssueToken { user, .. } => user_label(user),
+            RancherWrite::SetTokenTtl { name, .. } | RancherWrite::RevokeToken { name } => {
+                name.clone()
+            }
+            RancherWrite::SetSetting { name, .. } => name.clone(),
+        }
+    }
+}
+
+/// A token as handed back by [`apply_rancher_write`], exactly once.
+///
+/// `name` and `secret` are what a client sends as `Authorization: Bearer <name>:<secret>`, and what
+/// a kubeconfig puts in its `token:` field. The secret exists in this struct and nowhere else — it is
+/// never written to the state, to a log, or to disk.
+#[derive(Debug, Clone)]
+pub struct IssuedToken {
+    pub name: String,
+    pub secret: String,
+    pub user_id: String,
+    pub user_label: String,
+    pub ttl_minutes: i64,
+}
+
+impl IssuedToken {
+    /// The credential itself, in the only form a client accepts.
+    pub fn bearer(&self) -> String {
+        format!("{}:{}", self.name, self.secret)
+    }
+}
+
+pub async fn apply_rancher_write(
+    client: Client,
+    write: RancherWrite,
+) -> Result<Option<IssuedToken>, String> {
+    match write {
+        RancherWrite::IssueToken { user, ttl_minutes } => {
+            let issued = issue_token(&client, &user, ttl_minutes).await?;
+            Ok(Some(issued))
+        }
+        RancherWrite::SetTokenTtl { name, ttl_minutes } => {
+            // `ttl` is milliseconds on the object and minutes everywhere a human writes one.
+            let patch = serde_json::json!({ "ttl": ttl_minutes.saturating_mul(60_000) });
+            patch_mgmt(&client, "Token", &name, patch).await?;
+            Ok(None)
+        }
+        RancherWrite::RevokeToken { name } => {
+            let api = mgmt_api(&client, "Token").await?;
+            api.delete(&name, &kube::api::DeleteParams::default())
+                .await
+                .map_err(crate::edit::api_error_text)?;
+            Ok(None)
+        }
+        RancherWrite::SetSetting { name, value } => {
+            // Writing `value` is what an operator setting a setting does; `default` is the chart's
+            // and is never touched.
+            let patch = serde_json::json!({ "value": value });
+            patch_mgmt(&client, "Setting", &name, patch).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn mgmt_api(client: &Client, kind: &str) -> Result<Api<DynamicObject>, String> {
+    crate::yaml::dynamic_api(client, API_MGMT, kind, "").await
+}
+
+async fn patch_mgmt(
+    client: &Client,
+    kind: &str,
+    name: &str,
+    patch: Value,
+) -> Result<(), String> {
+    let api = mgmt_api(client, kind).await?;
+    api.patch(name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
+        .await
+        .map_err(crate::edit::api_error_text)?;
+    Ok(())
+}
+
+// Create the Token object, shaped like the ones Rancher creates for a kubeconfig: same labels, same
+// `isDerived`, same `userPrincipal`. A token that does not look like Rancher's own is a token whose
+// behaviour under Rancher's controllers is a guess.
+async fn issue_token(
+    client: &Client,
+    user: &RancherUser,
+    ttl_minutes: i64,
+) -> Result<IssuedToken, String> {
+    let st = crate::lang::active();
+    if user.id.is_empty() {
+        return Err(st.ranch_issue_no_user.to_string());
+    }
+    let secret = random_secret()?;
+    let name = format!("kubeconfig-{}{}", user.id, random_suffix()?);
+    let ttl_ms = ttl_minutes.max(0).saturating_mul(60_000);
+
+    // The principal the token authenticates as. For a directory-backed account it is the external
+    // principal; for a local one, the local id. Getting this wrong yields a token Rancher accepts
+    // and then cannot map to any authorisation.
+    let principal_name = if user.principal.is_empty() {
+        format!("local://{}", user.id)
+    } else {
+        user.principal.clone()
+    };
+    let provider = if user.provider.is_empty() { "local" } else { &user.provider };
+
+    let body = serde_json::json!({
+        "apiVersion": API_MGMT,
+        "kind": "Token",
+        "metadata": {
+            "name": name,
+            "labels": {
+                L_TOKEN_KIND: "kubeconfig",
+                "authn.management.cattle.io/token-userId": user.id,
+                // Whose hand this came from. Rancher does not write this one; it is here so that a
+                // token issued out-of-band is recognisable as such months later.
+                "kdt.io/issued-by": "kdt",
+            },
+        },
+        "authProvider": provider,
+        "description": st.ranch_issue_description,
+        "isDerived": true,
+        "token": secret,
+        "ttl": ttl_ms,
+        "userId": user.id,
+        "userPrincipal": {
+            "metadata": { "name": principal_name },
+            "displayName": user.display_name,
+            "loginName": if user.username.is_empty() { &user.id } else { &user.username },
+            "principalType": "user",
+            "provider": provider,
+            "me": false,
+        },
+    });
+
+    let api = mgmt_api(client, "Token").await?;
+    let obj: DynamicObject = serde_json::from_value(body).map_err(|e| e.to_string())?;
+    api.create(&kube::api::PostParams::default(), &obj)
+        .await
+        .map_err(crate::edit::api_error_text)?;
+
+    Ok(IssuedToken {
+        name,
+        secret,
+        user_id: user.id.clone(),
+        user_label: user_label(user),
+        ttl_minutes,
+    })
+}
+
+// 54 characters of [a-z0-9], the shape and length Rancher's own tokens have. Drawn from the OS
+// CSPRNG: a token is a credential, and a predictable one is worse than none.
+fn random_secret() -> Result<String, String> {
+    random_chars(54)
+}
+
+fn random_suffix() -> Result<String, String> {
+    random_chars(5)
+}
+
+fn random_chars(n: usize) -> Result<String, String> {
+    use std::io::Read;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut raw = vec![0u8; n * 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut raw))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    // Rejection-free mapping would bias the alphabet; 36 does not divide 256, so bytes outside the
+    // largest whole multiple are discarded rather than folded.
+    const LIMIT: u8 = 252; // 36 * 7
+    let mut out = String::with_capacity(n);
+    for b in raw {
+        if b >= LIMIT {
+            continue;
+        }
+        out.push(ALPHABET[(b % 36) as usize] as char);
+        if out.len() == n {
+            return Ok(out);
+        }
+    }
+    Err("/dev/urandom".to_string())
 }
 
 // --- Helpers -------------------------------------------------------------------------------------
@@ -1736,6 +2187,95 @@ mod tests {
     }
 
     #[test]
+    fn an_entra_guid_falls_back_to_the_display_name() {
+        // Azure AD / Entra hands out GUID principals. The GUID is the only identity in
+        // `principalIds`, so the column would read as a list of GUIDs — `displayName` is where
+        // Rancher kept the name of the person.
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let users = build_users(
+            st,
+            &[obj(json!({
+                "apiVersion": "management.cattle.io/v3",
+                "kind": "User",
+                "metadata": { "name": "u-hgsaew47xm" },
+                "displayName": "Corentin Fresnel",
+                "principalIds": ["azuread_user://15a93197-8de9-413e-9ace-e0e7410b7442"]
+            }))],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+        );
+        assert_eq!(users[0].identity, "Corentin Fresnel");
+        // The GUID is still carried, so a principal seen in a log resolves back to the account.
+        assert_eq!(
+            users[0].principal,
+            "azuread_user://15a93197-8de9-413e-9ace-e0e7410b7442"
+        );
+        assert!(!users[0].identity_opaque);
+        assert_eq!(users[0].provider, "azuread");
+    }
+
+    #[test]
+    fn a_guid_with_nothing_readable_stays_unresolved() {
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let users = build_users(
+            st,
+            &[obj(json!({
+                "apiVersion": "management.cattle.io/v3", "kind": "User",
+                "metadata": { "name": "u-abc" },
+                "principalIds": ["oidc_user://8f14e45f-ceea-467a-9575-1ad0f4d3e9a2"]
+            }))],
+            &BTreeMap::new(), &[], &[], &[], &[], &BTreeMap::new(), &BTreeSet::new(), &[],
+        );
+        // Nothing legible anywhere: the view says so rather than dressing the GUID up as a name.
+        assert!(users[0].identity_opaque);
+    }
+
+    #[test]
+    fn group_guids_resolve_to_their_directory_name() {
+        let attrs = vec![obj(json!({
+            "apiVersion": "management.cattle.io/v3",
+            "kind": "UserAttribute",
+            "metadata": { "name": "u-abc" },
+            "GroupPrincipals": {
+                "azuread": { "items": [
+                    {
+                        "metadata": { "name": "azuread_group://6f9d9ad4-9fc2-42a7-9d43-fed6404fa9b1" },
+                        "displayName": "Claranet DevOps",
+                        "principalType": "group"
+                    }
+                ]}
+            }
+        }))];
+        // The group list of the account reads as names.
+        let indexed = index_attributes(&attrs);
+        assert_eq!(indexed.get("u-abc").unwrap().groups, vec!["Claranet DevOps"]);
+
+        // And so does a binding that names the same group by principal only.
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let crtb = obj(json!({
+            "apiVersion": "management.cattle.io/v3",
+            "kind": "ClusterRoleTemplateBinding",
+            "metadata": { "name": "crtb-1", "namespace": "local" },
+            "clusterName": "local",
+            "roleTemplateName": "cluster-member",
+            "groupPrincipalName": "azuread_group://6f9d9ad4-9fc2-42a7-9d43-fed6404fa9b1"
+        }));
+        let out = build_bindings(
+            st, &BTreeSet::new(), &[], &[crtb], &[], &BTreeMap::new(), &BTreeMap::new(),
+            &BTreeMap::new(), &BTreeMap::new(), &group_names(&attrs),
+        );
+        assert_eq!(out[0].subject_label, "Claranet DevOps");
+        // The principal itself stays as the row's id, so the GUID remains searchable.
+        assert_eq!(out[0].subject_id, "6f9d9ad4-9fc2-42a7-9d43-fed6404fa9b1");
+    }
+
+    #[test]
     fn disabled_account_warns() {
         let st = crate::lang::t(crate::ai::AiLanguage::En);
         let users = build_users(
@@ -1841,7 +2381,10 @@ mod tests {
         let roles: BTreeMap<String, String> =
             [("project-owner".to_string(), "Project Owner".to_string())].into_iter().collect();
 
-        let out = build_bindings(st, &BTreeSet::new(), &[], &[], &[prtb], &users, &projects, &roles, &BTreeMap::new());
+        let out = build_bindings(
+            st, &BTreeSet::new(), &[], &[], &[prtb], &users, &projects, &roles, &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(out.len(), 1);
         let b = &out[0];
         assert_eq!(b.scope, Some(BindScope::Project));
@@ -1887,7 +2430,7 @@ mod tests {
             [("u-abc".to_string(), "John Doe".to_string())].into_iter().collect();
         let out = build_bindings(
             st, &defaults, &grbs, &[], &[], &users, &BTreeMap::new(), &BTreeMap::new(),
-            &display_names(&roles),
+            &display_names(&roles), &BTreeMap::new(),
         );
         assert_eq!(out[0].role, "admin");
         assert!(!out[0].automatic);
@@ -1909,7 +2452,7 @@ mod tests {
         }));
         let out = build_bindings(
             st, &BTreeSet::new(), &[], &[crtb], &[], &BTreeMap::new(), &BTreeMap::new(),
-            &BTreeMap::new(), &BTreeMap::new(),
+            &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(),
         );
         assert!(out[0].hints.iter().any(|h| h.level == HintLevel::Warn));
     }
@@ -1927,7 +2470,7 @@ mod tests {
         }));
         let out = build_bindings(
             st, &BTreeSet::new(), &[], &[crtb], &[], &BTreeMap::new(), &BTreeMap::new(),
-            &BTreeMap::new(), &BTreeMap::new(),
+            &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(),
         );
         assert_eq!(out[0].subject_kind, Some(PrincipalKind::Group));
         assert_eq!(out[0].subject_label, "dsm-ppl-k8s");
@@ -2076,6 +2619,103 @@ mod tests {
         assert_eq!(state.projects[0].id, "p-8f87r");
         assert_eq!(state.projects[0].namespaces, vec!["app-dev"]);
         assert_eq!(state.projects[0].members, 2);
+    }
+
+    #[test]
+    fn a_set_setting_is_told_apart_from_a_shipped_default() {
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let objs = vec![
+            obj(json!({
+                "apiVersion": "management.cattle.io/v3", "kind": "Setting",
+                "metadata": { "name": "auth-token-max-ttl-minutes" }, "default": "129600"
+            })),
+            obj(json!({
+                "apiVersion": "management.cattle.io/v3", "kind": "Setting",
+                "metadata": { "name": "kubeconfig-default-token-ttl-minutes" },
+                "value": "0", "default": "43200"
+            })),
+        ];
+        let out = token_settings(st, &objs);
+        assert_eq!(out.len(), 2);
+        // The ceiling comes first and is on its default.
+        assert!(out[0].ceiling);
+        assert!(out[0].is_default);
+        assert_eq!(out[0].minutes(), Some(129_600));
+        assert!(out[0].hints.is_empty());
+        // Someone set the kubeconfig default to 0, which is Rancher's "never expires".
+        assert!(!out[1].is_default);
+        assert_eq!(out[1].minutes(), Some(0));
+        assert_eq!(out[1].default, "43200");
+        assert!(out[1].hints.iter().any(|h| h.level == HintLevel::Warn));
+    }
+
+    #[test]
+    fn a_default_above_the_ceiling_says_it_will_be_clamped() {
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let objs = vec![
+            obj(json!({
+                "apiVersion": "management.cattle.io/v3", "kind": "Setting",
+                "metadata": { "name": "auth-token-max-ttl-minutes" }, "value": "1440"
+            })),
+            obj(json!({
+                "apiVersion": "management.cattle.io/v3", "kind": "Setting",
+                "metadata": { "name": "kubeconfig-default-token-ttl-minutes" }, "value": "43200"
+            })),
+        ];
+        let out = token_settings(st, &objs);
+        assert!(out[1].hints.iter().any(|h| h.level == HintLevel::Info));
+    }
+
+    #[test]
+    fn minutes_render_as_a_duration_and_zero_as_never() {
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        assert_eq!(format_minutes(0, st), st.ranch_ttl_never);
+        assert_eq!(format_minutes(30, st), "30m");
+        assert_eq!(format_minutes(960, st), "16h");
+        assert_eq!(format_minutes(129_600, st), "90d");
+    }
+
+    #[test]
+    fn token_hashing_reads_spec_then_default_then_lock() {
+        let off = obj(json!({
+            "apiVersion": "management.cattle.io/v3", "kind": "Feature",
+            "metadata": { "name": "token-hashing" }, "status": { "default": false }
+        }));
+        assert!(!token_hashing_on(&[off]));
+        let on = obj(json!({
+            "apiVersion": "management.cattle.io/v3", "kind": "Feature",
+            "metadata": { "name": "token-hashing" },
+            "spec": { "value": true }, "status": { "default": false }
+        }));
+        assert!(token_hashing_on(&[on]));
+        // Absent means off, not unknown: Rancher ships it disabled.
+        assert!(!token_hashing_on(&[]));
+    }
+
+    #[test]
+    fn an_issued_secret_has_rancher_shape() {
+        let secret = random_secret().unwrap();
+        assert_eq!(secret.chars().count(), 54);
+        assert!(secret.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        // No `:` anywhere, or `name:secret` would not parse back into two halves.
+        assert!(!secret.contains(':'));
+        // Two draws must not collide.
+        assert_ne!(secret, random_secret().unwrap());
+    }
+
+    #[test]
+    fn a_write_names_what_it_lands_on() {
+        let w = RancherWrite::RevokeToken { name: "kubeconfig-u-abc12345".to_string() };
+        assert_eq!(w.target(), "kubeconfig-u-abc12345");
+        let issued = IssuedToken {
+            name: "kubeconfig-u-abcxyz12".to_string(),
+            secret: "s".repeat(54),
+            user_id: "u-abc".to_string(),
+            user_label: "John Doe".to_string(),
+            ttl_minutes: 1440,
+        };
+        // The bearer is the only form a client accepts — the secret alone authenticates nothing.
+        assert_eq!(issued.bearer(), format!("kubeconfig-u-abcxyz12:{}", "s".repeat(54)));
     }
 
     #[test]
