@@ -87,6 +87,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
+| `netpol` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (native, Cilium, Calico) |
 | `storage` | `stockage`, `pvc`, `claims` | Storage, claim side (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Storage, volume side (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacity, node side |
@@ -124,11 +125,13 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
 | Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) |
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME |
-| Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE |
+| Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
-| K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `o` actions |
+| Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
+| K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `e`, `h`, `Ctrl-D` deliberately absent |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
+| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `n`/`0` namespace |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
 | YAML | `t` neat ↔ raw · `c` copy · `r` reload |
@@ -148,154 +151,152 @@ shows the query and its effect (`/coredns  (3)`).
 
 ## The views
 
-- **Events** — watches `Event` objects with an All / Warnings / Errors filter and a tabbed detail
-  pane (Logs / Status / Related). `p` reads the container's **previous run**: on a
-  `CrashLoopBackOff`, what killed the pod only lives there.
-- **Workloads** — flat pod list or workload → pod tree (`t`, which also shows workloads scaled to
-  0). Actions target the workload, even from one of its pod rows. `Space` unfolds a pod into its
-  containers (init, regular, ephemeral): each with its own state, its share of the usage against
-  *its* requests/limits, and the age of its last start. On a container row, `E` opens a shell in
-  that container and the Logs tab narrows to it on its own.
-- **Nodes** — list, detail, CPU/memory usage, and `o` operations: cordon/uncordon (one reversible
-  patch) and a **drain that reports first** — pods no controller will recreate, PDBs that will
-  refuse, no room elsewhere, `emptyDir` data lost, static pods left behind.
-- **Capacity** (`:capacity`, `:quota`) — headroom, not state. Per node: the "if this node dies,
-  these pods have nowhere to go" simulation (first-fit, largest pod first, on requests, honouring
-  taints, `nodeSelector` and `required` node affinity). Per workload: pods with no requests
-  (invisible to the scheduler), oversized ones, ones at their own limit. Per namespace: the
-  `ResourceQuota` about to refuse the next creation.
+- **Events** — watches `Event` objects. `a`/`w`/`x` filter All / Warnings / Errors, `s` freezes
+  scrolling, `Tab` cycles the detail tabs (Logs / Status / Related). Logs: `p` shows the container's
+  previous run (the only place the logs of a `CrashLoopBackOff` pod survive), `C` switches
+  container, `f` follows. `N` lists the nodes of the pod, `E` opens a shell, `D` runs the
+  diagnostic, `X` exports the PDF.
+- **Workloads** — flat pod list, or workload → pod tree with `t` (the tree also shows workloads
+  scaled to 0). `Space`, `→` and `←` unfold a pod into its containers (init, regular, ephemeral):
+  state, usage against *their own* requests/limits, age of the last start. Actions target the
+  workload even from one of its pod rows: `s` scale, `r` rescale / recycle / restart. On a container
+  row, `E` opens a shell in that container and the Logs tab narrows to it. `n`/`0` change namespace.
+- **Nodes** — list, detail, CPU/memory usage (`u`), sort (`s`), PDF export (`p`/`P`). `o` opens the
+  operations: cordon, uncordon, drain. The drain prints a report before any eviction: pods no
+  controller will recreate, PDBs that will refuse, pods with no room elsewhere, `emptyDir` data
+  lost, static pods.
+- **Capacity** (`:capacity`, `:quota`) — three worlds through `g`, `f` keeps problems only.
+  - *nodes*: node-loss simulation (first-fit, largest pod first, on requests, honouring taints,
+    `nodeSelector` and `required` node affinity) and the pods with nowhere to land;
+  - *workloads*: pods with no requests (invisible to the scheduler), oversized pods, pods at their
+    own limit;
+  - *quotas*: `ResourceQuota`s about to refuse the next creation.
 
   ![Capacity view](demo/capacity.gif)
 
-- **FluxCD** — cluster-wide inventory, dependency tree (`t`), applied-object inventory with live
-  state, controller logs filtered or aggregated. `r`: reconcile (resource, `--with-source`, root
-  sync, plus **force upgrade** and **reset** on a HelmRelease). `Ctrl-R`: **unblock** — kdt derives
-  leads from the controller message, **confirms each one against the cluster**, and offers the
-  counter-move (delete an orphaned webhook, strip finalizers, `resetAt` then `forceAt` on a pending
-  Helm release). One more reconcile is rarely the right move.
+- **FluxCD** — cluster-wide inventory, dependency tree (`t`), applied objects with their live state
+  (Inventory tab), controller logs (`l`, or `:flux-logs` for the aggregate). `z` suspends / resumes.
+  `r` opens the reconcile menu: resource, `--with-source`, root sync, plus force upgrade and reset
+  on a HelmRelease. `Ctrl-R` opens the unblock flow: kdt derives leads from the controller message,
+  confirms each one against the cluster and offers the matching action — delete an orphaned webhook,
+  strip finalizers, `resetAt` then `forceAt` on a Helm release stuck in pending.
 
   ![FluxCD view](demo/flux.gif)
 
 - **Vulnerabilities** — per-image CVEs from **Trivy Operator** `VulnerabilityReport`s (CVSS score,
   number of fixable CVEs) and the risk on the Kubernetes version itself (official feed, latest patch
-  of the minor as target, `EOL` badge). Without Trivy the view falls back to the k8s version alone.
-- **cert-manager** (`:certs`) — the issuance chain end to end: Issuer → Certificate →
-  CertificateRequest → Order → Challenge → served Secret. Healthy chains fold themselves away,
-  failing ones unfold. Diagnostics: slow DNS propagation, challenge not presented, ACME rate limit,
-  late renewal, Secret out of sync.
-- **Kyverno** — the join `kubectl get polr` won't do: a report names its rule with a plain string,
-  and you have to go read the policy to know what was checked. Three things only visible here: the
-  **`autogen-*` rules** (those are the ones reports name), the difference between `fail` (the
-  resource violates) and `error` (the rule can't evaluate — a policy bug), and **admission
-  denials**, which leave no trace in the reports and exist only as Events. A
-  `kyverno-resource-*` webhook count of zero means Kyverno intercepts nothing at all, green
-  controllers or not.
+  of the minor as target, `EOL` badge). `f` sets the severity floor (all → HIGH+ → CRIT). Without
+  Trivy Operator, only the k8s version part is shown.
+- **cert-manager** (`:certs`) — issuance chain Issuer → Certificate → CertificateRequest → Order →
+  Challenge → served Secret. `Space` folds/unfolds (healthy chains start folded, failing ones
+  unfolded), `t` switches tree/list, `f` filters ALL / PROBLEMS / IN-FLIGHT, `s` jumps to the
+  Secret, `r` renews or restarts the ACME challenge. Detections: incomplete DNS propagation,
+  challenge not presented, ACME rate limit, late renewal, Secret out of sync, JKS/PKCS12 keystore
+  requested but absent from the Secret, missing truststore, unresolvable `passwordSecretRef`.
+- **Kyverno** — policies joined to reports: a report names its rule with a plain string, and the
+  view goes and reads the matching rule in the policy. `t` switches by policy / by resource, `Space`
+  folds/unfolds, `f` filters ALL / PROBLEMS / ENFORCE, `P` opens the action menu (purge the
+  `UpdateRequest`s stuck in Pending/Failed). Shown here: the `autogen-*` rules (the ones reports
+  name), the difference between `fail` (the resource violates) and `error` (the rule cannot evaluate
+  — a policy bug), admission denials (absent from reports, present only as Events), the
+  `UpdateRequest` backlog, and the `kyverno-resource-*` webhook count (at zero, Kyverno intercepts
+  nothing at all).
 
   ![Kyverno view](demo/kyverno.gif)
 
-- **Reflector** ([kubernetes-reflector](https://github.com/emberstack/kubernetes-reflector)) — the
-  controller is **silent whenever it decides to do nothing**. This view answers "why is this mirror
-  missing, or stale?": a namespace blocked by a same-named object, a mirror edited by hand
+- **Reflector** ([kubernetes-reflector](https://github.com/emberstack/kubernetes-reflector)) —
+  sources, mirrors and orphans through `g`, `f` filters ALL / PROBLEMS, `s` jumps to the source, `r`
+  forces re-reflection. Detections: namespace blocked by a same-named object, mirror edited by hand
   (reflector only compares `reflected-version`, never the content), the real scope of the anchored
-  regexes (an empty list means *all namespaces*), and who is waiting for the copy.
-- **RBAC** — flat audit list by default, plus three tree orientations (`t`): by subject ("what can
-  this identity do in total"), by binding, by role. Severity is computed **per binding** — a Role
-  alone is inert, and the same ClusterRole is harmless in a RoleBinding and critical in a
-  ClusterRoleBinding. Shows template ClusterRoles rebound namespace by namespace, the composition of
-  aggregated roles (`admin`, `edit`, `view`), bindings naming a non-existent ServiceAccount, and
-  roles nobody binds.
+  regexes (an empty list means all namespaces), mirrors still waiting for the copy.
+- **RBAC** — flat audit list by default, three tree orientations through `t` (by subject, by
+  binding, by role), `f` sets the severity floor, `o` jumps to the managing Flux object. Severity is
+  computed **per binding**: a Role alone is inert, and the same ClusterRole is harmless in a
+  RoleBinding and critical in a ClusterRoleBinding. Shows template ClusterRoles rebound namespace by
+  namespace, the composition of aggregated roles (`admin`, `edit`, `view`), bindings naming a
+  non-existent ServiceAccount, and roles nobody binds.
 
   ![RBAC view](demo/rbac.gif)
 
-- **Velero** (`:velero`, `:restores`, `:bsl`) — a backup is only ever asked one question: *if
-  everything burns down right now, what comes back?* `PartiallyFailed` is shown as a failure,
-  because it is one — the backup ran to the end without capturing everything. The view **evaluates
-  the cron itself** to say that a schedule has stopped firing (velero reports this nowhere: it
-  simply does not create a backup), flags a TTL shorter than the cron period, an unavailable
-  location, a kopia repository with no maintenance, and above all the **namespaces holding PVCs
-  that no schedule covers any more**. `o` opens the operations: run a backup from a schedule, pause
-  it, restore, and *actually* delete a backup — through a `DeleteBackupRequest`, because deleting
-  the object deletes nothing and the next sync brings it back. `l` fetches the run log. `+` unfolds
-  what the backup really holds — namespaces, then kinds, then objects — and *Restore (options)*
-  uses that to prefill a narrowed `Restore`: namespaces to tick, remapping into a fresh namespace,
-  a filter by kind and by label, and the choice between stepping around what already exists and
-  overwriting it. Velero cannot target an object by name, so the view stops where the API stops
-  rather than promising a tick box per object.
-- **K8ssandra / Cassandra** (`:k8ssandra`, `:medusa`, `:reaper`) — on a database only one question
-  matters, and none of the surfaces that ought to answer it do. A `MedusaBackupSchedule` keeps a
-  fresh `lastExecution` and a clean `nextSchedule` whether the run it fired succeeded or failed; the
-  purge CronJob completes green while purging nothing; and the `MedusaBackup` objects, the catalogue
-  itself, simply stop appearing — no event, no condition, no status field. So a cluster can run for
-  months with everything green and not one restorable backup. This view puts that number in the
-  title: **the age of the last backup that covers every node** of the datacenter, a partial run
-  counting as a failure because it restores as if it were whole. It also reports successful runs
-  missing from the catalogue (the `sync` MedusaTask never ran), and that a restore **stops the
-  datacenter** — before you start it, not after.
-
-  The ring comes from no CRD but from the `cassandra` container's management API, reached through
-  the apiserver proxy: no port-forward, no `kubectl`, no exec. `nodetool status` and
-  `describecluster` come out of it as typed data (UN/DN state, load, tokens, schema agreement), and
-  `s` fetches `tpstats`, `compactionstats` and `netstats` for the selected node. A pod is joined to
-  its ring entry on the **address**, not on the `hostID` in `status.nodeStatuses`: that field is the
-  operator's memory and it goes stale — the view says so when the two disagree. `o` opens the
-  operations: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask`
-  jobs (cleanup, upgradesstables, compaction, scrub, rolling restart).
-- **Rancher** (`:rancher`, `:projects`, `:tokens`) — on a Rancher-managed cluster every human is a
-  `u-4oivhvq2jk`. That id is what the RoleBindings carry, what the audit log carries, and what
-  `kubectl get rolebinding -o yaml` shows; the person behind it lives in a `User` object nobody
-  looks at and in a `UserAttribute` object nobody knows exists. This view puts **both identities
-  side by side** — Rancher id and real identity (the CN of an LDAP/AD distinguished name, the
-  FreeIPA `uid`), with the provider, the directory groups, the global roles and when those groups
-  were last refreshed. `g` moves through the other three worlds: **access** (who has what, the three
-  binding kinds collapsed into one subject → role → scope list, with the binding Rancher gives every
-  account sorted last so it does not bury the grants someone actually made), **projects** (their
-  namespaces, members, owners and quota) and **tokens** (kubeconfig, session, or an API key with no
-  expiry).
-
-  Two clusters look alike and only one holds the data: the **local** cluster, the one running the
-  Rancher server, and a **downstream** cluster, where the same CRDs exist and are empty. Zero
-  `User` objects on a downstream is not "no accounts" but "not here" — the view says so, and falls
-  back on what the agent projected: the RoleBindings labelled with the Rancher binding that created
-  them. Groups show up there in clear text (the full DN), accounts stay `u-…` ids that nothing on
-  this cluster can resolve, and every row declares it instead of passing an identifier off as a name.
-
-  The **tokens** world lists, above the tokens themselves, the settings that decide how long a
-  credential lives — `auth-token-max-ttl-minutes` (the ceiling),
-  `kubeconfig-default-token-ttl-minutes`, `auth-user-session-ttl-minutes` — with the value in force,
-  the shipped default, and which of the two applies. That is what makes a column of tokens marked
-  "never" readable: someone set the kubeconfig default to `0`, and Rancher reads `0` as "no expiry".
-
-  A token also carries a **scope** — the `clusterName` field, what Rancher calls its scope: empty, it
-  is valid on every managed cluster *and* on the Rancher API; set, on that cluster only. The `SCOPE`
-  column says which, and `KIND` tells apart the families Rancher does not all name: `kubeconfig` (one
-  per download), `session` (the login itself — revoking it signs the account out), `api` (a key made
-  in *Account & API Keys*, recognisable by having no label and being derived), `provisioning`,
-  `telemetry`.
-
-  `o` opens the only writes this view has, each behind a confirmation and then an entry whose unit is
-  shown: **issue a token** for the selected account (a `Token` object shaped like the ones Rancher
-  creates — same labels, `isDerived`, reconstructed `userPrincipal` — with a 54-character secret from
-  `/dev/urandom`, shown **once** and never written to the state, a log or a file), **change the TTL**
-  of an existing token, **revoke** it (deleting the `Token` object is the only thing that actually
-  revokes a credential), and **set** a lifetime setting, whose cluster-wide scope is stated. All of
-  it already requires an admin kubeconfig on the local cluster: these are the same objects one would
-  `kubectl apply` by hand, and kdt adds no privilege. On a downstream the menu refuses and says why.
-  An issued token authenticates **as that account** — which the overlay says before it closes.
-
-  Everything else is read-only: `y` shows the YAML, `e`, `h` and `Ctrl-D` stay absent. A role or a
-  binding is changed in Rancher.
-- **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
-  missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
-  with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message
-  wins. Also: `Released` PVs (data sitting idle), `reclaimPolicy: Delete` surfaced on the PVC, `RWO`
-  PVCs mounted by several pods.
-- **Secrets / ConfigMaps / Services / Ingress** — inventories, with TLS certificate expiry and their
-  consumers.
-- **Diagnostic** (`D`) — a battery of checks: version, system namespaces, CoreDNS, CNI, webhooks,
-  Rancher, failing pods, PVs, recent warnings.
+- **Velero** (`:velero`, `:restores`, `:bsl`) — backups and schedules, restores, locations and
+  repositories.
+  - `PartiallyFailed` is counted as a failure.
+  - kdt evaluates the schedule cron itself: a schedule that stopped firing (velero reports it
+    nowhere, it simply creates no backup), a TTL shorter than the cron period, an unavailable
+    location, a kopia repository with no maintenance, namespaces holding PVCs that no schedule
+    covers any more.
+  - `o`: run a backup from a schedule, pause it, restore, delete a backup through a
+    `DeleteBackupRequest` (deleting the object deletes nothing, the next sync brings it back). `l`
+    fetches the run log.
+  - `+` unfolds what the backup actually holds — namespaces, then kinds, then objects. *Restore
+    (options)* uses it to prefill a narrowed `Restore`: namespaces to tick, remapping into another
+    namespace, a filter by kind and by label, and the choice between skipping and overwriting what
+    already exists. Velero cannot target an object by name: the selection stops at the kind.
+- **K8ssandra / Cassandra** (`:k8ssandra`, `:medusa`, `:reaper`) — three worlds through `g`: cluster
+  ring, Medusa backups, operations and Reaper. `f` filters ALL / PROBLEMS, `Space` folds/unfolds,
+  `l` opens the log of the container at fault.
+  - The backup world's title shows the age of the last backup covering **every node** of the
+    datacenter, a partial run counting as a failure. Detections: a schedule whose
+    `lastExecution`/`nextSchedule` stays clean although the run failed, a purge CronJob completing
+    green while purging nothing, successful runs missing from the catalogue (the `sync` MedusaTask
+    never ran). A restore stops the datacenter, which is stated before it is started.
+  - The ring comes from the `cassandra` container's management API, reached through the apiserver
+    pod proxy (no port-forward, no `kubectl`, no exec): `nodetool status` and `describecluster` as
+    typed data — UN/DN state, load, tokens, schema agreement. A pod is joined to its ring entry on
+    the address, not on the `hostID` in `status.nodeStatuses`: that field goes stale, and the view
+    says so when the two disagree.
+  - `s`: `tpstats`, `compactionstats` and `netstats` for the selected node (Reaper repairs in the
+    operations world). `S`: `listsnapshots`, folded per tag, with both sizes — the total (a
+    directory of hard links, shared with the live SSTables) and `True size`, the only space deleting
+    the tag gives back. On a 3.11 node, which does not date its snapshots, the date of
+    `truncated-`/`dropped-` tags is read from the tag itself.
+  - `o`: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask` jobs
+    (cleanup, upgradesstables, compaction, scrub, rolling restart).
+- **Rancher** (`:rancher`, `:projects`, `:tokens`) — four worlds through `g`, `f` filters ALL /
+  PROBLEMS. Read-only apart from `o`; `e`, `h` and `Ctrl-D` are absent.
+  - *users*: the Rancher id (`u-4oivhvq2jk`, the one RoleBindings and audit logs carry) and the real
+    identity next to it — the CN of an LDAP/AD distinguished name, the FreeIPA `uid` — read from the
+    `User` and `UserAttribute` objects, with the provider, the directory groups, the global roles
+    and when those groups were last refreshed.
+  - *access*: the three binding kinds collapsed into one subject → role → scope list; the binding
+    Rancher gives every account is sorted last.
+  - *projects*: namespaces, members, owners, quota.
+  - *tokens*: first the lifetime settings — `auth-token-max-ttl-minutes` (the ceiling),
+    `kubeconfig-default-token-ttl-minutes`, `auth-user-session-ttl-minutes` — with the value in
+    force, the shipped default and which of the two applies (Rancher reads `0` as "no expiry"). Then
+    the tokens, with a `SCOPE` column (`clusterName` empty = every managed cluster *and* the Rancher
+    API; set = that cluster only) and a `KIND` column: `kubeconfig` (one per download), `session`
+    (the login itself — revoking it signs the account out), `api` (a key made in *Account & API
+    Keys*, with no label and `isDerived`), `provisioning`, `telemetry`.
+  - On a **downstream** cluster the Rancher CRDs exist and are empty: the view says so and falls
+    back on what the agent projected, the RoleBindings labelled with the Rancher binding that
+    created them. Groups appear in clear text (the full DN), accounts stay `u-…` ids nothing on this
+    cluster can resolve, and every row declares it.
+  - `o`, on the local cluster only (refused with a reason on a downstream): **issue a token** for
+    the selected account (a `Token` object shaped like the ones Rancher creates — same labels,
+    `isDerived`, reconstructed `userPrincipal` — with a 54-character secret from `/dev/urandom`,
+    shown once and written nowhere), **change the TTL** of a token, **revoke** it (deleting the
+    `Token` object is the only real revocation), **set** a lifetime setting. These are the same
+    objects one would `kubectl apply` by hand; kdt adds no privilege.
+- **Network** (`:services`, `:ingress`, `:netpol`) — three worlds through `g`: Services/Endpoints,
+  Ingress/IngressClass, NetworkPolicies. Native policies are shown with their target, their
+  `policyTypes` and the effect per direction: `Deny` (direction governed, no rule allows anything),
+  `AllowAll` (empty `from`/`to`), `Selective` (explicit peers), `Unaffected` (direction not in
+  `policyTypes`). Cilium and Calico CRDs are listed as they are, with no verdict.
+- **Storage** (`:storage`, `:pv`) — two worlds through `g` (PVC → PV, SC → PV), `t` nests
+  parent/child, `f` keeps problems only, `n`/`0` change namespace. Detections: missing StorageClass,
+  no default class (or two), `WaitForFirstConsumer` waiting on a pod, class with no provisioner, a
+  `ProvisioningFailed` left by the provisioner (its message wins), `Released` PVs,
+  `reclaimPolicy: Delete` surfaced on the PVC, `RWO` PVCs mounted by several pods.
+- **Secrets / ConfigMaps** — inventories, with TLS certificate expiry and their consumers.
+- **Diagnostic** (`D`) — a battery of checks: API health, version, nodes, system namespaces,
+  `kube-system` pods, CoreDNS, CNI, validating and mutating webhooks, Rancher, failing pods, PVs,
+  storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, K8ssandra, RBAC, recent
+  warnings. A module absent from the cluster is reported as Info. `r` re-runs, `p`/`P` export the
+  PDF.
 - **Extract** (`X`) — full PDF report of the cluster state into `~/Downloads`.
 - **AI** (`i`) — sends the current context to an OpenAI-compatible API; the answer is streamed (SSE)
-  and rendered as it arrives. `L` re-runs it in the other language.
+  and rendered as it arrives. `L` re-runs it in the other language, `m` switches provider.
 
 ## Writing to the cluster
 
@@ -306,7 +307,7 @@ through guardrails.
 |---|---|---|
 | `e` | Full `PUT`, locked on `resourceVersion` | **Before**: GitOps-owned object that the next reconcile will overwrite, spec held by a controller, `can-i update` denied, object being deleted, spec frozen after creation. **After**: every changed field classified *applied* / *ignored* / *rejected by the API* |
 | `Ctrl-D` | `delete` with *background* propagation | GitOps ownership, GitOps entry point (Kustomization/HelmRelease/Application), `Namespace` and CRD (cascade), `ownerReferences`, system namespace, finalizers |
-| `h` | Merge patch of two annotations | None — it is the lightest gesture on this list |
+| `h` | Merge patch of two annotations | None |
 | `o` (Nodes) | `spec.unschedulable` patch, then evictions | Full drain report before a single eviction |
 | `r` / `z` | Reconcile, suspend, scale, restart, renew | Armed confirmation inside the menu |
 | `Ctrl-R` | Delete an admission config, strip finalizers | Type the object's exact name |

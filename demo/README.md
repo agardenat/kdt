@@ -26,10 +26,9 @@ enregistrement. Le fichier ne contient aucune clé d'API, ce qui garde le pannea
 
 **196 colonnes.** `Set FontSize 13` avec `Set Width 1560` y arrive tout juste. En dessous, le pied
 de page de kdt se tronque : `balance_footer_rows` l'étale sur deux lignes mais ne dégrade pas
-au-delà, et les derniers raccourcis se font couper. C'est le témoin de largeur le plus fiable —
-si le pied de page est entier, le reste l'est aussi.
+au-delà, et les derniers raccourcis se font couper. Le pied de page sert de témoin de largeur : s'il est entier, le reste l'est aussi.
 
-## Trois pièges appris à la dure
+## Pièges VHS
 
 **VHS n'a pas de commande `Escape`**, et `Ctrl+[` ne la remplace pas. Un tape ne doit donc jamais
 ouvrir un menu d'action : il ne saurait pas le refermer. Aucun scénario ici ne valide quoi que ce
@@ -42,7 +41,7 @@ change de vue, elle expire sur un tampon périmé au lieu de voir la vue arriver
 **Le parseur casse sur les chemins non quotés** contenant tirets et chiffres. Quand un chemin
 n'est pas relatif et simple, l'entourer de guillemets.
 
-## Un détail sur kdt lui-même
+## États par défaut à connaître
 
 Deux vues s'ouvrent dans un état qui n'est pas celui qu'on croit : `flux_tree` vaut `true` par
 défaut, donc `t` sur la vue Flux *sort* de l'arbre ; `rbac_orient` vaut `Flat`, donc il faut un `t`
