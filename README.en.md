@@ -265,6 +265,13 @@ shows the query and its effect (`/coredns  (3)`).
   the shipped default, and which of the two applies. That is what makes a column of tokens marked
   "never" readable: someone set the kubeconfig default to `0`, and Rancher reads `0` as "no expiry".
 
+  A token also carries a **scope** — the `clusterName` field, what Rancher calls its scope: empty, it
+  is valid on every managed cluster *and* on the Rancher API; set, on that cluster only. The `SCOPE`
+  column says which, and `KIND` tells apart the families Rancher does not all name: `kubeconfig` (one
+  per download), `session` (the login itself — revoking it signs the account out), `api` (a key made
+  in *Account & API Keys*, recognisable by having no label and being derived), `provisioning`,
+  `telemetry`.
+
   `o` opens the only writes this view has, each behind a confirmation and then an entry whose unit is
   shown: **issue a token** for the selected account (a `Token` object shaped like the ones Rancher
   creates — same labels, `isDerived`, reconstructed `userPrincipal` — with a 54-character secret from

@@ -422,9 +422,14 @@ pub struct RancherToken {
     /// The account's readable identity when it could be resolved.
     pub user_label: String,
     pub provider: String,
-    /// `kubeconfig`, `session`, `provisioning`, `telemetry`, or empty for a token created through
-    /// the API — which is what an API key looks like.
+    /// The `authn.management.cattle.io/kind` label: `kubeconfig`, `session`, `provisioning`,
+    /// `telemetry` — or empty, which is what a key created through Account & API Keys looks like.
     pub kind: String,
+    /// What the KIND column shows. Falls back to what `isDerived` says when the label is absent: a
+    /// derived token with no label is an API key, an underived one *is* the login session the others
+    /// were minted from — revoking that one logs the person out.
+    pub kind_label: String,
+    pub derived: bool,
     pub description: String,
     /// Milliseconds. `0` means the token never expires.
     pub ttl_ms: i64,
@@ -1557,6 +1562,14 @@ fn build_tokens(
                 .and_then(|l| l.get(L_TOKEN_KIND))
                 .cloned()
                 .unwrap_or_default();
+            let derived = o.data.get("isDerived").and_then(Value::as_bool).unwrap_or(false);
+            let kind_label = if !kind.is_empty() {
+                kind.clone()
+            } else if derived {
+                st.ranch_token_kind_api.to_string()
+            } else {
+                st.ranch_token_kind_login.to_string()
+            };
             let ttl_ms = o.data.get("ttl").and_then(Value::as_i64).unwrap_or(0);
             let expires_at = str_at(&o.data, "expiresAt").unwrap_or_default();
             let expired = o.data.get("expired").and_then(Value::as_bool).unwrap_or(false);
@@ -1581,6 +1594,12 @@ fn build_tokens(
             if ttl_ms == 0 && !expired && kind.is_empty() {
                 hints.push(info(st.ranch_token_no_expiry.to_string()));
             }
+            // A session token is the login itself, not a credential minted from it. Revoking it is
+            // a sign-out, which is a different act from revoking a key — worth saying before the
+            // confirmation rather than after.
+            if !derived {
+                hints.push(info(st.ranch_token_session.to_string()));
+            }
 
             RancherToken {
                 uid: format!("ranch|token|{}", name),
@@ -1589,6 +1608,8 @@ fn build_tokens(
                 user_label,
                 provider: str_at(&o.data, "authProvider").unwrap_or_default(),
                 kind,
+                kind_label,
+                derived,
                 description: str_at(&o.data, "description").unwrap_or_default(),
                 ttl_ms,
                 expires_at,
@@ -2546,7 +2567,7 @@ mod tests {
                 obj(json!({
                     "apiVersion": "management.cattle.io/v3", "kind": "Token",
                     "metadata": { "name": "token-api" },
-                    "userId": "u-abc", "authProvider": "openldap", "ttl": 0
+                    "userId": "u-abc", "authProvider": "openldap", "ttl": 0, "isDerived": true
                 })),
                 obj(json!({
                     "apiVersion": "management.cattle.io/v3", "kind": "Token",
@@ -2554,7 +2575,7 @@ mod tests {
                         "name": "kubeconfig-u-abc",
                         "labels": { "authn.management.cattle.io/kind": "kubeconfig" }
                     },
-                    "userId": "u-abc", "authProvider": "openldap", "ttl": 0
+                    "userId": "u-abc", "authProvider": "openldap", "ttl": 0, "isDerived": true
                 })),
             ],
             &users,
@@ -2565,6 +2586,42 @@ mod tests {
         assert!(!api.hints.is_empty());
         assert!(kubeconfig.hints.is_empty());
         assert_eq!(kubeconfig.kind, "kubeconfig");
+        // A derived token with no label is what Account & API Keys produces.
+        assert_eq!(api.kind_label, st.ranch_token_kind_api);
+    }
+
+    #[test]
+    fn a_session_token_and_a_scoped_one_are_told_apart() {
+        let st = crate::lang::t(crate::ai::AiLanguage::En);
+        let tokens = build_tokens(
+            st,
+            &[
+                // `isDerived: false` is the login session itself, not something minted from it.
+                obj(json!({
+                    "apiVersion": "management.cattle.io/v3", "kind": "Token",
+                    "metadata": {
+                        "name": "token-session",
+                        "labels": { "authn.management.cattle.io/kind": "session" }
+                    },
+                    "userId": "u-abc", "ttl": 57600000, "isDerived": false
+                })),
+                // Rancher's scope: valid on this cluster only.
+                obj(json!({
+                    "apiVersion": "management.cattle.io/v3", "kind": "Token",
+                    "metadata": { "name": "token-scoped" },
+                    "userId": "u-abc", "ttl": 0, "isDerived": true, "clusterName": "local"
+                })),
+            ],
+            &BTreeMap::new(),
+        );
+        let session = tokens.iter().find(|t| t.name == "token-session").unwrap();
+        let scoped = tokens.iter().find(|t| t.name == "token-scoped").unwrap();
+        assert!(!session.derived);
+        assert!(session.hints.iter().any(|h| h.text == st.ranch_token_session));
+        // An unscoped token has no cluster; this one names the only cluster it works on.
+        assert_eq!(scoped.cluster, "local");
+        assert!(scoped.derived);
+        assert!(scoped.hints.iter().all(|h| h.text != st.ranch_token_session));
     }
 
     #[test]

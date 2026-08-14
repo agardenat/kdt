@@ -276,6 +276,13 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   s'applique. C'est ce qui rend lisible une colonne de tokens marqués « jamais » : quelqu'un a mis le
   défaut kubeconfig à `0`, et Rancher lit `0` comme « pas d'expiration ».
 
+  Un token porte aussi une **portée** — le champ `clusterName`, ce que Rancher appelle son scope :
+  vide, il vaut sur tous les clusters gérés *et* sur l'API Rancher ; renseigné, sur ce cluster
+  seulement. La colonne `SCOPE` le dit, et `KIND` distingue les familles que Rancher ne nomme pas
+  toutes : `kubeconfig` (un par téléchargement), `session` (la connexion elle-même — la révoquer
+  déconnecte), `api` (une clé créée dans *Account & API Keys*, reconnaissable à son absence de label
+  et à son `isDerived`), `provisioning`, `telemetry`.
+
   `o` ouvre les seules écritures de la vue, chacune derrière une confirmation puis une saisie dont
   l'unité est affichée : **émettre un token** pour le compte sélectionné (objet `Token` calqué sur
   ceux que Rancher crée — mêmes labels, `isDerived`, `userPrincipal` reconstruit — secret de 54

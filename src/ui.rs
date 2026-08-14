@@ -8563,7 +8563,13 @@ impl App {
                     },
                     ActionItem {
                         label: st.k_ranch_revoke,
-                        desc: st.desc_ranch_revoke.to_string(),
+                        // Revoking a login session is a sign-out, not the removal of a key: the
+                        // description says which of the two this row is before the confirmation.
+                        desc: if t.derived {
+                            st.desc_ranch_revoke.to_string()
+                        } else {
+                            format!("{} {}", st.desc_ranch_revoke, st.ranch_token_session)
+                        },
                         action: MenuAction::RanchRevokeToken,
                     },
                 ],
@@ -16909,7 +16915,7 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         RancWorld::Tokens => {
             let header = Row::new(vec![
                 Cell::from("TOKEN"), Cell::from("USER"), Cell::from("PROVIDER"), Cell::from("KIND"),
-                Cell::from("TTL"), Cell::from("STATE"), Cell::from("AGE"),
+                Cell::from("SCOPE"), Cell::from("TTL"), Cell::from("STATE"), Cell::from("AGE"),
             ])
             .style(header_style);
             let rows = src
@@ -16932,11 +16938,20 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default().fg(DIM)
                         };
+                        // An unscoped token is valid on every managed cluster *and* on the Rancher
+                        // API itself; a scoped one only where it says. The wider of the two is the
+                        // one worth noticing.
+                        let (scope, scope_style) = if t.cluster.is_empty() {
+                            (st.ranch_token_scope_all.to_string(), Style::default().fg(Color::Yellow))
+                        } else {
+                            (t.cluster.clone(), Style::default().fg(Color::Cyan))
+                        };
                         Row::new(vec![
                             Cell::from(t.name.clone()),
                             Cell::from(owner).style(Style::default().add_modifier(Modifier::BOLD)),
                             Cell::from(t.provider.clone()).style(ranch_provider_style(&t.provider)),
-                            Cell::from(t.kind.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(t.kind_label.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(scope).style(scope_style),
                             Cell::from(format_ttl(t.ttl_ms, st)).style(ttl_style),
                             state,
                             Cell::from(t.age.clone()).style(Style::default().fg(DIM)),
@@ -16963,10 +16978,11 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         };
                         Row::new(vec![
                             Cell::from(s.name.clone()).style(name_style),
-                            Cell::from(if s.ceiling { st.ranch_setting_ceiling } else { "" })
-                                .style(Style::default().fg(DIM)),
+                            Cell::from(""),
                             Cell::from(""),
                             Cell::from("setting").style(Style::default().fg(Color::Magenta)),
+                            Cell::from(if s.ceiling { st.ranch_setting_ceiling } else { "" })
+                                .style(Style::default().fg(DIM)),
                             Cell::from(value).style(value_style),
                             source,
                             Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
@@ -16986,9 +17002,9 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 40,
             );
             let widths = vec![
-                Constraint::Length(token_w), Constraint::Min(24), Constraint::Length(14),
-                Constraint::Length(12), Constraint::Length(8), Constraint::Length(9),
-                Constraint::Length(5),
+                Constraint::Length(token_w), Constraint::Min(22), Constraint::Length(14),
+                Constraint::Length(12), Constraint::Length(10), Constraint::Length(8),
+                Constraint::Length(9), Constraint::Length(5),
             ];
             (header, rows, widths)
         }
@@ -17262,9 +17278,7 @@ fn ranch_detail_lines(
                 },
             ));
             lines.push(label(st.ranch_lbl_provider, t.provider.clone()));
-            if !t.kind.is_empty() {
-                lines.push(label(st.ranch_lbl_kind, t.kind.clone()));
-            }
+            lines.push(label(st.ranch_lbl_kind, t.kind_label.clone()));
             if !t.description.is_empty() {
                 lines.push(label(st.ranch_lbl_description, t.description.clone()));
             }
@@ -17272,9 +17286,14 @@ fn ranch_detail_lines(
             if !t.expires_at.is_empty() {
                 lines.push(label(st.ranch_lbl_expires, t.expires_at.clone()));
             }
-            if !t.cluster.is_empty() {
-                lines.push(label(st.lbl_cluster, t.cluster.clone()));
-            }
+            lines.push(label(
+                st.lbl_scope,
+                if t.cluster.is_empty() {
+                    st.ranch_token_scope_all.to_string()
+                } else {
+                    t.cluster.clone()
+                },
+            ));
             lines.push(label(st.lbl_age, t.age.clone()));
             if !t.hints.is_empty() {
                 lines.push(Line::from(""));
