@@ -471,6 +471,30 @@ use crate::svc::{
     IngressResource, ServiceResource, SharedNetwork,
 };
 use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
+use crate::rancher::{
+    fetch_rancher, format_refresh, format_ttl, new_rancher_state, BindScope, ClusterRole,
+    PrincipalKind, RancherBinding, RancherProject, RancherToken, RancherUser, SharedRancher,
+};
+
+// The four worlds of the Rancher view. They share one fetch and one snapshot; `g` moves between
+// them without refetching, as velero and k8ssandra already do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RancWorld {
+    Users,
+    Access,
+    Projects,
+    Tokens,
+}
+
+// One visual row of the Rancher view, index-aligned with the snapshot so the detail panel, `y`,
+// `Ctrl-D` and the search all track the selection without any code of their own.
+#[derive(Debug, Clone)]
+enum RancRow {
+    User(Box<RancherUser>),
+    Binding(Box<RancherBinding>),
+    Project(Box<RancherProject>),
+    Token(Box<RancherToken>),
+}
 
 // The two object worlds the Services/Ingress view toggles between (palette `svc` vs `ingress`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -884,7 +908,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull }
 
 // One visual line in the merged workloads view: a workload (parent/group row), one of its pods
 // (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
@@ -1153,6 +1177,12 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("k8ssandra", &["k8c", "cassandra", "cass", "cassandradatacenter", "cassandradatacenters", "dc", "datacenter", "datacenters"]),
     ("medusa", &["med", "medusabackup", "medusabackups", "cassbackup", "cassbackups"]),
     ("reaper", &["rea", "repair", "repairs", "reparation", "reparations"]),
+    // Rancher's own objects. `users` belongs here rather than to RBAC: on a Rancher-managed cluster
+    // the word means a person with a Rancher account, not a ServiceAccount. `projects` likewise —
+    // a Rancher project is what groups the namespaces this cluster shows.
+    ("rancher", &["ranch", "cattle", "users", "user", "identities", "identites"]),
+    ("projects", &["project", "proj"]),
+    ("tokens", &["token", "apikeys", "apikey", "kubeconfigs"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -1509,6 +1539,12 @@ pub struct App {
     k8c_rows: Vec<K8cRow>,
     pub k8c_detail_scroll: usize,
     pub k8c_refresh_handle: Option<JoinHandle<()>>,
+    pub ranch_state: SharedRancher,
+    ranch_world: RancWorld,
+    ranch_filter: StoFilter,
+    ranch_rows: Vec<RancRow>,
+    pub ranch_detail_scroll: usize,
+    pub ranch_refresh_handle: Option<JoinHandle<()>>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -1771,6 +1807,12 @@ impl App {
             k8c_rows: Vec::new(),
             k8c_detail_scroll: 0,
             k8c_refresh_handle: None,
+            ranch_state: new_rancher_state(),
+            ranch_world: RancWorld::Users,
+            ranch_filter: StoFilter::All,
+            ranch_rows: Vec::new(),
+            ranch_detail_scroll: 0,
+            ranch_refresh_handle: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -2525,7 +2567,9 @@ impl App {
             | Mode::Velero
             | Mode::VeleroFull
             | Mode::K8ssandra
-            | Mode::K8ssandraFull => {
+            | Mode::K8ssandraFull
+            | Mode::Rancher
+            | Mode::RancherFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -3461,7 +3505,7 @@ impl App {
                 | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra
                 | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces
                 | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
-                | Mode::Capacity | Mode::CapacityFull
+                | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull
         )
     }
 
@@ -3489,6 +3533,7 @@ impl App {
             Mode::Namespaces => step(&mut self.namespaces_detail_scroll, delta),
             Mode::Storage | Mode::StorageFull => step(&mut self.sto_detail_scroll, delta),
             Mode::Capacity | Mode::CapacityFull => step(&mut self.cap_detail_scroll, delta),
+            Mode::Rancher | Mode::RancherFull => step(&mut self.ranch_detail_scroll, delta),
             _ => {}
         }
     }
@@ -3503,7 +3548,8 @@ impl App {
             *v = if delta < 0 { v.saturating_sub(5) } else { v.saturating_add(5) };
         };
         match view_mode(self) {
-            Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull => {}
+            Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull
+            | Mode::Rancher | Mode::RancherFull => {}
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
             Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
             _ => step(&mut self.detail_h_scroll, delta),
@@ -3525,6 +3571,7 @@ impl App {
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c(),
+            Mode::Rancher | Mode::RancherFull => self.refresh_rancher(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             Mode::Namespaces => self.refresh_namespaces(),
             _ => {}
@@ -3903,6 +3950,7 @@ impl App {
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c_snapshot(),
+            Mode::Rancher | Mode::RancherFull => self.refresh_rancher_snapshot(),
             _ => {}
         }
     }
@@ -4040,6 +4088,23 @@ impl App {
                 self.leave_special_modes();
                 self.enter_k8c_mode(K8cWorld::Ops);
             }
+            "rancher" => {
+                // Always opens: on a cluster with no management.cattle.io the view says so, which is
+                // itself the answer to "is this thing Rancher-managed".
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_rancher_mode(RancWorld::Users);
+            }
+            "projects" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_rancher_mode(RancWorld::Projects);
+            }
+            "tokens" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_rancher_mode(RancWorld::Tokens);
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -4125,6 +4190,10 @@ impl App {
             }
             Mode::K8ssandra | Mode::K8ssandraFull => {
                 self.stop_k8c_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Rancher | Mode::RancherFull => {
+                self.stop_rancher_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -8229,6 +8298,186 @@ impl App {
         self.refresh_k8c_snapshot();
     }
 
+    // --- Rancher view ---------------------------------------------------------------------------
+
+    // Open the Rancher view on the given world. The four worlds share one fetch and one snapshot;
+    // `g` moves between them without refetching.
+    fn enter_rancher_mode(&mut self, world: RancWorld) {
+        self.mode = Mode::Rancher;
+        self.ranch_world = world;
+        self.ranch_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_rancher();
+        self.start_rancher_auto_refresh();
+        self.refresh_rancher_snapshot();
+    }
+
+    fn exit_rancher_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_rancher_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_rancher_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.ranch_detail_scroll = 0;
+        self.mode = Mode::RancherFull;
+    }
+
+    fn exit_rancher_full(&mut self) {
+        self.mode = Mode::Rancher;
+    }
+
+    fn refresh_rancher(&self) {
+        {
+            let mut s = self.ranch_state.lock().expect("rancher poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.ranch_state.clone();
+        tokio::spawn(async move { fetch_rancher(client, state).await; });
+    }
+
+    // 60s. Directories do not move on the scale the other views watch — an account is created once
+    // and a project once — and on a downstream cluster one pass reads every RoleBinding of the
+    // cluster, which is thousands of objects.
+    fn start_rancher_auto_refresh(&mut self) {
+        self.stop_rancher_auto_refresh();
+        let client = self.client.clone();
+        let state = self.ranch_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_rancher(client.clone(), state.clone()).await;
+            }
+        });
+        self.ranch_refresh_handle = Some(handle);
+    }
+
+    fn stop_rancher_auto_refresh(&mut self) {
+        if let Some(h) = self.ranch_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `ranch_rows` and `App::snapshot` in lockstep, so a selected index means the same row
+    // in both. That alignment is what gives this view `y`, `Ctrl-D`, the search and the AI panel
+    // without any code of its own.
+    fn refresh_rancher_snapshot(&mut self) {
+        let s = self.ranch_state.lock().expect("rancher poisoned").clone();
+        let problems_only = self.ranch_filter == StoFilter::Problems;
+        let worse = |hints: &[crate::storage::Hint]| {
+            hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+        };
+        let mut rows: Vec<RancRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        match self.ranch_world {
+            RancWorld::Users => {
+                for u in s.users.iter().filter(|u| !problems_only || worse(&u.hints)) {
+                    recs.push(ranch_user_record(u));
+                    rows.push(RancRow::User(Box::new(u.clone())));
+                }
+            }
+            RancWorld::Access => {
+                for b in s.bindings.iter().filter(|b| !problems_only || worse(&b.hints)) {
+                    recs.push(ranch_binding_record(b));
+                    rows.push(RancRow::Binding(Box::new(b.clone())));
+                }
+            }
+            RancWorld::Projects => {
+                for p in s.projects.iter().filter(|p| !problems_only || worse(&p.hints)) {
+                    recs.push(ranch_project_record(p));
+                    rows.push(RancRow::Project(Box::new(p.clone())));
+                }
+            }
+            RancWorld::Tokens => {
+                for t in s.tokens.iter().filter(|t| !problems_only || worse(&t.hints)) {
+                    recs.push(ranch_token_record(t));
+                    rows.push(RancRow::Token(Box::new(t.clone())));
+                }
+            }
+        }
+
+        self.ranch_rows = rows;
+        // The row the cursor was on, so a refresh under the ticker does not move the selection out
+        // from under the reader.
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            // A flat list has no ancestors to keep: every row stands alone.
+            retain_aligned(&mut self.ranch_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_ranch_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.ranch_detail_scroll = 0;
+    }
+
+    fn ranch_selected(&self) -> Option<&RancRow> {
+        self.ranch_rows.get(self.table_state.selected()?)
+    }
+
+    fn cycle_ranch_world(&mut self) {
+        self.ranch_world = match self.ranch_world {
+            RancWorld::Users => RancWorld::Access,
+            RancWorld::Access => RancWorld::Projects,
+            RancWorld::Projects => RancWorld::Tokens,
+            RancWorld::Tokens => RancWorld::Users,
+        };
+        self.ranch_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_rancher_snapshot();
+    }
+
+    fn cycle_ranch_filter(&mut self) {
+        self.ranch_filter = match self.ranch_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_rancher_snapshot();
+    }
+
     // --- Reflector view -------------------------------------------------------------------------
 
     fn enter_reflector_mode(&mut self) {
@@ -10363,6 +10612,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // The k8ssandra operations report through the same channel as the Flux reconciles.
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::Rancher | Mode::RancherFull) {
+            app.refresh_rancher_snapshot();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -10666,13 +10918,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
             app.enter_search();
         }
 
@@ -10695,7 +10947,7 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
             app.open_yaml_view();
         }
 
@@ -11221,6 +11473,17 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('S'), _, Mode::K8ssandra) => app.k8c_toggle_snapshots(),
         (KeyCode::Char('i'), _, Mode::K8ssandra) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandra) => {}
+        (KeyCode::Up, _, Mode::Rancher) => app.move_ranch_selection(-1),
+        (KeyCode::Down, _, Mode::Rancher) => app.move_ranch_selection(1),
+        (KeyCode::PageUp, _, Mode::Rancher) => app.move_ranch_selection(-10),
+        (KeyCode::PageDown, _, Mode::Rancher) => app.move_ranch_selection(10),
+        (KeyCode::Char('g'), _, Mode::Rancher) => app.cycle_ranch_world(),
+        (KeyCode::Char('f'), _, Mode::Rancher) => app.cycle_ranch_filter(),
+        (KeyCode::Enter, _, Mode::Rancher) => app.enter_rancher_full(),
+        (KeyCode::F(5), _, Mode::Rancher) => app.refresh_rancher(),
+        (KeyCode::Esc, _, Mode::Rancher) => app.exit_rancher_mode(),
+        (KeyCode::Char('i'), _, Mode::Rancher) => app.enter_ai_panel(),
+        (_, _, Mode::Rancher) => {}
 
         (KeyCode::Up, m, Mode::VeleroFull) if !m.contains(KeyModifiers::SHIFT) => {
             app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
@@ -11264,6 +11527,24 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('S'), _, Mode::K8ssandraFull) => app.k8c_toggle_snapshots(),
         (KeyCode::Char('i'), _, Mode::K8ssandraFull) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandraFull) => {}
+        (KeyCode::Up, m, Mode::RancherFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.ranch_detail_scroll = app.ranch_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::RancherFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.ranch_detail_scroll = app.ranch_detail_scroll.saturating_add(1)
+        }
+        (KeyCode::PageUp, _, Mode::RancherFull) => {
+            app.ranch_detail_scroll = app.ranch_detail_scroll.saturating_sub(10)
+        }
+        (KeyCode::PageDown, _, Mode::RancherFull) => {
+            app.ranch_detail_scroll = app.ranch_detail_scroll.saturating_add(10)
+        }
+        (KeyCode::Enter, _, Mode::RancherFull) => app.exit_rancher_full(),
+        (KeyCode::Esc, _, Mode::RancherFull) => app.exit_rancher_full(),
+        (KeyCode::Char('g'), _, Mode::RancherFull) => app.ranch_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::RancherFull) => app.ranch_detail_scroll = usize::MAX,
+        (KeyCode::Char('i'), _, Mode::RancherFull) => app.enter_ai_panel(),
+        (_, _, Mode::RancherFull) => {}
 
         (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
         (KeyCode::Down, _, Mode::Reflector) => app.move_refl_selection(1),
@@ -11442,11 +11723,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -11462,8 +11743,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -11490,6 +11771,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
         Mode::Velero | Mode::VeleroFull => st.mode_velero,
         Mode::K8ssandra | Mode::K8ssandraFull => st.mode_k8ssandra,
+        Mode::Rancher | Mode::RancherFull => st.mode_rancher,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Namespaces => st.mode_ns,
         Mode::Services | Mode::ServicesFull => st.mode_services,
@@ -11563,6 +11845,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_velero_table(f, app, ta);
         } else if draw_mode == Mode::K8ssandra {
             draw_k8ssandra_table(f, app, ta);
+        } else if draw_mode == Mode::Rancher {
+            draw_rancher_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Namespaces {
@@ -11576,7 +11860,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -12062,6 +12346,32 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
         }
+        Mode::Rancher => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.ranch_world {
+                RancWorld::Users => st.k_ranch_access,
+                RancWorld::Access => st.k_ranch_projects,
+                RancWorld::Projects => st.k_ranch_tokens,
+                RancWorld::Tokens => st.k_ranch_users,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_k8c_filter, app.ranch_filter.label())),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::RancherFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+        ],
         Mode::K8ssandraFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
@@ -12093,6 +12403,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     if !matches!(draw_mode, Mode::Vuln | Mode::VulnFull) {
         global_spans.push(Span::styled(" y ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_yaml)));
+    }
+    // The Rancher view is read-only: an account, a binding or a token is changed in Rancher, and
+    // the bar does not offer keys this view deliberately does not answer.
+    if !matches!(
+        draw_mode,
+        Mode::Vuln | Mode::VulnFull | Mode::Rancher | Mode::RancherFull
+    ) {
         global_spans.push(Span::styled(" e ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_edit)));
         global_spans.push(Span::styled(" h ", kbg));
@@ -15768,6 +16085,807 @@ fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// --- Rancher view rendering -----------------------------------------------------------------------
+
+// A Rancher row's severity comes from its hints, never from the object's own state: a disabled
+// account is a warning, an account with no access at all is not.
+fn ranch_severity(hints: &[crate::storage::Hint]) -> Severity {
+    match hints.iter().map(|h| h.level).max() {
+        Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
+        _ => Severity::Normal,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranch_record(
+    uid: &str,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[crate::storage::Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: ranch_severity(hints),
+        reason: reason.to_string(),
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// The message is what the AI panel and the search read, so it carries both identities of the
+// account rather than the one the column happens to show.
+fn ranch_user_record(u: &RancherUser) -> EventRecord {
+    let st = lang::active();
+    let mut parts: Vec<String> = Vec::new();
+    if !u.identity.is_empty() {
+        parts.push(u.identity.clone());
+    }
+    if !u.username.is_empty() && u.username != u.identity {
+        parts.push(u.username.clone());
+    }
+    parts.push(format!("{}={}", st.ranch_lbl_provider, u.provider));
+    if !u.global_roles.is_empty() {
+        parts.push(format!("{}={}", st.ranch_lbl_global_roles, u.global_roles.join(",")));
+    }
+    if !u.groups.is_empty() {
+        parts.push(format!("{}={}", st.ranch_lbl_groups, u.groups.join(",")));
+    }
+    ranch_record(
+        &u.uid,
+        crate::rancher::API_MGMT,
+        "User",
+        "",
+        &u.id,
+        if u.is_admin { "Admin" } else { "User" },
+        parts.join(" · "),
+        &u.hints,
+    )
+}
+
+fn ranch_binding_record(b: &RancherBinding) -> EventRecord {
+    let st = lang::active();
+    let message = format!(
+        "{} {} → {} ({})",
+        b.subject_label,
+        st.ranch_lbl_role,
+        b.role_label,
+        b.scope_label,
+    );
+    ranch_record(
+        &b.uid,
+        &b.api_version,
+        &b.kind,
+        &b.namespace,
+        &b.name,
+        b.scope.map(|s| s.label()).unwrap_or("access"),
+        message,
+        &b.hints,
+    )
+}
+
+fn ranch_project_record(p: &RancherProject) -> EventRecord {
+    let st = lang::active();
+    let message = format!(
+        "{} · {} {} · {} {}",
+        p.display_name,
+        p.namespaces.len(),
+        st.ranch_lbl_namespaces,
+        p.members,
+        st.ranch_lbl_members,
+    );
+    ranch_record(
+        &p.uid,
+        crate::rancher::API_MGMT,
+        "Project",
+        &p.namespace,
+        &p.name,
+        "Project",
+        message,
+        &p.hints,
+    )
+}
+
+fn ranch_token_record(t: &RancherToken) -> EventRecord {
+    let st = lang::active();
+    let owner = if t.user_label.is_empty() { t.user_id.clone() } else { t.user_label.clone() };
+    let message = format!(
+        "{} · {} {} · {} {}",
+        owner,
+        st.ranch_lbl_provider,
+        t.provider,
+        st.ranch_lbl_ttl,
+        format_ttl(t.ttl_ms, st),
+    );
+    ranch_record(
+        &t.uid,
+        crate::rancher::API_MGMT,
+        "Token",
+        "",
+        &t.name,
+        if t.kind.is_empty() { "Token" } else { &t.kind },
+        message,
+        &t.hints,
+    )
+}
+
+// How the installation is named in every title: what this cluster is, so that an empty user list
+// reads as "the accounts are elsewhere" rather than as "there are none".
+fn ranch_role_label(app: &App, server: &crate::rancher::RancherServer) -> String {
+    let st = lang::t(app.ai_language);
+    match server.role {
+        ClusterRole::Local => lang::fill(st.ranch_role_local, &[("version", &server.version)]),
+        ClusterRole::Downstream => {
+            let target = if server.url.is_empty() { server.cluster_id.clone() } else { server.url.clone() };
+            lang::fill(st.ranch_role_downstream, &[("url", &target)])
+        }
+        ClusterRole::Absent => st.ranch_absent.to_string(),
+    }
+}
+
+fn ranch_provider_style(provider: &str) -> Style {
+    match provider {
+        // A local account is the one credential no directory offboarding revokes: it reads
+        // differently from a directory-backed one at a glance.
+        "local" | "" => Style::default().fg(Color::Yellow),
+        "system" => Style::default().fg(DIM),
+        _ => Style::default().fg(Color::Cyan),
+    }
+}
+
+fn ranch_state_cell(u: &RancherUser) -> Cell<'static> {
+    let st = lang::active();
+    match u.enabled {
+        Some(false) => Cell::from(st.ranch_state_disabled)
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        // Absent means active — see the module header. Shown dim so the column reads as background
+        // information rather than as a verdict.
+        _ => Cell::from(st.ranch_state_active).style(Style::default().fg(DIM)),
+    }
+}
+
+fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, server, totals) = {
+        let s = app.ranch_state.lock().expect("rancher poisoned");
+        let totals = RanchTotals {
+            users: s.users.len(),
+            external: s.external_users(),
+            admins: s.admins(),
+            bindings: s.bindings.len(),
+            binding_users: s
+                .bindings
+                .iter()
+                .filter(|b| b.subject_kind == Some(PrincipalKind::User))
+                .count(),
+            binding_groups: s
+                .bindings
+                .iter()
+                .filter(|b| b.subject_kind == Some(PrincipalKind::Group))
+                .count(),
+            projects: s.projects.len(),
+            project_namespaces: s.projects.iter().map(|p| p.namespaces.len()).sum(),
+            orphan_namespaces: s.orphan_namespaces,
+            tokens: s.tokens.len(),
+            expired_tokens: s.tokens.iter().filter(|t| t.expired).count(),
+        };
+        (s.loading, s.error.clone(), s.server.clone(), totals)
+    };
+
+    let st = lang::t(app.ai_language);
+    let role = ranch_role_label(app, &server);
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "rancher"), ("e", e)])
+    } else if loading && app.ranch_rows.is_empty() {
+        lang::fill(st.ui_title_loading, &[("view", "rancher")])
+    } else {
+        match app.ranch_world {
+            RancWorld::Users => lang::fill(
+                st.ranch_title_users,
+                &[
+                    ("total", &totals.users.to_string()),
+                    ("ext", &totals.external.to_string()),
+                    ("admins", &totals.admins.to_string()),
+                    ("role", &role),
+                ],
+            ),
+            RancWorld::Access => lang::fill(
+                st.ranch_title_access,
+                &[
+                    ("total", &totals.bindings.to_string()),
+                    ("users", &totals.binding_users.to_string()),
+                    ("groups", &totals.binding_groups.to_string()),
+                    ("role", &role),
+                ],
+            ),
+            RancWorld::Projects => lang::fill(
+                st.ranch_title_projects,
+                &[
+                    ("total", &totals.projects.to_string()),
+                    ("ns", &totals.project_namespaces.to_string()),
+                    ("orphan", &totals.orphan_namespaces.to_string()),
+                    ("role", &role),
+                ],
+            ),
+            RancWorld::Tokens => lang::fill(
+                st.ranch_title_tokens,
+                &[
+                    ("total", &totals.tokens.to_string()),
+                    ("expired", &totals.expired_tokens.to_string()),
+                    ("role", &role),
+                ],
+            ),
+        }
+    };
+
+    let header_style =
+        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    let src = &app.ranch_rows;
+
+    // Each world is its own table: the four have nothing in common beyond the frame around them.
+    let (header, rows, widths): (Row, Vec<Row>, Vec<Constraint>) = match app.ranch_world {
+        RancWorld::Users => {
+            let header = Row::new(vec![
+                Cell::from("RANCHER ID"), Cell::from("IDENTITY"), Cell::from("LOGIN"),
+                Cell::from("PROVIDER"), Cell::from("GLOBAL ROLE"), Cell::from("GRP"),
+                Cell::from("ACC"), Cell::from("TOK"), Cell::from("REFRESH"), Cell::from("STATE"),
+                Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    RancRow::User(u) => {
+                        let identity_style = if u.identity_opaque {
+                            Style::default().fg(DIM)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        };
+                        // An account this cluster cannot resolve gets a dash, not its own id
+                        // repeated: the detail panel is where the reason belongs.
+                        let identity = if u.identity.is_empty() {
+                            "—".to_string()
+                        } else {
+                            u.identity.clone()
+                        };
+                        let role_style = if u.is_admin {
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        Row::new(vec![
+                            Cell::from(u.id.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(identity).style(identity_style),
+                            Cell::from(u.username.clone()),
+                            Cell::from(u.provider.clone()).style(ranch_provider_style(&u.provider)),
+                            Cell::from(u.global_roles.join(",")).style(role_style),
+                            Cell::from(count_cell(u.groups.len())),
+                            Cell::from(count_cell(u.binding_count)),
+                            Cell::from(count_cell(u.token_count)),
+                            Cell::from(format_refresh(&u.last_refresh))
+                                .style(Style::default().fg(DIM)),
+                            ranch_state_cell(u),
+                            Cell::from(u.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let id_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::User(u) => u.id.as_str(),
+                    _ => "",
+                }),
+                "RANCHER ID",
+                10,
+                18,
+            );
+            let login_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::User(u) => u.username.as_str(),
+                    _ => "",
+                }),
+                "LOGIN",
+                8,
+                26,
+            );
+            // The identity column is sized to its content rather than being the one that absorbs the
+            // leftover width: a directory of short logins would otherwise push everything else to
+            // the right edge. The global role takes the slack — it is the one field with no bound.
+            let identity_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::User(u) => u.identity.as_str(),
+                    _ => "",
+                }),
+                "IDENTITY",
+                20,
+                44,
+            );
+            let widths = vec![
+                Constraint::Length(id_w), Constraint::Length(identity_w),
+                Constraint::Length(login_w), Constraint::Length(12), Constraint::Min(16),
+                Constraint::Length(3), Constraint::Length(3), Constraint::Length(3),
+                Constraint::Length(7), Constraint::Length(9), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        RancWorld::Access => {
+            let header = Row::new(vec![
+                Cell::from("SCOPE"), Cell::from("TARGET"), Cell::from("SUBJECT"),
+                Cell::from("TYPE"), Cell::from("PROVIDER"), Cell::from("ROLE"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    RancRow::Binding(b) => {
+                        let scope_style = match b.scope {
+                            Some(BindScope::Global) => {
+                                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                            }
+                            Some(BindScope::Cluster) => Style::default().fg(Color::Cyan),
+                            _ => Style::default().fg(DIM),
+                        };
+                        let subject_style = match b.subject_kind {
+                            Some(PrincipalKind::Group) => Style::default().fg(Color::Blue),
+                            _ => Style::default(),
+                        };
+                        let role_style = if b.owner_role {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        let kind = match b.subject_kind {
+                            Some(PrincipalKind::Group) => "group",
+                            Some(PrincipalKind::User) => "user",
+                            None => "—",
+                        };
+                        // The binding every account gets by default reads as background: it is in
+                        // the list because it exists, not because anyone decided it.
+                        let (scope_style, subject_style) = if b.automatic {
+                            (Style::default().fg(DIM), Style::default().fg(DIM))
+                        } else {
+                            (scope_style, subject_style)
+                        };
+                        Row::new(vec![
+                            Cell::from(b.scope.map(|s| s.label()).unwrap_or("—"))
+                                .style(scope_style),
+                            Cell::from(b.scope_label.clone()),
+                            Cell::from(b.subject_label.clone()).style(subject_style),
+                            Cell::from(kind).style(Style::default().fg(DIM)),
+                            Cell::from(b.provider.clone()).style(ranch_provider_style(&b.provider)),
+                            Cell::from(b.role_label.clone()).style(role_style),
+                            Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            // The role is what varies without bound (custom RoleTemplates carry long display
+            // names), so it takes the slack rather than the subject.
+            let subject_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::Binding(b) => b.subject_label.as_str(),
+                    _ => "",
+                }),
+                "SUBJECT",
+                20,
+                46,
+            );
+            let target_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::Binding(b) => b.scope_label.as_str(),
+                    _ => "",
+                }),
+                "TARGET",
+                8,
+                28,
+            );
+            let widths = vec![
+                Constraint::Length(8), Constraint::Length(target_w),
+                Constraint::Length(subject_w), Constraint::Length(6), Constraint::Length(14),
+                Constraint::Min(20), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        RancWorld::Projects => {
+            let header = Row::new(vec![
+                Cell::from("PROJECT"), Cell::from("ID"), Cell::from("CLUSTER"), Cell::from("NS"),
+                Cell::from("MEMBERS"), Cell::from("OWNERS"), Cell::from("QUOTA"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    RancRow::Project(p) => Row::new(vec![
+                        Cell::from(p.display_name.clone())
+                            .style(Style::default().add_modifier(Modifier::BOLD)),
+                        Cell::from(p.id.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(p.cluster.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(count_cell(p.namespaces.len())),
+                        Cell::from(count_cell(p.members)),
+                        Cell::from(p.owners.join(", ")),
+                        Cell::from(p.quota.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
+                    ]),
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let name_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::Project(p) => p.display_name.as_str(),
+                    _ => "",
+                }),
+                "PROJECT",
+                12,
+                32,
+            );
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(9), Constraint::Length(10),
+                Constraint::Length(4), Constraint::Length(7), Constraint::Min(20),
+                Constraint::Length(26), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        RancWorld::Tokens => {
+            let header = Row::new(vec![
+                Cell::from("TOKEN"), Cell::from("USER"), Cell::from("PROVIDER"), Cell::from("KIND"),
+                Cell::from("TTL"), Cell::from("STATE"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    RancRow::Token(t) => {
+                        let owner = if t.user_label.is_empty() {
+                            t.user_id.clone()
+                        } else {
+                            t.user_label.clone()
+                        };
+                        let state = if t.expired {
+                            Cell::from(st.ranch_state_disabled)
+                                .style(Style::default().fg(Color::Yellow))
+                        } else {
+                            Cell::from(st.ranch_state_active).style(Style::default().fg(DIM))
+                        };
+                        let ttl_style = if t.ttl_ms == 0 {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        Row::new(vec![
+                            Cell::from(t.name.clone()),
+                            Cell::from(owner).style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(t.provider.clone()).style(ranch_provider_style(&t.provider)),
+                            Cell::from(t.kind.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(format_ttl(t.ttl_ms, st)).style(ttl_style),
+                            state,
+                            Cell::from(t.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let token_w = col_width(
+                src.iter().map(|r| match r {
+                    RancRow::Token(t) => t.name.as_str(),
+                    _ => "",
+                }),
+                "TOKEN",
+                20,
+                40,
+            );
+            let widths = vec![
+                Constraint::Length(token_w), Constraint::Min(24), Constraint::Length(14),
+                Constraint::Length(12), Constraint::Length(8), Constraint::Length(9),
+                Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// The counters the four titles are built from, read under one lock.
+struct RanchTotals {
+    users: usize,
+    external: usize,
+    admins: usize,
+    bindings: usize,
+    binding_users: usize,
+    binding_groups: usize,
+    projects: usize,
+    project_namespaces: usize,
+    orphan_namespaces: usize,
+    tokens: usize,
+    expired_tokens: usize,
+}
+
+// A zero reads as nothing rather than as "0": in a column of counts what matters is the rows that
+// have some.
+fn count_cell(n: usize) -> Span<'static> {
+    if n == 0 {
+        Span::styled("·", Style::default().fg(DIM))
+    } else {
+        Span::raw(n.to_string())
+    }
+}
+
+fn draw_rancher_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let Some(row) = app.ranch_selected().cloned() else {
+        // With nothing selected the panel answers the question the view exists for: what is this
+        // cluster to Rancher, and which providers can log into it.
+        let server = app.ranch_state.lock().expect("rancher poisoned").server.clone();
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("{:<13}", st.ranch_lbl_server), Style::default().fg(DIM)),
+            Span::raw(ranch_role_label(app, &server)),
+        ])];
+        if !server.url.is_empty() {
+            lines.push(ranch_label_line("url", server.url.clone()));
+        }
+        if !server.cluster_id.is_empty() {
+            lines.push(ranch_label_line(st.lbl_cluster, {
+                if server.cluster_name.is_empty() || server.cluster_name == server.cluster_id {
+                    server.cluster_id.clone()
+                } else {
+                    format!("{} ({})", server.cluster_name, server.cluster_id)
+                }
+            }));
+        }
+        if !server.providers.is_empty() {
+            let providers: Vec<String> = server
+                .providers
+                .iter()
+                .map(|p| {
+                    if p.access_mode.is_empty() {
+                        p.name.clone()
+                    } else {
+                        format!("{} ({})", p.name, p.access_mode)
+                    }
+                })
+                .collect();
+            lines.push(ranch_label_line(st.ranch_lbl_auth, providers.join(", ")));
+        }
+        if !server.hints.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(hint_lines(&server.hints, area.width.saturating_sub(2) as usize));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            st.ranch_empty_select,
+            Style::default().fg(DIM),
+        )));
+        let p = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" rancher "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, mut lines) = ranch_detail_lines(&row, st, area.width.saturating_sub(2) as usize);
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.ranch_detail_scroll > max_scroll {
+        app.ranch_detail_scroll = max_scroll;
+    }
+    app.ranch_detail_scroll = text_search_top(
+        app,
+        Mode::RancherFull,
+        &mut lines,
+        visible,
+        app.ranch_detail_scroll,
+        max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.ranch_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// 13 columns, because `global roles` is 12 and a label flush against its value reads as one word.
+fn ranch_label_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<13}"), Style::default().fg(DIM)),
+        Span::raw(value),
+    ])
+}
+
+fn ranch_detail_lines(
+    row: &RancRow,
+    st: &'static lang::Strings,
+    width: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let banner = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let label = ranch_label_line;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let title = match row {
+        RancRow::User(u) => {
+            let shown = if u.identity.is_empty() { u.id.clone() } else { u.identity.clone() };
+            // The two identities, side by side, are the whole point of the view.
+            lines.push(label(st.ranch_lbl_rancher_id, u.id.clone()));
+            lines.push(label(
+                st.ranch_lbl_identity,
+                if u.identity.is_empty() {
+                    st.ranch_identity_unresolved.to_string()
+                } else {
+                    u.identity.clone()
+                },
+            ));
+            // The name Rancher shows in its own UI, when it is neither the identity nor the login.
+            if !u.display_name.is_empty() && u.display_name != u.identity {
+                lines.push(label(st.ranch_lbl_display, u.display_name.clone()));
+            }
+            if !u.username.is_empty() {
+                lines.push(label(st.ranch_lbl_login, u.username.clone()));
+            }
+            lines.push(label(st.ranch_lbl_provider, u.provider.clone()));
+            if !u.principal.is_empty() {
+                lines.push(label(st.ranch_lbl_principal, u.principal.clone()));
+            }
+            lines.push(label(
+                st.lbl_state,
+                match u.enabled {
+                    Some(false) => st.ranch_state_disabled.to_string(),
+                    _ => st.ranch_state_active.to_string(),
+                },
+            ));
+            if !u.global_roles.is_empty() {
+                lines.push(label(st.ranch_lbl_global_roles, u.global_roles.join(", ")));
+            }
+            lines.push(label(st.ranch_lbl_access, u.binding_count.to_string()));
+            lines.push(label(st.ranch_lbl_tokens, u.token_count.to_string()));
+            if !u.last_refresh.is_empty() {
+                lines.push(label(st.ranch_lbl_refresh, format_refresh(&u.last_refresh)));
+            }
+            lines.push(label(st.lbl_age, u.age.clone()));
+            if !u.groups.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("{} ({})", st.ranch_lbl_groups, u.groups.len()),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+                for g in &u.groups {
+                    lines.push(Line::from(Span::raw(format!("  {g}"))));
+                }
+            }
+            if !u.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(hint_lines(&u.hints, width));
+            }
+            banner(format!(" {} ", shown))
+        }
+        RancRow::Binding(b) => {
+            lines.push(label(st.lbl_scope, format!(
+                "{} · {}",
+                b.scope.map(|s| s.label()).unwrap_or("—"),
+                b.scope_label,
+            )));
+            lines.push(label(st.ranch_lbl_subject, b.subject_label.clone()));
+            if b.subject_id != b.subject_label {
+                lines.push(label(st.ranch_lbl_principal, b.subject_id.clone()));
+            }
+            lines.push(label(st.ranch_lbl_provider, b.provider.clone()));
+            lines.push(label(
+                st.ranch_lbl_role,
+                if b.role == b.role_label {
+                    b.role.clone()
+                } else {
+                    format!("{} ({})", b.role_label, b.role)
+                },
+            ));
+            lines.push(label(
+                st.ranch_lbl_binding,
+                if b.namespace.is_empty() {
+                    format!("{} {}", b.kind, b.name)
+                } else {
+                    format!("{} {}/{}", b.kind, b.namespace, b.name)
+                },
+            ));
+            lines.push(label(st.lbl_age, b.age.clone()));
+            // A projected row says what it was rebuilt from, so nothing here reads as a Rancher
+            // object it is not.
+            let mut hints = b.hints.clone();
+            if !b.authoritative {
+                hints.push(crate::storage::Hint {
+                    level: StoHintLevel::Info,
+                    text: st.ranch_binding_projected.to_string(),
+                });
+            }
+            if !hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(hint_lines(&hints, width));
+            }
+            banner(format!(" {} → {} ", b.subject_label, b.role_label))
+        }
+        RancRow::Project(p) => {
+            lines.push(label(st.ranch_lbl_project, p.id.clone()));
+            lines.push(label(st.lbl_cluster, p.cluster.clone()));
+            lines.push(label(st.ranch_lbl_members, p.members.to_string()));
+            if !p.owners.is_empty() {
+                lines.push(label(st.ranch_lbl_owners, p.owners.join(", ")));
+            }
+            if !p.quota.is_empty() {
+                lines.push(label(st.ranch_lbl_quota, p.quota.clone()));
+            }
+            if !p.creator.is_empty() {
+                lines.push(label(st.ranch_lbl_creator, p.creator.clone()));
+            }
+            if !p.age.is_empty() {
+                lines.push(label(st.lbl_age, p.age.clone()));
+            }
+            if !p.namespaces.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("{} ({})", st.ranch_lbl_namespaces, p.namespaces.len()),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+                for ns in &p.namespaces {
+                    lines.push(Line::from(Span::raw(format!("  {ns}"))));
+                }
+            }
+            if !p.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(hint_lines(&p.hints, width));
+            }
+            banner(format!(" {} ", p.display_name))
+        }
+        RancRow::Token(t) => {
+            lines.push(label(
+                st.ranch_lbl_user,
+                if t.user_label.is_empty() { t.user_id.clone() } else {
+                    format!("{} ({})", t.user_label, t.user_id)
+                },
+            ));
+            lines.push(label(st.ranch_lbl_provider, t.provider.clone()));
+            if !t.kind.is_empty() {
+                lines.push(label(st.ranch_lbl_kind, t.kind.clone()));
+            }
+            if !t.description.is_empty() {
+                lines.push(label(st.ranch_lbl_description, t.description.clone()));
+            }
+            lines.push(label(st.ranch_lbl_ttl, format_ttl(t.ttl_ms, st)));
+            if !t.expires_at.is_empty() {
+                lines.push(label(st.ranch_lbl_expires, t.expires_at.clone()));
+            }
+            if !t.cluster.is_empty() {
+                lines.push(label(st.lbl_cluster, t.cluster.clone()));
+            }
+            lines.push(label(st.lbl_age, t.age.clone()));
+            if !t.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(hint_lines(&t.hints, width));
+            }
+            banner(format!(" {} ", t.name))
+        }
+    };
+
+    (title, lines)
 }
 
 // --- Velero view rendering ----------------------------------------------------------------------
@@ -23225,6 +24343,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
     let is_k8c_mode = matches!(view_mode(app), Mode::K8ssandra | Mode::K8ssandraFull);
     if is_k8c_mode {
         draw_k8ssandra_detail(f, app, area);
+        return;
+    }
+    let is_rancher_mode = matches!(view_mode(app), Mode::Rancher | Mode::RancherFull);
+    if is_rancher_mode {
+        draw_rancher_detail(f, app, area);
         return;
     }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);

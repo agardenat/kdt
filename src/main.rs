@@ -28,6 +28,7 @@ mod netpol;
 mod nodeops;
 mod pdf;
 mod pods;
+mod rancher;
 mod rbac;
 mod reflector;
 mod repair;

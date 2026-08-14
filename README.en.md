@@ -81,6 +81,9 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `k8ssandra` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, ring side |
 | `medusa` | `med`, `medusabackup`, `cassbackup` | K8ssandra, Medusa backup side |
 | `reaper` | `rea`, `repair`, `repairs` | K8ssandra, operations and Reaper |
+| `rancher` | `ranch`, `cattle`, `users`, `identities` | Rancher, accounts and identities |
+| `projects` | `project`, `proj` | Rancher, projects and namespaces |
+| `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, tokens |
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
 | `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
@@ -124,6 +127,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `o` actions |
+| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · read-only (`e`, `h`, `Ctrl-D` deliberately absent) |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
@@ -236,6 +240,27 @@ shows the query and its effect (`/coredns  (3)`).
   operator's memory and it goes stale — the view says so when the two disagree. `o` opens the
   operations: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask`
   jobs (cleanup, upgradesstables, compaction, scrub, rolling restart).
+- **Rancher** (`:rancher`, `:projects`, `:tokens`) — on a Rancher-managed cluster every human is a
+  `u-4oivhvq2jk`. That id is what the RoleBindings carry, what the audit log carries, and what
+  `kubectl get rolebinding -o yaml` shows; the person behind it lives in a `User` object nobody
+  looks at and in a `UserAttribute` object nobody knows exists. This view puts **both identities
+  side by side** — Rancher id and real identity (the CN of an LDAP/AD distinguished name, the
+  FreeIPA `uid`), with the provider, the directory groups, the global roles and when those groups
+  were last refreshed. `g` moves through the other three worlds: **access** (who has what, the three
+  binding kinds collapsed into one subject → role → scope list, with the binding Rancher gives every
+  account sorted last so it does not bury the grants someone actually made), **projects** (their
+  namespaces, members, owners and quota) and **tokens** (kubeconfig, session, or an API key with no
+  expiry).
+
+  Two clusters look alike and only one holds the data: the **local** cluster, the one running the
+  Rancher server, and a **downstream** cluster, where the same CRDs exist and are empty. Zero
+  `User` objects on a downstream is not "no accounts" but "not here" — the view says so, and falls
+  back on what the agent projected: the RoleBindings labelled with the Rancher binding that created
+  them. Groups show up there in clear text (the full DN), accounts stay `u-…` ids that nothing on
+  this cluster can resolve, and every row declares it instead of passing an identifier off as a name.
+
+  The view is **read-only**: `y` shows the YAML, `e`, `h` and `Ctrl-D` are absent. Access is changed
+  in Rancher.
 - **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
   missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
   with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message
@@ -383,6 +408,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | Scored RBAC, Secrets/TLS, cert-manager chain |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVEs |
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
+| `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens (read-only) |
 | `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, and the Cassandra management API through the apiserver proxy |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |
