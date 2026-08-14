@@ -127,7 +127,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `f` ALL/PROBLEMS/ENFORCE |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `o` actions |
-| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · read-only (`e`, `h`, `Ctrl-D` deliberately absent) |
+| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `e`, `h`, `Ctrl-D` deliberately absent |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
@@ -259,8 +259,24 @@ shows the query and its effect (`/coredns  (3)`).
   them. Groups show up there in clear text (the full DN), accounts stay `u-…` ids that nothing on
   this cluster can resolve, and every row declares it instead of passing an identifier off as a name.
 
-  The view is **read-only**: `y` shows the YAML, `e`, `h` and `Ctrl-D` are absent. Access is changed
-  in Rancher.
+  The **tokens** world lists, above the tokens themselves, the settings that decide how long a
+  credential lives — `auth-token-max-ttl-minutes` (the ceiling),
+  `kubeconfig-default-token-ttl-minutes`, `auth-user-session-ttl-minutes` — with the value in force,
+  the shipped default, and which of the two applies. That is what makes a column of tokens marked
+  "never" readable: someone set the kubeconfig default to `0`, and Rancher reads `0` as "no expiry".
+
+  `o` opens the only writes this view has, each behind a confirmation and then an entry whose unit is
+  shown: **issue a token** for the selected account (a `Token` object shaped like the ones Rancher
+  creates — same labels, `isDerived`, reconstructed `userPrincipal` — with a 54-character secret from
+  `/dev/urandom`, shown **once** and never written to the state, a log or a file), **change the TTL**
+  of an existing token, **revoke** it (deleting the `Token` object is the only thing that actually
+  revokes a credential), and **set** a lifetime setting, whose cluster-wide scope is stated. All of
+  it already requires an admin kubeconfig on the local cluster: these are the same objects one would
+  `kubectl apply` by hand, and kdt adds no privilege. On a downstream the menu refuses and says why.
+  An issued token authenticates **as that account** — which the overlay says before it closes.
+
+  Everything else is read-only: `y` shows the YAML, `e`, `h` and `Ctrl-D` stay absent. A role or a
+  binding is changed in Rancher.
 - **Storage** (`:storage`, `:pv`) — `kubectl get pvc` says a PVC is `Pending`, never why. Here:
   missing StorageClass, no default class (or two), `WaitForFirstConsumer` waiting on a pod, class
   with no provisioner — and when the provisioner left a `ProvisioningFailed` event, **its** message
@@ -287,6 +303,7 @@ through guardrails.
 | `o` (Nodes) | `spec.unschedulable` patch, then evictions | Full drain report before a single eviction |
 | `r` / `z` | Reconcile, suspend, scale, restart, renew | Armed confirmation inside the menu |
 | `Ctrl-R` | Delete an admission config, strip finalizers | Type the object's exact name |
+| `o` (Rancher) | Create a `Token`, patch its `.ttl`, delete a `Token`, patch a `Setting` | Armed confirmation, then an entry whose unit is shown; refused on a downstream cluster; the issued secret is shown once and written nowhere |
 
 **No warning blocks**, but **the default answer is no**: `Enter` and `Esc` both cancel, and only the
 key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, drain) requires
@@ -408,7 +425,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | Scored RBAC, Secrets/TLS, cert-manager chain |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVEs |
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
-| `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens (read-only) |
+| `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens and TTL settings |
 | `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, and the Cassandra management API through the apiserver proxy |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |

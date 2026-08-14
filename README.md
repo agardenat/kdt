@@ -127,7 +127,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `f` ALL/PROBLEMS/ENFORCE |
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
-| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · lecture seule (`e`, `h`, `Ctrl-D` volontairement absents) |
+| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `e`, `h`, `Ctrl-D` volontairement absents |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
@@ -270,8 +270,25 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   `u-…` que rien sur ce cluster ne peut résoudre, et chaque ligne le déclare au lieu de faire passer
   un identifiant pour un nom.
 
-  La vue est en **lecture seule** : `y` montre le YAML, `e`, `h` et `Ctrl-D` sont absents. Un accès
-  se change dans Rancher.
+  Le monde **tokens** liste d'abord les settings qui décident de la durée de vie d'un credential —
+  `auth-token-max-ttl-minutes` (le plafond), `kubeconfig-default-token-ttl-minutes`,
+  `auth-user-session-ttl-minutes` — avec la valeur en force, le défaut d'origine et lequel des deux
+  s'applique. C'est ce qui rend lisible une colonne de tokens marqués « jamais » : quelqu'un a mis le
+  défaut kubeconfig à `0`, et Rancher lit `0` comme « pas d'expiration ».
+
+  `o` ouvre les seules écritures de la vue, chacune derrière une confirmation puis une saisie dont
+  l'unité est affichée : **émettre un token** pour le compte sélectionné (objet `Token` calqué sur
+  ceux que Rancher crée — mêmes labels, `isDerived`, `userPrincipal` reconstruit — secret de 54
+  caractères tiré de `/dev/urandom`, montré **une seule fois** et jamais écrit dans l'état, un log ou
+  un fichier), **changer le TTL** d'un token existant, **le révoquer** (supprimer l'objet `Token` est
+  la seule chose qui révoque vraiment), et **régler un setting** de durée de vie, dont la portée
+  cluster est annoncée. Tout cela suppose déjà un kubeconfig admin sur le cluster local : ce sont les
+  mêmes objets qu'un `kubectl apply` à la main, kdt n'ajoute aucun privilège. Sur un downstream le
+  menu refuse et dit pourquoi. Un token émis authentifie **au nom du compte** — ce que l'overlay
+  rappelle avant de refermer.
+
+  Le reste est en lecture : `y` montre le YAML, `e`, `h` et `Ctrl-D` restent absents. Un rôle ou un
+  binding se change dans Rancher.
 - **Stockage** (`:storage`, `:pv`) — `kubectl get pvc` dit qu'un PVC est `Pending`, jamais
   pourquoi. Ici : StorageClass introuvable, aucune classe par défaut (ou deux), `WaitForFirstConsumer`
   qui attend un pod, classe sans provisioner — et si le provisioner a laissé un `ProvisioningFailed`,
@@ -298,6 +315,7 @@ déclenche explicitement, et elles passent par des garde-fous.
 | `o` (Nodes) | Patch `spec.unschedulable`, puis évictions | Rapport de drain complet avant la moindre éviction |
 | `r` / `z` | Reconcile, suspend, scale, restart, renew | Confirmation armée dans le menu |
 | `Ctrl-R` | Suppression d'une config d'admission, retrait de finalizers | Saisie du nom exact de l'objet |
+| `o` (Rancher) | Création d'un `Token`, patch de son `.ttl`, suppression d'un `Token`, patch d'un `Setting` | Confirmation armée, puis saisie dont l'unité est affichée ; refusé sur un cluster downstream ; le secret émis n'est montré qu'une fois et n'est écrit nulle part |
 
 **Aucun avertissement ne bloque**, mais **la réponse par défaut est non** : `Entrée` et `Esc`
 annulent, seule la touche qui a ouvert le panneau avance vers l'écriture. Un constat ⛔ (`e`,
@@ -421,7 +439,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | RBAC scoré, Secrets/TLS, chaîne cert-manager |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVE |
 | `velero.rs` | Velero : backups, schedules (cron évalué), restaurations, locations |
-| `rancher.rs` | Rancher : comptes et identités réelles, bindings, projects, tokens (lecture seule) |
+| `rancher.rs` | Rancher : comptes et identités réelles, bindings, projects, tokens et settings de TTL |
 | `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, et l'API de management Cassandra via le proxy apiserver |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
