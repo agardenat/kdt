@@ -40,6 +40,18 @@ sudo install -m 0755 kdt /usr/local/bin/kdt
 cargo build --release   # → target/release/kdt
 ```
 
+### Mise à jour
+
+Homebrew — `brew update` rafraîchit le tap, sans quoi `upgrade` ne voit pas la nouvelle version :
+
+```bash
+brew update
+brew upgrade agardenat/kdt/kdt
+```
+
+Paquets et archives : réinstaller la nouvelle version par-dessus l'ancienne avec les mêmes
+commandes que ci-dessus. `kdt --version` donne la version en place.
+
 ## Utilisation
 
 ```bash
@@ -53,7 +65,9 @@ kdt [OPTIONS]
 | `--context <CTX>` | Contexte kubeconfig | contexte courant |
 | `--buffer-size <N>` | Taille du buffer d'évènements | `5000` |
 
-La connexion utilise le kubeconfig standard. L'application démarre sur la vue évènements.
+La connexion utilise le kubeconfig standard, `proxy-url` compris. Quand le DNS renvoie à la fois
+de l'IPv4 et de l'IPv6 pour l'API server, l'IPv4 est essayée d'abord. L'application démarre sur la
+vue évènements.
 
 ## Palette de commandes (`:`)
 

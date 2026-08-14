@@ -10,6 +10,7 @@ mod cli;
 mod clip;
 mod config;
 mod configmaps;
+mod connect;
 mod delete;
 mod diagnostic;
 mod edit;
@@ -66,7 +67,7 @@ async fn build_client(context: Option<&str>) -> Result<(Client, String)> {
         None => Config::infer().await?,
     };
     let url = config.cluster_url.to_string();
-    Ok((Client::try_from(config)?, url))
+    Ok((connect::build(config)?, url))
 }
 
 // Resolve the log file path: explicit env var, then XDG state dir, HOME, finally /tmp.
