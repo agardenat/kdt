@@ -4586,6 +4586,10 @@ impl App {
         });
     }
 
+    fn flux_suspend_label(&self, st: &'static lang::Strings) -> &'static str {
+        suspend_key_label(self.table_state.selected().and_then(|i| self.snapshot.get(i)), st)
+    }
+
     fn start_flux_auto_refresh(&mut self) {
         self.stop_flux_auto_refresh();
         let client = self.client.clone();
@@ -12270,7 +12274,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
-            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
+            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", app.flux_suspend_label(st))),
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
             Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
         ],
@@ -12283,7 +12287,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
             Span::styled(" ^R ", kbg), Span::raw(format!(" {}   ", st.k_repair)),
-            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", st.k_suspend)),
+            Span::styled(" z ", kbg), Span::raw(format!(" {}   ", app.flux_suspend_label(st))),
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_flux_logs)),
         ],
         Mode::Pods => vec![
@@ -24439,17 +24443,41 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-// Message cell for a Flux row, prefixed with a warning badge when a Kustomization prunes (deletes)
-// objects removed from git (spec.prune = true).
+// Badge prefixed to the message of a Kustomization that does not prune (spec.prune = false): what it
+// applied outlives its removal from git. Pruning is the Flux default and what a GitOps reader
+// assumes, so it is the absence that is worth marking, not the presence — and a Kustomization set to
+// keep its objects is a deliberate state, not a fault, hence a neutral badge and not a warning.
+const NO_PRUNE_BADGE: &str = "⊡ no-prune ";
+
+// Empty for the kinds that have no spec.prune at all (everything but Kustomization) as well as for
+// the pruning ones: only `false` says something the message does not already say.
+fn prune_badge(prune: Option<bool>) -> &'static str {
+    if prune == Some(false) { NO_PRUNE_BADGE } else { "" }
+}
+
+fn no_prune_badge_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
+// Message cell for a Flux row, prefixed with the no-prune badge when the Kustomization keeps objects
+// removed from git.
 fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
-    if r.prune == Some(true) {
+    let badge = prune_badge(r.prune);
+    if badge.is_empty() {
+        Cell::from(r.message.clone()).style(Style::default().fg(msg_color))
+    } else {
         Cell::from(Line::from(vec![
-            Span::styled("▲ prune ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(badge, no_prune_badge_style()),
             Span::styled(r.message.clone(), Style::default().fg(msg_color)),
         ]))
-    } else {
-        Cell::from(r.message.clone()).style(Style::default().fg(msg_color))
     }
+}
+
+// Footer label for `z`: the key toggles, so it has to name what it would do to the row under the
+// cursor — on an already suspended resource it resumes. The reading comes from the snapshot, the
+// same state the table shows; the patch itself still decides its direction from the live object.
+fn suspend_key_label(sel: Option<&EventRecord>, st: &'static lang::Strings) -> &'static str {
+    if sel.is_some_and(|r| r.reason == "Suspended") { st.k_resume } else { st.k_suspend }
 }
 
 // Word-wrap to `width` columns, hard-breaking tokens longer than the width (Flux failure messages
@@ -24492,8 +24520,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 // Multi-line message cell for the focused row, so a failure reason is fully readable inline instead
 // of being truncated at the column edge. Returns the cell and the row height it needs.
 fn flux_message_cell_wrapped(r: &FluxResource, msg_color: Color, width: usize) -> (Cell<'static>, u16) {
-    let prune_prefix = r.prune == Some(true);
-    let prefix = if prune_prefix { "▲ prune " } else { "" };
+    let prefix = prune_badge(r.prune);
     let body = format!("{}{}", prefix, r.message);
     let wrapped = wrap_words(&body, width);
     let height = wrapped.len().clamp(1, 8) as u16;
@@ -26617,6 +26644,61 @@ mod k8c_snapshot_panel_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod flux_view_tests {
+    use super::*;
+
+    fn res(kind: &str, prune: Option<bool>, suspended: bool) -> FluxResource {
+        FluxResource {
+            kind: kind.to_string(),
+            api_version: "kustomize.toolkit.fluxcd.io/v1".to_string(),
+            namespace: "flux-system".to_string(),
+            name: "apps".to_string(),
+            ready: FluxReady::Ready,
+            suspended,
+            message: "Applied revision main@sha1:abc".to_string(),
+            revision: String::new(),
+            age: String::new(),
+            source_ref: None,
+            depends_on: Vec::new(),
+            prune,
+        }
+    }
+
+    #[test]
+    fn only_a_kustomization_that_keeps_its_objects_is_badged() {
+        assert_eq!(prune_badge(Some(false)), NO_PRUNE_BADGE);
+        // Pruning is the norm: nothing to say about it, and nothing to say about the kinds that have
+        // no spec.prune in the first place.
+        assert_eq!(prune_badge(Some(true)), "");
+        assert_eq!(prune_badge(None), "");
+    }
+
+    #[test]
+    fn the_badge_is_the_only_thing_the_message_column_gains() {
+        let (_, height) = flux_message_cell_wrapped(&res("Kustomization", Some(true), false), Color::White, 60);
+        assert_eq!(height, 1, "a short message stays on one row");
+        let r = res("Kustomization", Some(false), false);
+        let (_, height) = flux_message_cell_wrapped(&r, Color::White, 60);
+        assert_eq!(height, 1, "the badge fits alongside the message at a usable width");
+        // Narrow enough that badge + message no longer share a row: the cell grows instead of
+        // spilling past the column, which is what would push the right border out.
+        let (_, height) = flux_message_cell_wrapped(&r, Color::White, 20);
+        assert!(height > 1, "a badged message too long for the column wraps");
+    }
+
+    #[test]
+    fn the_suspend_key_names_the_direction_it_would_take() {
+        let st = lang::t(AiLanguage::En);
+        let running = synthetic_flux_record(&res("HelmRelease", None, false));
+        let suspended = synthetic_flux_record(&res("HelmRelease", None, true));
+        assert_eq!(suspend_key_label(Some(&running), st), st.k_suspend);
+        assert_eq!(suspend_key_label(Some(&suspended), st), st.k_resume);
+        // No row under the cursor: the key still exists, and it suspends.
+        assert_eq!(suspend_key_label(None, st), st.k_suspend);
     }
 }
 

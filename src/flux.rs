@@ -49,7 +49,7 @@ pub struct FluxResource {
     // (namespace, name) of each spec.dependsOn entry, for nesting dependent Kustomizations.
     pub depends_on: Vec<(String, String)>,
     // spec.prune for a Kustomization (None for other kinds). When false, objects removed from git
-    // are not garbage-collected, so we surface it as a warning.
+    // are not garbage-collected, so the row is badged.
     pub prune: Option<bool>,
 }
 
@@ -810,7 +810,7 @@ pub struct InventoryState {
     pub items: Vec<InventoryItem>,
     pub error: Option<String>,
     pub loading: bool,
-    // spec.prune of the inspected Kustomization, surfaced as a warning when false.
+    // spec.prune of the inspected Kustomization, badged in the message column when false.
     pub prune: Option<bool>,
 }
 
