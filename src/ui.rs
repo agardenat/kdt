@@ -18,7 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 const DIM: Color = Color::Rgb(150, 150, 150);
 const SYS_DIM: Color = Color::Rgb(95, 95, 95);
 
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::DefaultTerminal;
 use tokio::task::JoinHandle;
@@ -1349,6 +1349,10 @@ pub struct App {
     pub related_pin_top: bool,
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
+    // Horizontal pan of the MESSAGE column on the focused table row. The row keeps the height of
+    // every other one — what does not fit is reached with ←/→, not by wrapping the row taller.
+    // The upper bound is clamped at draw time, where the column width and the text are both known.
+    pub msg_scroll: usize,
     pub ns_pick_state: SharedNsList,
     pub watcher_handle: JoinHandle<()>,
     pub buffer_capacity: usize,
@@ -1689,6 +1693,7 @@ impl App {
             related_pin_top: false,
             h_scroll: 0,
             detail_h_scroll: 0,
+            msg_scroll: 0,
             ns_pick_state: new_ns_list_state(),
             watcher_handle,
             buffer_capacity,
@@ -2004,6 +2009,17 @@ impl App {
         self.status_scroll = 0;
         self.related_scroll = 0;
         self.detail_h_scroll = 0;
+        self.msg_scroll = 0;
+    }
+
+    // ←/→ on a table view pans the MESSAGE column of the row under the cursor. A step of 5, the
+    // same as the horizontal scroll of the text panels, so the two feel like one gesture.
+    fn scroll_msg(&mut self, delta: i32) {
+        self.msg_scroll = if delta < 0 {
+            self.msg_scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.msg_scroll.saturating_add(delta as usize)
+        };
     }
 
     fn clear_status_state(&self) {
@@ -6294,6 +6310,7 @@ impl App {
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
         self.certs_detail_scroll = 0;
+        self.msg_scroll = 0;
         self.refresh_certs_snapshot();
     }
 
@@ -6713,6 +6730,7 @@ impl App {
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
         self.ky_detail_scroll = 0;
+        self.msg_scroll = 0;
         self.refresh_kyverno_snapshot();
     }
 
@@ -11391,6 +11409,11 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Down, _, Mode::Flux) => app.move_flux_selection(1),
         (KeyCode::PageUp, _, Mode::Flux) => app.move_flux_selection(-10),
         (KeyCode::PageDown, _, Mode::Flux) => app.move_flux_selection(10),
+        // ←/→ pan the MESSAGE column of the row under the cursor: the row keeps the height of its
+        // neighbours, and what the column cuts off is read by walking it.
+        (KeyCode::Left, _, Mode::Flux) => app.scroll_msg(-5),
+        (KeyCode::Right, _, Mode::Flux) => app.scroll_msg(5),
+        (KeyCode::Home, _, Mode::Flux) => app.msg_scroll = 0,
         (KeyCode::Tab, _, Mode::Flux) => app.cycle_tab(),
         (KeyCode::BackTab, _, Mode::Flux) => app.cycle_tab_back(),
         (KeyCode::Char(' '), _, Mode::Flux) if app.flux_tree => app.toggle_flux_node(),
@@ -11573,6 +11596,9 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Down, _, Mode::Certs) => app.move_cert_selection(1),
         (KeyCode::PageUp, _, Mode::Certs) => app.move_cert_selection(-10),
         (KeyCode::PageDown, _, Mode::Certs) => app.move_cert_selection(10),
+        (KeyCode::Left, _, Mode::Certs) => app.scroll_msg(-5),
+        (KeyCode::Right, _, Mode::Certs) => app.scroll_msg(5),
+        (KeyCode::Home, _, Mode::Certs) => app.msg_scroll = 0,
         (KeyCode::Char(' '), _, Mode::Certs) => app.toggle_cert_node(),
         (KeyCode::Char('t'), _, Mode::Certs) => app.toggle_certs_tree(),
         (KeyCode::Char('f'), _, Mode::Certs) => app.cycle_certs_filter(),
@@ -11600,6 +11626,9 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Down, _, Mode::Kyverno) => app.move_ky_selection(1),
         (KeyCode::PageUp, _, Mode::Kyverno) => app.move_ky_selection(-10),
         (KeyCode::PageDown, _, Mode::Kyverno) => app.move_ky_selection(10),
+        (KeyCode::Left, _, Mode::Kyverno) => app.scroll_msg(-5),
+        (KeyCode::Right, _, Mode::Kyverno) => app.scroll_msg(5),
+        (KeyCode::Home, _, Mode::Kyverno) => app.msg_scroll = 0,
         (KeyCode::Char(' '), _, Mode::Kyverno) => app.toggle_ky_node(),
         (KeyCode::Char('t'), _, Mode::Kyverno) => app.toggle_ky_orientation(),
         (KeyCode::Char('f'), _, Mode::Kyverno) => app.cycle_ky_filter(),
@@ -12265,6 +12294,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_msg_scroll)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             Span::styled(" Tab ", kbg), Span::raw(format!(" {}   ", st.k_view)),
             footer_sep(),
@@ -12380,6 +12410,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_msg_scroll)),
             Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
@@ -12404,6 +12435,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+            Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_msg_scroll)),
             Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
@@ -21920,9 +21952,21 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let name_col = (name_w as u16).clamp(28, 72);
     let selected = app.table_state.selected();
     // Six columns, so five inter-column gaps — and `highlight_symbol("> ")` takes two more cells off
-    // every row. Miss either and the wrapped message of the focused row runs into the right border.
-    // The trailing +1 keeps the longest wrapped line from sitting flush against that border.
+    // every row. Miss either and the message of the focused row runs into the right border. The
+    // trailing +1 keeps the longest line from sitting flush against that border.
     let msg_w = flux_msg_width(area.width, name_col + 10 + 28 + 8 + 6 + HIGHLIGHT_W + 1, 6);
+    // Same pan as the Flux table: the focused row keeps its height and ←/→ walk the message.
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.certs_tree_view.get(i))
+            .and_then(|row| match row {
+                CertRow::Res(n) => resources.get(n.idx),
+                CertRow::Secret { .. } => None,
+            })
+            .map(|r| msg_max_offset(r.message.chars().count(), msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
 
     // Secret leaves are joined from the Secrets view rather than fetched again.
     let secret_facts: std::collections::HashMap<(String, String), (Option<i64>, usize)> = {
@@ -21951,13 +21995,13 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     };
                     let (ready_txt, ready_color) = cert_ready_cell(r.ready);
                     let msg_color = if r.ready == CmReady::Failed { Color::Red } else { DIM };
-                    // The focused row expands its message so the full reason is readable inline.
-                    let (msg_cell, height) = if selected == Some(vi) && !r.message.is_empty() {
-                        let wrapped = wrap_words(&r.message, msg_w).join("\n");
-                        let h = wrapped.lines().count().clamp(1, 8) as u16;
-                        (Cell::from(wrapped).style(Style::default().fg(msg_color)), h)
+                    // The focused row pans its message with ←/→ and stays one line high.
+                    let msg_line =
+                        Line::from(Span::styled(r.message.clone(), Style::default().fg(msg_color)));
+                    let msg_cell = if selected == Some(vi) {
+                        Cell::from(line_window(&msg_line, msg_scroll, msg_w))
                     } else {
-                        (Cell::from(r.message.clone()).style(Style::default().fg(msg_color)), 1)
+                        Cell::from(msg_line)
                     };
                     Row::new(vec![
                         cert_label_cell(label, r),
@@ -21968,7 +22012,6 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
                         msg_cell,
                     ])
-                    .height(height)
                     .style(cert_row_style(r.ready))
                 }
                 CertRow::Secret { namespace, name, .. } => {
@@ -23176,9 +23219,22 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let name_col = (name_w as u16).clamp(30, 64);
     let selected = app.table_state.selected();
     // Five columns, so four inter-column gaps — and `highlight_symbol("> ")` takes two more cells
-    // off every row. Miss either and the wrapped detail of the focused row runs into the right
-    // border. The trailing +1 keeps the longest wrapped line off that border.
+    // off every row. Miss either and the detail of the focused row runs into the right border. The
+    // trailing +1 keeps the longest line off that border.
     let msg_w = flux_msg_width(area.width, name_col + 9 + 11 + 26 + HIGHLIGHT_W + 1, 5);
+    // Same pan as the Flux table: the focused row keeps its height and ←/→ walk the message. Only a
+    // violation leaf carries one; the group rows show counters, which always fit.
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.ky_rows.get(i))
+            .and_then(|row| match row {
+                KyRow::Violation { idx, .. } => app.ky_view_violations.get(*idx),
+                _ => None,
+            })
+            .map(|v| msg_max_offset(v.message.chars().count(), msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
 
     let rows: Vec<Row> = app
         .ky_rows
@@ -23233,7 +23289,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let Some(v) = app.ky_view_violations.get(*idx) else {
                         return Row::new(vec![Cell::from(label)]);
                     };
-                    ky_violation_row(label, v, selected == Some(vi), msg_w)
+                    ky_violation_row(label, v, selected == Some(vi), msg_w, msg_scroll)
                 }
                 KyRow::Exception { policy, exception } => {
                     let Some(e) = app
@@ -23261,9 +23317,11 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    // Pinned to the width the message was windowed at, not `Min`: a `Min` last column swallows the
+    // reserved margin and puts the text back on the right border.
     let widths = [
         Constraint::Length(name_col), Constraint::Length(9), Constraint::Length(11),
-        Constraint::Length(26), Constraint::Min(20),
+        Constraint::Length(26), Constraint::Length(msg_w as u16),
     ];
 
     let table = Table::new(rows, widths)
@@ -23327,6 +23385,18 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
     let selected = app.table_state.selected();
     // Four columns, so three gaps, plus the two cells of `highlight_symbol` and one of margin.
     let msg_w = flux_msg_width(area.width, name_col + 10 + 34 + HIGHLIGHT_W + 1, 4);
+    // Same pan as the policy orientation above.
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.ky_rows.get(i))
+            .and_then(|row| match row {
+                KyRow::Violation { idx, .. } => app.ky_view_violations.get(*idx),
+                _ => None,
+            })
+            .map(|v| msg_max_offset(v.message.chars().count(), msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
 
     let rows: Vec<Row> = app
         .ky_rows
@@ -23357,7 +23427,7 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
                         return Row::new(vec![Cell::from(label)]);
                     };
                     let color = ky_result_color(v.result);
-                    let (msg_cell, height) = ky_message_cell(v, selected == Some(vi), msg_w);
+                    let msg_cell = ky_message_cell(v, selected == Some(vi), msg_w, msg_scroll);
                     Row::new(vec![
                         Cell::from(label).style(Style::default().fg(color)),
                         Cell::from(""),
@@ -23365,16 +23435,16 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
                             .style(Style::default().fg(Color::Cyan)),
                         msg_cell,
                     ])
-                    .height(height)
                 }
                 _ => Row::new(vec![Cell::from(label)]),
             }
         })
         .collect();
 
+    // Pinned to the width the message was windowed at, for the same reason as the orientation above.
     let widths = [
         Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(34),
-        Constraint::Min(20),
+        Constraint::Length(msg_w as u16),
     ];
 
     let table = Table::new(rows, widths)
@@ -23386,9 +23456,15 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn ky_violation_row(label: String, v: &KyViolation, focused: bool, msg_w: usize) -> Row<'static> {
+fn ky_violation_row(
+    label: String,
+    v: &KyViolation,
+    focused: bool,
+    msg_w: usize,
+    msg_scroll: usize,
+) -> Row<'static> {
     let color = ky_result_color(v.result);
-    let (msg_cell, height) = ky_message_cell(v, focused, msg_w);
+    let msg_cell = ky_message_cell(v, focused, msg_w, msg_scroll);
     Row::new(vec![
         Cell::from(label).style(Style::default().fg(color)),
         Cell::from(v.result.label()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
@@ -23396,19 +23472,18 @@ fn ky_violation_row(label: String, v: &KyViolation, focused: bool, msg_w: usize)
         Cell::from(v.severity.clone()).style(Style::default().fg(DIM)),
         msg_cell,
     ])
-    .height(height)
 }
 
-// The focused row expands its message so the full reason is readable inline, which matters here:
-// a Kyverno validation message is usually one long sentence naming the exact failing path.
-fn ky_message_cell(v: &KyViolation, focused: bool, msg_w: usize) -> (Cell<'static>, u16) {
+// The focused row pans its message with ←/→, which matters here: a Kyverno validation message is
+// usually one long sentence naming the exact failing path. It stays one line high like every other
+// row, so the table does not reflow under the cursor.
+fn ky_message_cell(v: &KyViolation, focused: bool, msg_w: usize, msg_scroll: usize) -> Cell<'static> {
     let color = ky_result_color(v.result);
-    if focused && !v.message.is_empty() {
-        let wrapped = wrap_words(&v.message, msg_w).join("\n");
-        let h = wrapped.lines().count().clamp(1, 8) as u16;
-        (Cell::from(wrapped).style(Style::default().fg(color)), h)
+    let line = Line::from(Span::styled(v.message.clone(), Style::default().fg(color)));
+    if focused {
+        Cell::from(line_window(&line, msg_scroll, msg_w))
     } else {
-        (Cell::from(v.message.clone()).style(Style::default().fg(color)), 1)
+        Cell::from(line)
     }
 }
 
@@ -24207,12 +24282,38 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         )
     };
 
-    let header_row = Row::new(vec![
+    let header_row = flux_header_row();
+    let selected = app.table_state.selected();
+    let (rows, widths, msg_scroll) =
+        flux_table_parts(&resources, selected, app.msg_scroll, area.width);
+    app.msg_scroll = msg_scroll;
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn flux_header_row() -> Row<'static> {
+    Row::new(vec![
         Cell::from("KIND"), Cell::from("NAMESPACE"), Cell::from("NAME"),
         Cell::from("READY"), Cell::from("REVISION"), Cell::from("AGE"), Cell::from("MESSAGE"),
     ])
-    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+}
 
+// Rows and column widths of the flat Flux table, plus the message offset clamped to what the
+// focused row can actually show. Split out of the draw so the layout can be rendered — and its
+// right border checked — without a cluster behind it.
+fn flux_table_parts(
+    resources: &[FluxResource],
+    selected: Option<usize>,
+    msg_scroll: usize,
+    area_width: u16,
+) -> (Vec<Row<'static>>, Vec<Constraint>, usize) {
     let kind_w = col_width(resources.iter().map(|r| r.kind.as_str()), "KIND", 8, 20);
     let ns_w = col_width(resources.iter().map(|r| r.namespace.as_str()), "NAMESPACE", 9, 24);
     let name_w = col_width(resources.iter().map(|r| r.name.as_str()), "NAME", 12, 50);
@@ -24222,13 +24323,21 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // back whatever is needed to leave the message column a usable width.
     const MSG_MIN: u16 = 24;
     let others = kind_w + ns_w + 10 + 20 + 6 + HIGHLIGHT_W + 1 + 6;
-    let budget = area.width.saturating_sub(2).saturating_sub(others);
+    let budget = area_width.saturating_sub(2).saturating_sub(others);
     let name_w = name_w.min(budget.saturating_sub(MSG_MIN)).max(12);
-    let selected = app.table_state.selected();
     // Seven columns, so six inter-column gaps — plus the two cells `highlight_symbol("> ")` takes
-    // off every row, which the focused row's wrapped message would otherwise spend running into the
-    // right border. The trailing +1 keeps the longest wrapped line off that border.
-    let msg_w = flux_msg_width(area.width, kind_w + ns_w + name_w + 10 + 20 + 6 + HIGHLIGHT_W + 1, 7);
+    // off every row, which the focused row's message would otherwise spend running into the right
+    // border. The trailing +1 keeps the longest line off that border.
+    let msg_w = flux_msg_width(area_width, kind_w + ns_w + name_w + 10 + 20 + 6 + HIGHLIGHT_W + 1, 7);
+    // Clamped here rather than in the key handler: this is where both the column width and the text
+    // under the cursor are known, so ← comes straight back instead of walking off an offset that
+    // was never displayed.
+    let msg_scroll = msg_scroll.min(
+        selected
+            .and_then(|i| resources.get(i))
+            .map(|r| msg_max_offset(flux_message_len(r), msg_w))
+            .unwrap_or(0),
+    );
 
     let rows: Vec<Row> = resources.iter().enumerate().map(|(i, r)| {
         let (ready_txt, ready_color) = if r.suspended {
@@ -24251,11 +24360,12 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             (false, FluxReady::NotApplicable) => Style::default(),
         };
         let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
-        // The focused row expands its message over multiple lines so the full reason is readable.
-        let (msg_cell, height) = if selected == Some(i) && !r.message.is_empty() {
-            flux_message_cell_wrapped(r, msg_color, msg_w)
+        // The focused row pans its message with ←/→; every row stays one line high. It goes through
+        // the window even at offset 0, so the trailing `…` says there is something to pan to.
+        let msg_cell = if selected == Some(i) {
+            Cell::from(line_window(&flux_message_line(r, msg_color), msg_scroll, msg_w))
         } else {
-            (flux_message_cell(r, msg_color), 1)
+            flux_message_cell(r, msg_color)
         };
         Row::new(vec![
             Cell::from(r.kind.clone()).style(Style::default().fg(Color::Cyan)),
@@ -24266,25 +24376,18 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
             msg_cell,
         ])
-        .height(height)
         .style(row_style)
     }).collect();
 
     // Pinned rather than `Min`, for the same reason as the tree below: a `Min` last column swallows
-    // the margin that was reserved for it and the wrapped message lands on the right border.
-    let widths = [
+    // the margin that was reserved for it and the message lands on the right border.
+    let widths = vec![
         Constraint::Length(kind_w), Constraint::Length(ns_w), Constraint::Length(name_w),
         Constraint::Length(10), Constraint::Length(20), Constraint::Length(6),
         Constraint::Length(msg_w as u16),
     ];
 
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(table, area, &mut app.table_state);
+    (rows, widths, msg_scroll)
 }
 
 // Renders the Flux dependency tree (source → workload → dependent workloads) with indentation and
@@ -24353,6 +24456,19 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // Five columns, four gaps, plus `highlight_symbol("> ")` and the one-cell margin — same reason
     // as the flat table above.
     let msg_w = flux_msg_width(area.width, name_col + 10 + 18 + 6 + HIGHLIGHT_W + 1, 5);
+    // Same clamp as the flat table. An inventory leaf has no message of its own, so the pan simply
+    // has nowhere to go there.
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.flux_tree_view.get(i))
+            .and_then(|row| match row {
+                TreeRow::Res(n) => resources.get(n.idx),
+                TreeRow::Inv { .. } => None,
+            })
+            .map(|r| msg_max_offset(flux_message_len(r), msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
 
     let mut emit_idx = 0usize;
     let rows: Vec<Row> = app
@@ -24385,11 +24501,11 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         (false, FluxReady::NotApplicable) => Style::default(),
                     };
                     let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
-                    // The focused row expands its message so the full reason is readable inline.
-                    let (msg_cell, height) = if selected == Some(this_idx) && !r.message.is_empty() {
-                        flux_message_cell_wrapped(r, msg_color, msg_w)
+                    // The focused row pans its message with ←/→ and stays one line high.
+                    let msg_cell = if selected == Some(this_idx) {
+                        Cell::from(line_window(&flux_message_line(r, msg_color), msg_scroll, msg_w))
                     } else {
-                        (flux_message_cell(r, msg_color), 1)
+                        flux_message_cell(r, msg_color)
                     };
                     Row::new(vec![
                         Cell::from(label),
@@ -24398,7 +24514,6 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
                         msg_cell,
                     ])
-                    .height(height)
                     .style(row_style)
                 }
                 TreeRow::Inv { item, .. } => {
@@ -24426,9 +24541,9 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    // The message column is pinned to the width its text was wrapped at, not left as `Min`: a `Min`
-    // column expands over every cell that is left, the reserved margin included, so the wrapped
-    // text ends up flush against the right border however carefully `msg_w` was computed.
+    // The message column is pinned to the width its text was windowed at, not left as `Min`: a
+    // `Min` column expands over every cell that is left, the reserved margin included, so the text
+    // ends up flush against the right border however carefully `msg_w` was computed.
     let widths = [
         Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(18),
         Constraint::Length(6), Constraint::Length(msg_w as u16),
@@ -24459,18 +24574,26 @@ fn no_prune_badge_style() -> Style {
     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
 }
 
-// Message cell for a Flux row, prefixed with the no-prune badge when the Kustomization keeps objects
+// Message of a Flux row, prefixed with the no-prune badge when the Kustomization keeps objects
 // removed from git.
-fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
+fn flux_message_line(r: &FluxResource, msg_color: Color) -> Line<'static> {
     let badge = prune_badge(r.prune);
-    if badge.is_empty() {
-        Cell::from(r.message.clone()).style(Style::default().fg(msg_color))
-    } else {
-        Cell::from(Line::from(vec![
-            Span::styled(badge, no_prune_badge_style()),
-            Span::styled(r.message.clone(), Style::default().fg(msg_color)),
-        ]))
+    let mut spans = Vec::with_capacity(2);
+    if !badge.is_empty() {
+        spans.push(Span::styled(badge, no_prune_badge_style()));
     }
+    spans.push(Span::styled(r.message.clone(), Style::default().fg(msg_color)));
+    Line::from(spans)
+}
+
+fn flux_message_cell(r: &FluxResource, msg_color: Color) -> Cell<'static> {
+    Cell::from(flux_message_line(r, msg_color))
+}
+
+// Character length of what the MESSAGE cell of a Flux row holds, badge included — the quantity the
+// pan offset is bounded by.
+fn flux_message_len(r: &FluxResource) -> usize {
+    prune_badge(r.prune).chars().count() + r.message.chars().count()
 }
 
 // Footer label for `z`: the key toggles, so it has to name what it would do to the row under the
@@ -24517,19 +24640,57 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-// Multi-line message cell for the focused row, so a failure reason is fully readable inline instead
-// of being truncated at the column edge. Returns the cell and the row height it needs.
-fn flux_message_cell_wrapped(r: &FluxResource, msg_color: Color, width: usize) -> (Cell<'static>, u16) {
-    let prefix = prune_badge(r.prune);
-    let body = format!("{}{}", prefix, r.message);
-    let wrapped = wrap_words(&body, width);
-    let height = wrapped.len().clamp(1, 8) as u16;
-    let lines: Vec<Line<'static>> = wrapped
-        .into_iter()
-        .take(8)
-        .map(|l| Line::from(Span::styled(l, Style::default().fg(msg_color))))
+// Horizontal window over a styled line, `width` cells wide, starting `offset` characters in. The
+// focused row of a table keeps the height of every other row: a message longer than its column is
+// read by panning with ←/→ rather than by wrapping the row taller than its neighbours. A `…` marks
+// each side that still holds text and costs the one cell it takes.
+fn line_window(line: &Line<'static>, offset: usize, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| {
+            let style = s.style;
+            s.content.chars().map(move |c| (c, style))
+        })
         .collect();
-    (Cell::from(Text::from(lines)), height)
+    let start = offset.min(chars.len());
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut avail = width;
+    if start > 0 {
+        out.push(Span::styled("…", Style::default().fg(DIM)));
+        avail = avail.saturating_sub(1);
+    }
+    let more_right = chars.len() - start > avail;
+    if more_right {
+        avail = avail.saturating_sub(1);
+    }
+    let mut cur = String::new();
+    let mut cur_style: Option<Style> = None;
+    for (c, style) in chars.iter().skip(start).take(avail) {
+        if cur_style != Some(*style) {
+            if let Some(s) = cur_style {
+                out.push(Span::styled(std::mem::take(&mut cur), s));
+            }
+            cur_style = Some(*style);
+        }
+        cur.push(*c);
+    }
+    if let Some(s) = cur_style {
+        out.push(Span::styled(cur, s));
+    }
+    if more_right {
+        out.push(Span::styled("…", Style::default().fg(DIM)));
+    }
+    Line::from(out)
+}
+
+// Furthest the pan may go: one cell of the window is spent on the left `…`, so the tail is only
+// reachable if the bound accounts for it — stop short and the last character never shows.
+fn msg_max_offset(len: usize, width: usize) -> usize {
+    len.saturating_sub(width.saturating_sub(1))
 }
 
 // Width available for the flux MESSAGE column: inner width minus the fixed columns and the
@@ -26677,17 +26838,130 @@ mod flux_view_tests {
         assert_eq!(prune_badge(None), "");
     }
 
+    fn win_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
-    fn the_badge_is_the_only_thing_the_message_column_gains() {
-        let (_, height) = flux_message_cell_wrapped(&res("Kustomization", Some(true), false), Color::White, 60);
-        assert_eq!(height, 1, "a short message stays on one row");
+    fn the_focused_row_pans_its_message_instead_of_growing_taller() {
+        let mut r = res("Kustomization", None, false);
+        r.message = "abcdefghijklmnopqrstuvwxyz".to_string();
+        let line = flux_message_line(&r, Color::White);
+        let w = 10;
+
+        let head = win_text(&line_window(&line, 0, w));
+        assert_eq!(head, "abcdefghi…", "the cut side is marked and the window fills the column exactly");
+        assert_eq!(head.chars().count(), w);
+
+        // The bound has to pay for the left marker, or the last characters are never reachable.
+        let tail = win_text(&line_window(&line, msg_max_offset(flux_message_len(&r), w), w));
+        assert!(tail.starts_with('…'), "the text left behind is marked too");
+        assert!(tail.ends_with('z'), "the end of the message is reachable: {tail}");
+        assert!(tail.chars().count() <= w);
+
+        // An offset past the end of the text is a window, not a panic.
+        assert!(win_text(&line_window(&line, 999, w)).chars().count() <= w);
+        assert_eq!(win_text(&line_window(&line, 0, 0)), "");
+    }
+
+    fn render_table(resources: &[FluxResource], selected: usize, msg_scroll: usize, width: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        const H: u16 = 10;
+        let (rows, widths, _) =
+            flux_table_parts(resources, Some(selected), msg_scroll, width);
+        let mut state = TableState::default();
+        state.select(Some(selected));
+        let mut terminal = Terminal::new(TestBackend::new(width, H)).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let t = Table::new(rows, widths)
+                    .header(flux_header_row())
+                    .block(Block::default().borders(Borders::ALL).title("flux"))
+                    .row_highlight_style(Style::default().bg(Color::Blue))
+                    .highlight_symbol("> ");
+                f.render_stateful_widget(t, f.area(), &mut state);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..H)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).expect("cell").symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn long_message_set() -> Vec<FluxResource> {
+        let mut failed = res("Kustomization", Some(false), false);
+        failed.ready = FluxReady::Failed;
+        failed.message = "Kustomize build failed: accumulating resources from '../../base/app': \
+            evalsymlink failure on '/tmp/kustomization-1234/base/app' : lstat: no such file"
+            .to_string();
+        vec![res("GitRepository", None, false), failed, res("HelmRelease", None, true)]
+    }
+
+    // The bug this replaced: the focused row grew several lines tall and reflowed the table under
+    // the cursor. Every row is one line now, whatever the message and wherever the pan sits.
+    #[test]
+    fn the_focused_row_never_takes_more_than_one_line() {
+        let resources = long_message_set();
+        for scroll in [0_usize, 20, 400] {
+            let lines = render_table(&resources, 1, scroll, 140);
+            // Header on row 1, then one row per resource — the fourth is already blank.
+            assert!(lines[2].contains("GitRepository"), "{}", lines[2]);
+            assert!(lines[3].contains("Kustomization"), "row {scroll}: {}", lines[3]);
+            assert!(lines[4].contains("HelmRelease"), "row {scroll}: {}", lines[4]);
+            assert!(lines[3].starts_with("│> "), "the cursor sits on one row only: {}", lines[3]);
+        }
+    }
+
+    #[test]
+    fn panning_the_focused_row_walks_the_message_without_touching_the_right_border() {
+        let resources = long_message_set();
+        let border = ratatui::symbols::border::PLAIN;
+        for width in [60_u16, 100, 140, 190, 196] {
+            for scroll in [0_usize, 15, 60, 400] {
+                let lines = render_table(&resources, 1, scroll, width);
+                for (y, line) in lines.iter().enumerate() {
+                    let last = line.chars().last().expect("a rendered line");
+                    let expected = match y {
+                        0 => border.top_right,
+                        9 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(
+                        last.to_string(),
+                        expected,
+                        "right border eaten at width {width}, scroll {scroll}, row {y}: {line}"
+                    );
+                }
+            }
+        }
+        // What the pan is for: text that the column cut off at rest becomes readable further along.
+        let head = render_table(&resources, 1, 0, 140)[3].clone();
+        let panned = render_table(&resources, 1, 60, 140)[3].clone();
+        assert!(head.contains("Kustomize build failed"), "{head}");
+        assert!(!head.contains("evalsymlink"), "the tail is cut off at rest: {head}");
+        assert!(panned.contains("evalsymlink"), "the pan reveals it: {panned}");
+    }
+
+    #[test]
+    fn the_badge_keeps_its_style_in_the_window_and_pans_out_of_it() {
         let r = res("Kustomization", Some(false), false);
-        let (_, height) = flux_message_cell_wrapped(&r, Color::White, 60);
-        assert_eq!(height, 1, "the badge fits alongside the message at a usable width");
-        // Narrow enough that badge + message no longer share a row: the cell grows instead of
-        // spilling past the column, which is what would push the right border out.
-        let (_, height) = flux_message_cell_wrapped(&r, Color::White, 20);
-        assert!(height > 1, "a badged message too long for the column wraps");
+        let line = flux_message_line(&r, Color::White);
+
+        let head = line_window(&line, 0, 40);
+        assert_eq!(head.spans[0].content, NO_PRUNE_BADGE);
+        assert_eq!(head.spans[0].style, no_prune_badge_style());
+
+        // Panned past the badge, what is left is the message alone — the badge is text like the
+        // rest, not a pinned prefix.
+        let panned = win_text(&line_window(&line, NO_PRUNE_BADGE.chars().count(), 40));
+        assert!(panned.starts_with('…'));
+        assert!(!panned.contains("no-prune"));
+        assert!(panned.contains("Applied revision"));
     }
 
     #[test]
