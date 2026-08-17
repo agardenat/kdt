@@ -1552,6 +1552,10 @@ pub struct App {
     // state because neither is ever fetched by the ticker: a log tail is a streamed request and the
     // metrics exposition is tens of thousands of lines.
     pub k8c_panel: SharedK8cPanel,
+    // The uid of the row the panel was opened on. The panel is one row's reading, not the view's:
+    // when the cursor leaves that row the panel goes with it, or the previous node's snapshots stay
+    // on screen under the new node's detail.
+    k8c_panel_uid: Option<String>,
     k8c_world: K8cWorld,
     k8c_filter: StoFilter,
     // Rows the user folded (`Espace`), keyed by uid. Unlike the velero view this one starts folded
@@ -1827,6 +1831,7 @@ impl App {
             vel_restore_view: None,
             k8c_state: new_k8c_state(),
             k8c_panel: new_k8c_panel(),
+            k8c_panel_uid: None,
             k8c_world: K8cWorld::Cluster,
             k8c_filter: StoFilter::All,
             k8c_collapsed: std::collections::HashSet::new(),
@@ -7665,6 +7670,7 @@ impl App {
     fn exit_k8c_mode(&mut self) {
         self.mode = Mode::Selection;
         self.stop_k8c_auto_refresh();
+        self.k8c_close_panel();
         self.snapshot.clear();
         self.table_state.select(None);
         self.selected_uid = None;
@@ -7902,6 +7908,7 @@ impl App {
         }
         if self.snapshot.is_empty() {
             self.table_state.select(None);
+            self.k8c_close_panel();
             return;
         }
         let idx = prev_uid
@@ -7911,6 +7918,9 @@ impl App {
             });
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        // The world, the filter, a fold or a namespace change move the cursor onto another row
+        // without going through `move_k8c_selection`.
+        self.k8c_sync_panel();
     }
 
     // A heading over a flat list, plus the list itself when unfolded. Three of the Backups world's
@@ -8187,15 +8197,7 @@ impl App {
             return;
         };
         let key = format!("log|{namespace}/{pod}/{container}");
-        {
-            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
-            // Second press on the same row closes the panel rather than fetching it again.
-            if s.key == key {
-                *s = crate::k8ssandra::K8cPanel::default();
-                return;
-            }
-        }
-        self.k8c_detail_scroll = 0;
+        if !self.k8c_open_panel(&key) { return; }
         let client = self.client.clone();
         let state = self.k8c_panel.clone();
         tokio::spawn(async move {
@@ -8211,14 +8213,7 @@ impl App {
             let (namespace, service, secret) =
                 (r.namespace.clone(), r.service.clone(), r.ui_secret.clone());
             let key = format!("repairs|{namespace}/{service}");
-            {
-                let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
-                if s.key == key {
-                    *s = crate::k8ssandra::K8cPanel::default();
-                    return;
-                }
-            }
-            self.k8c_detail_scroll = 0;
+            if !self.k8c_open_panel(&key) { return; }
             let client = self.client.clone();
             let state = self.k8c_panel.clone();
             tokio::spawn(async move {
@@ -8233,14 +8228,7 @@ impl App {
         };
         let (namespace, pod) = (n.namespace.clone(), n.name.clone());
         let key = format!("metrics|{namespace}/{pod}");
-        {
-            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
-            if s.key == key {
-                *s = crate::k8ssandra::K8cPanel::default();
-                return;
-            }
-        }
-        self.k8c_detail_scroll = 0;
+        if !self.k8c_open_panel(&key) { return; }
         let client = self.client.clone();
         let state = self.k8c_panel.clone();
         tokio::spawn(async move {
@@ -8260,19 +8248,43 @@ impl App {
         };
         let (namespace, pod) = (n.namespace.clone(), n.name.clone());
         let key = format!("snapshots|{namespace}/{pod}");
-        {
-            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
-            if s.key == key {
-                *s = crate::k8ssandra::K8cPanel::default();
-                return;
-            }
-        }
-        self.k8c_detail_scroll = 0;
+        if !self.k8c_open_panel(&key) { return; }
         let client = self.client.clone();
         let state = self.k8c_panel.clone();
         tokio::spawn(async move {
             fetch_k8c_snapshots(client, namespace, pod, key, state).await;
         });
+    }
+
+    // Open the panel for the row under the cursor, or close it when it is already the one showing —
+    // a second press on the same row. Returns whether the caller still has a reading to fetch.
+    fn k8c_open_panel(&mut self, key: &str) -> bool {
+        {
+            let mut s = self.k8c_panel.lock().expect("k8ssandra panel poisoned");
+            if s.key == key {
+                *s = crate::k8ssandra::K8cPanel::default();
+                self.k8c_panel_uid = None;
+                return false;
+            }
+        }
+        // Bound to the row it was asked on, so leaving that row takes the panel with it.
+        self.k8c_panel_uid = self.selected_uid.clone();
+        self.k8c_detail_scroll = 0;
+        true
+    }
+
+    fn k8c_close_panel(&mut self) {
+        self.k8c_panel_uid = None;
+        *self.k8c_panel.lock().expect("k8ssandra panel poisoned") =
+            crate::k8ssandra::K8cPanel::default();
+    }
+
+    // Drop the panel once the cursor has left the row it belongs to: it answers about one node, and
+    // under another node's detail it is the wrong answer. Any in-flight fetch is dropped with it —
+    // the fetchers write nothing once the key no longer matches.
+    fn k8c_sync_panel(&mut self) {
+        if self.k8c_panel_uid.is_none() || self.k8c_panel_uid == self.selected_uid { return; }
+        self.k8c_close_panel();
     }
 
     fn move_k8c_selection(&mut self, delta: i32) {
@@ -8282,6 +8294,7 @@ impl App {
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
         self.k8c_detail_scroll = 0;
+        self.k8c_sync_panel();
     }
 
     fn k8c_selected(&self) -> Option<&K8cRow> {
