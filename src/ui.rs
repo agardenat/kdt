@@ -13096,6 +13096,16 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
 // on word boundaries, so dividing the total width by the available one under-counts as soon as the
 // text holds words that do not fit the remainder — and a panel that under-counts its own height
 // pushes its last line, which is always the prompt, off the bottom.
+// Rows a wrapped panel really paints, asked to the widget itself. Measuring the text by hand (as
+// `wrapped_rows` does for a popup) under-counts a line whose key column is padded to a fixed width:
+// those spaces are most of the row, and a row missed here is a row left below the frame — the node
+// panel is anchored on its bottom, so that row is the one the eye lands on.
+fn wrapped_panel_rows(lines: &[Line<'static>], width: usize) -> usize {
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width as u16)
+}
+
 fn wrapped_rows(line: &Line, width: usize) -> usize {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     wrap_text(&text, width).len()
@@ -15150,7 +15160,7 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = if loading {
         format!("nodes ({}, loading...)", nodes.len())
     } else if let Some(e) = &error {
-        format!("nodes (erreur: {})", e)
+        lang::fill(lang::t(app.ai_language).ui_title_error, &[("view", "nodes"), ("e", e)])
     } else {
         format!("nodes ({})", nodes.len())
     };
@@ -25102,8 +25112,20 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         }
     };
 
+    // Wrap the Status tab (and node status) so long condition messages — typically a Flux
+    // reconciliation error — are fully visible instead of being cut at the right edge. Logs and
+    // Related keep horizontal scrolling.
+    let wrap_status = is_node_mode || app.detail_tab == DetailTab::Status;
     let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
+    // The scroll of a wrapped panel counts wrapped rows, not lines: the node panel is anchored on
+    // its bottom, and counting raw lines would leave its last block (the taints) below the frame as
+    // soon as a long annotation value wraps.
+    let total: usize = if wrap_status {
+        let wrap_w = area.width.saturating_sub(2) as usize;
+        wrapped_panel_rows(&lines, wrap_w)
+    } else {
+        lines.len()
+    };
     let max_scroll = total.saturating_sub(visible);
 
     // The Related tab is held at the top while pinned (re-evaluated each frame so it stays at the top
@@ -25139,11 +25161,6 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         }
     }
 
-    // Wrap the Status tab (and node status) so long condition messages — typically a Flux
-    // reconciliation error — are fully visible instead of being cut at the right edge. Logs and
-    // Related keep horizontal scrolling. Status content is short enough that the bottom-anchored
-    // scroll math stays accurate after wrapping.
-    let wrap_status = is_node_mode || app.detail_tab == DetailTab::Status;
     let block = Block::default().borders(Borders::ALL).title(title);
     let p = if wrap_status {
         Paragraph::new(lines)
@@ -27156,5 +27173,22 @@ mod footer_tests {
         let (top, bottom) = layout(400);
         assert!(bottom.is_empty(), "second row should stay empty: {bottom}");
         assert!(top.contains("modèle:local"), "tool bar should join the single row: {top}");
+    }
+}
+
+#[cfg(test)]
+mod wrapped_panel_rows_tests {
+    use super::*;
+
+    #[test]
+    fn a_padded_key_column_counts_its_spaces() {
+        // The line the node panel is made of: a key padded to a fixed column, then its value. On its
+        // words alone it fits one row — with the padding it takes two, and the panel scrolled on the
+        // short count would keep its last block below the frame.
+        let text = format!("  {:<44} = {}", "rke2.io/node-config-hash", "U".repeat(56));
+        let lines = vec![Line::from(text.clone())];
+        assert_eq!(wrapped_rows(&Line::from(text), 98), 1, "the word-only measure misses the padding");
+        assert_eq!(wrapped_panel_rows(&lines, 98), 2);
+        assert_eq!(wrapped_panel_rows(&lines, 198), 1);
     }
 }
