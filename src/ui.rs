@@ -15936,6 +15936,15 @@ fn col_width<'a>(values: impl Iterator<Item = &'a str>, header: &str, min: u16, 
 // of the names matches what the column actually shows.
 const NODE_COL_W: u16 = 20;
 
+// Width the NODE column gets: the longest name it has to show, never below `NODE_COL_W`, and never
+// more than the cells the columns to its left and right leave free. `others` is those columns plus
+// the spacing between them; the borders and the `> ` selection symbol are taken off here.
+fn node_col_width<'a>(values: impl Iterator<Item = &'a str>, width: u16, others: u16) -> u16 {
+    let longest = values.map(|v| v.chars().count()).max().unwrap_or(0) as u16;
+    let free = width.saturating_sub(4 + others);
+    longest.clamp(NODE_COL_W, free.max(NODE_COL_W))
+}
+
 // A value shown in a fixed-width column, cut in its middle rather than at its end. Node names share
 // a long prefix and differ by their suffix (`aks-pool-12345678-vmss000003`): end-truncated, every
 // row would read the same, so the head and the tail are both kept around a `…`.
@@ -15993,7 +16002,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         )
     };
 
-    let (rows, widths) = pods_table_parts(src, app.pods_show_workloads, &app.pods_expanded);
+    let (rows, widths) = pods_table_parts(src, app.pods_show_workloads, &app.pods_expanded, area.width);
 
     let table = Table::new(rows, widths)
         .header(header_row())
@@ -16020,6 +16029,7 @@ fn pods_table_parts<'a>(
     src: &'a [PodRow],
     show_workloads: bool,
     expanded: &std::collections::HashSet<String>,
+    width: u16,
 ) -> (Vec<Row<'a>>, [Constraint; 14]) {
     // A pod row nests under the workload row it immediately follows when its owner matches; otherwise
     // it is an orphan. `parent[i]` is the index of the owning workload row (None for orphans), used
@@ -16070,6 +16080,33 @@ fn pods_table_parts<'a>(
         format!("{}{}{}", pod_indent, marker, p.name)
     };
     let ctr_label = |c: &ContainerResource| format!("{}  · {}", pod_indent, c.display_name());
+    let ns_values = src.iter().map(|r| match r {
+        PodRow::Workload(w) => w.namespace.as_str(),
+        PodRow::Pod(p) => p.namespace.as_str(),
+        PodRow::Container(c) => c.namespace.as_str(),
+    });
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            PodRow::Workload(w) => format!("▾ {} {}", w.kind, w.name),
+            PodRow::Pod(p) => pod_label(p),
+            PodRow::Container(c) => ctr_label(c),
+        })
+        .collect();
+    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 56);
+    // The NODE column is sized before the rows are built: the names are elided to the width the
+    // column will actually have, which is as wide as the rest of the table leaves room for.
+    // 87 cells of fixed columns (READY…IP, AGE) and 13 single-cell gaps between the 14 columns.
+    let node_w = node_col_width(
+        src.iter().map(|r| match r {
+            PodRow::Pod(p) => p.node.as_str(),
+            _ => "",
+        }),
+        width,
+        ns_w + name_w + 87 + 13,
+    );
+
     let rows: Vec<Row> = src
         .iter()
         .enumerate()
@@ -16122,7 +16159,7 @@ fn pods_table_parts<'a>(
                     pct_cell(p.mem_bytes, p.mem_req),
                     pct_cell(p.mem_bytes, p.mem_lim),
                     Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
-                    Cell::from(elide_middle(&p.node, NODE_COL_W as usize)).style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&p.node, node_w as usize)).style(Style::default().fg(DIM)),
                     Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
                 ])
                 .style(pod_row_style(status_color))
@@ -16155,26 +16192,11 @@ fn pods_table_parts<'a>(
         })
         .collect();
 
-    let ns_values = src.iter().map(|r| match r {
-        PodRow::Workload(w) => w.namespace.as_str(),
-        PodRow::Pod(p) => p.namespace.as_str(),
-        PodRow::Container(c) => c.namespace.as_str(),
-    });
-    let names: Vec<String> = src
-        .iter()
-        .map(|r| match r {
-            PodRow::Workload(w) => format!("▾ {} {}", w.kind, w.name),
-            PodRow::Pod(p) => pod_label(p),
-            PodRow::Container(c) => ctr_label(c),
-        })
-        .collect();
-    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
-    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 56);
     let widths = [
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(7),
         Constraint::Length(12), Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
         Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
-        Constraint::Length(15), Constraint::Length(NODE_COL_W), Constraint::Length(5),
+        Constraint::Length(15), Constraint::Length(node_w), Constraint::Length(5),
     ];
     (rows, widths)
 }
@@ -16222,6 +16244,35 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let ep_indent = if app.net_group { "    " } else { "" };
     let blank = || Cell::from("");
+    // Same sizing as the workloads table: 82 cells of fixed columns and 8 gaps between the 9
+    // columns, plus the two name columns, decide what is left for NODE.
+    let ns_w = col_width(
+        src.iter().map(|r| match r {
+            NetRow::Service(s) => s.namespace.as_str(),
+            NetRow::Endpoint(e) => e.service_namespace.as_str(),
+            _ => "",
+        }),
+        "NAMESPACE",
+        9,
+        24,
+    );
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            NetRow::Service(s) => s.name.clone(),
+            NetRow::Endpoint(e) => format!("{}{}", ep_indent, e.target_name),
+            _ => String::new(),
+        })
+        .collect();
+    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 48);
+    let node_w = node_col_width(
+        src.iter().map(|r| match r {
+            NetRow::Endpoint(e) => e.node.as_str(),
+            _ => "",
+        }),
+        area.width,
+        ns_w + name_w + 82 + 8,
+    );
     let rows: Vec<Row> = src
         .iter()
         .map(|row| match row {
@@ -16262,7 +16313,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     blank(),
                     blank(),
                     Cell::from(ready_txt).style(Style::default().fg(ready_color)),
-                    Cell::from(elide_middle(&e.node, NODE_COL_W as usize)).style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&e.node, node_w as usize)).style(Style::default().fg(DIM)),
                     blank(),
                 ])
             }
@@ -16270,25 +16321,10 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let ns_values = src.iter().map(|r| match r {
-        NetRow::Service(s) => s.namespace.as_str(),
-        NetRow::Endpoint(e) => e.service_namespace.as_str(),
-        _ => "",
-    });
-    let names: Vec<String> = src
-        .iter()
-        .map(|r| match r {
-            NetRow::Service(s) => s.name.clone(),
-            NetRow::Endpoint(e) => format!("{}{}", ep_indent, e.target_name),
-            _ => String::new(),
-        })
-        .collect();
-    let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
-    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 48);
     let widths = [
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(12),
         Constraint::Length(16), Constraint::Length(18), Constraint::Length(20),
-        Constraint::Length(11), Constraint::Length(NODE_COL_W), Constraint::Length(5),
+        Constraint::Length(11), Constraint::Length(node_w), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -26649,7 +26685,7 @@ mod pods_container_rows_tests {
     }
 
     fn render(rows: &[PodRow], expanded: &std::collections::HashSet<String>, width: u16) -> Vec<String> {
-        let (table_rows, widths) = pods_table_parts(rows, true, expanded);
+        let (table_rows, widths) = pods_table_parts(rows, true, expanded, width);
         let mut terminal = Terminal::new(TestBackend::new(width, 12)).expect("test terminal");
         terminal
             .draw(|f| {
@@ -26710,9 +26746,27 @@ mod pods_container_rows_tests {
             PodRow::Pod(Box::new(p1)),
             PodRow::Pod(Box::new(p2)),
         ];
-        let text = render(&rows, &std::collections::HashSet::new(), 190).join("\n");
-        assert!(text.contains("aks-syste…vmss000003"), "{text}");
-        assert!(text.contains("aks-syste…vmss000017"), "{text}");
+        let expanded = std::collections::HashSet::new();
+        // Wide enough: the column grows to the names instead of leaving the space empty.
+        let wide = render(&rows, &expanded, 190);
+        let text = wide.join("\n");
+        assert!(text.contains("aks-systempool-41894869-vmss000003"), "{text}");
+        assert!(text.contains("aks-systempool-41894869-vmss000017"), "{text}");
+        // Narrow enough that the column caps at what is left: head and tail both survive.
+        let narrow = render(&rows, &expanded, 171);
+        let text = narrow.join("\n");
+        assert!(text.contains("aks-systempo…9-vmss000003"), "{text}");
+        assert!(text.contains("aks-systempo…9-vmss000017"), "{text}");
+        // Neither width shears the right border: every body line still closes on `│`, and the
+        // corners of the top and bottom rules stay in the last column.
+        for lines in [&wide, &narrow] {
+            for line in lines.iter().skip(1).take(lines.len() - 2) {
+                assert!(line.ends_with('│'), "{line}");
+            }
+            for rule in [lines.first().expect("top"), lines.last().expect("bottom")] {
+                assert!(!rule.ends_with(' '), "{rule}");
+            }
+        }
     }
 
     #[test]
