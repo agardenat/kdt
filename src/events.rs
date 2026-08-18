@@ -518,9 +518,10 @@ pub async fn fetch_status(
                     }
                     Err(e) => {
                         lines.push((LineColor::Plain, String::new()));
-                        lines.push((LineColor::Warn, format!("(impossible de lister les pods du noeud: {})", e)));
+                        lines.push((LineColor::Warn, fill(crate::lang::active().ev_node_pods_unlistable, &[("err", &e.to_string())])));
                     }
                 }
+                lines.extend(format_node_metadata(&n));
                 Ok(lines)
             }
             Err(e) => Err(e.to_string()),
@@ -924,24 +925,6 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
         if spec.unschedulable.unwrap_or(false) {
             out.push((LineColor::Err, "▲ Unschedulable (cordoned)".into()));
         }
-        if let Some(taints) = &spec.taints {
-            if !taints.is_empty() {
-                out.push((LineColor::Plain, String::new()));
-                out.push((LineColor::Info, format!("Taints ({}) :", taints.len())));
-                for t in taints {
-                    let color = match t.effect.as_str() {
-                        "NoSchedule" | "NoExecute" => LineColor::Warn,
-                        _ => LineColor::Plain,
-                    };
-                    out.push((color, format!(
-                        "  {}={} : {}",
-                        t.key,
-                        t.value.as_deref().unwrap_or(""),
-                        t.effect,
-                    )));
-                }
-            }
-        }
     }
 
     let status = node.status.as_ref();
@@ -949,7 +932,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
     if let Some(s) = status {
         if let Some(conds) = &s.conditions {
             out.push((LineColor::Plain, String::new()));
-            out.push((LineColor::Info, "Conditions :".into()));
+            out.push((LineColor::Info, st.ev_node_conditions.into()));
             for c in conds {
                 let typ = c.type_.as_str();
                 let bad = match typ {
@@ -971,7 +954,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
         }
 
         out.push((LineColor::Plain, String::new()));
-        out.push((LineColor::Info, "Capacity / Allocatable (limites du noeud, pas l'usage) :".into()));
+        out.push((LineColor::Info, st.ev_node_capacity.into()));
         let cap = s.capacity.as_ref();
         let alloc = s.allocatable.as_ref();
         for key in ["cpu", "memory", "ephemeral-storage", "pods"] {
@@ -990,7 +973,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
 
         if let Some(info) = &s.node_info {
             out.push((LineColor::Plain, String::new()));
-            out.push((LineColor::Info, "System info :".into()));
+            out.push((LineColor::Info, st.ev_node_system_info.into()));
             out.push((LineColor::Dim, format!("  kubelet: {}", info.kubelet_version)));
             out.push((LineColor::Dim, format!("  containerd: {}", info.container_runtime_version)));
             out.push((LineColor::Dim, format!("  OS: {} ({})", info.operating_system, info.os_image)));
@@ -1001,7 +984,7 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
         if let Some(addrs) = &s.addresses {
             if !addrs.is_empty() {
                 out.push((LineColor::Plain, String::new()));
-                out.push((LineColor::Info, "Addresses :".into()));
+                out.push((LineColor::Info, st.ev_node_addresses.into()));
                 for a in addrs {
                     out.push((LineColor::Dim, format!("  {:<14} {}", a.type_, a.address)));
                 }
@@ -1010,6 +993,81 @@ pub fn format_node_status(node: &Node) -> Vec<(LineColor, String)> {
     } else {
         out.push((LineColor::Warn, st.ev_no_status.into()));
     }
+    out
+}
+
+// Annotations, labels and taints of a node, rendered as the last block of its panel: that panel is
+// anchored on its bottom, so this is what is on screen the moment the cursor lands on another node.
+// Taints come last for the same reason — they are the shortest of the three and the one that
+// decides what the node accepts, so they stay visible even when the other two overflow upwards.
+// Keys keep their alphabetical order, but the well-known `*.kubernetes.io` ones are dimmed: what
+// the cluster itself puts on a node (a tenant, a pool, a scheduling hint) is what is worth reading.
+pub fn format_node_metadata(node: &Node) -> Vec<(LineColor, String)> {
+    let st = crate::lang::active();
+    let mut out: Vec<(LineColor, String)> = Vec::new();
+    let empty: BTreeMap<String, String> = BTreeMap::new();
+
+    let annotations = node.metadata.annotations.as_ref().unwrap_or(&empty);
+    out.push((LineColor::Plain, String::new()));
+    out.push((LineColor::Info, fill(st.ev_node_annotations, &[("n", &annotations.len().to_string())])));
+    let w = meta_key_width(annotations.keys().map(|k| k.as_str()));
+    for (k, v) in annotations {
+        // An annotation value runs to hundreds of characters (`rke2.io/node-args`, a last-applied
+        // config): wrapped in full it would push every other key off the panel. `y` still shows the
+        // object exactly as the API returns it.
+        out.push((meta_key_color(k), format!("  {:<w$} = {}", k, elide_end(v, META_VALUE_MAX))));
+    }
+
+    let labels = node.metadata.labels.as_ref().unwrap_or(&empty);
+    out.push((LineColor::Plain, String::new()));
+    out.push((LineColor::Info, fill(st.ev_node_labels, &[("n", &labels.len().to_string())])));
+    let w = meta_key_width(labels.keys().map(|k| k.as_str()));
+    for (k, v) in labels {
+        out.push((meta_key_color(k), format!("  {:<w$} = {}", k, v)));
+    }
+
+    let taints = node.spec.as_ref().and_then(|s| s.taints.as_deref()).unwrap_or(&[]);
+    out.push((LineColor::Plain, String::new()));
+    out.push((LineColor::Info, fill(st.ev_node_taints, &[("n", &taints.len().to_string())])));
+    let w = meta_key_width(taints.iter().map(|t| t.key.as_str()));
+    for t in taints {
+        let color = match t.effect.as_str() {
+            "NoSchedule" | "NoExecute" => LineColor::Warn,
+            _ => LineColor::Plain,
+        };
+        out.push((color, format!(
+            "  {:<w$} = {}   [{}]",
+            t.key,
+            t.value.as_deref().unwrap_or(""),
+            t.effect,
+        )));
+    }
+
+    out
+}
+
+const META_VALUE_MAX: usize = 96;
+
+// Width of the key column, capped so a single very long key does not push every value off screen.
+fn meta_key_width<'a>(keys: impl Iterator<Item = &'a str>) -> usize {
+    keys.map(|k| k.chars().count()).max().unwrap_or(0).min(44)
+}
+
+fn meta_key_color(key: &str) -> LineColor {
+    let domain = key.split('/').next().unwrap_or("");
+    if domain.ends_with("kubernetes.io") || domain.ends_with("k8s.io") {
+        LineColor::Dim
+    } else {
+        LineColor::Plain
+    }
+}
+
+fn elide_end(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 

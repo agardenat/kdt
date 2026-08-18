@@ -176,8 +176,10 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   actions visent le workload même depuis la ligne d'un de ses pods : `s` scale, `r` rescale /
   recyclage / restart. Sur une ligne container, `E` ouvre un shell dans ce container et l'onglet
   Logs s'y restreint automatiquement. `n`/`0` changent de namespace.
-- **Nodes** — liste, détail, usage CPU/mémoire (`u`), tri (`s`), export PDF (`p`/`P`). `o` ouvre les
-  opérations : cordon, uncordon, drain. Le drain affiche un rapport avant toute éviction : pods
+- **Nodes** — liste, détail, usage CPU/mémoire (`u`), tri (`s`), export PDF (`p`/`P`). Le détail
+  donne conditions, capacity/allocatable, system info, adresses, réservations et OOM récents, puis
+  annotations, labels et taints en fin de panneau — la partie affichée quand le curseur change de
+  nœud. `o` ouvre les opérations : cordon, uncordon, drain. Le drain affiche un rapport avant toute éviction : pods
   qu'aucun contrôleur ne recréera, PDB qui refuseront, pods sans place ailleurs, `emptyDir` perdus,
   pods statiques.
 - **Capacité** (`:capacity`, `:quota`) — trois mondes par `g`, `f` ne garde que les problèmes.

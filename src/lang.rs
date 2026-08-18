@@ -1070,6 +1070,14 @@ pub struct Strings {
     pub ev_no_status: &'static str,
     pub ev_node_recent_ooms: &'static str,
     pub ev_more_entries: &'static str,
+    pub ev_node_taints: &'static str,
+    pub ev_node_labels: &'static str,
+    pub ev_node_annotations: &'static str,
+    pub ev_node_conditions: &'static str,
+    pub ev_node_capacity: &'static str,
+    pub ev_node_system_info: &'static str,
+    pub ev_node_addresses: &'static str,
+    pub ev_node_pods_unlistable: &'static str,
     pub ev_node_reserved: &'static str,
 
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.
@@ -2670,6 +2678,14 @@ pub const FR: Strings = Strings {
     ev_no_status: "aucun status disponible",
     ev_node_recent_ooms: "▲ Récents OOMKilled sur ce node ({n}) :",
     ev_more_entries: "  ... ({n} de plus)",
+    ev_node_taints: "Taints ({n}) :",
+    ev_node_labels: "Labels ({n}) :",
+    ev_node_annotations: "Annotations ({n}) :",
+    ev_node_conditions: "Conditions :",
+    ev_node_capacity: "Capacity / Allocatable (limites du node, pas l'usage) :",
+    ev_node_system_info: "System info :",
+    ev_node_addresses: "Addresses :",
+    ev_node_pods_unlistable: "(impossible de lister les pods du node : {err})",
     ev_node_reserved: "Réservé par les pods (somme des requests/limits sur {active} pods actifs / {total} total ; le ratio est sur l'allocatable du node) :",
 
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.
@@ -4267,6 +4283,14 @@ pub const EN: Strings = Strings {
     ev_no_status: "no status available",
     ev_node_recent_ooms: "▲ Recent OOMKills on this node ({n}):",
     ev_more_entries: "  ... ({n} more)",
+    ev_node_taints: "Taints ({n}):",
+    ev_node_labels: "Labels ({n}):",
+    ev_node_annotations: "Annotations ({n}):",
+    ev_node_conditions: "Conditions:",
+    ev_node_capacity: "Capacity / Allocatable (node limits, not usage):",
+    ev_node_system_info: "System info:",
+    ev_node_addresses: "Addresses:",
+    ev_node_pods_unlistable: "(cannot list the pods of this node: {err})",
     ev_node_reserved: "Reserved by pods (sum of requests/limits over {active} active pods / {total} total; the ratio is against the node's allocatable):",
 
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.

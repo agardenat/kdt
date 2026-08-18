@@ -174,8 +174,10 @@ shows the query and its effect (`/coredns  (3)`).
   state, usage against *their own* requests/limits, age of the last start. Actions target the
   workload even from one of its pod rows: `s` scale, `r` rescale / recycle / restart. On a container
   row, `E` opens a shell in that container and the Logs tab narrows to it. `n`/`0` change namespace.
-- **Nodes** — list, detail, CPU/memory usage (`u`), sort (`s`), PDF export (`p`/`P`). `o` opens the
-  operations: cordon, uncordon, drain. The drain prints a report before any eviction: pods no
+- **Nodes** — list, detail, CPU/memory usage (`u`), sort (`s`), PDF export (`p`/`P`). The detail
+  panel gives conditions, capacity/allocatable, system info, addresses, reservations and recent OOM
+  kills, then annotations, labels and taints at its end — what is on screen when the cursor moves to
+  another node. `o` opens the operations: cordon, uncordon, drain. The drain prints a report before any eviction: pods no
   controller will recreate, PDBs that will refuse, pods with no room elsewhere, `emptyDir` data
   lost, static pods.
 - **Capacity** (`:capacity`, `:quota`) — three worlds through `g`, `f` keeps problems only.
