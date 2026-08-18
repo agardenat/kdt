@@ -99,6 +99,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, tokens |
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
+| `forward` | `pf`, `portforward`, `tunnels` | Running port-forwards (over the current view) |
 | `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
 | `netpol` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (native, Cilium, Calico) |
 | `storage` | `stockage`, `pvc`, `claims` | Storage, claim side (PVC → PV) |
@@ -144,7 +145,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `e`, `h`, `Ctrl-D` deliberately absent |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
-| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `n`/`0` namespace |
+| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
 | YAML | `t` neat ↔ raw · `c` copy · `r` reload |
@@ -298,6 +299,15 @@ shows the query and its effect (`/coredns  (3)`).
   `policyTypes` and the effect per direction: `Deny` (direction governed, no rule allows anything),
   `AllowAll` (empty `from`/`to`), `Selective` (explicit peers), `Unaffected` (direction not in
   `policyTypes`). Cilium and Calico CRDs are listed as they are, with no verdict.
+- **Port-forward** (`f` on a Service, `F` or `:forward` for the list) — the tunnel is opened by kdt
+  itself, with no `kubectl`: the form lists the Service ports, offers the same number as the local
+  port (`0` takes any free one), `Enter` starts or stops. It listens on `127.0.0.1`, and the table's
+  `FORWARD` column shows the local port (`→ :8080`, `+n` when there is more than one). The target is
+  resolved through the EndpointSlices: the first **ready** endpoint, and the container port it
+  declares (so a named `targetPort` is followed). What cannot be forwarded is named: `ExternalName`
+  Service, non-TCP port, no endpoint, no ready endpoint. The `F` list gives the pod reached, the
+  state, the connections open and served, and `d` stops one. The tunnels live inside the kdt
+  process: they survive a change of view or namespace, and go away with it.
 - **Storage** (`:storage`, `:pv`) — two worlds through `g` (PVC → PV, SC → PV), `t` nests
   parent/child, `f` keeps problems only, `n`/`0` change namespace. Detections: missing StorageClass,
   no default class (or two), `WaitForFirstConsumer` waiting on a pod, class with no provisioner, a
@@ -444,6 +454,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `ui.rs` | ratatui TUI: modes, rendering, keyboard |
 | `events.rs` | Event watcher, logs, status, nodes, usage |
 | `pods.rs` · `svc.rs` · `configmaps.rs` | Workloads, Services/Ingress, ConfigMaps |
+| `portfwd.rs` | Service port-forward (EndpointSlice resolution, local listener) |
 | `flux.rs` · `repair.rs` | FluxCD (inventory, reconcile, tree) and the `Ctrl-R` unblock |
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | Scored RBAC, Secrets/TLS, cert-manager chain |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVEs |

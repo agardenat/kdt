@@ -468,8 +468,9 @@ use crate::namespaces::{
 };
 use crate::svc::{
     endpoint_belongs_to, fetch_network, new_network_state, EndpointRow, IngressClassResource,
-    IngressResource, ServiceResource, SharedNetwork,
+    IngressResource, ServiceResource, SharedNetwork, SvcPortSpec,
 };
+use crate::portfwd::{self, PfRequest, PfRow, PfState, SharedForwards};
 use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
 use crate::rancher::{
     apply_rancher_write, fetch_rancher, format_minutes, format_refresh, format_ttl,
@@ -519,6 +520,30 @@ enum NetRow {
     Ingress(IngressResource),
     IngressClass(IngressClassResource),
     NetPol(NetPolResource),
+}
+
+// The `f` overlay: which port of the selected Service to forward, and onto which local port. The
+// ports come from the row already on screen, so the form opens without a fetch; resolving the pod
+// behind the Service is the started forward's job, not the form's.
+//
+// Each port keeps its own local-port buffer: moving the cursor to compare two ports must not throw
+// away what was typed on the first one.
+struct PfView {
+    namespace: String,
+    service: String,
+    ports: Vec<SvcPortSpec>,
+    locals: Vec<String>,
+    cursor: usize,
+    // Refused input (a local port that is not a number, a UDP port): shown in the form rather than
+    // as a toast the form would hide.
+    error: Option<String>,
+}
+
+// The `F` overlay: every forward kdt is carrying, whatever view it was started from. A forward
+// outlives the row it came from — the namespace scope can move, the Service can be filtered out —
+// so this list is the only place that always accounts for them.
+struct ForwardsView {
+    cursor: usize,
 }
 use crate::storage::{
     fetch_storage, new_storage_state, volume_in_class, HintLevel as StoHintLevel, PvResource,
@@ -1220,6 +1245,9 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // arrives at this view. The workloads world is one `g` away.
     ("capacity", &["cap", "capacite", "marge", "headroom"]),
     ("quota", &["quotas", "rq", "resourcequota", "resourcequotas"]),
+    // The port-forward inventory, reachable from anywhere: a forward outlives the view it was
+    // started from, so the way to it cannot be inside that view only.
+    ("forward", &["pf", "portforward", "port-forward", "forwards", "tunnel", "tunnels"]),
     ("quit", &["q"]),
 ];
 
@@ -1447,6 +1475,11 @@ pub struct App {
     net_group: bool,
     pub net_refresh_handle: Option<JoinHandle<()>>,
     last_net_sel_uid: Option<String>,
+    // The port-forwards kdt is carrying, and the two overlays that start and stop them. The list is
+    // shared with the background tasks, which are the only writers of the counters and the state.
+    forwards: SharedForwards,
+    pf_view: Option<PfView>,
+    forwards_view: Option<ForwardsView>,
     // Storage view: same shape as the network view above — shared inventory, flattened display rows
     // index-aligned with the snapshot, the active world, the `t` grouping and the `f` filter.
     pub storage_state: SharedStorage,
@@ -1756,6 +1789,9 @@ impl App {
             net_group: false,
             net_refresh_handle: None,
             last_net_sel_uid: None,
+            forwards: portfwd::new_forwards(),
+            pf_view: None,
+            forwards_view: None,
             storage_state: new_storage_state(),
             sto_rows: Vec::new(),
             sto_world: StoWorld::Claims,
@@ -4032,6 +4068,11 @@ impl App {
             .map(|a| ns_arg_to_opt(a));
         match cmd {
             "quit" => self.should_quit = true,
+            // An overlay, not a view: the mode it was called from keeps refreshing underneath.
+            "forward" => {
+                self.mode = origin;
+                self.open_forwards_view();
+            }
             "events" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -4807,6 +4848,168 @@ impl App {
         self.last_related_key = None;
         self.reset_scroll();
         self.refresh_net_snapshot();
+    }
+
+    // --- port-forward -------------------------------------------------------------------------
+
+    fn toast(&mut self, msg: String) {
+        self.clipboard_status = Some((std::time::Instant::now(), msg));
+    }
+
+    // `f`: the port-forward form for the selected Service. Everything it offers is already on the
+    // row, so it opens without a round-trip; what the ports resolve to is the forward's problem.
+    fn open_pf_view(&mut self) {
+        let st = lang::t(self.ai_language);
+        let row = self.table_state.selected().and_then(|i| self.net_rows.get(i)).cloned();
+        let Some(NetRow::Service(svc)) = row else {
+            self.toast(st.pf_select_service.to_string());
+            return;
+        };
+        if svc.external_name {
+            self.toast(st.pf_external_name.to_string());
+            return;
+        }
+        if svc.port_specs.is_empty() {
+            self.toast(st.pf_no_ports.to_string());
+            return;
+        }
+        let locals = svc
+            .port_specs
+            .iter()
+            .map(|p| portfwd::default_local_port(p.port).to_string())
+            .collect();
+        self.pf_view = Some(PfView {
+            namespace: svc.namespace.clone(),
+            service: svc.name.clone(),
+            ports: svc.port_specs.clone(),
+            locals,
+            cursor: 0,
+            error: None,
+        });
+    }
+
+    fn pf_move(&mut self, delta: isize) {
+        let Some(v) = self.pf_view.as_mut() else { return };
+        if v.ports.is_empty() { return; }
+        let last = v.ports.len() - 1;
+        v.cursor = (v.cursor as isize + delta).clamp(0, last as isize) as usize;
+        v.error = None;
+    }
+
+    fn pf_input(&mut self, c: char) {
+        let Some(v) = self.pf_view.as_mut() else { return };
+        let Some(buf) = v.locals.get_mut(v.cursor) else { return };
+        // A port is five digits at most; refusing the sixth keeps the field showing a number the
+        // parse can accept rather than one it will reject on Enter.
+        if buf.len() < 5 {
+            buf.push(c);
+        }
+        v.error = None;
+    }
+
+    fn pf_backspace(&mut self) {
+        let Some(v) = self.pf_view.as_mut() else { return };
+        if let Some(buf) = v.locals.get_mut(v.cursor) {
+            buf.pop();
+        }
+        v.error = None;
+    }
+
+    fn pf_close(&mut self) {
+        self.pf_view = None;
+    }
+
+    // Enter: start the highlighted port, or stop the forward already on it. The form stays open
+    // after a stop — the reason one stops a forward is usually to start it on another port.
+    fn pf_activate(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(v) = self.pf_view.as_ref() else { return };
+        let Some(port) = v.ports.get(v.cursor).cloned() else { return };
+        let namespace = v.namespace.clone();
+        let service = v.service.clone();
+        let typed = v.locals.get(v.cursor).cloned().unwrap_or_default();
+
+        if let Some(active) = portfwd::find(&self.forwards, &namespace, &service, port.port) {
+            let label = active.local_address();
+            portfwd::stop(&self.forwards, active.id);
+            self.toast(lang::fill(st.pf_stopped, &[("d", &label)]));
+            return;
+        }
+        if port.protocol != "TCP" {
+            if let Some(v) = self.pf_view.as_mut() {
+                v.error = Some(lang::fill(st.pf_not_tcp, &[("d", &port.protocol)]));
+            }
+            return;
+        }
+        let trimmed = typed.trim();
+        let local_port = if trimmed.is_empty() {
+            portfwd::default_local_port(port.port)
+        } else {
+            match trimmed.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => {
+                    if let Some(v) = self.pf_view.as_mut() {
+                        v.error = Some(st.pf_bad_local.to_string());
+                    }
+                    return;
+                }
+            }
+        };
+        portfwd::start(
+            self.client.clone(),
+            PfRequest {
+                namespace,
+                service,
+                service_port: port.port,
+                port_name: port.name.clone(),
+                local_port,
+            },
+            &self.forwards,
+        );
+        self.pf_view = None;
+    }
+
+    // `F`, and the `:forward` palette entry: the inventory of what is currently forwarded. Opens
+    // over whatever view is showing — a forward is not tied to the view it was started from.
+    fn open_forwards_view(&mut self) {
+        self.forwards_view = Some(ForwardsView { cursor: 0 });
+    }
+
+    fn forwards_close(&mut self) {
+        self.forwards_view = None;
+    }
+
+    fn forwards_move(&mut self, delta: isize) {
+        let n = portfwd::count(&self.forwards);
+        let Some(v) = self.forwards_view.as_mut() else { return };
+        if n == 0 {
+            v.cursor = 0;
+            return;
+        }
+        v.cursor = (v.cursor as isize + delta).clamp(0, n as isize - 1) as usize;
+    }
+
+    // `d`: stop the highlighted forward. No confirmation — nothing in the cluster changes, and the
+    // only thing lost is a socket the user can reopen with one keystroke.
+    fn forwards_stop_selected(&mut self) {
+        let cursor = self.forwards_view.as_ref().map(|v| v.cursor).unwrap_or(0);
+        let rows = portfwd::rows(&self.forwards);
+        let Some(row) = rows.get(cursor) else { return };
+        let label = row.local_address();
+        portfwd::stop(&self.forwards, row.id);
+        let st = lang::t(self.ai_language);
+        self.toast(lang::fill(st.pf_stopped, &[("d", &label)]));
+        let n = portfwd::count(&self.forwards);
+        if let Some(v) = self.forwards_view.as_mut() {
+            v.cursor = v.cursor.min(n.saturating_sub(1));
+        }
+    }
+
+    // The forwards run off the UI thread: what they have to say arrives here, once per tick.
+    fn drain_forward_events(&mut self) {
+        for msg in portfwd::drain_events(&self.forwards) {
+            self.toast(msg);
+        }
     }
 
     // One-shot fetch of the network inventory for the current namespace scope.
@@ -10883,6 +11086,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
             app.refresh_net_snapshot();
         }
+        // Forwards report from their own tasks, whatever view is showing.
+        app.drain_forward_events();
         if matches!(app.mode, Mode::Storage | Mode::StorageFull) {
             app.refresh_storage_snapshot();
         }
@@ -10967,6 +11172,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             _ = tokio::signal::ctrl_c() => { app.should_quit = true; }
         }
     }
+    // The tasks would die with the process anyway; closing the sockets here means they are gone
+    // before the terminal comes back, rather than while it is being repainted.
+    portfwd::stop_all(&app.forwards);
     Ok(())
 }
 
@@ -11162,6 +11370,33 @@ fn handle_event(app: &mut App, ev: Event) {
             (KeyCode::Char(c), _) if c.is_ascii_digit() => app.action_menu_input(c),
             (KeyCode::Up | KeyCode::Char('k'), _) => app.action_menu_move(-1),
             (KeyCode::Down | KeyCode::Char('j'), _) => app.action_menu_move(1),
+            _ => {}
+        }
+        return;
+    }
+    // The port-forward form grabs all input while open (Ctrl-C still quits). Digits go to the local
+    // port field of the highlighted row — there is no other typing to compete with.
+    if app.pf_view.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter, _) => app.pf_activate(),
+            (KeyCode::Esc, _) => app.pf_close(),
+            (KeyCode::Up, _) => app.pf_move(-1),
+            (KeyCode::Down, _) => app.pf_move(1),
+            (KeyCode::Backspace, _) => app.pf_backspace(),
+            (KeyCode::Char(c), _) if c.is_ascii_digit() => app.pf_input(c),
+            _ => {}
+        }
+        return;
+    }
+    // The forwards inventory grabs all input while open (Ctrl-C still quits).
+    if app.forwards_view.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Esc | KeyCode::Enter, _) => app.forwards_close(),
+            (KeyCode::Up | KeyCode::Char('k'), _) => app.forwards_move(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => app.forwards_move(1),
+            (KeyCode::Char('d'), _) => app.forwards_stop_selected(),
             _ => {}
         }
         return;
@@ -11702,6 +11937,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('0'), _, Mode::Services) => app.clear_namespace_filter(),
         (KeyCode::Char('t'), _, Mode::Services) => app.toggle_network_group(),
         (KeyCode::Char('g'), _, Mode::Services) => app.cycle_network_world(),
+        (KeyCode::Char('f'), _, Mode::Services) => app.open_pf_view(),
+        (KeyCode::Char('F'), _, Mode::Services | Mode::ServicesFull) => app.open_forwards_view(),
         (KeyCode::F(5), _, Mode::Services) => app.refresh_network(),
         (KeyCode::Char('i'), _, Mode::Services) => app.enter_ai_panel(),
         (_, _, Mode::Services) => {}
@@ -12520,6 +12757,17 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             }
             spans.push(Span::styled(" g ", kbg));
             spans.push(Span::raw(format!(" {}   ", world_label)));
+            // `f` only means anything on a Service row; `F` lists what is already forwarded, and is
+            // offered as soon as there is one to list, whichever world is showing.
+            if app.net_world == NetWorld::Services {
+                spans.push(footer_sep());
+                spans.push(Span::styled(" f ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_forward)));
+            }
+            if portfwd::count(&app.forwards) > 0 {
+                spans.push(Span::styled(" F ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_forwards)));
+            }
             spans
         }
         Mode::ServicesFull => vec![
@@ -12824,6 +13072,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     // z-order, and the two have to agree.
     if app.vel_restore_view.is_some() {
         draw_vel_restore_view(f, app, area);
+    }
+    // Same order as the key-grab chain above: the draw order is the z-order, and the two have to
+    // agree.
+    if app.pf_view.is_some() {
+        draw_pf_popup(f, app, area);
+    }
+    if app.forwards_view.is_some() {
+        draw_forwards_popup(f, app, area);
     }
     if app.secrets_copy_menu.is_some() {
         draw_secrets_copy_menu_popup(f, app, area);
@@ -14140,6 +14396,183 @@ fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect
 }
 
 // Copy picker over a secret: a highlighted list of its data keys; Enter copies the decoded value.
+// The `f` form: one line per Service port, the local port editable on the line under the cursor.
+// A port already forwarded shows where it is listening instead of a field — the same Enter that
+// would have started it stops it, and the line has to say which of the two it is about to do.
+fn draw_pf_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(v) = app.pf_view.as_ref() else { return };
+    let st = lang::t(app.ai_language);
+    // Resolved here rather than inside the body: the lines are then a pure function of the form and
+    // of what is running, which is what the tests render.
+    let active: Vec<Option<PfRow>> = v
+        .ports
+        .iter()
+        .map(|p| portfwd::find(&app.forwards, &v.namespace, &v.service, p.port))
+        .collect();
+    let lines = pf_form_lines(v, &active, st);
+
+    let popup_w = 90.min(area.width.saturating_sub(2)).max(30);
+    let inner_w = popup_w.saturating_sub(2) as usize;
+    let body: u16 = lines.iter().map(|l| wrapped_rows(l, inner_w).max(1) as u16).sum();
+    let popup_h = (body + 2).min(area.height.saturating_sub(2)).max(5);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} · {}/{} ", st.pf_title, v.namespace, v.service))
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), popup_area);
+}
+
+fn pf_form_lines(v: &PfView, active: &[Option<PfRow>], st: &lang::Strings) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, port) in v.ports.iter().enumerate() {
+        let selected = i == v.cursor;
+        let name = port.name.as_deref().map(|n| format!(" ({})", n)).unwrap_or_default();
+        let mut spans = vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}/{}{}", port.port, port.protocol, name),
+                if selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+            Span::styled(format!("  → {}", port.target), Style::default().fg(DIM)),
+        ];
+        match active.get(i).and_then(|o| o.as_ref()) {
+            Some(row) => {
+                let (label, color) = pf_state_label(&row.state, st);
+                spans.push(Span::styled(
+                    format!("   {} ", row.local_address()),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(label, Style::default().fg(color)));
+            }
+            None => {
+                spans.push(Span::styled(
+                    format!("   {} ", st.pf_local_label),
+                    Style::default().fg(DIM),
+                ));
+                // The field is always visible with the value it will use: the caret only marks
+                // which line the digits are going to.
+                spans.push(Span::styled(
+                    v.locals.get(i).cloned().unwrap_or_default(),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+                if selected {
+                    spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    if let Some(e) = &v.error {
+        lines.push(Line::from(Span::styled(e.clone(), Style::default().fg(Color::Red))));
+    }
+    // Why the forward under the cursor failed. On its own line rather than on the port's: the cause
+    // is a sentence, and the port line has to stay a port line.
+    if let Some(PfState::Failed(cause)) = active.get(v.cursor).and_then(|o| o.as_ref()).map(|r| &r.state) {
+        lines.push(Line::from(Span::styled(clip_error(cause), Style::default().fg(Color::Red))));
+    }
+    lines.push(Line::from(Span::styled(st.pf_hint, Style::default().fg(DIM))));
+    lines
+}
+
+// The `F` inventory: every forward, with what it is really pointing at. The pod is named because a
+// Service port-forward lands on one replica, not on the Service — which is exactly what surprises
+// people when only half their requests behave.
+fn draw_forwards_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    if app.forwards_view.is_none() { return; }
+    let st = lang::t(app.ai_language);
+    let rows = portfwd::rows(&app.forwards);
+    let cursor = app.forwards_view.as_ref().map(|v| v.cursor).unwrap_or(0);
+    let lines = pf_list_lines(&rows, cursor, st);
+
+    let popup_w = 92.min(area.width.saturating_sub(2)).max(30);
+    let inner_w = popup_w.saturating_sub(2) as usize;
+    let body: u16 = lines.iter().map(|l| wrapped_rows(l, inner_w).max(1) as u16).sum();
+    let popup_h = (body + 2).min(area.height.saturating_sub(2)).max(5);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ({}) ", st.pf_list_title, rows.len()))
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), popup_area);
+}
+
+fn pf_list_lines(rows: &[PfRow], cursor: usize, st: &lang::Strings) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", st.pf_list_empty),
+            Style::default().fg(DIM),
+        )));
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let selected = i == cursor;
+        let (label, color) = pf_state_label(&row.state, st);
+        let target = match &row.port_name {
+            Some(n) => format!("{}/{}:{} ({})", row.namespace, row.service, row.service_port, n),
+            None => format!("{}/{}:{}", row.namespace, row.service, row.service_port),
+        };
+        // Two lines per forward rather than one long one: what it exposes, then what is behind it.
+        // A single line holds a local address, a Service port, a pod name and two counters, and no
+        // terminal width fits that — it would come back as a wrap with no indent.
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                row.local_address(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  → {}", target), Style::default().fg(Color::Gray)),
+        ]));
+        let counters = lang::fill(
+            st.pf_conns,
+            &[("o", &row.open.to_string()), ("n", &row.served.to_string())],
+        );
+        let mut detail: Vec<Span<'static>> = vec![Span::raw("    ")];
+        if !row.pod.is_empty() {
+            detail.push(Span::styled(
+                format!("{}:{}  ", row.pod, row.remote_port),
+                Style::default().fg(DIM),
+            ));
+        }
+        detail.push(Span::styled(label, Style::default().fg(color)));
+        // Counters on a forward that never opened would be two zeros dressed as a measurement.
+        if !matches!(row.state, PfState::Failed(_)) {
+            detail.push(Span::styled(format!("  ·  {}", counters), Style::default().fg(DIM)));
+        }
+        lines.push(Line::from(detail));
+        // The cause, on its own line: the failure of the listener, or — on a tunnel that is still
+        // up — the last connection that did not go through.
+        let cause = match &row.state {
+            PfState::Failed(e) => Some((e.clone(), Color::Red)),
+            _ => row.last_error.clone().map(|e| (e, Color::Yellow)),
+        };
+        if let Some((text, colour)) = cause {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", clip_error(&text)),
+                Style::default().fg(colour),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(st.pf_list_hint, Style::default().fg(DIM))));
+    lines
+}
+
 fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(menu) = app.secrets_copy_menu.as_ref() else { return; };
 
@@ -16221,6 +16654,32 @@ fn draw_net_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+// The FORWARD cell of a Service row. Several forwards on one Service are summarised by the first
+// one and a count: the column says "there is a socket open on this row", the `F` inventory says
+// exactly which. A failed forward is shown rather than hidden — it is still holding its slot, and
+// the reason it failed is one keystroke away.
+fn forward_cell(rows: &[PfRow]) -> (String, Color) {
+    let Some(first) = rows.first() else { return (String::new(), DIM) };
+    let (glyph, color) = if rows.iter().any(|r| matches!(r.state, PfState::Failed(_))) {
+        ("✗", Color::Red)
+    } else if rows.iter().all(|r| r.state == PfState::Listening) {
+        ("→", Color::Green)
+    } else {
+        ("·", Color::Yellow)
+    };
+    let extra = if rows.len() > 1 { format!(" +{}", rows.len() - 1) } else { String::new() };
+    (format!("{} :{}{}", glyph, first.local_port, extra), color)
+}
+
+// How a forward's state reads in the two overlays.
+fn pf_state_label(state: &PfState, st: &lang::Strings) -> (String, Color) {
+    match state {
+        PfState::Starting => (st.pf_state_starting.to_string(), Color::Yellow),
+        PfState::Listening => (st.pf_state_listening.to_string(), Color::Green),
+        PfState::Failed(_) => (st.pf_state_failed.to_string(), Color::Red),
+    }
+}
+
 // Services table: each Service row, with its backing endpoints nested under it when `t` grouping is on.
 fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (loading, error, n_svc, n_ep) = {
@@ -16247,15 +16706,22 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("TYPE"), Cell::from("CLUSTER-IP"),
-        Cell::from("EXTERNAL-IP"), Cell::from("PORTS"), Cell::from("ENDPOINTS"), Cell::from("NODE"),
-        Cell::from("AGE"),
+        Cell::from("EXTERNAL-IP"), Cell::from("PORTS"), Cell::from(lang::t(app.ai_language).pf_col_forward),
+        Cell::from("ENDPOINTS"), Cell::from("NODE"), Cell::from("AGE"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    // What kdt is forwarding, per Service: the column is the only thing that says a local socket is
+    // open on this row, and `f` reads as a toggle only because of it.
+    let forwarded = portfwd::by_service(&app.forwards);
+
     let ep_indent = if app.net_group { "    " } else { "" };
     let blank = || Cell::from("");
-    // Same sizing as the workloads table: 82 cells of fixed columns and 8 gaps between the 9
-    // columns, plus the two name columns, decide what is left for NODE.
+    // Same sizing as the workloads table: 82 cells of fixed columns and 9 gaps between the 10
+    // columns, plus the two name columns and the FORWARD column, decide what is left for NODE. The
+    // forward column is only paid for when there is a forward: a table nobody has opened a tunnel
+    // in keeps the 14 cells for the names.
+    let fwd_w: u16 = if forwarded.is_empty() { 0 } else { 14 };
     let ns_w = col_width(
         src.iter().map(|r| match r {
             NetRow::Service(s) => s.namespace.as_str(),
@@ -16281,7 +16747,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             _ => "",
         }),
         area.width,
-        ns_w + name_w + 82 + 8,
+        ns_w + name_w + 82 + fwd_w + 9,
     );
     let rows: Vec<Row> = src
         .iter()
@@ -16296,6 +16762,9 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Color::Green
                 };
                 let prefix = if app.net_group { "▾ " } else { "" };
+                let (fwd_txt, fwd_color) = forward_cell(
+                    forwarded.get(&(s.namespace.clone(), s.name.clone())).map(Vec::as_slice).unwrap_or(&[]),
+                );
                 Row::new(vec![
                     Cell::from(s.namespace.clone()).style(Style::default().fg(DIM)),
                     Cell::from(format!("{}{}", prefix, s.name))
@@ -16304,6 +16773,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(s.cluster_ip.clone()),
                     Cell::from(s.external_ip.clone()).style(Style::default().fg(DIM)),
                     Cell::from(s.ports.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(fwd_txt).style(Style::default().fg(fwd_color).add_modifier(Modifier::BOLD)),
                     Cell::from(endpoints).style(Style::default().fg(ep_color).add_modifier(Modifier::BOLD)),
                     blank(),
                     Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
@@ -16322,6 +16792,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(e.address.clone()),
                     blank(),
                     blank(),
+                    blank(),
                     Cell::from(ready_txt).style(Style::default().fg(ready_color)),
                     Cell::from(elide_middle(&e.node, node_w as usize)).style(Style::default().fg(DIM)),
                     blank(),
@@ -16334,7 +16805,8 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(12),
         Constraint::Length(16), Constraint::Length(18), Constraint::Length(20),
-        Constraint::Length(11), Constraint::Length(node_w), Constraint::Length(5),
+        Constraint::Length(fwd_w), Constraint::Length(11), Constraint::Length(node_w),
+        Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -26917,6 +27389,195 @@ mod k8c_snapshot_panel_tests {
                     expected,
                     "right border eaten at width {width}, row {y}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod portfwd_view_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn row(local: u16, state: PfState) -> PfRow {
+        PfRow {
+            id: 1,
+            namespace: "apps".to_string(),
+            service: "web".to_string(),
+            service_port: 80,
+            port_name: Some("http".to_string()),
+            local_port: local,
+            pod: "web-7c9d5f8b6d-x2klm".to_string(),
+            remote_port: 8080,
+            state,
+            open: 2,
+            served: 14,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn the_column_says_nothing_about_a_service_nobody_forwards() {
+        let (txt, _) = forward_cell(&[]);
+        assert!(txt.is_empty(), "an unforwarded Service gets a blank cell, not a dash: {txt:?}");
+    }
+
+    #[test]
+    fn the_column_names_the_local_port_and_counts_the_others() {
+        let (txt, color) = forward_cell(&[row(18080, PfState::Listening)]);
+        assert_eq!(txt, "→ :18080");
+        assert_eq!(color, Color::Green);
+        let (txt, _) = forward_cell(&[row(18080, PfState::Listening), row(18443, PfState::Listening)]);
+        assert_eq!(txt, "→ :18080 +1", "the second forward is counted, not hidden");
+    }
+
+    // A forward that failed keeps its row: the cell has to show it, or the only trace of a port
+    // that never opened is a toast that has already scrolled away.
+    #[test]
+    fn a_failed_forward_colours_the_column_even_next_to_a_live_one() {
+        let failed = row(18080, PfState::Failed("address already in use".to_string()));
+        let (_, color) = forward_cell(&[row(18443, PfState::Listening), failed]);
+        assert_eq!(color, Color::Red);
+        let (_, color) = forward_cell(&[row(18080, PfState::Starting)]);
+        assert_eq!(color, Color::Yellow, "starting is not yet listening");
+    }
+
+    fn view() -> PfView {
+        PfView {
+            namespace: "apps".to_string(),
+            service: "web".to_string(),
+            ports: vec![
+                SvcPortSpec {
+                    name: Some("http".to_string()),
+                    port: 80,
+                    protocol: "TCP".to_string(),
+                    target: "8080".to_string(),
+                },
+                SvcPortSpec {
+                    name: Some("metrics".to_string()),
+                    port: 9090,
+                    protocol: "TCP".to_string(),
+                    target: "metrics".to_string(),
+                },
+            ],
+            locals: vec!["80".to_string(), "9090".to_string()],
+            cursor: 0,
+            error: None,
+        }
+    }
+
+    fn text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // The rule this project holds to for any prompt: the field is visible, with the value it will
+    // use, before a single digit is typed.
+    #[test]
+    fn the_form_shows_every_port_with_the_local_port_it_would_take() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let v = view();
+        let joined = text(&pf_form_lines(&v, &[None, None], st));
+        assert!(joined.contains("80/TCP (http)"), "{joined}");
+        assert!(joined.contains("→ 8080"), "the target port is named: {joined}");
+        assert!(joined.contains("→ metrics"), "a named targetPort is shown as named: {joined}");
+        assert!(joined.contains(st.pf_local_label), "{joined}");
+        assert!(joined.contains("9090"), "{joined}");
+    }
+
+    // A port already forwarded must not offer a field: the same Enter stops it, and the line says
+    // where it is listening instead of pretending a new one can be typed.
+    #[test]
+    fn a_forwarded_port_shows_where_it_listens_instead_of_a_field() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let v = view();
+        let lines = pf_form_lines(&v, &[Some(row(18080, PfState::Listening)), None], st);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.contains("127.0.0.1:18080"), "{first}");
+        assert!(first.contains(st.pf_state_listening), "{first}");
+        assert!(!first.contains(st.pf_local_label), "no field on a live forward: {first}");
+    }
+
+    #[test]
+    fn the_list_names_the_pod_the_service_landed_on() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let joined = text(&pf_list_lines(&[row(18080, PfState::Listening)], 0, st));
+        assert!(joined.contains("127.0.0.1:18080"), "{joined}");
+        assert!(joined.contains("apps/web:80 (http)"), "{joined}");
+        // The pod and its port: a Service forward lands on one replica, and the list is where that
+        // is admitted.
+        assert!(joined.contains("web-7c9d5f8b6d-x2klm:8080"), "{joined}");
+        assert!(joined.contains("14"), "the connection counters: {joined}");
+    }
+
+    // The regression this split fixed: the state carried the whole toast sentence, so the row read
+    // "failed: ✗ port-forward: local port 8000 unusable" — the reason twice over, once decorated.
+    #[test]
+    fn a_failed_forward_states_its_cause_once_and_counts_nothing() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let failed = PfRow {
+            state: PfState::Failed("port local 8000 inutilisable (Address in use)".to_string()),
+            open: 0,
+            served: 0,
+            ..row(8000, PfState::Listening)
+        };
+        let joined = text(&pf_list_lines(&[failed], 0, st));
+        assert_eq!(joined.matches("port local 8000 inutilisable").count(), 1, "{joined}");
+        assert!(joined.contains(st.pf_state_failed), "{joined}");
+        assert!(!joined.contains("servie"), "no counters on a forward that never opened: {joined}");
+    }
+
+    #[test]
+    fn an_empty_list_says_so_rather_than_showing_an_empty_frame() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let joined = text(&pf_list_lines(&[], 0, st));
+        assert!(joined.contains(st.pf_list_empty), "{joined}");
+    }
+
+    // Both overlays are text panels inside a bordered block: the rule that has bitten every other
+    // one of them applies here too.
+    #[test]
+    fn the_right_border_survives_every_width() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let v = view();
+        let long = PfRow {
+            state: PfState::Failed("address already in use, and a long explanation after it".to_string()),
+            ..row(18080, PfState::Listening)
+        };
+        let panels = [
+            pf_form_lines(&v, &[Some(row(18080, PfState::Listening)), None], st),
+            pf_list_lines(&[long, row(18443, PfState::Starting)], 1, st),
+        ];
+        for lines in panels {
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+                terminal
+                    .draw(|f| {
+                        let p = Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .block(Block::default().borders(Borders::ALL).title(" port-forward "));
+                        f.render_widget(p, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                let border = ratatui::symbols::border::PLAIN;
+                for y in 0..24 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        23 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(
+                        cell.symbol(),
+                        expected,
+                        "right border eaten at width {width}, row {y}"
+                    );
+                }
             }
         }
     }

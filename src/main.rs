@@ -29,6 +29,7 @@ mod netpol;
 mod nodeops;
 mod pdf;
 mod pods;
+mod portfwd;
 mod rancher;
 mod rbac;
 mod reflector;

@@ -5,8 +5,9 @@
 //! each Ingress is listed alongside the IngressClasses, so the view can group ingresses under their
 //! class (the class row also surfaces the controller that serves it).
 //!
-//! Everything is read-only: this view has no actions, only inspection (Status/Related tabs reuse the
-//! generic detail machinery via the real apiVersion/kind/namespace/name of each row).
+//! Nothing here writes to the cluster: the view inspects (Status/Related tabs reuse the generic
+//! detail machinery via the real apiVersion/kind/namespace/name of each row), and its one action —
+//! the port-forward of [`crate::portfwd`] — opens a local socket rather than changing an object.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,6 +40,22 @@ pub struct ServiceResource {
     // Readiness summed across the Service's EndpointSlices, for an "ENDPOINTS" column (ready/total).
     pub endpoints_ready: usize,
     pub endpoints_total: usize,
+    // The spec ports, kept structured next to the display string: the port-forward popup has to
+    // offer them one by one, and a formatted "80:31234/TCP,443/TCP" cannot be picked from.
+    pub port_specs: Vec<SvcPortSpec>,
+    // An ExternalName Service is a DNS alias with nothing behind it in the cluster — nothing to
+    // forward to, and the popup says so instead of offering ports.
+    pub external_name: bool,
+}
+
+// One port of a Service spec, as the port-forward popup reads it.
+#[derive(Debug, Clone)]
+pub struct SvcPortSpec {
+    pub name: Option<String>,
+    pub port: i32,
+    pub protocol: String,
+    // `targetPort` as written: a number, or the container port name it points at.
+    pub target: String,
 }
 
 // One backing endpoint of a Service (typically a Pod), nested under its Service row when grouping is on.
@@ -249,6 +266,21 @@ fn service_resource(s: &Service, ep_summary: &EndpointSummary) -> ServiceResourc
         .get(&(namespace.clone(), name.clone()))
         .copied()
         .unwrap_or((0, 0));
+    let port_specs = spec
+        .and_then(|sp| sp.ports.as_ref())
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|p| SvcPortSpec {
+                    name: p.name.clone(),
+                    port: p.port,
+                    protocol: p.protocol.clone().unwrap_or_else(|| "TCP".to_string()),
+                    target: crate::portfwd::target_port_label(p.target_port.as_ref(), p.port),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let external_name = spec.and_then(|sp| sp.external_name.as_ref()).is_some();
     ServiceResource {
         uid: format!("service|{}/{}", namespace, name),
         namespace,
@@ -260,6 +292,8 @@ fn service_resource(s: &Service, ep_summary: &EndpointSummary) -> ServiceResourc
         age,
         endpoints_ready,
         endpoints_total,
+        port_specs,
+        external_name,
     }
 }
 
