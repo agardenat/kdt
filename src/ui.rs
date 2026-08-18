@@ -15932,6 +15932,31 @@ fn col_width<'a>(values: impl Iterator<Item = &'a str>, header: &str, min: u16, 
     (longest as u16).clamp(min, max)
 }
 
+// Width of the NODE column, shared by the workloads and the endpoints tables so the middle-elision
+// of the names matches what the column actually shows.
+const NODE_COL_W: u16 = 20;
+
+// A value shown in a fixed-width column, cut in its middle rather than at its end. Node names share
+// a long prefix and differ by their suffix (`aks-pool-12345678-vmss000003`): end-truncated, every
+// row would read the same, so the head and the tail are both kept around a `…`.
+fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    // The tail gets the odd cell: what distinguishes two nodes of a same pool is their suffix.
+    let keep = max - 1;
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(chars[chars.len() - tail..].iter());
+    out
+}
+
 // Does pod `p` resolve up to workload `w` (so it nests under it in the merged view)?
 fn pod_belongs_to(p: &PodResource, w: &WorkloadResource) -> bool {
     p.owner
@@ -16097,7 +16122,7 @@ fn pods_table_parts<'a>(
                     pct_cell(p.mem_bytes, p.mem_req),
                     pct_cell(p.mem_bytes, p.mem_lim),
                     Cell::from(p.ip.clone()).style(Style::default().fg(DIM)),
-                    Cell::from(p.node.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&p.node, NODE_COL_W as usize)).style(Style::default().fg(DIM)),
                     Cell::from(p.age.clone()).style(Style::default().fg(DIM)),
                 ])
                 .style(pod_row_style(status_color))
@@ -16149,7 +16174,7 @@ fn pods_table_parts<'a>(
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(7),
         Constraint::Length(12), Constraint::Length(4), Constraint::Length(7), Constraint::Length(9),
         Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7),
-        Constraint::Length(15), Constraint::Length(20), Constraint::Length(5),
+        Constraint::Length(15), Constraint::Length(NODE_COL_W), Constraint::Length(5),
     ];
     (rows, widths)
 }
@@ -16237,7 +16262,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     blank(),
                     blank(),
                     Cell::from(ready_txt).style(Style::default().fg(ready_color)),
-                    Cell::from(e.node.clone()).style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&e.node, NODE_COL_W as usize)).style(Style::default().fg(DIM)),
                     blank(),
                 ])
             }
@@ -16263,7 +16288,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(12),
         Constraint::Length(16), Constraint::Length(18), Constraint::Length(20),
-        Constraint::Length(11), Constraint::Length(20), Constraint::Length(5),
+        Constraint::Length(11), Constraint::Length(NODE_COL_W), Constraint::Length(5),
     ];
 
     let table = Table::new(rows, widths)
@@ -26670,6 +26695,24 @@ mod pods_container_rows_tests {
         // The pod's node and IP are not repeated on the container lines.
         assert_eq!(text.matches("10.244.3.17").count(), 1, "{text}");
         assert_eq!(text.matches("aks-pool-000000").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_node_name_too_long_for_its_column_keeps_its_head_and_its_tail() {
+        // Two pods of the same nodepool: only the suffix tells their nodes apart, so an
+        // end-truncated column would print the same string twice.
+        let mut p1 = pod("konnectivity-agent-7d9f", vec![]);
+        p1.node = "aks-systempool-41894869-vmss000003".to_string();
+        let mut p2 = pod("konnectivity-agent-8a1c", vec![]);
+        p2.node = "aks-systempool-41894869-vmss000017".to_string();
+        let rows = vec![
+            PodRow::Workload(workload()),
+            PodRow::Pod(Box::new(p1)),
+            PodRow::Pod(Box::new(p2)),
+        ];
+        let text = render(&rows, &std::collections::HashSet::new(), 190).join("\n");
+        assert!(text.contains("aks-syste…vmss000003"), "{text}");
+        assert!(text.contains("aks-syste…vmss000017"), "{text}");
     }
 
     #[test]
