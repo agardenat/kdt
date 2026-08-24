@@ -98,6 +98,10 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | `rancher` | `ranch`, `cattle`, `users`, `identities` | Rancher, côté comptes et identités |
 | `projects` | `project`, `proj` | Rancher, côté projects et namespaces |
 | `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, côté jetons |
+| `argocd` | `argo`, `acd`, `apps`, `applications` | Argo CD, côté Applications |
+| `appsets` | `appset`, `applicationsets` | Argo CD, côté ApplicationSets |
+| `appprojects` | `appproject`, `appproj` | Argo CD, côté AppProjects |
+| `argorepos` | `argorepo`, `argoclusters` | Argo CD, côté repositories et clusters enregistrés |
 | `configmaps` | `cm`, `config` | ConfigMaps |
 | `services` | `svc`, `service` | Services / Endpoints |
 | `forward` | `pf`, `portforward`, `tunnels` | Port-forwards en cours (superposé à la vue courante) |
@@ -145,6 +149,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`0` namespace |
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `e`, `h`, `Ctrl-D` volontairement absents |
+| Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
@@ -297,6 +302,40 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     affiché une seule fois et écrit nulle part), **changer le TTL** d'un token, **le révoquer**
     (supprimer l'objet `Token` est la seule révocation réelle), **régler un setting** de durée de
     vie. Ce sont les mêmes objets qu'un `kubectl apply` à la main ; kdt n'ajoute aucun privilège.
+- **Argo CD** (`:argocd`, `:appsets`, `:appprojects`, `:argorepos`) — quatre mondes par `g`, `f`
+  filtre ALL / PROBLEMS.
+  - *apps* : chaque `Application` avec **ses deux états côte à côte**, `sync` et `health`. Un
+    `sync: Unknown` signale que le controller n'a pas pu construire l'état désiré (credential git
+    expiré, dépôt Helm injoignable, plugin en erreur) : le `health` affiché à côté a été calculé
+    *avant* l'échec, et la vue le dit et le grise au lieu de le montrer en vert. La colonne `POLICY`
+    lit `syncPolicy.automated` tel qu'il se comporte — `automated: { enabled: false }` est un
+    auto-sync déclaré et éteint, affiché `manual`. Puis le project, la destination (nom du cluster
+    enregistré, pas son URL), la revision, le nombre de resources hors sync, la dernière opération
+    et son âge, et l'âge de la dernière comparaison.
+  - Le panneau de détail donne le diagnostic **avant** l'inventaire : conditions Argo (`*Error` en
+    rouge, `OrphanedResourceWarning` en info — c'est un réglage du project), opération en échec avec
+    son message et son nombre de tentatives, project inexistant, destination absente des clusters
+    enregistrés, absence de comparaison depuis plus de trois périodes (`timeout.reconciliation` lu
+    dans `argocd-cm`), et la présence ou non du finalizer de cascade — c'est-à-dire si supprimer
+    l'Application supprime aussi ce qu'elle a déployé. Suivent les resources hors état attendu,
+    l'historique des revisions déployées et les images.
+  - *sets* : `ApplicationSet` avec ses generators, les Applications qu'il a réellement générées
+    (lues par `ownerReferences`), leur état, `syncPolicy.applicationsSync`,
+    `preserveResourcesOnDeletion`, `goTemplate` et les conditions du controller.
+  - *projects* : `AppProject` avec le nombre d'Applications, `sourceRepos` (`*` affiché comme tel),
+    destinations, listes de resources autorisées/interdites, sync windows, et les roles avec la
+    distinction lecture / écriture calculée sur le verbe de chaque policy Casbin.
+  - *repos* : les repositories, credentials templates et clusters, qui ne sont pas des CRD mais des
+    `Secret` étiquetés `argocd.argoproj.io/secret-type`. kdt en décode l'**adressage** (url, nom,
+    type, project, portée) et déduit la méthode d'authentification de la **présence** des clés —
+    aucun credential n'est lu. La colonne `USED` compte les Applications qui s'y réfèrent.
+  - Sans lien avec un CRD : la ligne du haut du panneau nomme l'installation (namespace découvert
+    via `argocd-cm`, URL de l'UI, période de comparaison, état des composants) et signale les
+    Applications posées hors des namespaces que le controller honore (`application.namespaces`).
+  - `r` : **refresh** et **hard refresh** (annotation `argocd.argoproj.io/refresh`), **sync** et
+    **sync + prune** (champ `.operation`, sans revision figée : le controller résout le
+    `targetRevision` de l'Application), **terminate** quand une opération tourne. Ce sont les
+    écritures que fait le CLI `argocd` ; kdt n'ajoute aucun privilège.
 - **Réseau** (`:services`, `:ingress`, `:netpol`) — trois mondes par `g` : Services/Endpoints,
   Ingress/IngressClass, NetworkPolicies. Les policies natives sont affichées avec leur cible, leurs
   `policyTypes` et l'effet par direction : `Deny` (direction gouvernée, aucune règle n'autorise),
@@ -342,6 +381,7 @@ déclenche explicitement, et elles passent par des garde-fous.
 | `o` (Nodes) | Patch `spec.unschedulable`, puis évictions | Rapport de drain complet avant la moindre éviction |
 | `r` / `z` | Reconcile, suspend, scale, restart, renew | Confirmation armée dans le menu |
 | `Ctrl-R` | Suppression d'une config d'admission, retrait de finalizers | Saisie du nom exact de l'objet |
+| `r` (Argo CD) | Annotation `argocd.argoproj.io/refresh`, champ `.operation`, `status.operationState.phase` | Confirmation armée dans le menu ; le prune est une entrée distincte, jamais une option cochée |
 | `o` (Rancher) | Création d'un `Token`, patch de son `.ttl`, suppression d'un `Token`, patch d'un `Setting` | Confirmation armée, puis saisie dont l'unité est affichée ; refusé sur un cluster downstream ; le secret émis n'est montré qu'une fois et n'est écrit nulle part |
 
 **Aucun avertissement ne bloque**, mais **la réponse par défaut est non** : `Entrée` et `Esc`
@@ -467,6 +507,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | RBAC scoré, Secrets/TLS, chaîne cert-manager |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVE |
 | `velero.rs` | Velero : backups, schedules (cron évalué), restaurations, locations |
+| `argocd.rs` | Argo CD : Applications, ApplicationSets, AppProjects, repositories et clusters |
 | `rancher.rs` | Rancher : comptes et identités réelles, bindings, projects, tokens et settings de TTL |
 | `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, et l'API de management Cassandra via le proxy apiserver |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |

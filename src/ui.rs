@@ -472,6 +472,30 @@ use crate::svc::{
 };
 use crate::portfwd::{self, PfRequest, PfRow, PfState, SharedForwards};
 use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
+use crate::argocd::{
+    fetch_argocd, new_argo_state, ArgoApp, ArgoAppSet, ArgoEndpoint, ArgoProject, ArgoWrite,
+    EndpointKind, SharedArgo,
+};
+
+// The four worlds of the Argo CD view. They share one fetch and one snapshot; `g` moves between
+// them without refetching, as velero, k8ssandra and rancher already do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgoWorld {
+    Apps,
+    Sets,
+    Projects,
+    Repos,
+}
+
+// One visual row of the Argo CD view, index-aligned with the snapshot so the detail panel, `y`,
+// `e`, `Ctrl-D` and the search all track the selection without any code of their own.
+#[derive(Debug, Clone)]
+enum ArgoRow {
+    App(Box<ArgoApp>),
+    Set(Box<ArgoAppSet>),
+    Project(Box<ArgoProject>),
+    Endpoint(Box<ArgoEndpoint>),
+}
 use crate::rancher::{
     apply_rancher_write, fetch_rancher, format_minutes, format_refresh, format_ttl,
     new_rancher_state, BindScope, ClusterRole, IssuedToken, PrincipalKind, RancherBinding,
@@ -939,7 +963,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull }
 
 // One visual line in the merged workloads view: a workload (parent/group row), one of its pods
 // (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
@@ -992,6 +1016,11 @@ enum MenuAction {
     RanchSetTokenTtl,
     RanchRevokeToken,
     RanchSetSetting,
+    // Argo CD: re-read the sources (`true` throws the manifest cache away first), ask for a sync
+    // (`true` prunes), or stop the operation in flight.
+    ArgoRefresh(bool),
+    ArgoSync(bool),
+    ArgoTerminate,
 }
 
 // The menu actions that ask for a typed value before they run. Each names the unit it expects, and
@@ -1232,6 +1261,14 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("rancher", &["ranch", "cattle", "users", "user", "identities", "identites"]),
     ("projects", &["project", "proj"]),
     ("tokens", &["token", "apikeys", "apikey", "kubeconfigs"]),
+    // Argo CD's own objects. `apps`/`app` belong here rather than to the workloads view: on a
+    // cluster running Argo CD that word means an `Application`, not a Deployment. `projects` is
+    // already Rancher's, so the AppProjects answer to `appprojects` and the registered repositories
+    // and clusters to `argorepos` — each opens on the world it names instead of one `g` away.
+    ("argocd", &["argo", "acd", "applications", "application", "apps", "app"]),
+    ("appsets", &["appset", "applicationset", "applicationsets"]),
+    ("appprojects", &["appproject", "appproj"]),
+    ("argorepos", &["argorepo", "argoclusters", "argocluster"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -1604,6 +1641,12 @@ pub struct App {
     k8c_rows: Vec<K8cRow>,
     pub k8c_detail_scroll: usize,
     pub k8c_refresh_handle: Option<JoinHandle<()>>,
+    pub argo_state: SharedArgo,
+    argo_world: ArgoWorld,
+    argo_filter: StoFilter,
+    argo_rows: Vec<ArgoRow>,
+    pub argo_detail_scroll: usize,
+    pub argo_refresh_handle: Option<JoinHandle<()>>,
     pub ranch_state: SharedRancher,
     ranch_world: RancWorld,
     ranch_filter: StoFilter,
@@ -1880,6 +1923,12 @@ impl App {
             k8c_rows: Vec::new(),
             k8c_detail_scroll: 0,
             k8c_refresh_handle: None,
+            argo_state: new_argo_state(),
+            argo_world: ArgoWorld::Apps,
+            argo_filter: StoFilter::All,
+            argo_rows: Vec::new(),
+            argo_detail_scroll: 0,
+            argo_refresh_handle: None,
             ranch_state: new_rancher_state(),
             ranch_world: RancWorld::Users,
             ranch_filter: StoFilter::All,
@@ -2654,7 +2703,9 @@ impl App {
             | Mode::K8ssandra
             | Mode::K8ssandraFull
             | Mode::Rancher
-            | Mode::RancherFull => {
+            | Mode::RancherFull
+            | Mode::Argo
+            | Mode::ArgoFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -3619,6 +3670,7 @@ impl App {
             Mode::Storage | Mode::StorageFull => step(&mut self.sto_detail_scroll, delta),
             Mode::Capacity | Mode::CapacityFull => step(&mut self.cap_detail_scroll, delta),
             Mode::Rancher | Mode::RancherFull => step(&mut self.ranch_detail_scroll, delta),
+            Mode::Argo | Mode::ArgoFull => step(&mut self.argo_detail_scroll, delta),
             _ => {}
         }
     }
@@ -3634,7 +3686,7 @@ impl App {
         };
         match view_mode(self) {
             Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull
-            | Mode::Rancher | Mode::RancherFull => {}
+            | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull => {}
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
             Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
             _ => step(&mut self.detail_h_scroll, delta),
@@ -3657,6 +3709,7 @@ impl App {
             Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher(),
+            Mode::Argo | Mode::ArgoFull => self.refresh_argo(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             Mode::Namespaces => self.refresh_namespaces(),
             _ => {}
@@ -4036,6 +4089,7 @@ impl App {
             Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c_snapshot(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher_snapshot(),
+            Mode::Argo | Mode::ArgoFull => self.refresh_argo_snapshot(),
             _ => {}
         }
     }
@@ -4195,6 +4249,28 @@ impl App {
                 self.leave_special_modes();
                 self.enter_rancher_mode(RancWorld::Tokens);
             }
+            "argocd" => {
+                // Always opens: on a cluster with no argoproj.io the view says so, which is itself
+                // the answer to "is Argo CD installed here".
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_argo_mode(ArgoWorld::Apps);
+            }
+            "appsets" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_argo_mode(ArgoWorld::Sets);
+            }
+            "appprojects" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_argo_mode(ArgoWorld::Projects);
+            }
+            "argorepos" => {
+                self.mode = origin;
+                self.leave_special_modes();
+                self.enter_argo_mode(ArgoWorld::Repos);
+            }
             "configmaps" => {
                 self.mode = origin;
                 self.leave_special_modes();
@@ -4284,6 +4360,10 @@ impl App {
             }
             Mode::Rancher | Mode::RancherFull => {
                 self.stop_rancher_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Argo | Mode::ArgoFull => {
+                self.stop_argo_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -8934,6 +9014,307 @@ impl App {
         self.refresh_rancher_snapshot();
     }
 
+    // --- Argo CD view ---------------------------------------------------------------------------
+
+    // Open the Argo CD view on the given world. The four worlds share one fetch and one snapshot;
+    // `g` moves between them without refetching.
+    fn enter_argo_mode(&mut self, world: ArgoWorld) {
+        self.mode = Mode::Argo;
+        self.argo_world = world;
+        self.argo_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_argo();
+        self.start_argo_auto_refresh();
+        self.refresh_argo_snapshot();
+    }
+
+    fn exit_argo_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_argo_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_argo_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.argo_detail_scroll = 0;
+        self.mode = Mode::ArgoFull;
+    }
+
+    fn exit_argo_full(&mut self) {
+        self.mode = Mode::Argo;
+    }
+
+    fn refresh_argo(&self) {
+        {
+            let mut s = self.argo_state.lock().expect("argocd poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.argo_state.clone();
+        tokio::spawn(async move { fetch_argocd(client, state).await; });
+    }
+
+    // 20s. An Application moves on the controller's comparison period, which defaults to three
+    // minutes — but a sync asked for from here finishes in seconds, and the row has to show it.
+    fn start_argo_auto_refresh(&mut self) {
+        self.stop_argo_auto_refresh();
+        let client = self.client.clone();
+        let state = self.argo_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_argocd(client.clone(), state.clone()).await;
+            }
+        });
+        self.argo_refresh_handle = Some(handle);
+    }
+
+    fn stop_argo_auto_refresh(&mut self) {
+        if let Some(h) = self.argo_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `argo_rows` and `App::snapshot` in lockstep, so a selected index means the same row
+    // in both. That alignment is what gives this view `y`, `e`, `Ctrl-D`, the search and the AI
+    // panel without any code of its own.
+    fn refresh_argo_snapshot(&mut self) {
+        let s = self.argo_state.lock().expect("argocd poisoned").clone();
+        let problems_only = self.argo_filter == StoFilter::Problems;
+        let worse = |hints: &[crate::storage::Hint]| {
+            hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+        };
+        let mut rows: Vec<ArgoRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        match self.argo_world {
+            ArgoWorld::Apps => {
+                for a in s.apps.iter().filter(|a| !problems_only || worse(&a.hints)) {
+                    recs.push(argo_app_record(a));
+                    rows.push(ArgoRow::App(Box::new(a.clone())));
+                }
+            }
+            ArgoWorld::Sets => {
+                for x in s.sets.iter().filter(|x| !problems_only || worse(&x.hints)) {
+                    recs.push(argo_set_record(x));
+                    rows.push(ArgoRow::Set(Box::new(x.clone())));
+                }
+            }
+            ArgoWorld::Projects => {
+                for x in s.projects.iter().filter(|x| !problems_only || worse(&x.hints)) {
+                    recs.push(argo_project_record(x));
+                    rows.push(ArgoRow::Project(Box::new(x.clone())));
+                }
+            }
+            ArgoWorld::Repos => {
+                for x in s.endpoints.iter().filter(|x| !problems_only || worse(&x.hints)) {
+                    recs.push(argo_endpoint_record(x));
+                    rows.push(ArgoRow::Endpoint(Box::new(x.clone())));
+                }
+            }
+        }
+
+        self.argo_rows = rows;
+        // The row the cursor was on, so a refresh under the ticker does not move the selection out
+        // from under the reader.
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            // A flat list has no ancestors to keep: every row stands alone.
+            retain_aligned(&mut self.argo_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_argo_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.argo_detail_scroll = 0;
+    }
+
+    fn argo_selected(&self) -> Option<&ArgoRow> {
+        self.argo_rows.get(self.table_state.selected()?)
+    }
+
+    fn cycle_argo_world(&mut self) {
+        self.argo_world = match self.argo_world {
+            ArgoWorld::Apps => ArgoWorld::Sets,
+            ArgoWorld::Sets => ArgoWorld::Projects,
+            ArgoWorld::Projects => ArgoWorld::Repos,
+            ArgoWorld::Repos => ArgoWorld::Apps,
+        };
+        self.argo_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_argo_snapshot();
+    }
+
+    fn cycle_argo_filter(&mut self) {
+        self.argo_filter = match self.argo_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_argo_snapshot();
+    }
+
+    // Only an Application has anything to write. A set, a project, a repository Secret are all
+    // changed where they are declared — and the toast says so rather than opening an empty menu,
+    // the same rule the velero and reflector views follow.
+    fn open_argo_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(ArgoRow::App(app)) = self.argo_selected().cloned() else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.argo_no_action.to_string()));
+            return;
+        };
+
+        let mut items = vec![
+            ActionItem {
+                label: st.k_argo_refresh,
+                desc: st.desc_argo_refresh.to_string(),
+                action: MenuAction::ArgoRefresh(false),
+            },
+            ActionItem {
+                label: st.k_argo_hard_refresh,
+                desc: st.desc_argo_hard_refresh.to_string(),
+                action: MenuAction::ArgoRefresh(true),
+            },
+        ];
+        // What a sync would move to, named before it runs: an app whose revision is a branch and an
+        // app pinned to a tag do not mean the same thing by "sync".
+        let target = app
+            .sources
+            .first()
+            .map(|s| {
+                if s.target_revision.is_empty() { "HEAD".to_string() } else { s.target_revision.clone() }
+            })
+            .unwrap_or_else(|| "HEAD".to_string());
+        items.push(ActionItem {
+            label: st.k_argo_sync,
+            desc: lang::fill(st.desc_argo_sync, &[("revision", &target)]),
+            action: MenuAction::ArgoSync(false),
+        });
+        items.push(ActionItem {
+            label: st.k_argo_sync_prune,
+            desc: st.desc_argo_sync_prune.to_string(),
+            action: MenuAction::ArgoSync(true),
+        });
+        if app.operation_running() {
+            items.push(ActionItem {
+                label: st.k_argo_terminate,
+                desc: lang::fill(
+                    st.desc_argo_terminate,
+                    &[("phase", &app.op_phase), ("age", &app.op_age)],
+                ),
+                action: MenuAction::ArgoTerminate,
+            });
+        }
+
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_argo_app_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            // A sync that is already running is the context in which every other entry of this menu
+            // reads differently, so it is stated above them rather than inside one of them.
+            note: app
+                .operation_running()
+                .then(|| lang::fill(st.argo_op_running, &[("age", &app.op_age)])),
+        });
+    }
+
+    fn argo_refresh_app(&mut self, hard: bool) {
+        let st = lang::t(self.ai_language);
+        let Some(ArgoRow::App(a)) = self.argo_selected().cloned() else { return };
+        let write = ArgoWrite::Refresh {
+            namespace: a.namespace.clone(),
+            name: a.name.clone(),
+            hard,
+        };
+        self.argo_run_write(write, st.msg_argo_refreshed, st.msg_argo_write_failed);
+    }
+
+    fn argo_sync_app(&mut self, prune: bool) {
+        let st = lang::t(self.ai_language);
+        let Some(ArgoRow::App(a)) = self.argo_selected().cloned() else { return };
+        let write = ArgoWrite::Sync {
+            namespace: a.namespace.clone(),
+            name: a.name.clone(),
+            prune,
+        };
+        self.argo_run_write(write, st.msg_argo_synced, st.msg_argo_write_failed);
+    }
+
+    fn argo_terminate_app(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(ArgoRow::App(a)) = self.argo_selected().cloned() else { return };
+        let write = ArgoWrite::Terminate {
+            namespace: a.namespace.clone(),
+            name: a.name.clone(),
+        };
+        self.argo_run_write(write, st.msg_argo_terminated, st.msg_argo_write_failed);
+    }
+
+    // One write, reported through the same channel as the Flux reconciles, then a refresh so the
+    // outcome shows without waiting on the ticker.
+    fn argo_run_write(
+        &mut self,
+        write: ArgoWrite,
+        ok_msg: &'static str,
+        err_msg: &'static str,
+    ) {
+        let target = write.target();
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        tokio::spawn(async move {
+            let text = match crate::argocd::apply_argo_write(client, write).await {
+                Ok(()) => lang::fill(ok_msg, &[("name", &target)]),
+                Err(e) => lang::fill(err_msg, &[("name", &target), ("e", &e)]),
+            };
+            let mut s = status.lock().expect("reconcile status poisoned");
+            *s = Some((std::time::Instant::now(), text));
+        });
+        self.refresh_argo();
+    }
+
     // --- Reflector view -------------------------------------------------------------------------
 
     fn enter_reflector_mode(&mut self) {
@@ -10455,6 +10836,9 @@ impl App {
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
             Some(MenuAction::NodeDrain) => self.open_node_drain(),
             Some(MenuAction::RanchRevokeToken) => self.ranch_revoke_token(),
+            Some(MenuAction::ArgoRefresh(hard)) => self.argo_refresh_app(hard),
+            Some(MenuAction::ArgoSync(prune)) => self.argo_sync_app(prune),
+            Some(MenuAction::ArgoTerminate) => self.argo_terminate_app(),
             Some(MenuAction::ScaleSet)
             | Some(MenuAction::RanchIssueToken)
             | Some(MenuAction::RanchSetTokenTtl)
@@ -11119,6 +11503,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // Token writes report through the same channel as the Flux reconciles.
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::Argo | Mode::ArgoFull) {
+            app.refresh_argo_snapshot();
+            // The Argo writes report through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -11463,13 +11852,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
             app.enter_search();
         }
 
@@ -11492,12 +11881,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
             app.open_edit_view();
         }
 
@@ -11510,12 +11899,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
             app.open_delete_view();
         }
 
@@ -12044,6 +12433,19 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::Rancher) => app.enter_ai_panel(),
         (_, _, Mode::Rancher) => {}
 
+        (KeyCode::Up, _, Mode::Argo) => app.move_argo_selection(-1),
+        (KeyCode::Down, _, Mode::Argo) => app.move_argo_selection(1),
+        (KeyCode::PageUp, _, Mode::Argo) => app.move_argo_selection(-10),
+        (KeyCode::PageDown, _, Mode::Argo) => app.move_argo_selection(10),
+        (KeyCode::Char('g'), _, Mode::Argo) => app.cycle_argo_world(),
+        (KeyCode::Char('f'), _, Mode::Argo) => app.cycle_argo_filter(),
+        (KeyCode::Char('r'), _, Mode::Argo) => app.open_argo_action_menu(),
+        (KeyCode::Enter, _, Mode::Argo) => app.enter_argo_full(),
+        (KeyCode::F(5), _, Mode::Argo) => app.refresh_argo(),
+        (KeyCode::Esc, _, Mode::Argo) => app.exit_argo_mode(),
+        (KeyCode::Char('i'), _, Mode::Argo) => app.enter_ai_panel(),
+        (_, _, Mode::Argo) => {}
+
         (KeyCode::Up, m, Mode::VeleroFull) if !m.contains(KeyModifiers::SHIFT) => {
             app.vel_detail_scroll = app.vel_detail_scroll.saturating_sub(1)
         }
@@ -12104,6 +12506,26 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('G'), _, Mode::RancherFull) => app.ranch_detail_scroll = usize::MAX,
         (KeyCode::Char('i'), _, Mode::RancherFull) => app.enter_ai_panel(),
         (_, _, Mode::RancherFull) => {}
+
+        (KeyCode::Up, m, Mode::ArgoFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.argo_detail_scroll = app.argo_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::ArgoFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.argo_detail_scroll = app.argo_detail_scroll.saturating_add(1)
+        }
+        (KeyCode::PageUp, _, Mode::ArgoFull) => {
+            app.argo_detail_scroll = app.argo_detail_scroll.saturating_sub(10)
+        }
+        (KeyCode::PageDown, _, Mode::ArgoFull) => {
+            app.argo_detail_scroll = app.argo_detail_scroll.saturating_add(10)
+        }
+        (KeyCode::Enter, _, Mode::ArgoFull) => app.exit_argo_full(),
+        (KeyCode::Esc, _, Mode::ArgoFull) => app.exit_argo_full(),
+        (KeyCode::Char('g'), _, Mode::ArgoFull) => app.argo_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::ArgoFull) => app.argo_detail_scroll = usize::MAX / 2,
+        (KeyCode::Char('r'), _, Mode::ArgoFull) => app.open_argo_action_menu(),
+        (KeyCode::Char('i'), _, Mode::ArgoFull) => app.enter_ai_panel(),
+        (_, _, Mode::ArgoFull) => {}
 
         (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
         (KeyCode::Down, _, Mode::Reflector) => app.move_refl_selection(1),
@@ -12251,7 +12673,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
         Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull => app.command_return_mode,
+            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull => app.command_return_mode,
             _ => Mode::Selection,
         },
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
@@ -12282,11 +12704,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -12302,8 +12724,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     };
 
@@ -12331,6 +12753,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Velero | Mode::VeleroFull => st.mode_velero,
         Mode::K8ssandra | Mode::K8ssandraFull => st.mode_k8ssandra,
         Mode::Rancher | Mode::RancherFull => st.mode_rancher,
+        Mode::Argo | Mode::ArgoFull => st.mode_argocd,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Namespaces => st.mode_ns,
         Mode::Services | Mode::ServicesFull => st.mode_services,
@@ -12406,6 +12829,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_k8ssandra_table(f, app, ta);
         } else if draw_mode == Mode::Rancher {
             draw_rancher_table(f, app, ta);
+        } else if draw_mode == Mode::Argo {
+            draw_argo_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Namespaces {
@@ -12419,7 +12844,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -12941,6 +13366,34 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
         }
+        Mode::Argo => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.argo_world {
+                ArgoWorld::Apps => st.k_argo_sets,
+                ArgoWorld::Sets => st.k_argo_projects,
+                ArgoWorld::Projects => st.k_argo_repos,
+                ArgoWorld::Repos => st.k_argo_apps,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_argo_filter, app.argo_filter.label())),
+                Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_argo_actions)),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::ArgoFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_argo_actions)),
+        ],
         Mode::RancherFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
@@ -17027,6 +17480,966 @@ fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 // A Rancher row's severity comes from its hints, never from the object's own state: a disabled
 // account is a warning, an account with no access at all is not.
+// --- Argo CD view rendering -----------------------------------------------------------------------
+
+fn argo_severity(hints: &[crate::storage::Hint]) -> Severity {
+    match hints.iter().map(|h| h.level).max() {
+        Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
+        _ => Severity::Normal,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn argo_record(
+    uid: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[crate::storage::Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: argo_severity(hints),
+        reason: reason.to_string(),
+        api_version: crate::argocd::API_ARGO.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// The message is what the AI panel and the search read, so it carries the two words that decide
+// everything — sync and health — plus where the app deploys and what it deploys from. `/` then finds
+// an Application from a repository url or from a destination namespace, which is how one arrives
+// here from a ticket.
+fn argo_app_record(a: &ArgoApp) -> EventRecord {
+    let st = lang::active();
+    let mut parts = vec![format!("{} / {}", a.sync, a.health)];
+    parts.push(format!("{}={}", st.argo_lbl_project, a.project));
+    parts.push(format!("{} {}/{}", st.argo_lbl_destination, a.dest_label, a.dest_namespace));
+    for s in &a.sources {
+        parts.push(s.label());
+    }
+    if !a.op_phase.is_empty() {
+        parts.push(format!("{} {}", st.argo_lbl_operation, a.op_phase));
+    }
+    argo_record(
+        &a.uid,
+        crate::argocd::KIND_APP,
+        &a.namespace,
+        &a.name,
+        if a.sync.is_empty() { "Application" } else { &a.sync },
+        parts.join(" · "),
+        &a.hints,
+    )
+}
+
+fn argo_set_record(s: &ArgoAppSet) -> EventRecord {
+    let st = lang::active();
+    let message = format!(
+        "{} {} · {} {}",
+        st.argo_lbl_generators,
+        if s.generators.is_empty() { "—".to_string() } else { s.generators.join(",") },
+        s.apps.len(),
+        st.argo_lbl_apps,
+    );
+    argo_record(
+        &s.uid,
+        crate::argocd::KIND_APPSET,
+        &s.namespace,
+        &s.name,
+        "ApplicationSet",
+        message,
+        &s.hints,
+    )
+}
+
+fn argo_project_record(p: &ArgoProject) -> EventRecord {
+    let st = lang::active();
+    let mut message = format!("{} {}", p.apps, st.argo_lbl_apps);
+    if !p.description.is_empty() {
+        message.push_str(" · ");
+        message.push_str(&p.description);
+    }
+    if !p.source_repos.is_empty() {
+        message.push_str(&format!(" · {} {}", st.argo_lbl_repos, p.source_repos.join(",")));
+    }
+    argo_record(
+        &p.uid,
+        crate::argocd::KIND_PROJECT,
+        &p.namespace,
+        &p.name,
+        "AppProject",
+        message,
+        &p.hints,
+    )
+}
+
+// An endpoint row stands in for its Secret, because that is the object `y`, `e` and `Ctrl-D` have to
+// open: Argo CD has no CRD for a repository.
+fn argo_endpoint_record(e: &ArgoEndpoint) -> EventRecord {
+    let st = lang::active();
+    let message = format!(
+        "{} · {} {} · {} {}",
+        e.url,
+        st.argo_lbl_auth,
+        e.auth,
+        e.used_by,
+        st.argo_lbl_apps,
+    );
+    argo_record(
+        &e.uid,
+        "Secret",
+        &e.namespace,
+        &e.secret,
+        e.kind.label(),
+        message,
+        &e.hints,
+    )
+    .with_api_version("v1")
+}
+
+impl EventRecord {
+    // An endpoint row is a core/v1 Secret, not an argoproj.io object: the shared YAML machinery
+    // resolves the kind through this field and would look for the wrong resource otherwise.
+    fn with_api_version(mut self, v: &str) -> Self {
+        self.api_version = v.to_string();
+        self
+    }
+}
+
+// The Argo CD install as every title names it: what it is and where, so an empty list reads as
+// "nothing is declared" rather than as "nothing was read".
+fn argo_install_label(app: &App, server: &crate::argocd::ArgoServer) -> String {
+    let st = lang::t(app.ai_language);
+    if !server.present {
+        return st.argo_absent.to_string();
+    }
+    let ns = if server.namespace.is_empty() { "?" } else { server.namespace.as_str() };
+    // A rebuilt image labels itself with its branch, and a branch shown where a version goes reads
+    // as one. The raw label stays available in the panel; only a version number reaches the title.
+    if crate::argocd::looks_like_a_version(&server.version) {
+        lang::fill(st.argo_install, &[("version", &server.version), ("ns", ns)])
+    } else {
+        lang::fill(st.argo_install_plain, &[("ns", ns)])
+    }
+}
+
+// Green means "compared and equal", and nothing else. `Unknown` is the one that has to stand out:
+// it is the state a reader mistakes for "probably fine".
+fn argo_sync_style(sync: &str) -> Style {
+    match sync {
+        "Synced" => Style::default().fg(Color::Green),
+        "OutOfSync" => Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD),
+        "Unknown" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+// The health of an app whose comparison is broken is a memory, not a measurement: it is shown dim
+// whatever it says, so a stale `Healthy` never reads as a green light.
+fn argo_health_style(a: &ArgoApp) -> Style {
+    if a.comparison_broken() {
+        return Style::default().fg(DIM);
+    }
+    match a.health.as_str() {
+        "Healthy" => Style::default().fg(Color::Green),
+        "Progressing" => Style::default().fg(Color::Cyan),
+        "Degraded" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "Missing" => Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD),
+        "Suspended" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+fn argo_phase_style(phase: &str) -> Style {
+    match phase {
+        "Succeeded" => Style::default().fg(DIM),
+        "Running" => Style::default().fg(Color::Cyan),
+        "Terminating" => Style::default().fg(Color::Yellow),
+        "Failed" | "Error" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+// Auto-sync is the norm on most installs, so it reads as background; a manual policy is the
+// exception and is the one that gets a colour.
+fn argo_policy_cell(a: &ArgoApp) -> Cell<'static> {
+    let label = a.policy_label();
+    if a.auto {
+        Cell::from(label).style(Style::default().fg(DIM))
+    } else {
+        Cell::from(label).style(Style::default().fg(Color::Yellow))
+    }
+}
+
+// The counters the four titles are built from, read under one lock.
+struct ArgoTotals {
+    apps: usize,
+    out_of_sync: usize,
+    blind: usize,
+    unhealthy: usize,
+    sets: usize,
+    set_apps: usize,
+    projects: usize,
+    project_apps: usize,
+    repos: usize,
+    creds: usize,
+    clusters: usize,
+}
+
+fn draw_argo_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, server, totals) = {
+        let s = app.argo_state.lock().expect("argocd poisoned");
+        let totals = ArgoTotals {
+            apps: s.apps.len(),
+            out_of_sync: s.out_of_sync(),
+            blind: s.blind(),
+            unhealthy: s.unhealthy(),
+            sets: s.sets.len(),
+            set_apps: s.sets.iter().map(|x| x.apps.len()).sum(),
+            projects: s.projects.len(),
+            project_apps: s.projects.iter().map(|p| p.apps).sum(),
+            repos: s.endpoints.iter().filter(|e| e.kind == EndpointKind::Repo).count(),
+            creds: s.endpoints.iter().filter(|e| e.kind == EndpointKind::RepoCreds).count(),
+            clusters: s.endpoints.iter().filter(|e| e.kind == EndpointKind::Cluster).count(),
+        };
+        (s.loading, s.error.clone(), s.server.clone(), totals)
+    };
+
+    let st = lang::t(app.ai_language);
+    let install = argo_install_label(app, &server);
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "argocd"), ("e", e)])
+    } else if loading && app.argo_rows.is_empty() {
+        lang::fill(st.ui_title_loading, &[("view", "argocd")])
+    } else {
+        match app.argo_world {
+            ArgoWorld::Apps => lang::fill(
+                st.argo_title_apps,
+                &[
+                    ("total", &totals.apps.to_string()),
+                    ("oos", &totals.out_of_sync.to_string()),
+                    ("blind", &totals.blind.to_string()),
+                    ("bad", &totals.unhealthy.to_string()),
+                    ("server", &install),
+                ],
+            ),
+            ArgoWorld::Sets => lang::fill(
+                st.argo_title_sets,
+                &[
+                    ("total", &totals.sets.to_string()),
+                    ("apps", &totals.set_apps.to_string()),
+                    ("server", &install),
+                ],
+            ),
+            ArgoWorld::Projects => lang::fill(
+                st.argo_title_projects,
+                &[
+                    ("total", &totals.projects.to_string()),
+                    ("apps", &totals.project_apps.to_string()),
+                    ("server", &install),
+                ],
+            ),
+            ArgoWorld::Repos => lang::fill(
+                st.argo_title_repos,
+                &[
+                    ("repos", &totals.repos.to_string()),
+                    ("creds", &totals.creds.to_string()),
+                    ("clusters", &totals.clusters.to_string()),
+                    ("server", &install),
+                ],
+            ),
+        }
+    };
+
+    let (header, rows, widths) = argo_table_parts(app.argo_world, &app.argo_rows, area.width);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// The header, the rows and the widths of one world, apart from the frame around them: built here
+// rather than inline so the border test renders the table the view really draws.
+#[allow(clippy::type_complexity)]
+fn argo_table_parts(
+    world: ArgoWorld,
+    src: &[ArgoRow],
+    width: u16,
+) -> (Row<'static>, Vec<Row<'static>>, Vec<Constraint>) {
+    // What the slack column really gets: the frame, the `> ` marker and the columns around it taken
+    // off. A url and a `cluster/namespace` both differ by their tail, so they are elided in their
+    // middle — cut at the end, every row of a repo list reads the same.
+    let slack = |others: u16| {
+        width.saturating_sub(4 + others).max(12) as usize
+    };
+    let header_style =
+        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+
+    // Each world is its own table: the four have nothing in common beyond the frame around them.
+    match world {
+        ArgoWorld::Apps => {
+            let header = Row::new(vec![
+                Cell::from("NS"), Cell::from("NAME"), Cell::from("PROJECT"), Cell::from("SYNC"),
+                Cell::from("HEALTH"), Cell::from("POLICY"), Cell::from("DESTINATION"),
+                Cell::from("REV"), Cell::from("OOS"), Cell::from("OPERATION"), Cell::from("CMP"),
+                Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let name_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::App(a) => a.name.as_str(), _ => "" }),
+                "NAME", 18, 44,
+            );
+            let ns_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::App(a) => a.namespace.as_str(), _ => "" }),
+                "NS", 6, 20,
+            );
+            let proj_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::App(a) => a.project.as_str(), _ => "" }),
+                "PROJECT", 8, 24,
+            );
+            // Everything but DESTINATION, plus one cell of spacing per gap.
+            let dest_w = slack(ns_w + name_w + proj_w + 9 + 11 + 14 + 8 + 3 + 14 + 5 + 5 + 11);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    ArgoRow::App(a) => {
+                        // A count of zero reads as nothing: what matters is the rows that have some.
+                        let oos = if a.out_of_sync == 0 {
+                            Span::styled("·", Style::default().fg(DIM))
+                        } else {
+                            Span::styled(
+                                a.out_of_sync.to_string(),
+                                Style::default().fg(Color::Rgb(255, 140, 0)),
+                            )
+                        };
+                        let dest = elide_middle(
+                            &format!("{}/{}", a.dest_label, a.dest_namespace),
+                            dest_w,
+                        );
+                        let op = if a.op_phase.is_empty() {
+                            "—".to_string()
+                        } else if a.op_age.is_empty() {
+                            a.op_phase.clone()
+                        } else {
+                            format!("{} {}", a.op_phase, a.op_age)
+                        };
+                        Row::new(vec![
+                            Cell::from(elide_middle(&a.namespace, ns_w as usize))
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(elide_middle(&a.name, name_w as usize))
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(elide_middle(&a.project, proj_w as usize))
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(if a.sync.is_empty() { "—".to_string() } else { a.sync.clone() })
+                                .style(argo_sync_style(&a.sync)),
+                            Cell::from(if a.health.is_empty() { "—".to_string() } else { a.health.clone() })
+                                .style(argo_health_style(a)),
+                            argo_policy_cell(a),
+                            Cell::from(dest),
+                            Cell::from(a.revision.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(oos),
+                            Cell::from(op).style(argo_phase_style(&a.op_phase)),
+                            Cell::from(a.reconciled_age.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(a.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let widths = vec![
+                Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(proj_w),
+                Constraint::Length(9), Constraint::Length(11), Constraint::Length(14),
+                Constraint::Min(16), Constraint::Length(8), Constraint::Length(3),
+                Constraint::Length(14), Constraint::Length(5), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        ArgoWorld::Sets => {
+            let header = Row::new(vec![
+                Cell::from("NS"), Cell::from("NAME"), Cell::from("GENERATORS"), Cell::from("APPS"),
+                Cell::from("OOS"), Cell::from("BAD"), Cell::from("POLICY"), Cell::from("STATE"),
+                Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let name_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Set(x) => x.name.as_str(), _ => "" }),
+                "NAME", 18, 44,
+            );
+            let ns_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Set(x) => x.namespace.as_str(), _ => "" }),
+                "NS", 6, 20,
+            );
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    ArgoRow::Set(x) => {
+                        let error = x
+                            .conditions
+                            .iter()
+                            .any(|c| c.kind == "ErrorOccurred" && c.status == "True");
+                        let state = if error { "ErrorOccurred" } else { "ok" };
+                        let state_style = if error {
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Green)
+                        };
+                        let policy = if x.apps_sync.is_empty() { "sync".to_string() } else { x.apps_sync.clone() };
+                        Row::new(vec![
+                            Cell::from(elide_middle(&x.namespace, ns_w as usize))
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(elide_middle(&x.name, name_w as usize))
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(x.generators.join(",")),
+                            Cell::from(x.apps.len().to_string()),
+                            Cell::from(count_cell(x.apps_out_of_sync)),
+                            Cell::from(count_cell(x.apps_unhealthy)),
+                            Cell::from(policy).style(Style::default().fg(DIM)),
+                            Cell::from(state).style(state_style),
+                            Cell::from(x.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let widths = vec![
+                Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Min(16),
+                Constraint::Length(4), Constraint::Length(3), Constraint::Length(3),
+                Constraint::Length(13), Constraint::Length(14), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        ArgoWorld::Projects => {
+            let header = Row::new(vec![
+                Cell::from("NS"), Cell::from("NAME"), Cell::from("APPS"), Cell::from("OOS"),
+                Cell::from("REPOS"), Cell::from("DESTINATIONS"), Cell::from("ROLES"),
+                Cell::from("WIN"), Cell::from("DESCRIPTION"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let name_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Project(x) => x.name.as_str(), _ => "" }),
+                "NAME", 14, 34,
+            );
+            let ns_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Project(x) => x.namespace.as_str(), _ => "" }),
+                "NS", 6, 20,
+            );
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    ArgoRow::Project(x) => {
+                        // A `*` is not a count: a project that allows everything is shown as
+                        // allowing everything, because that is the fact one comes here to check.
+                        let repos = if x.open_sources {
+                            Span::styled("*", Style::default().fg(Color::Yellow))
+                        } else {
+                            Span::raw(x.source_repos.len().to_string())
+                        };
+                        let dests = if x.open_destinations {
+                            Span::styled("*/*", Style::default().fg(Color::Yellow))
+                        } else {
+                            Span::raw(x.destinations.len().to_string())
+                        };
+                        let writers = x.roles.iter().filter(|r| r.writes).count();
+                        let roles = if x.roles.is_empty() {
+                            Span::styled("·", Style::default().fg(DIM))
+                        } else if writers > 0 {
+                            Span::styled(
+                                format!("{} ({}w)", x.roles.len(), writers),
+                                Style::default().fg(Color::Cyan),
+                            )
+                        } else {
+                            Span::raw(x.roles.len().to_string())
+                        };
+                        Row::new(vec![
+                            Cell::from(elide_middle(&x.namespace, ns_w as usize))
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(elide_middle(&x.name, name_w as usize))
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(count_cell(x.apps)),
+                            Cell::from(count_cell(x.apps_out_of_sync)),
+                            Cell::from(repos),
+                            Cell::from(dests),
+                            Cell::from(roles),
+                            Cell::from(count_cell(x.windows.len())),
+                            Cell::from(x.description.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(x.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let widths = vec![
+                Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(4),
+                Constraint::Length(3), Constraint::Length(5), Constraint::Length(12),
+                Constraint::Length(8), Constraint::Length(3), Constraint::Min(18),
+                Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        ArgoWorld::Repos => {
+            let header = Row::new(vec![
+                Cell::from("KIND"), Cell::from("NAME"), Cell::from("URL"), Cell::from("TYPE"),
+                Cell::from("PROJECT"), Cell::from("AUTH"), Cell::from("SCOPE"), Cell::from("USED"),
+                Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let label_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Endpoint(e) => e.label.as_str(), _ => "" }),
+                "NAME", 14, 34,
+            );
+            let proj_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Endpoint(e) => e.project.as_str(), _ => "" }),
+                "PROJECT", 7, 26,
+            );
+            let auth_w = col_width(
+                src.iter().map(|r| match r { ArgoRow::Endpoint(e) => e.auth.as_str(), _ => "" }),
+                "AUTH", 6, 22,
+            );
+            // Everything but URL, plus one cell of spacing per gap.
+            let url_w = slack(7 + label_w + 6 + proj_w + auth_w + 6 + 4 + 5 + 8);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    ArgoRow::Endpoint(e) => {
+                        let kind_style = match e.kind {
+                            EndpointKind::Cluster => {
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            }
+                            EndpointKind::Repo => Style::default().fg(Color::Blue),
+                            EndpointKind::RepoCreds => Style::default().fg(DIM),
+                        };
+                        // A cluster restricted to a few namespaces behaves nothing like an
+                        // unrestricted one, and the difference is invisible in the Argo CD UI.
+                        let scope = match (e.kind, e.namespaces.is_empty()) {
+                            (EndpointKind::Cluster, false) => Span::styled(
+                                format!("{} ns", e.namespaces.len()),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            (EndpointKind::Cluster, true) => {
+                                Span::styled("all", Style::default().fg(DIM))
+                            }
+                            _ if e.oci => Span::styled("oci", Style::default().fg(Color::Magenta)),
+                            _ => Span::styled("·", Style::default().fg(DIM)),
+                        };
+                        let auth_style = if e.auth == "none" {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        Row::new(vec![
+                            Cell::from(e.kind.label()).style(kind_style),
+                            Cell::from(elide_middle(&e.label, label_w as usize))
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(elide_middle(&e.url, url_w)),
+                            Cell::from(e.repo_type.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(elide_middle(&e.project, proj_w as usize))
+                                .style(Style::default().fg(DIM)),
+                            Cell::from(e.auth.clone()).style(auth_style),
+                            Cell::from(scope),
+                            Cell::from(count_cell(e.used_by)),
+                            Cell::from(e.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let widths = vec![
+                Constraint::Length(7), Constraint::Length(label_w), Constraint::Min(24),
+                Constraint::Length(6), Constraint::Length(proj_w), Constraint::Length(auth_w),
+                Constraint::Length(6), Constraint::Length(4), Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+    }
+}
+
+fn draw_argo_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let width = area.width.saturating_sub(2) as usize;
+    let Some(row) = app.argo_selected().cloned() else {
+        // With nothing selected the panel answers the question the view exists for: what this
+        // install is, where it lives, and whether its own workloads are up.
+        let server = app.argo_state.lock().expect("argocd poisoned").server.clone();
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("{:<14}", st.argo_lbl_server), Style::default().fg(DIM)),
+            Span::raw(argo_install_label(app, &server)),
+        ])];
+        if !server.version.is_empty() {
+            lines.push(argo_label_line(st.argo_lbl_version_label, server.version.clone()));
+        }
+        if !server.url.is_empty() {
+            lines.push(argo_label_line(st.argo_lbl_url, server.url.clone()));
+        }
+        if !server.reconcile.is_empty() {
+            lines.push(argo_label_line(st.argo_lbl_period, server.reconcile.clone()));
+        }
+        if !server.app_namespaces.is_empty() {
+            lines.push(argo_label_line(
+                st.argo_lbl_namespaces,
+                server.app_namespaces.join(", "),
+            ));
+        }
+        if !server.components.is_empty() {
+            let comps: Vec<String> = server
+                .components
+                .iter()
+                .map(|c| format!("{} {}/{}", c.name, c.ready, c.desired))
+                .collect();
+            lines.push(argo_label_line(st.argo_lbl_components, comps.join(", ")));
+        }
+        if !server.hints.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(hint_lines(&server.hints, width));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            st.argo_empty_select,
+            Style::default().fg(DIM),
+        )));
+        let p = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" argocd "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, mut lines) = argo_detail_lines(&row, st, width);
+    let visible = area.height.saturating_sub(2) as usize;
+    // The panel wraps, so its scroll counts wrapped rows: measured on the lines themselves, a long
+    // ComparisonError message would leave the hints below the frame.
+    let max_scroll = wrapped_panel_rows(&lines, width).saturating_sub(visible);
+    if app.argo_detail_scroll > max_scroll {
+        app.argo_detail_scroll = max_scroll;
+    }
+    app.argo_detail_scroll = text_search_top(
+        app,
+        Mode::ArgoFull,
+        &mut lines,
+        visible,
+        app.argo_detail_scroll,
+        max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.argo_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// 14 columns, because `destinations` is 12 and a label flush against its value reads as one word.
+fn argo_label_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<14}"), Style::default().fg(DIM)),
+        Span::raw(value),
+    ])
+}
+
+fn argo_detail_lines(
+    row: &ArgoRow,
+    st: &'static lang::Strings,
+    width: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let banner = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let section = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let label = argo_label_line;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let title = match row {
+        ArgoRow::App(a) => {
+            // The two words that decide everything, on one line and in that order.
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<14}", st.argo_lbl_sync), Style::default().fg(DIM)),
+                Span::styled(
+                    if a.sync.is_empty() { "—".to_string() } else { a.sync.clone() },
+                    argo_sync_style(&a.sync),
+                ),
+                Span::raw("   "),
+                Span::styled(format!("{} ", st.argo_lbl_health), Style::default().fg(DIM)),
+                Span::styled(
+                    if a.health.is_empty() { "—".to_string() } else { a.health.clone() },
+                    argo_health_style(a),
+                ),
+            ]));
+            lines.push(label(st.argo_lbl_project, a.project.clone()));
+            lines.push(label(
+                st.argo_lbl_destination,
+                format!("{} · {}", a.dest_label, a.dest_namespace),
+            ));
+            if !a.dest_server.is_empty() && a.dest_server != a.dest_label {
+                lines.push(label("", a.dest_server.clone()));
+            }
+            for s in &a.sources {
+                lines.push(label(st.argo_lbl_source, s.label()));
+            }
+            if !a.source_type.is_empty() {
+                lines.push(label(st.argo_lbl_sourcetype, a.source_type.clone()));
+            }
+            if !a.revision_full.is_empty() {
+                lines.push(label(st.argo_lbl_revision, a.revision_full.clone()));
+            }
+            lines.push(label(st.argo_lbl_policy, a.policy_label()));
+            if !a.sync_options.is_empty() {
+                lines.push(label(st.argo_lbl_options, a.sync_options.join(", ")));
+            }
+            if !a.reconciled_age.is_empty() {
+                lines.push(label(st.argo_lbl_reconciled, a.reconciled_age.clone()));
+            }
+            if !a.op_phase.is_empty() {
+                let mut op = format!("{} ({})", a.op_phase, a.op_age);
+                if !a.op_by.is_empty() {
+                    op.push_str(&format!(" · {}", a.op_by));
+                }
+                if a.op_retries > 0 {
+                    op.push_str(&format!(" · {}×", a.op_retries));
+                }
+                lines.push(label(st.argo_lbl_operation, op));
+            }
+            lines.push(label(st.lbl_age, a.age.clone()));
+
+            if !a.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.lbl_diagnostic));
+                lines.extend(hint_lines(&a.hints, width));
+            }
+
+            if !a.resources.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(&format!(
+                    "{} ({} · {} OutOfSync)",
+                    st.argo_lbl_resources,
+                    a.resources.len(),
+                    a.out_of_sync
+                )));
+                // Only what is not in the expected state: a list of forty Synced/Healthy rows is
+                // exactly the noise this panel exists to remove.
+                let mut shown = 0usize;
+                for r in a.resources.iter().filter(|r| {
+                    r.sync == "OutOfSync" || matches!(r.health.as_str(), "Degraded" | "Missing")
+                }) {
+                    if shown >= 20 {
+                        break;
+                    }
+                    shown += 1;
+                    let mut marks: Vec<String> = Vec::new();
+                    if !r.sync.is_empty() && r.sync != "Synced" {
+                        marks.push(r.sync.clone());
+                    }
+                    if !r.health.is_empty() && r.health != "Healthy" {
+                        marks.push(r.health.clone());
+                    }
+                    if r.requires_pruning {
+                        marks.push("prune".to_string());
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("  {}", r.label())),
+                        Span::styled(
+                            format!("  [{}]", marks.join(" ")),
+                            Style::default().fg(Color::Rgb(255, 140, 0)),
+                        ),
+                    ]));
+                }
+                if shown == 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", st.argo_all_expected),
+                        Style::default().fg(DIM),
+                    )));
+                }
+            }
+
+            if !a.history.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.argo_lbl_history));
+                for h in &a.history {
+                    lines.push(Line::from(Span::raw(format!(
+                        "  {}  {}",
+                        h.revision,
+                        if h.age.is_empty() { h.deployed_at.clone() } else { h.age.clone() }
+                    ))));
+                }
+            }
+
+            if !a.images.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.argo_lbl_images));
+                for i in a.images.iter().take(12) {
+                    lines.push(Line::from(Span::raw(format!("  {i}"))));
+                }
+            }
+
+            banner(format!(" {}/{} ", a.namespace, a.name))
+        }
+        ArgoRow::Set(x) => {
+            lines.push(label(
+                st.argo_lbl_generators,
+                if x.generators.is_empty() { "—".to_string() } else { x.generators.join(", ") },
+            ));
+            lines.push(label(
+                st.argo_lbl_policy,
+                if x.apps_sync.is_empty() { "sync".to_string() } else { x.apps_sync.clone() },
+            ));
+            if x.rolling {
+                lines.push(label(st.argo_lbl_strategy, "rollingSync".to_string()));
+            }
+            // Which templating the set uses decides how its `{{ }}` are read, so a reader looking
+            // at the template needs it before anything else.
+            lines.push(label(
+                "goTemplate",
+                if x.go_template { st.lbl_yes.to_string() } else { st.lbl_no.to_string() },
+            ));
+            lines.push(label(st.lbl_age, x.age.clone()));
+            if !x.conditions.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.argo_lbl_conditions));
+                for c in &x.conditions {
+                    // The reason is the machine-readable half of an ApplicationSet condition and is
+                    // what the controller's own logs are grepped for.
+                    let head = if c.reason.is_empty() {
+                        format!("  {} = {}", c.kind, c.status)
+                    } else {
+                        format!("  {} = {} ({})", c.kind, c.status, c.reason)
+                    };
+                    lines.push(Line::from(Span::raw(format!("{}  {}", head, c.message))));
+                }
+            }
+            if !x.apps.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(&format!("{} ({})", st.argo_lbl_apps, x.apps.len())));
+                for name in x.apps.iter().take(30) {
+                    lines.push(Line::from(Span::raw(format!("  {name}"))));
+                }
+            }
+            if !x.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.lbl_diagnostic));
+                lines.extend(hint_lines(&x.hints, width));
+            }
+            banner(format!(" {}/{} ", x.namespace, x.name))
+        }
+        ArgoRow::Project(x) => {
+            if !x.description.is_empty() {
+                lines.push(label(st.argo_lbl_description, x.description.clone()));
+            }
+            lines.push(label(st.argo_lbl_apps, format!("{} ({} OutOfSync)", x.apps, x.apps_out_of_sync)));
+            lines.push(label(st.lbl_age, x.age.clone()));
+
+            let block = |lines: &mut Vec<Line<'static>>, title: &str, items: &[String]| {
+                if items.is_empty() {
+                    return;
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("{} ({})", title, items.len()),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+                for i in items.iter().take(30) {
+                    lines.push(Line::from(Span::raw(format!("  {i}"))));
+                }
+            };
+            block(&mut lines, st.argo_lbl_repos, &x.source_repos);
+            block(&mut lines, st.argo_lbl_destinations, &x.destinations);
+            block(&mut lines, "clusterResourceWhitelist", &x.cluster_allow);
+            block(&mut lines, "clusterResourceBlacklist", &x.cluster_deny);
+            block(&mut lines, "namespaceResourceWhitelist", &x.ns_allow);
+            block(&mut lines, "namespaceResourceBlacklist", &x.ns_deny);
+            block(&mut lines, st.argo_lbl_windows, &x.windows);
+
+            if !x.roles.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(&format!("{} ({})", st.argo_lbl_roles, x.roles.len())));
+                for r in &x.roles {
+                    // A role that can sync or delete is not the same object as a read-only one, and
+                    // the policy count alone does not say which it is.
+                    let verbs = if r.writes { "write" } else { "read" };
+                    let groups = if r.groups.is_empty() {
+                        "—".to_string()
+                    } else {
+                        r.groups.join(", ")
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(format!("  {}  ", r.name)),
+                        Span::styled(
+                            verbs.to_string(),
+                            if r.writes {
+                                Style::default().fg(Color::Cyan)
+                            } else {
+                                Style::default().fg(DIM)
+                            },
+                        ),
+                        Span::styled(
+                            format!("  {} policies  {}", r.policies, groups),
+                            Style::default().fg(DIM),
+                        ),
+                    ]));
+                }
+            }
+
+            if !x.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.lbl_diagnostic));
+                lines.extend(hint_lines(&x.hints, width));
+            }
+            banner(format!(" {} ", x.name))
+        }
+        ArgoRow::Endpoint(e) => {
+            // Two different things are called "type" here: what the row *is* (a repository, a
+            // credentials template, a cluster) and what a repository *serves* (git, helm). Naming
+            // both the same way is how a reader stops trusting either.
+            lines.push(label(st.argo_lbl_kind, e.kind.label().to_string()));
+            lines.push(label(st.argo_lbl_url, e.url.clone()));
+            lines.push(label(st.argo_lbl_secret, format!("{}/{}", e.namespace, e.secret)));
+            if !e.repo_type.is_empty() {
+                lines.push(label(st.argo_lbl_type, e.repo_type.clone()));
+            }
+            lines.push(label(st.argo_lbl_auth, e.auth.clone()));
+            if !e.project.is_empty() {
+                lines.push(label(st.argo_lbl_project, e.project.clone()));
+            }
+            if !e.namespaces.is_empty() {
+                lines.push(label(st.argo_lbl_namespaces, e.namespaces.join(", ")));
+            }
+            if let Some(cr) = e.cluster_resources {
+                lines.push(label(
+                    "clusterResources",
+                    if cr { st.lbl_yes.to_string() } else { st.lbl_no.to_string() },
+                ));
+            }
+            lines.push(label(st.argo_lbl_used_by, e.used_by.to_string()));
+            lines.push(label(st.lbl_age, e.age.clone()));
+            if !e.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(section(st.lbl_diagnostic));
+                lines.extend(hint_lines(&e.hints, width));
+            }
+            banner(format!(" {} ", e.label))
+        }
+    };
+
+    (title, lines)
+}
+
 fn ranch_severity(hints: &[crate::storage::Hint]) -> Severity {
     match hints.iter().map(|h| h.level).max() {
         Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
@@ -25538,6 +26951,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_rancher_detail(f, app, area);
         return;
     }
+    let is_argo_mode = matches!(view_mode(app), Mode::Argo | Mode::ArgoFull);
+    if is_argo_mode {
+        draw_argo_detail(f, app, area);
+        return;
+    }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
     if is_configmaps_mode {
         draw_configmaps_detail(f, app, area);
@@ -27851,5 +29269,235 @@ mod wrapped_panel_rows_tests {
         assert_eq!(wrapped_rows(&Line::from(text), 98), 1, "the word-only measure misses the padding");
         assert_eq!(wrapped_panel_rows(&lines, 98), 2);
         assert_eq!(wrapped_panel_rows(&lines, 198), 1);
+    }
+}
+
+#[cfg(test)]
+mod argo_view_tests {
+    use super::*;
+    use crate::argocd::{
+        ArgoApp, ArgoAppSet, ArgoCondition, ArgoEndpoint, ArgoProject, ArgoResource, ArgoRole,
+        ArgoSource, EndpointKind,
+    };
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // The row read off a real cluster: a comparison that failed on a git credential, and a health
+    // left over from before it did.
+    fn blind_app() -> ArgoApp {
+        ArgoApp {
+            namespace: "argocd-prd".to_string(),
+            name: "application-dsm-blanche-pprd-it".to_string(),
+            project: "application-dsm-blanche".to_string(),
+            sync: "Unknown".to_string(),
+            health: "Healthy".to_string(),
+            dest_label: "dsm-staging".to_string(),
+            dest_namespace: "blanche-pprd".to_string(),
+            dest_server: "https://dsm-staging.privatelink.northeurope.azmk8s.io:443".to_string(),
+            sources: vec![ArgoSource {
+                repo_url: "https://gitlab.example.com/group/subgroup/a-very-long-chart-name.git"
+                    .to_string(),
+                path: "chart".to_string(),
+                target_revision: "main".to_string(),
+                ..ArgoSource::default()
+            }],
+            revision: "4097485".to_string(),
+            revision_full: "4097485d00206a5fb6ce11b7a3c8c6f3c294f770".to_string(),
+            op_phase: "Failed".to_string(),
+            op_age: "5d".to_string(),
+            op_message: "one or more objects failed to apply, reason: secrets is forbidden \
+                         and the message keeps going well past any column width"
+                .to_string(),
+            conditions: vec![ArgoCondition {
+                kind: "ComparisonError".to_string(),
+                message: "failed to list refs: authentication required".to_string(),
+                ..ArgoCondition::default()
+            }],
+            resources: vec![ArgoResource {
+                kind: "Deployment".to_string(),
+                group: "apps".to_string(),
+                namespace: "blanche-pprd".to_string(),
+                name: "blanche".to_string(),
+                sync: "OutOfSync".to_string(),
+                health: "Missing".to_string(),
+                requires_pruning: false,
+            }],
+            out_of_sync: 1,
+            reconciled_age: "2h".to_string(),
+            age: "142d".to_string(),
+            hints: vec![
+                crate::argocd::Hint {
+                    level: crate::argocd::HintLevel::Danger,
+                    text: "ComparisonError : failed to list refs: authentication required, and a \
+                           message long enough to wrap several times over in a narrow panel"
+                        .to_string(),
+                },
+                crate::argocd::Hint {
+                    level: crate::argocd::HintLevel::Warn,
+                    text: "health Healthy predates the comparison error.".to_string(),
+                },
+            ],
+            uid: "argo|app|argocd-prd/blanche".to_string(),
+            ..ArgoApp::default()
+        }
+    }
+
+    fn set() -> ArgoAppSet {
+        ArgoAppSet {
+            namespace: "argocd-prd".to_string(),
+            name: "tenants".to_string(),
+            generators: vec!["git".to_string(), "clusters".to_string()],
+            apps: vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            apps_out_of_sync: 1,
+            conditions: vec![ArgoCondition {
+                kind: "ErrorOccurred".to_string(),
+                status: "True".to_string(),
+                reason: "ApplicationGenerationFromParamsError".to_string(),
+                message: "error generating params from git".to_string(),
+            }],
+            age: "30d".to_string(),
+            ..ArgoAppSet::default()
+        }
+    }
+
+    fn project() -> ArgoProject {
+        ArgoProject {
+            namespace: "argocd-prd".to_string(),
+            name: "dsm-webtools".to_string(),
+            description: "AppProject for dsm-webtools, with a description long enough to fill the \
+                          slack column and then some"
+                .to_string(),
+            source_repos: vec!["*".to_string()],
+            destinations: vec!["dsm-staging/dsm-webtools-dev".to_string()],
+            open_sources: true,
+            roles: vec![ArgoRole {
+                name: "project-operators".to_string(),
+                groups: vec!["FR-Rule-MSE-DATASMART-techleads".to_string()],
+                policies: 22,
+                writes: true,
+            }],
+            apps: 4,
+            apps_out_of_sync: 1,
+            age: "76d".to_string(),
+            ..ArgoProject::default()
+        }
+    }
+
+    fn endpoint() -> ArgoEndpoint {
+        ArgoEndpoint {
+            kind: EndpointKind::Cluster,
+            namespace: "argocd-prd".to_string(),
+            secret: "cluster-dsm-staging".to_string(),
+            url: "https://dsm-staging-hs-neu-aks.privatelink.northeurope.azmk8s.io:443".to_string(),
+            label: "dsm-staging".to_string(),
+            auth: "bearer token".to_string(),
+            namespaces: vec!["a".to_string(), "b".to_string()],
+            used_by: 12,
+            age: "160d".to_string(),
+            ..ArgoEndpoint::default()
+        }
+    }
+
+    fn rows() -> Vec<(ArgoWorld, Vec<ArgoRow>)> {
+        vec![
+            (ArgoWorld::Apps, vec![ArgoRow::App(Box::new(blind_app()))]),
+            (ArgoWorld::Sets, vec![ArgoRow::Set(Box::new(set()))]),
+            (ArgoWorld::Projects, vec![ArgoRow::Project(Box::new(project()))]),
+            (ArgoWorld::Repos, vec![ArgoRow::Endpoint(Box::new(endpoint()))]),
+        ]
+    }
+
+    // A stale `Healthy` must never be painted green: that colour is the whole reason the row is
+    // misread in the Argo CD UI in the first place.
+    #[test]
+    fn a_health_computed_before_the_comparison_broke_is_not_green() {
+        let a = blind_app();
+        assert_eq!(argo_health_style(&a).fg, Some(DIM));
+        let sound = ArgoApp { sync: "Synced".to_string(), conditions: Vec::new(), ..a };
+        assert_eq!(argo_health_style(&sound).fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn the_right_border_survives_every_width_in_all_four_worlds() {
+        let border = ratatui::symbols::border::PLAIN;
+        for (world, src) in rows() {
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, 12)).expect("test terminal");
+                terminal
+                    .draw(|f| {
+                        let (header, rows, widths) = argo_table_parts(world, &src, width);
+                        let table = Table::new(rows, widths)
+                            .header(header)
+                            .block(Block::default().borders(Borders::ALL).title(" argocd "))
+                            .highlight_symbol("> ");
+                        f.render_widget(table, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                for y in 0..12 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        11 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(
+                        cell.symbol(),
+                        expected,
+                        "right border eaten at width {width}, row {y}, world {world:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_detail_panel_keeps_its_frame_at_every_width() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let border = ratatui::symbols::border::PLAIN;
+        for (_, src) in rows() {
+            let row = src.into_iter().next().expect("one row");
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+                let (title, lines) = argo_detail_lines(&row, st, width.saturating_sub(2) as usize);
+                terminal
+                    .draw(|f| {
+                        let p = Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .block(Block::default().borders(Borders::ALL).title(title.clone()));
+                        f.render_widget(p, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                for y in 0..24 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        23 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(
+                        cell.symbol(),
+                        expected,
+                        "right border eaten at width {width}, row {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The panel is anchored on its own height: counting raw lines would leave the diagnostic block
+    // — the last one, and the reason the panel is open — below the frame as soon as a hint wraps.
+    #[test]
+    fn the_wrapped_height_of_the_panel_exceeds_its_line_count() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let row = ArgoRow::App(Box::new(blind_app()));
+        let (_, lines) = argo_detail_lines(&row, st, 58);
+        assert!(
+            wrapped_panel_rows(&lines, 58) > lines.len(),
+            "a panel whose hints wrap is taller than its line count"
+        );
     }
 }

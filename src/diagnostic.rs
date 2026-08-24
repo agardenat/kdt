@@ -28,6 +28,7 @@ use crate::velero::{age_of, fetch_velero, new_velero_state};
 use crate::storage::{fetch_storage, new_storage_state};
 use crate::capacity::{fetch_capacity, new_capacity_state};
 use crate::rbac::{critical_namespaces, fetch_rbac, new_rbac_state, Severity};
+use crate::argocd::{fetch_argocd, new_argo_state};
 use crate::reflector::{fetch_reflector, new_reflector_state};
 use crate::k8ssandra::{fetch_k8ssandra, new_k8c_state};
 
@@ -144,6 +145,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     check_kyverno(&client, &state, run_id).await;
     check_velero(&client, &state, run_id).await;
     check_reflector(&client, &state, run_id).await;
+    check_argocd(&client, &state, run_id).await;
     check_k8ssandra(&client, &state, run_id).await;
     check_rbac(&client, &state, run_id).await;
     check_recent_warnings(&client, &state, run_id).await;
@@ -1756,6 +1758,70 @@ async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64)
             ),
         ));
         push_reflector_hints(&mut lines, &s.cluster_hints, &mut status);
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(state, run_id, active().diag_step_argocd, "kubectl get applications.argoproj.io -A") else {
+        return;
+    };
+    let argo = new_argo_state();
+    fetch_argocd(client.clone(), argo.clone()).await;
+    let s = argo.lock().expect("argocd poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.server.present {
+        lines.push((LineColor::Info, active().diag_argocd_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Info;
+        let blind = s.blind();
+        let oos = s.out_of_sync();
+        let bad = s.unhealthy();
+        lines.push((
+            if blind > 0 || bad > 0 {
+                LineColor::Warn
+            } else if oos > 0 {
+                LineColor::Info
+            } else {
+                LineColor::Ok
+            },
+            fill(
+                active().diag_argocd_summary,
+                &[
+                    ("apps", &s.apps.len().to_string()),
+                    ("oos", &oos.to_string()),
+                    ("blind", &blind.to_string()),
+                    ("bad", &bad.to_string()),
+                ],
+            ),
+        ));
+        push_storage_hints(&mut lines, &s.server.hints, &mut status);
+        // The Applications nobody can vouch for come first: an OutOfSync row is a known gap, a row
+        // whose comparison failed is a row whose green columns were computed before the failure.
+        for a in s.apps.iter().filter(|a| a.comparison_broken()).take(8) {
+            lines.push((
+                LineColor::Warn,
+                format!("{}/{}: sync {} · health {}", a.namespace, a.name, a.sync, a.health),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        for a in s
+            .apps
+            .iter()
+            .filter(|a| a.health == "Degraded" || matches!(a.op_phase.as_str(), "Failed" | "Error"))
+            .take(8)
+        {
+            lines.push((
+                LineColor::Err,
+                format!(
+                    "{}/{}: health {} · operation {}",
+                    a.namespace, a.name, a.health, a.op_phase
+                ),
+            ));
+            status = worse(status, DiagStatus::Err);
+        }
         status
     };
     finish_step(state, run_id, idx, status, lines);
