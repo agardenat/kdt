@@ -758,7 +758,15 @@ fn push_subtree(
     visited[idx] = true;
     let has_children = !children[idx].is_empty();
     let is_collapsed = collapsed.contains(&resources[idx].uid());
-    out.push(crate::flux::FlatTreeNode { idx, depth, has_children, collapsed: is_collapsed });
+    out.push(crate::flux::FlatTreeNode {
+        idx,
+        depth,
+        has_children,
+        collapsed: is_collapsed,
+        // The certificate tree folds nothing away that the Flux badge would count.
+        hidden_failed: 0,
+        hidden_reconciling: 0,
+    });
     if has_children && !is_collapsed {
         for &c in &children[idx] {
             push_subtree(c, depth + 1, resources, children, collapsed, visited, out);

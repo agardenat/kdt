@@ -51,6 +51,11 @@ pub struct FluxResource {
     // spec.prune for a Kustomization (None for other kinds). When false, objects removed from git
     // are not garbage-collected, so the row is badged.
     pub prune: Option<bool>,
+    // (namespace, name) of the HelmChart the helm-controller generated for a HelmRelease, read from
+    // status.helmChart. The chart is what the release actually pulls from, so it is the real edge
+    // between a HelmRelease and its repository — and its namespace is the source's, not the
+    // release's, which is why it is read rather than derived from the name.
+    pub helm_chart: Option<(String, String)>,
 }
 
 impl FluxResource {
@@ -102,15 +107,6 @@ impl FluxState {
 
 pub type SharedFlux = Arc<Mutex<FluxState>>;
 
-// Source kinds that sit at the root of the dependency tree (everything else hangs off them).
-const SOURCE_KINDS: &[&str] = &[
-    "GitRepository",
-    "OCIRepository",
-    "HelmRepository",
-    "HelmChart",
-    "Bucket",
-];
-
 // A flattened tree row: which resource it is, its depth, and whether it has (collapsed) children.
 #[derive(Debug, Clone)]
 pub struct FlatTreeNode {
@@ -118,6 +114,11 @@ pub struct FlatTreeNode {
     pub depth: usize,
     pub has_children: bool,
     pub collapsed: bool,
+    // How many failing / reconciling resources the fold is hiding (0/0 when the node is expanded).
+    // A folded branch that says nothing about what it contains is exactly what forces a hunt through
+    // the tree to find out where the error is.
+    pub hidden_failed: usize,
+    pub hidden_reconciling: usize,
 }
 
 // Stable identifier for a Flux resource, used to remember collapsed nodes across refreshes.
@@ -125,35 +126,96 @@ pub fn flux_tree_uid(r: &FluxResource) -> String {
     format!("{}|{}/{}", r.kind, r.namespace, r.name)
 }
 
-// Builds the dependency tree: sources are roots, workloads (Kustomization/HelmRelease) hang off the
-// source they reference, and a workload that dependsOn another present Kustomization nests under it.
-// Resources whose parent can't be resolved stay at the root. Returns the rows to display, honouring
-// the `collapsed` set (a collapsed node's descendants are omitted).
-pub fn build_flux_tree(resources: &[FluxResource], collapsed: &HashSet<String>) -> Vec<FlatTreeNode> {
+// Resolves each resource's parent index in the dependency tree (None = a root).
+//
+// The edges, in the order they are preferred:
+//   * `dependsOn` — always references the referring object's own kind (a Kustomization waits on
+//     Kustomizations, a HelmRelease on HelmReleases), hence the lookup keyed on `r.kind`;
+//   * `status.helmChart` — the HelmChart the helm-controller generated for a HelmRelease. This is
+//     the edge that puts the Helm trio in the same tree as everything else: HelmRepository →
+//     HelmChart → HelmRelease. Taking `spec.chart.spec.sourceRef` instead would hang the release
+//     straight off the repository and leave every generated chart floating at the root;
+//   * `spec.sourceRef` / `spec.chartRef` — the source a Kustomization, a HelmRelease using
+//     `chartRef`, or a HelmChart reads from.
+//
+// Sources are not skipped: a HelmChart is a source *and* has a source of its own, and the other
+// source kinds simply have no reference to resolve, so they stay roots on their own.
+fn resolve_parents(resources: &[FluxResource]) -> Vec<Option<usize>> {
     let key = |kind: &str, ns: &str, name: &str| format!("{}|{}/{}", kind, ns, name);
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for (i, r) in resources.iter().enumerate() {
         by_key.insert(key(&r.kind, &r.namespace, &r.name), i);
     }
 
-    // Resolve each resource's parent index (None = root).
     let mut parent: Vec<Option<usize>> = vec![None; resources.len()];
     for (i, r) in resources.iter().enumerate() {
-        if SOURCE_KINDS.contains(&r.kind.as_str()) {
-            continue;
-        }
-        // Prefer nesting under a dependsOn sibling when present. `dependsOn` always references the
-        // referring object's own kind (a Kustomization waits on Kustomizations, a HelmRelease on
-        // HelmReleases), so the lookup is keyed on `r.kind` rather than on Kustomization alone.
         let dep_parent = r
             .depends_on
             .iter()
             .find_map(|(dns, dname)| by_key.get(&key(&r.kind, dns, dname)).copied());
+        let chart_parent = r
+            .helm_chart
+            .as_ref()
+            .and_then(|(cns, cname)| by_key.get(&key("HelmChart", cns, cname)).copied());
         let src_parent = r.source_ref.as_ref().and_then(|(skind, sname, sns)| {
             by_key.get(&key(skind, sns, sname)).copied()
         });
-        parent[i] = dep_parent.or(src_parent);
+        parent[i] = dep_parent.or(chart_parent).or(src_parent);
     }
+    parent
+}
+
+// Every ancestor of a resource that is failing or reconciling, as tree uids. Folding those away is
+// what buries an error deep in the tree, so the view unfolds exactly this set while the trouble
+// lasts and lets it close again once the resource goes back to Ready.
+pub fn problem_ancestors(resources: &[FluxResource]) -> HashSet<String> {
+    let parent = resolve_parents(resources);
+    let mut out = HashSet::new();
+    for (i, r) in resources.iter().enumerate() {
+        if r.suspended || !matches!(r.ready, FluxReady::Failed | FluxReady::Reconciling) {
+            continue;
+        }
+        walk_up(&parent, resources, i, &mut out);
+    }
+    out
+}
+
+// The ancestors of one resource, named by its tree uid. The row under the cursor gets the same
+// treatment as a problem: a branch folding back on its own must never take the selected row with
+// it, or the reconcile the user is watching ends with the cursor thrown back to the top of the tree.
+pub fn ancestors_of(resources: &[FluxResource], uid: &str) -> HashSet<String> {
+    let parent = resolve_parents(resources);
+    let mut out = HashSet::new();
+    if let Some(i) = resources.iter().position(|r| flux_tree_uid(r) == uid) {
+        walk_up(&parent, resources, i, &mut out);
+    }
+    out
+}
+
+// Records every ancestor of `idx`. Walking up stops at an ancestor already recorded: its own chain
+// is recorded too. That also terminates a dependency cycle, whose members are all each other's
+// ancestors.
+fn walk_up(
+    parent: &[Option<usize>],
+    resources: &[FluxResource],
+    idx: usize,
+    out: &mut HashSet<String>,
+) {
+    let mut cur = parent[idx];
+    while let Some(p) = cur {
+        if !out.insert(flux_tree_uid(&resources[p])) {
+            break;
+        }
+        cur = parent[p];
+    }
+}
+
+// Builds the dependency tree from the edges `resolve_parents` draws: repositories are roots,
+// everything that references one hangs off it, and a resource whose parent can't be resolved stays
+// at the root. Returns the rows to display, honouring the `collapsed` set (a collapsed node's
+// descendants are omitted, and the row carries a tally of the problems they hide).
+pub fn build_flux_tree(resources: &[FluxResource], collapsed: &HashSet<String>) -> Vec<FlatTreeNode> {
+    let parent = resolve_parents(resources);
 
     // Children adjacency, preserving the input ordering (already sorted problems-first).
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); resources.len()];
@@ -197,15 +259,26 @@ fn push_subtree(
     visited[idx] = true;
     let has_children = !children[idx].is_empty();
     let is_collapsed = collapsed.contains(&flux_tree_uid(&resources[idx]));
-    out.push(FlatTreeNode { idx, depth, has_children, collapsed: is_collapsed });
+    let row = out.len();
+    out.push(FlatTreeNode {
+        idx,
+        depth,
+        has_children,
+        collapsed: is_collapsed,
+        hidden_failed: 0,
+        hidden_reconciling: 0,
+    });
     if has_children {
         if is_collapsed {
             // Folded away, but still *reached*: the descendants must be marked visited all the same,
             // or the unreachable-node pass below would take them for orphans and promote them back
             // to the root — quietly undoing the fold the user just asked for.
+            let mut hidden = (0usize, 0usize);
             for &c in &children[idx] {
-                mark_subtree(c, children, visited);
+                mark_subtree(c, resources, children, visited, &mut hidden);
             }
+            out[row].hidden_failed = hidden.0;
+            out[row].hidden_reconciling = hidden.1;
         } else {
             for &c in &children[idx] {
                 push_subtree(c, depth + 1, resources, children, collapsed, visited, out);
@@ -214,15 +287,30 @@ fn push_subtree(
     }
 }
 
-// Marks a subtree as reached without emitting any row. The `visited` guard doubles as the cycle
-// guard, so a loop among the hidden descendants terminates here too.
-fn mark_subtree(idx: usize, children: &[Vec<usize>], visited: &mut [bool]) {
+// Marks a subtree as reached without emitting any row, tallying the failing and reconciling
+// resources it hides on the way. The `visited` guard doubles as the cycle guard, so a loop among the
+// hidden descendants terminates here too.
+fn mark_subtree(
+    idx: usize,
+    resources: &[FluxResource],
+    children: &[Vec<usize>],
+    visited: &mut [bool],
+    hidden: &mut (usize, usize),
+) {
     if visited[idx] {
         return;
     }
     visited[idx] = true;
+    let r = &resources[idx];
+    if !r.suspended {
+        match r.ready {
+            FluxReady::Failed => hidden.0 += 1,
+            FluxReady::Reconciling => hidden.1 += 1,
+            _ => {}
+        }
+    }
     for &c in &children[idx] {
-        mark_subtree(c, children, visited);
+        mark_subtree(c, resources, children, visited, hidden);
     }
 }
 
@@ -415,6 +503,13 @@ fn parse_flux(
     } else {
         None
     };
+    // status.helmChart is "<namespace>/<name>" and is the controller's own record of the chart it
+    // generated — the namespace is the source's, so nothing here is derived from the release's name.
+    let helm_chart = status
+        .and_then(|s| s.get("helmChart"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split_once('/'))
+        .map(|(ns, name)| (ns.to_string(), name.to_string()));
     let source_ref = source_ref(obj, &namespace);
     let depends_on = obj
         .data
@@ -445,6 +540,7 @@ fn parse_flux(
         source_ref,
         depends_on,
         prune,
+        helm_chart,
     }
 }
 
@@ -1147,6 +1243,7 @@ mod tests {
             source_ref: None,
             depends_on: Vec::new(),
             prune: None,
+            helm_chart: None,
         }
     }
 
@@ -1212,6 +1309,96 @@ mod tests {
         ];
         let rows = build_flux_tree(&resources, &HashSet::new());
         assert!(rows.iter().all(|n| n.depth == 0), "no cross-kind dependsOn edge");
+    }
+
+    fn from_source(mut r: FluxResource, kind: &str, name: &str) -> FluxResource {
+        r.source_ref = Some((kind.to_string(), name.to_string(), "default".to_string()));
+        r
+    }
+
+    #[test]
+    fn the_helm_trio_nests_repository_chart_release() {
+        // The generated HelmChart used to float at the root next to its repository, and the release
+        // hung straight off the repository — the three halves of one deployment, side by side.
+        let repo = res("HelmRepository", "charts");
+        let chart = from_source(res("HelmChart", "default-app"), "HelmRepository", "charts");
+        let mut rel = from_source(res("HelmRelease", "app"), "HelmRepository", "charts");
+        rel.helm_chart = Some(("default".to_string(), "default-app".to_string()));
+        let resources = vec![repo, chart, rel];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert_eq!(names(&rows, &resources), vec!["charts", "default-app", "app"]);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1, "the chart nests under its repository");
+        assert_eq!(rows[2].depth, 2, "the release nests under its chart");
+    }
+
+    #[test]
+    fn a_release_without_a_generated_chart_falls_back_to_its_source() {
+        // spec.chartRef (Flux 2.3+) generates no HelmChart: the release references the OCIRepository
+        // directly and must still find its place under it.
+        let resources = vec![
+            res("OCIRepository", "oci"),
+            from_source(res("HelmRelease", "app"), "OCIRepository", "oci"),
+        ];
+        let rows = build_flux_tree(&resources, &HashSet::new());
+        assert_eq!(names(&rows, &resources), vec!["oci", "app"]);
+        assert_eq!(rows[1].depth, 1);
+    }
+
+    #[test]
+    fn a_fold_counts_the_problems_it_hides() {
+        let mut child = depends(res("Kustomization", "app"), "infra");
+        child.ready = FluxReady::Failed;
+        let mut grandchild = depends(res("Kustomization", "leaf"), "app");
+        grandchild.ready = FluxReady::Reconciling;
+        let resources = vec![res("Kustomization", "infra"), child, grandchild];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(flux_tree_uid(&resources[0]));
+        let rows = build_flux_tree(&resources, &collapsed);
+        assert_eq!(names(&rows, &resources), vec!["infra"]);
+        assert_eq!(rows[0].hidden_failed, 1);
+        assert_eq!(rows[0].hidden_reconciling, 1);
+    }
+
+    #[test]
+    fn the_ancestors_of_a_problem_are_the_ones_to_unfold() {
+        let mut leaf = depends(res("Kustomization", "leaf"), "app");
+        leaf.ready = FluxReady::Failed;
+        let resources = vec![
+            res("Kustomization", "infra"),
+            depends(res("Kustomization", "app"), "infra"),
+            leaf,
+        ];
+        let reveal = problem_ancestors(&resources);
+        assert!(reveal.contains(&flux_tree_uid(&resources[0])));
+        assert!(reveal.contains(&flux_tree_uid(&resources[1])));
+        // The failing node is not its own ancestor: it stays folded if it was folded by hand.
+        assert!(!reveal.contains(&flux_tree_uid(&resources[2])));
+    }
+
+    #[test]
+    fn the_selected_row_keeps_its_branch_open() {
+        // Nothing is failing here: the reveal comes from the cursor alone, so the branch the user is
+        // reading does not fold shut under them when the reconcile it was showing finishes.
+        let resources = vec![
+            res("Kustomization", "infra"),
+            depends(res("Kustomization", "app"), "infra"),
+        ];
+        let reveal = ancestors_of(&resources, &flux_tree_uid(&resources[1]));
+        assert_eq!(reveal.len(), 1);
+        assert!(reveal.contains(&flux_tree_uid(&resources[0])));
+        // A uid nobody carries reveals nothing rather than panicking.
+        assert!(ancestors_of(&resources, "Kustomization|nowhere/gone").is_empty());
+    }
+
+    #[test]
+    fn a_suspended_failure_unfolds_nothing() {
+        // Suspended is a deliberate state, not a problem to chase across the tree.
+        let mut leaf = depends(res("Kustomization", "leaf"), "infra");
+        leaf.ready = FluxReady::Failed;
+        leaf.suspended = true;
+        let resources = vec![res("Kustomization", "infra"), leaf];
+        assert!(problem_ancestors(&resources).is_empty());
     }
 
     #[test]

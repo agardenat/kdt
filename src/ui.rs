@@ -44,6 +44,7 @@ use crate::clip;
 use crate::extract::{new_extract_state, run_full_extract, SharedExtract};
 use crate::flux::{
     build_flux_tree, controller_for_kind, fetch_flux, fetch_inventory, flux_tree_uid, new_flux_state,
+    ancestors_of, problem_ancestors,
     new_inventory_state, new_reconcile_status, reconcile, toggle_suspend, FlatTreeNode, FluxReady,
     FluxResource, InventoryItem, ReconcileScope, SharedFlux, SharedInventory, SharedReconcile,
     ALL_CONTROLLERS,
@@ -1521,6 +1522,11 @@ pub struct App {
     pub last_inventory_tick: std::time::Instant,
     pub flux_tree: bool,
     pub flux_collapsed: std::collections::HashSet<String>,
+    // While on, the branches leading to a failing or reconciling resource are unfolded whatever the
+    // manual folds say, and fold back on their own once it settles: a reconcile in flight walks its
+    // way open, and an error never has to be hunted for behind a `▸`. The manual folds are not
+    // touched — the reveal is an override recomputed at every refresh.
+    pub flux_auto_reveal: bool,
     // Flattened tree currently displayed (resource nodes + expanded inventory children).
     pub flux_tree_view: Vec<TreeRow>,
     // Kustomizations whose inventory is expanded in the tree: uid → (api_version, kind, ns, name).
@@ -1867,6 +1873,7 @@ impl App {
             last_inventory_tick: std::time::Instant::now(),
             flux_tree: true,
             flux_collapsed: std::collections::HashSet::new(),
+            flux_auto_reveal: true,
             flux_tree_view: Vec::new(),
             flux_inv_expanded: std::collections::HashMap::new(),
             flux_inv: std::collections::HashMap::new(),
@@ -4511,7 +4518,20 @@ impl App {
         let recs: Vec<EventRecord> = {
             let s = self.flux_state.lock().expect("flux poisoned");
             if self.flux_tree {
-                let flat = build_flux_tree(&s.resources, &self.flux_collapsed);
+                let flat = if self.flux_auto_reveal {
+                    let mut reveal = problem_ancestors(&s.resources);
+                    // The row under the cursor is revealed too: its branch would otherwise fold back
+                    // the moment the resource it was showing returns to Ready, and the selection —
+                    // recovered by uid below — would fall back to the top of the tree.
+                    if let Some(uid) = self.selected_uid.as_deref().and_then(|u| u.strip_prefix("flux|")) {
+                        reveal.extend(ancestors_of(&s.resources, uid));
+                    }
+                    let effective: std::collections::HashSet<String> =
+                        self.flux_collapsed.difference(&reveal).cloned().collect();
+                    build_flux_tree(&s.resources, &effective)
+                } else {
+                    build_flux_tree(&s.resources, &self.flux_collapsed)
+                };
                 let mut view: Vec<TreeRow> = Vec::with_capacity(flat.len());
                 let mut recs: Vec<EventRecord> = Vec::with_capacity(flat.len());
                 for n in flat {
@@ -4602,6 +4622,16 @@ impl App {
     // Switches the Flux panel between the flat table and the dependency tree.
     fn toggle_flux_tree(&mut self) {
         self.flux_tree = !self.flux_tree;
+        self.refresh_flux_snapshot();
+    }
+
+    // Switches the automatic reveal of the branches leading to a problem on and off. The manual folds
+    // survive either way: turning it off simply stops overriding them.
+    fn toggle_flux_auto_reveal(&mut self) {
+        self.flux_auto_reveal = !self.flux_auto_reveal;
+        let st = lang::t(self.ai_language);
+        let msg = if self.flux_auto_reveal { st.flux_reveal_on } else { st.flux_reveal_off };
+        self.clipboard_status = Some((std::time::Instant::now(), msg.to_string()));
         self.refresh_flux_snapshot();
     }
 
@@ -4809,6 +4839,11 @@ impl App {
 
     fn flux_suspend_label(&self, st: &'static lang::Strings) -> &'static str {
         suspend_key_label(self.table_state.selected().and_then(|i| self.snapshot.get(i)), st)
+    }
+
+    // `a` toggles, so the footer names the state it would switch to, not the one in force.
+    fn flux_reveal_label(&self, st: &'static lang::Strings) -> &'static str {
+        if self.flux_auto_reveal { st.k_flux_reveal_off } else { st.k_flux_reveal_on }
     }
 
     fn start_flux_auto_refresh(&mut self) {
@@ -12156,6 +12191,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('r'), _, Mode::Flux) => app.open_flux_action_menu(),
         (KeyCode::Char('z'), _, Mode::Flux) => app.toggle_suspend(),
         (KeyCode::Char('t'), _, Mode::Flux) => app.toggle_flux_tree(),
+        (KeyCode::Char('a'), _, Mode::Flux) if app.flux_tree => app.toggle_flux_auto_reveal(),
         (KeyCode::Char('l'), _, Mode::Flux) => app.enter_flux_logs(),
         (KeyCode::Char('i'), _, Mode::Flux) => app.enter_ai_panel(),
         (KeyCode::Char('g'), _, Mode::Flux) => app.scroll_detail_top(),
@@ -13077,6 +13113,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             footer_sep(),
             Span::styled(" t ", kbg), Span::raw(format!(" {}   ", st.k_tree)),
             Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
+            Span::styled(" a ", kbg), Span::raw(format!(" {}   ", app.flux_reveal_label(st))),
             Span::styled(" +/- ", kbg), Span::raw(format!(" {}   ", st.k_inventory)),
             footer_sep(),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_reconcile)),
@@ -26514,16 +26551,48 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         )
     };
 
-    let header_row = Row::new(vec![
+    let selected = app.table_state.selected();
+    let (rows, widths, msg_scroll) = flux_tree_table_parts(
+        &app.flux_tree_view,
+        &resources,
+        &app.flux_inv_expanded,
+        selected,
+        app.msg_scroll,
+        area.width,
+    );
+    app.msg_scroll = msg_scroll;
+
+    let table = Table::new(rows, widths)
+        .header(flux_tree_header_row())
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn flux_tree_header_row() -> Row<'static> {
+    Row::new(vec![
         Cell::from("RESOURCE"), Cell::from("READY"), Cell::from("REVISION"),
         Cell::from("AGE"), Cell::from("MESSAGE"),
     ])
-    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+}
 
+// Rows and column widths of the Flux tree, plus the message offset clamped to what the focused row
+// can show. Split out of the draw for the same reason as the flat table: the layout is rendered and
+// its right border checked without a cluster behind it.
+fn flux_tree_table_parts(
+    view: &[TreeRow],
+    resources: &[FluxResource],
+    inv_expanded: &std::collections::HashMap<String, (String, String, String, String)>,
+    selected: Option<usize>,
+    msg_scroll: usize,
+    area_width: u16,
+) -> (Vec<Row<'static>>, Vec<Constraint>, usize) {
     // First pass: build every (indented) label so the RESOURCE column can be sized before the rows
     // are constructed — the MESSAGE width (needed to wrap the focused row) depends on that column.
-    let labels: Vec<String> = app
-        .flux_tree_view
+    let labels: Vec<String> = view
         .iter()
         .map(|row| match row {
             TreeRow::Res(n) => {
@@ -26536,9 +26605,10 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let mut label = format!("{}{} {} {}", "  ".repeat(n.depth), marker, r.kind, r.name);
                 // Show that a Kustomization can reveal (or hide) its applied objects with +/-.
                 if r.kind == "Kustomization" {
-                    let expanded = app.flux_inv_expanded.contains_key(&flux_tree_uid(r));
+                    let expanded = inv_expanded.contains_key(&flux_tree_uid(r));
                     label.push_str(if expanded { "  ⊟" } else { "  ⊞" });
                 }
+                label.push_str(&hidden_badge(n));
                 label
             }
             TreeRow::Inv { depth, item, .. } => {
@@ -26558,15 +26628,14 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .unwrap_or(0)
         .max("RESOURCE".chars().count());
     let name_col = (name_w as u16).clamp(24, 80);
-    let selected = app.table_state.selected();
     // Five columns, four gaps, plus `highlight_symbol("> ")` and the one-cell margin — same reason
     // as the flat table above.
-    let msg_w = flux_msg_width(area.width, name_col + 10 + 18 + 6 + HIGHLIGHT_W + 1, 5);
+    let msg_w = flux_msg_width(area_width, name_col + 10 + 18 + 6 + HIGHLIGHT_W + 1, 5);
     // Same clamp as the flat table. An inventory leaf has no message of its own, so the pan simply
     // has nowhere to go there.
-    app.msg_scroll = app.msg_scroll.min(
+    let msg_scroll = msg_scroll.min(
         selected
-            .and_then(|i| app.flux_tree_view.get(i))
+            .and_then(|i| view.get(i))
             .and_then(|row| match row {
                 TreeRow::Res(n) => resources.get(n.idx),
                 TreeRow::Inv { .. } => None,
@@ -26574,11 +26643,9 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .map(|r| msg_max_offset(flux_message_len(r), msg_w))
             .unwrap_or(0),
     );
-    let msg_scroll = app.msg_scroll;
 
     let mut emit_idx = 0usize;
-    let rows: Vec<Row> = app
-        .flux_tree_view
+    let rows: Vec<Row> = view
         .iter()
         .enumerate()
         .filter_map(|(vi, row)| {
@@ -26614,7 +26681,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         flux_message_cell(r, msg_color)
                     };
                     Row::new(vec![
-                        Cell::from(label),
+                        Cell::from(labelled_row(&label, n)),
                         Cell::from(ready_txt).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
                         Cell::from(r.revision.clone()).style(Style::default().fg(DIM)),
                         Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
@@ -26650,18 +26717,45 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // The message column is pinned to the width its text was windowed at, not left as `Min`: a
     // `Min` column expands over every cell that is left, the reserved margin included, so the text
     // ends up flush against the right border however carefully `msg_w` was computed.
-    let widths = [
+    let widths = vec![
         Constraint::Length(name_col), Constraint::Length(10), Constraint::Length(18),
         Constraint::Length(6), Constraint::Length(msg_w as u16),
     ];
 
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+    (rows, widths, msg_scroll)
+}
 
-    f.render_stateful_widget(table, area, &mut app.table_state);
+// What a folded branch hides, appended to its label: a fold that says nothing about its contents is
+// what turns "where is the error" into a walk down the whole tree. Only the two states worth acting
+// on are counted — a folded branch full of Ready resources has nothing to announce.
+fn hidden_badge(n: &FlatTreeNode) -> String {
+    let mut badge = String::new();
+    if n.hidden_failed > 0 {
+        badge.push_str(&format!("  ✗{}", n.hidden_failed));
+    }
+    if n.hidden_reconciling > 0 {
+        badge.push_str(&format!("  ↻{}", n.hidden_reconciling));
+    }
+    badge
+}
+
+// The label of a resource row, with the hidden-problem badge coloured apart from the rest: red for a
+// failure buried under the fold, cyan for a reconcile in flight — the same colours the rows
+// themselves use, so the badge reads as "that state, down there".
+fn labelled_row(label: &str, n: &FlatTreeNode) -> Line<'static> {
+    let badge = hidden_badge(n);
+    if badge.is_empty() {
+        return Line::from(label.to_string());
+    }
+    let plain = label.len() - badge.len();
+    let colour = if n.hidden_failed > 0 { Color::Red } else { Color::Cyan };
+    Line::from(vec![
+        Span::raw(label[..plain].to_string()),
+        Span::styled(
+            badge,
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 // Badge prefixed to the message of a Kustomization that does not prune (spec.prune = false): what it
@@ -29213,6 +29307,7 @@ mod flux_view_tests {
             source_ref: None,
             depends_on: Vec::new(),
             prune,
+            helm_chart: None,
         }
     }
 
@@ -29332,6 +29427,154 @@ mod flux_view_tests {
         assert!(head.contains("Kustomize build failed"), "{head}");
         assert!(!head.contains("evalsymlink"), "the tail is cut off at rest: {head}");
         assert!(panned.contains("evalsymlink"), "the pan reveals it: {panned}");
+    }
+
+    fn node(collapsed: bool, failed: usize, reconciling: usize) -> FlatTreeNode {
+        FlatTreeNode {
+            idx: 0,
+            depth: 1,
+            has_children: true,
+            collapsed,
+            hidden_failed: failed,
+            hidden_reconciling: reconciling,
+        }
+    }
+
+    #[test]
+    fn a_fold_announces_the_problems_it_hides_and_stays_silent_otherwise() {
+        assert_eq!(hidden_badge(&node(true, 2, 1)), "  ✗2  ↻1");
+        assert_eq!(hidden_badge(&node(true, 0, 3)), "  ↻3");
+        // A branch folded over healthy resources has nothing to announce.
+        assert_eq!(hidden_badge(&node(true, 0, 0)), "");
+        // An expanded node carries no tally: what it holds is on screen already.
+        assert_eq!(hidden_badge(&node(false, 0, 0)), "");
+    }
+
+    #[test]
+    fn the_hidden_badge_is_split_off_a_label_full_of_multibyte_glyphs() {
+        // The label is sliced on a byte index, and the tree markers are three bytes each: a naive
+        // count would cut one in half and panic.
+        let n = node(true, 1, 0);
+        let label = format!("  ▸ Kustomization apps  ⊞{}", hidden_badge(&n));
+        let line = labelled_row(&label, &n);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "  ▸ Kustomization apps  ⊞");
+        assert_eq!(line.spans[1].content, "  ✗1");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Red));
+        // No tally, no split: one plain span.
+        let plain = labelled_row("  ▾ HelmRelease app", &node(false, 0, 0));
+        assert_eq!(plain.spans.len(), 1);
+    }
+
+    #[test]
+    fn a_reconciling_fold_is_cyan_and_a_failing_one_red() {
+        assert_eq!(
+            labelled_row(&format!("x{}", hidden_badge(&node(true, 0, 2))), &node(true, 0, 2)).spans[1].style.fg,
+            Some(Color::Cyan)
+        );
+        // A failure outranks a reconcile in flight: it is the one worth walking to.
+        assert_eq!(
+            labelled_row(&format!("x{}", hidden_badge(&node(true, 1, 2))), &node(true, 1, 2)).spans[1].style.fg,
+            Some(Color::Red)
+        );
+    }
+
+    fn render_tree(
+        view: &[TreeRow],
+        resources: &[FluxResource],
+        selected: usize,
+        msg_scroll: usize,
+        width: u16,
+    ) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        const H: u16 = 10;
+        let expanded = std::collections::HashMap::new();
+        let (rows, widths, _) =
+            flux_tree_table_parts(view, resources, &expanded, Some(selected), msg_scroll, width);
+        let mut state = TableState::default();
+        state.select(Some(selected));
+        let mut terminal = Terminal::new(TestBackend::new(width, H)).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let t = Table::new(rows, widths)
+                    .header(flux_tree_header_row())
+                    .block(Block::default().borders(Borders::ALL).title("flux tree"))
+                    .row_highlight_style(Style::default().bg(Color::Blue))
+                    .highlight_symbol("> ");
+                f.render_stateful_widget(t, f.area(), &mut state);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..H)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).expect("cell").symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    // A deep tree whose deepest row carries both the inventory marker and a hidden-problem tally:
+    // the widest RESOURCE label the column has to size itself on.
+    fn deep_tree_set() -> (Vec<TreeRow>, Vec<FluxResource>) {
+        let mut resources = Vec::new();
+        let mut view = Vec::new();
+        for depth in 0..6 {
+            let mut r = res("Kustomization", Some(false), false);
+            r.name = format!("a-rather-long-kustomization-name-{depth}");
+            if depth == 5 {
+                r.ready = FluxReady::Failed;
+                r.message = "Kustomize build failed: evalsymlink failure on \
+                    '/tmp/kustomization-1234/base/app' : lstat: no such file".to_string();
+            }
+            resources.push(r);
+            view.push(TreeRow::Res(FlatTreeNode {
+                idx: depth,
+                depth,
+                has_children: depth < 5,
+                collapsed: depth == 4,
+                hidden_failed: if depth == 4 { 3 } else { 0 },
+                hidden_reconciling: if depth == 4 { 12 } else { 0 },
+            }));
+        }
+        (view, resources)
+    }
+
+    #[test]
+    fn the_tree_keeps_its_right_border_at_every_width() {
+        let (view, resources) = deep_tree_set();
+        let border = ratatui::symbols::border::PLAIN;
+        for width in [60_u16, 80, 100, 140, 196] {
+            for scroll in [0_usize, 30, 400] {
+                for selected in [0_usize, 4, 5] {
+                    let lines = render_tree(&view, &resources, selected, scroll, width);
+                    for (y, line) in lines.iter().enumerate() {
+                        let last = line.chars().last().expect("a rendered line");
+                        let expected = match y {
+                            0 => border.top_right,
+                            9 => border.bottom_right,
+                            _ => border.vertical_right,
+                        };
+                        assert_eq!(
+                            last.to_string(),
+                            expected,
+                            "right border eaten at width {width}, scroll {scroll}, row {selected}, line {y}: {line}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_branch_shows_its_tally_on_screen() {
+        let (view, resources) = deep_tree_set();
+        let lines = render_tree(&view, &resources, 0, 0, 196);
+        // Header on row 1, then one line per node: the folded one is the fifth.
+        let folded = &lines[6];
+        assert!(folded.contains("✗3"), "the failures under the fold are announced: {folded}");
+        assert!(folded.contains("↻12"), "so are the reconciles in flight: {folded}");
     }
 
     #[test]

@@ -141,7 +141,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | Workloads | `t` list ↔ tree · `Space` (or `→`/`←`) unfold the pod into its containers · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` usage view · `s` sort · `o` cordon/uncordon/drain · `p`/`P` PDF export |
 | Capacity | `g` world (nodes → workloads → quotas) · `f` problems only |
-| FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `←`/`→` pan the message of the selected row (`Home` resets it) · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
+| FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `Space` fold/unfold · `a` auto-reveal of the branches reconciling or failing · `←`/`→` pan the message of the selected row (`Home` resets it) · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
 | Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) |
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
@@ -198,7 +198,12 @@ shows the query and its effect (`/coredns  (3)`).
   ![Capacity view](demo/capacity.gif)
 
 - **FluxCD** — cluster-wide inventory, dependency tree (`t`), applied objects with their live state
-  (Inventory tab), controller logs (`l`, or `:flux-logs` for the aggregate). `z` suspends / resumes.
+  (Inventory tab), controller logs (`l`, or `:flux-logs` for the aggregate). The tree follows the
+  real dependencies, Helm chain included: HelmRepository → HelmChart (the one `status.helmChart`
+  names) → HelmRelease. A folded node announces what it hides — `✗n` failures, `↻n` reconciles in
+  flight. `a` sets the automatic reveal: by default the branches that reconcile or fail unfold on
+  their own and fold back once they return to Ready, the folds set by hand being kept underneath.
+  `z` suspends / resumes.
   `r` opens the reconcile menu: resource, `--with-source`, root sync, plus force upgrade and reset
   on a HelmRelease. `Ctrl-R` opens the unblock flow: kdt derives leads from the controller message,
   confirms each one against the cluster and offers the matching action — delete an orphaned webhook,

@@ -142,7 +142,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | Workloads | `t` liste ↔ arbre · `Space` (ou `→`/`←`) déplier le pod en containers · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` vue usage · `s` tri · `o` cordon/uncordon/drain · `p`/`P` export PDF |
 | Capacité | `g` monde (nœuds → workloads → quotas) · `f` problèmes seulement |
-| FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `←`/`→` faire défiler le message de la ligne sélectionnée (`Home` remet à zéro) · `l` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
+| FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `Space` plier/déplier · `a` suivi auto des branches en cours ou en échec · `←`/`→` faire défiler le message de la ligne sélectionnée (`Home` remet à zéro) · `l` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
 | Vulnérabilités | `f` seuil de sévérité (tous → HIGH+ → CRIT) |
 | cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME |
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge des `UpdateRequest` bloqués) |
@@ -200,8 +200,12 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   ![Vue capacité](demo/capacity.gif)
 
 - **FluxCD** — inventaire cluster-wide, arbre de dépendances (`t`), objets appliqués et leur état
-  live (onglet Inventory), logs des controllers (`l`, ou `:flux-logs` pour l'agrégat). `z` suspend /
-  reprend. `r` ouvre le menu de réconciliation : ressource, `--with-source`, sync racine, plus force
+  live (onglet Inventory), logs des controllers (`l`, ou `:flux-logs` pour l'agrégat). L'arbre suit
+  les dépendances réelles, chaîne Helm comprise : HelmRepository → HelmChart (celui que
+  `status.helmChart` désigne) → HelmRelease. Un nœud plié annonce ce qu'il cache — `✗n` échecs,
+  `↻n` réconciliations en cours. `a` règle le suivi automatique : par défaut les branches qui
+  réconcilient ou qui échouent se déplient seules et se replient une fois revenues à Ready, les plis
+  posés à la main étant conservés en dessous. `z` suspend / reprend. `r` ouvre le menu de réconciliation : ressource, `--with-source`, sync racine, plus force
   upgrade et reset sur une HelmRelease. `Ctrl-R` ouvre le déblocage : kdt tire des pistes du message
   du contrôleur, les vérifie contre le cluster et propose l'action correspondante — supprimer un
   webhook orphelin, retirer des finalizers, `resetAt` puis `forceAt` sur une release Helm bloquée en
