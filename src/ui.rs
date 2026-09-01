@@ -143,7 +143,7 @@ use crate::lang::Strings;
 use crate::pdf;
 use crate::pods::{
     fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, ContainerKind,
-    ContainerResource, PodResource, SharedPods, WorkloadResource,
+    ContainerResource, JobStatus, PodResource, SharedPods, WorkloadResource, WorkloadStatus,
 };
 use crate::rbac::{
     critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, PolicyRule as RbacRule,
@@ -16599,10 +16599,7 @@ fn synthetic_container_record(c: &ContainerResource) -> EventRecord {
 // Adapt a WorkloadResource (the focused object) into an EventRecord. Status/Related tabs work via the
 // real kind/apiVersion; Logs shows "n/a" for non-Pod kinds, which is the existing behaviour.
 fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
-    let replicas = w
-        .replicas
-        .map(|r| format!("{}/{}", w.ready_replicas, r))
-        .unwrap_or_else(|| format!("{} ready", w.ready_replicas));
+    let replicas = w.ready_label();
     EventRecord {
         uid: format!("workload|{}", w.uid),
         time: k8s_openapi::jiff::Timestamp::now(),
@@ -16612,7 +16609,13 @@ fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
         kind: w.kind.clone(),
         namespace: w.namespace.clone(),
         name: w.name.clone(),
-        message: format!("{} {}/{}  replicas={}  age={}", w.kind, w.namespace, w.name, replicas, w.age),
+        message: match w.status() {
+            WorkloadStatus::Job(j) => format!(
+                "{} {}/{}  {}  completions={}  age={}",
+                w.kind, w.namespace, w.name, j.label(), replicas, w.age
+            ),
+            _ => format!("{} {}/{}  replicas={}  age={}", w.kind, w.namespace, w.name, replicas, w.age),
+        },
         component: String::new(),
         host: String::new(),
         count: 1,
@@ -17207,14 +17210,15 @@ fn pods_table_parts<'a>(
         .enumerate()
         .map(|(i, row)| match row {
             PodRow::Workload(w) => {
-                let ready = w
-                    .replicas
-                    .map(|r| format!("{}/{}", w.ready_replicas, r))
-                    .unwrap_or_else(|| w.ready_replicas.to_string());
-                let (status, status_color) = match w.replicas {
-                    Some(r) if w.ready_replicas >= r => ("Ready", Color::Green),
-                    Some(_) => ("Scaling", Color::Yellow),
-                    None => (w.kind.as_str(), Color::Cyan),
+                let ready = w.ready_label();
+                let (status, status_color) = match w.status() {
+                    WorkloadStatus::Ready => ("Ready", Color::Green),
+                    WorkloadStatus::Scaling => ("Scaling", Color::Yellow),
+                    WorkloadStatus::Job(JobStatus::Complete) => ("Complete", Color::Green),
+                    WorkloadStatus::Job(JobStatus::Failed) => ("Failed", Color::Red),
+                    WorkloadStatus::Job(JobStatus::Suspended) => ("Suspended", DIM),
+                    WorkloadStatus::Job(JobStatus::Running) => ("Running", Color::Cyan),
+                    WorkloadStatus::Unknown => (w.kind.as_str(), Color::Cyan),
                 };
                 let (cpu, mem, has_cpu, has_mem) = agg[i];
                 Row::new(vec![
@@ -28819,6 +28823,8 @@ mod pods_container_rows_tests {
             name: "konnectivity-agent".to_string(),
             replicas: Some(2),
             ready_replicas: 2,
+            desired: None,
+            job: None,
             age: "30d".to_string(),
             uid: WorkloadResource::uid("Deployment", "kube-system", "konnectivity-agent"),
         }

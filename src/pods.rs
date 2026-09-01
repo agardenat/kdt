@@ -121,6 +121,46 @@ impl PodResource {
     }
 }
 
+// Where a Job stands, read from its conditions like `kubectl get jobs` reads them: a finished Job
+// has no pod left, so the row is all there is to tell a success from a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Complete,
+    Failed,
+    Suspended,
+    Running,
+}
+
+impl JobStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            JobStatus::Complete => "Complete",
+            JobStatus::Failed => "Failed",
+            JobStatus::Suspended => "Suspended",
+            JobStatus::Running => "Running",
+        }
+    }
+}
+
+// A Job counts completions, not ready replicas. `completions` is `spec.completions`, left None when
+// the spec does not set it rather than guessed at 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobState {
+    pub succeeded: i32,
+    pub completions: Option<i32>,
+    pub status: JobStatus,
+}
+
+// What the STATUS column says about a workload row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadStatus {
+    Ready,
+    Scaling,
+    Job(JobStatus),
+    // Nothing to compare the ready count against: the row names its kind rather than judging it.
+    Unknown,
+}
+
 // The "object" row shown at the top of the hierarchical view.
 #[derive(Debug, Clone)]
 pub struct WorkloadResource {
@@ -128,8 +168,13 @@ pub struct WorkloadResource {
     pub api_version: String,
     pub namespace: String,
     pub name: String,
+    // `spec.replicas` only — it doubles as "this kind can be scaled", so a DaemonSet's desired count
+    // must not land here.
     pub replicas: Option<i32>,
     pub ready_replicas: i32,
+    // Desired count for a kind that has one without a `spec.replicas` (DaemonSet).
+    pub desired: Option<i32>,
+    pub job: Option<JobState>,
     pub age: String,
     pub uid: String,
 }
@@ -137,6 +182,32 @@ pub struct WorkloadResource {
 impl WorkloadResource {
     pub fn uid(kind: &str, ns: &str, name: &str) -> String {
         format!("{}|{}/{}", kind, ns, name)
+    }
+
+    // READY as this kind counts it: replicas for a Deployment/StatefulSet, scheduled pods for a
+    // DaemonSet, completions for a Job.
+    pub fn ready_label(&self) -> String {
+        if let Some(j) = &self.job {
+            return match j.completions {
+                Some(c) => format!("{}/{}", j.succeeded, c),
+                None => j.succeeded.to_string(),
+            };
+        }
+        match self.replicas.or(self.desired) {
+            Some(r) => format!("{}/{}", self.ready_replicas, r),
+            None => self.ready_replicas.to_string(),
+        }
+    }
+
+    pub fn status(&self) -> WorkloadStatus {
+        if let Some(j) = &self.job {
+            return WorkloadStatus::Job(j.status);
+        }
+        match self.replicas.or(self.desired) {
+            Some(r) if self.ready_replicas >= r => WorkloadStatus::Ready,
+            Some(_) => WorkloadStatus::Scaling,
+            None => WorkloadStatus::Unknown,
+        }
     }
 
     pub fn as_owner(&self) -> OwnerRef {
@@ -299,6 +370,17 @@ fn workload_from_obj(obj: &DynamicObject, kind: &str, api_version: &str) -> Work
         })
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
+    // A DaemonSet has no `spec.replicas`; its desired count is what the scheduler was asked for.
+    let desired = (kind == "DaemonSet")
+        .then(|| {
+            obj.data
+                .get("status")
+                .and_then(|s| s.get("desiredNumberScheduled"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        })
+        .flatten();
+    let job = (kind == "Job").then(|| job_state(obj));
     let age = obj
         .metadata
         .creation_timestamp
@@ -312,8 +394,53 @@ fn workload_from_obj(obj: &DynamicObject, kind: &str, api_version: &str) -> Work
         name: name.clone(),
         replicas,
         ready_replicas,
+        desired,
+        job,
         age,
         uid: WorkloadResource::uid(kind, &namespace, &name),
+    }
+}
+
+// Completions and verdict of a Job. The verdict comes from the conditions — the counters alone
+// cannot tell a Job still running from one that gave up — with the same precedence as kubectl:
+// Complete wins over Failed, Suspended only applies while neither is set.
+fn job_state(obj: &DynamicObject) -> JobState {
+    let status = obj.data.get("status");
+    let counter = |k: &str| {
+        status
+            .and_then(|s| s.get(k))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32
+    };
+    let cond_true = |t: &str| {
+        status
+            .and_then(|s| s.get("conditions"))
+            .and_then(|c| c.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|c| {
+                    c.get("type").and_then(|v| v.as_str()) == Some(t)
+                        && c.get("status").and_then(|v| v.as_str()) == Some("True")
+                })
+            })
+    };
+    let state = if cond_true("Complete") {
+        JobStatus::Complete
+    } else if cond_true("Failed") {
+        JobStatus::Failed
+    } else if cond_true("Suspended") {
+        JobStatus::Suspended
+    } else {
+        JobStatus::Running
+    };
+    JobState {
+        succeeded: counter("succeeded"),
+        completions: obj
+            .data
+            .get("spec")
+            .and_then(|s| s.get("completions"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        status: state,
     }
 }
 
@@ -873,5 +1000,112 @@ mod container_tests {
         // Nothing is invented for the container metrics-server did not report.
         assert_eq!(out[1].cpu_milli, None);
         assert_eq!(out[1].mem_bytes, None);
+    }
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+
+    fn obj(json: serde_json::Value) -> DynamicObject {
+        serde_json::from_value(json).expect("object")
+    }
+
+    #[test]
+    fn a_finished_job_reads_its_completions_and_verdict_not_zero_ready() {
+        let w = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "helm-install-k8ssandra-operator", "namespace": "kube-system"},
+                "spec": {"completions": 1},
+                "status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}
+            })),
+            "Job",
+            "batch/v1",
+        );
+        assert_eq!(w.ready_label(), "1/1");
+        assert_eq!(w.status(), WorkloadStatus::Job(JobStatus::Complete));
+        // A Job is never scalable: the scale guard reads `replicas`, which must stay empty.
+        assert!(w.replicas.is_none());
+    }
+
+    #[test]
+    fn a_job_that_gave_up_is_failed_and_one_still_going_is_running() {
+        let failed = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "clean", "namespace": "app-bk"},
+                "spec": {"completions": 1},
+                "status": {"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}
+            })),
+            "Job",
+            "batch/v1",
+        );
+        assert_eq!(failed.status(), WorkloadStatus::Job(JobStatus::Failed));
+        assert_eq!(failed.ready_label(), "0/1");
+
+        // Counters alone cannot tell "still working" from "gave up": with no condition set, the Job
+        // is running, not failed.
+        let running = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "sos", "namespace": "app-bk"},
+                "spec": {"completions": 3},
+                "status": {"active": 1, "succeeded": 1}
+            })),
+            "Job",
+            "batch/v1",
+        );
+        assert_eq!(running.status(), WorkloadStatus::Job(JobStatus::Running));
+        assert_eq!(running.ready_label(), "1/3");
+    }
+
+    #[test]
+    fn a_job_without_declared_completions_shows_the_count_alone() {
+        let w = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "adhoc", "namespace": "default"},
+                "spec": {},
+                "status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}
+            })),
+            "Job",
+            "batch/v1",
+        );
+        assert_eq!(w.ready_label(), "1");
+    }
+
+    #[test]
+    fn a_daemonset_counts_against_its_desired_number_but_stays_unscalable() {
+        let w = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "DaemonSet",
+                "metadata": {"name": "cilium", "namespace": "kube-system"},
+                "spec": {},
+                "status": {"numberReady": 19, "desiredNumberScheduled": 20}
+            })),
+            "DaemonSet",
+            "apps/v1",
+        );
+        assert_eq!(w.ready_label(), "19/20");
+        assert_eq!(w.status(), WorkloadStatus::Scaling);
+        assert!(w.replicas.is_none());
+    }
+
+    #[test]
+    fn a_deployment_is_untouched_by_the_job_and_daemonset_paths() {
+        let w = workload_from_obj(
+            &obj(serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "rancher", "namespace": "cattle-system"},
+                "spec": {"replicas": 3},
+                "status": {"readyReplicas": 3}
+            })),
+            "Deployment",
+            "apps/v1",
+        );
+        assert_eq!(w.ready_label(), "3/3");
+        assert_eq!(w.status(), WorkloadStatus::Ready);
+        assert!(w.job.is_none() && w.desired.is_none());
     }
 }
