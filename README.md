@@ -176,8 +176,9 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   `p` affiche le run précédent du container (seul endroit où subsistent les logs d'un pod en
   `CrashLoopBackOff`), `C` change de container, `f` suit en continu. `N` liste les nodes du pod,
   `E` ouvre un shell, `D` lance le diagnostic, `X` exporte le PDF.
-- **Workloads** — liste plate des pods, ou arbre workloads → pods avec `t` (l'arbre montre aussi les
-  workloads scalés à 0). `Space`, `→` et `←` déplient un pod en ses containers (init, réguliers,
+- **Workloads** — arbre workloads → pods (Deployment, StatefulSet, DaemonSet, Job ; l'arbre montre
+  aussi les Jobs terminés et les workloads scalés à 0), ou liste plate des pods avec `t` — `:pods`
+  ouvre directement la liste plate, `:workloads` l'arbre. `Space`, `→` et `←` déplient un pod en ses containers (init, réguliers,
   éphémères) : état, consommation face à *leurs* requests/limits, âge du dernier démarrage. Les
   actions visent le workload même depuis la ligne d'un de ses pods : `s` scale, `r` rescale /
   recyclage / restart. Sur une ligne container, `E` ouvre un shell dans ce container et l'onglet

@@ -1325,6 +1325,13 @@ fn command_name_suggestions(input: &str) -> Vec<&'static str> {
     hits
 }
 
+// One command, two views: the pod words open the flat pod list, every other way in (`:workloads`,
+// `:wl`, `:deploy`…) opens the workload tree, where a Job or a scaled-to-zero Deployment is a row of
+// its own. Matched on the exact word so a prefix of something else never decides the view.
+fn typed_means_pods(typed: &str) -> bool {
+    matches!(typed.trim().to_lowercase().as_str(), "pods" | "po" | "pod")
+}
+
 // Commands that take an optional namespace argument (`:ns/pods/events <name>`).
 fn command_takes_ns(cmd: &str) -> bool {
     matches!(cmd, "events" | "namespace" | "workloads")
@@ -1491,8 +1498,9 @@ pub struct App {
     pub pods_state: SharedPods,
     // Flattened display rows (workload then its pods), kept in lockstep with `snapshot`.
     pub pods_rows: Vec<PodRow>,
-    // When true, the workloads view shows parent workload rows with their pods nested under them;
-    // when false (default) only pods are listed flat. Toggled with `t`.
+    // When true (default), the workloads view shows parent workload rows — Deployment, StatefulSet,
+    // DaemonSet, Job — with their pods nested under them; when false only pods are listed flat.
+    // Toggled with `t`, and set on entry by the word typed in the palette (`:pods` opens flat).
     pub pods_show_workloads: bool,
     // Pods (by uid) whose containers are unfolded under them, toggled with `x`. Per-pod rather than
     // global: a namespace-wide expansion would triple the row count for the one pod being looked at.
@@ -1823,7 +1831,7 @@ impl App {
             cluster_info: new_cluster_info_state(),
             pods_state: new_pods_state(),
             pods_rows: Vec::new(),
-            pods_show_workloads: false,
+            pods_show_workloads: true,
             pods_expanded: std::collections::HashSet::new(),
             pods_log_container_auto: false,
             network_state: new_network_state(),
@@ -4096,6 +4104,15 @@ impl App {
 
     fn command_run(&mut self) {
         // Enter runs the highlighted suggestion (or the raw input if nothing matches).
+        // The word as typed, before the highlighted suggestion replaces it: `:pods` and `:workloads`
+        // resolve to the same command but not to the same view, and the canonical name no longer
+        // says which one was asked for.
+        let typed = self
+            .command_input
+            .trim()
+            .split_once(' ')
+            .map(|(c, _)| c.to_string())
+            .unwrap_or_else(|| self.command_input.trim().to_string());
         let suggestions = self.command_suggestions();
         if let Some(sel) = suggestions.get(self.command_cursor) {
             self.command_input = sel.clone();
@@ -4153,6 +4170,7 @@ impl App {
                 self.mode = origin;
                 self.leave_special_modes();
                 if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
+                self.pods_show_workloads = !typed_means_pods(&typed);
                 self.enter_pods_mode();
             }
             "flux" => {
@@ -16875,9 +16893,16 @@ fn pod_belongs_to(p: &PodResource, w: &WorkloadResource) -> bool {
 // Rendered straight from `app.pods_rows`, which is index-aligned with the snapshot/`table_state`, so
 // the highlighted row matches the detail panel and the scale/restart target.
 fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, n_pods, n_workloads) = {
+    let (loading, error, n_pods, n_workloads, missing) = {
         let s = app.pods_state.lock().expect("pods poisoned");
-        (s.loading, s.error.clone(), s.pods.len(), s.workloads.len())
+        (s.loading, s.error.clone(), s.pods.len(), s.workloads.len(), s.missing_kinds.join(", "))
+    };
+    // A kind the API server would not list is named in the title: an empty section must not read as
+    // "there are none".
+    let missing = if missing.is_empty() {
+        String::new()
+    } else {
+        format!(" · non listé — {}", missing)
     };
     let src = &app.pods_rows;
 
@@ -16888,8 +16913,8 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         format!("{} (chargement...)", view_label)
     } else if app.pods_show_workloads {
         format!(
-            "workloads ({} workloads · {} pods) · ns={} · [t] pods · [Space] containers",
-            n_workloads, n_pods, app.namespace_label
+            "workloads ({} workloads · {} pods) · ns={}{} · [t] pods · [Space] containers",
+            n_workloads, n_pods, app.namespace_label, missing
         )
     } else {
         format!(

@@ -154,6 +154,10 @@ pub struct PodsState {
     pub pods: Vec<PodResource>,
     pub workloads: Vec<WorkloadResource>,
     pub error: Option<String>,
+    // Kinds the API server refused (RBAC) or could not serve for this listing, with the reason.
+    // Skipping them silently would let the view claim "no Job" when the truth is "not allowed to
+    // look", so the caller shows what is missing rather than an empty gap.
+    pub missing_kinds: Vec<String>,
     pub loading: bool,
 }
 
@@ -213,7 +217,7 @@ pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: S
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
-    let mut workloads = list_workloads(&client, &namespace).await;
+    let (mut workloads, missing_kinds) = list_workloads(&client, &namespace).await;
     workloads.sort_by(|a, b| {
         (a.namespace.as_str(), a.kind.as_str(), a.name.as_str())
             .cmp(&(b.namespace.as_str(), b.kind.as_str(), b.name.as_str()))
@@ -222,26 +226,58 @@ pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: S
     let mut s = state.lock().expect("pods poisoned");
     s.loading = false;
     s.workloads = workloads;
+    s.missing_kinds = missing_kinds;
     s.pods = pods;
     s.error = None;
 }
 
-async fn list_workloads(client: &Client, namespace: &Option<String>) -> Vec<WorkloadResource> {
+// Returns the workloads found, and the kinds that could not be listed at all (discovery or list
+// refused) with their reason — a Job the caller is not allowed to list must not look like a cluster
+// without Jobs.
+async fn list_workloads(
+    client: &Client,
+    namespace: &Option<String>,
+) -> (Vec<WorkloadResource>, Vec<String>) {
     let mut out = Vec::new();
+    let mut missing = Vec::new();
     for (group, version, kind) in WORKLOAD_KINDS {
         let gvk = GroupVersionKind::gvk(group, version, kind);
-        let Ok((ar, _caps)) = discovery::pinned_kind(client, &gvk).await else { continue };
+        let ar = match discovery::pinned_kind(client, &gvk).await {
+            Ok((ar, _caps)) => ar,
+            Err(e) => {
+                missing.push(format!("{}: {}", kind, short_reason(&e.to_string())));
+                continue;
+            }
+        };
         let api: Api<DynamicObject> = match namespace {
             Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
             None => Api::all_with(client.clone(), &ar),
         };
-        let Ok(list) = api.list(&ListParams::default()).await else { continue };
+        let list = match api.list(&ListParams::default()).await {
+            Ok(l) => l,
+            Err(e) => {
+                missing.push(format!("{}: {}", kind, short_reason(&e.to_string())));
+                continue;
+            }
+        };
         let api_version = format!("{}/{}", group, version);
         for obj in &list.items {
             out.push(workload_from_obj(obj, kind, &api_version));
         }
     }
-    out
+    (out, missing)
+}
+
+// Keep a listing failure to one readable clause: the title line has room for a cause, not for a
+// serialised API error.
+fn short_reason(e: &str) -> String {
+    let first = e.split(':').next_back().unwrap_or(e).trim();
+    let first = if first.is_empty() { e.trim() } else { first };
+    if first.chars().count() > 60 {
+        format!("{}…", first.chars().take(59).collect::<String>())
+    } else {
+        first.to_string()
+    }
 }
 
 fn workload_from_obj(obj: &DynamicObject, kind: &str, api_version: &str) -> WorkloadResource {

@@ -175,8 +175,9 @@ shows the query and its effect (`/coredns  (3)`).
   previous run (the only place the logs of a `CrashLoopBackOff` pod survive), `C` switches
   container, `f` follows. `N` lists the nodes of the pod, `E` opens a shell, `D` runs the
   diagnostic, `X` exports the PDF.
-- **Workloads** — flat pod list, or workload → pod tree with `t` (the tree also shows workloads
-  scaled to 0). `Space`, `→` and `←` unfold a pod into its containers (init, regular, ephemeral):
+- **Workloads** — workload → pod tree (Deployment, StatefulSet, DaemonSet, Job; the tree also shows
+  finished Jobs and workloads scaled to 0), or flat pod list with `t` — `:pods` opens the flat list
+  directly, `:workloads` the tree. `Space`, `→` and `←` unfold a pod into its containers (init, regular, ephemeral):
   state, usage against *their own* requests/limits, age of the last start. Actions target the
   workload even from one of its pod rows: `s` scale, `r` rescale / recycle / restart. On a container
   row, `E` opens a shell in that container and the Logs tab narrows to it. `n`/`0` change namespace.
