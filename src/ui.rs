@@ -1462,8 +1462,9 @@ pub struct App {
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
     // Set by `²`: collapses the top panel of a split view so the table below takes the whole
-    // screen. Session-only, and it survives a change of view — the reason to hide the panel (a long
-    // list to read) usually outlives the view it was hidden in.
+    // screen. It survives a change of view — the reason to hide the panel (a long list to read)
+    // usually outlives the view it was hidden in — and is written to the config file, so it also
+    // survives the session.
     pub hide_top_panel: bool,
     // Horizontal pan of the MESSAGE column on the focused table row. The row keeps the height of
     // every other one — what does not fit is reached with ←/→, not by wrapping the row taller.
@@ -1831,7 +1832,7 @@ impl App {
             related_pin_top: false,
             h_scroll: 0,
             detail_h_scroll: 0,
-            hide_top_panel: false,
+            hide_top_panel: file_config.hide_top_panel.unwrap_or(false),
             msg_scroll: 0,
             ns_pick_state: new_ns_list_state(),
             watcher_handle,
@@ -3723,6 +3724,7 @@ impl App {
 
     fn toggle_top_panel(&mut self) {
         self.hide_top_panel = !self.hide_top_panel;
+        config::save_hide_top_panel(self.hide_top_panel);
     }
 
     // `delta` is in screen terms: negative scrolls towards the top of the panel.

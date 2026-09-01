@@ -122,7 +122,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | `↑` `↓` `PgUp` `PgDn` | Navigation |
 | `Enter` | Détail plein écran (ou plier/déplier dans un arbre) |
 | `Shift-↑/↓`, `g` / `G` | Scroll du panneau de détail |
-| `²` (ou `=`) | Masquer / réafficher le panneau du haut : la table prend tout l'écran |
+| `²` (ou `=`) | Masquer / réafficher le panneau du haut : la table prend tout l'écran (état conservé d'une session à l'autre) |
 | `/` | Recherche (voir plus bas) |
 | `y` | YAML de l'objet sélectionné (`t` : neat ↔ brut) |
 | `e` / `h` / `Ctrl-D` | Éditer / toucher / supprimer l'objet (garde-fous) |
@@ -443,6 +443,9 @@ tienne dedans : ~4096 tokens réservés à la réponse, puis remplissage par pri
 status d'abord, logs, puis contexte) en omettant les sections de plus basse priorité, ce qui est
 signalé dans le prompt. La valeur n'est jamais transmise à l'API. Derrière un proxy multi-modèles,
 déclarer la fenêtre du **plus petit** modèle atteignable.
+
+La clé `hide_top_panel` retient le dernier pli du panneau du haut (`²`) : elle est réécrite seule à
+chaque appui, comme `language`, et relit l'interface dans le même état à la session suivante.
 
 ### Langue
 

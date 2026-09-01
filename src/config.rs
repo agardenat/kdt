@@ -30,6 +30,8 @@ pub struct FileConfig {
     pub active_provider: Option<String>,
     // Extra namespaces treated as security-critical in the RBAC view, merged with the built-in list.
     pub critical_namespaces: Vec<String>,
+    // Last state of the `²` fold: whether the top panel of a split view starts collapsed.
+    pub hide_top_panel: Option<bool>,
 }
 
 // Load the config file, falling back to defaults when it is missing or malformed
@@ -99,12 +101,22 @@ pub fn system_language() -> Option<AiLanguage> {
     None
 }
 
-// Persist the language picked with the `l` key. Best-effort: a failure is logged, never fatal.
+// Persist the language picked with the `L` key. Best-effort: a failure is logged, never fatal.
+pub fn save_language(lang: AiLanguage) {
+    save_key("language", serde_json::Value::String(lang.code().to_string()));
+}
+
+// Persist the `²` fold, so a panel folded away stays folded in the next session.
+pub fn save_hide_top_panel(hidden: bool) {
+    save_key("hide_top_panel", serde_json::Value::Bool(hidden));
+}
+
+// Write one key into the config file. Best-effort: a failure is logged, never fatal.
 //
 // The file is edited as raw JSON rather than re-serialized from `FileConfig`, because serializing
 // would drop every key this struct does not know about and rewrite the plaintext API keys through
-// our own code path. Mutating the single `language` key leaves the rest of the file byte-identical.
-pub fn save_language(lang: AiLanguage) {
+// our own code path. Mutating the single key leaves the rest of the file byte-identical.
+fn save_key(key: &str, value: serde_json::Value) {
     let path = config_path();
     let existing = std::fs::read_to_string(&path).ok();
     let mut root = match existing.as_deref() {
@@ -112,17 +124,14 @@ pub fn save_language(lang: AiLanguage) {
             Ok(v @ serde_json::Value::Object(_)) => v,
             // A malformed file is left alone: overwriting it would lose the user's API keys.
             _ => {
-                tracing::warn!(file = %path.display(), "config unreadable, language not saved");
+                tracing::warn!(file = %path.display(), key, "config unreadable, setting not saved");
                 return;
             }
         },
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     let Some(obj) = root.as_object_mut() else { return };
-    obj.insert(
-        "language".to_string(),
-        serde_json::Value::String(lang.code().to_string()),
-    );
+    obj.insert(key.to_string(), value);
     let Ok(text) = serde_json::to_string_pretty(&root) else {
         return;
     };

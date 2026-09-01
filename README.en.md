@@ -121,7 +121,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `↑` `↓` `PgUp` `PgDn` | Navigate |
 | `Enter` | Full-screen detail (or fold/unfold in a tree) |
 | `Shift-↑/↓`, `g` / `G` | Scroll the detail pane |
-| `²` (or `=`) | Hide / show the top pane: the table takes the whole screen |
+| `²` (or `=`) | Hide / show the top pane: the table takes the whole screen (kept across sessions) |
 | `/` | Search (see below) |
 | `y` | YAML of the selected object (`t`: neat ↔ raw) |
 | `e` / `h` / `Ctrl-D` | Edit / touch / delete the object (guardrails) |
@@ -437,6 +437,9 @@ still supported as a `default` provider.
 tokens reserved for the answer, then the prompt is filled by priority (event and status first, logs,
 then context), dropping the lowest-priority sections and saying so in the prompt. The value is never
 sent to the API. Behind a multi-model proxy, declare the window of the **smallest** reachable model.
+
+The `hide_top_panel` key remembers the last fold of the top pane (`²`): it is rewritten on its own
+at every keypress, like `language`, and brings the interface back in the same state next session.
 
 ### Language
 
