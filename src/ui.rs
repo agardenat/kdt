@@ -28349,7 +28349,7 @@ fn line_color_to_pdf(c: LineColor) -> &'static str {
 mod glyph_guard {
     // Vérifiés dans DejaVu Sans Mono (présents, avance 1233 = une cellule) et absents de Noto
     // Color Emoji.
-    const APPROVED: &str = "·«»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
+    const APPROVED: &str = "²·«»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
 
     #[test]
     fn sources_use_only_font_safe_glyphs() {
