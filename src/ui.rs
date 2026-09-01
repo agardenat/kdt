@@ -1069,6 +1069,34 @@ fn view_mode(app: &App) -> Mode {
     }
 }
 
+// The split views: a panel on top, a table below. They are the only ones where hiding the panel
+// means anything — in a full-screen detail mode the panel *is* the view, and the panel-less views
+// (diagnostic, extraction, AI, flux logs) have nothing to hide.
+fn is_split_mode(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Selection
+            | Mode::Nodes
+            | Mode::Flux
+            | Mode::Pods
+            | Mode::Rbac
+            | Mode::Vuln
+            | Mode::Secrets
+            | Mode::Certs
+            | Mode::Kyverno
+            | Mode::Reflector
+            | Mode::Velero
+            | Mode::K8ssandra
+            | Mode::Configmaps
+            | Mode::Namespaces
+            | Mode::Services
+            | Mode::Storage
+            | Mode::Capacity
+            | Mode::Rancher
+            | Mode::Argo
+    )
+}
+
 // Views whose body is a scrolled panel rather than a row list — every full-screen detail mode, plus
 // the standalone panels. There `/` highlights and jumps through the matches instead of narrowing a
 // table the user cannot see, and it uses `text_query` rather than `search_query`.
@@ -1421,6 +1449,10 @@ pub struct App {
     pub related_pin_top: bool,
     pub h_scroll: usize,
     pub detail_h_scroll: usize,
+    // Set by `²`: collapses the top panel of a split view so the table below takes the whole
+    // screen. Session-only, and it survives a change of view — the reason to hide the panel (a long
+    // list to read) usually outlives the view it was hidden in.
+    pub hide_top_panel: bool,
     // Horizontal pan of the MESSAGE column on the focused table row. The row keeps the height of
     // every other one — what does not fit is reached with ←/→, not by wrapping the row taller.
     // The upper bound is clamped at draw time, where the column width and the text are both known.
@@ -1777,6 +1809,7 @@ impl App {
             related_pin_top: false,
             h_scroll: 0,
             detail_h_scroll: 0,
+            hide_top_panel: false,
             msg_scroll: 0,
             ns_pick_state: new_ns_list_state(),
             watcher_handle,
@@ -3650,7 +3683,18 @@ impl App {
                 | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces
                 | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
                 | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull
-        )
+                | Mode::Argo | Mode::ArgoFull
+        ) && !self.top_panel_collapsed()
+    }
+
+    // True when the panel is not on screen at all: `²` only collapses split views, so the flag says
+    // nothing about a full-screen detail mode, where the panel is the whole view.
+    fn top_panel_collapsed(&self) -> bool {
+        self.hide_top_panel && is_split_mode(view_mode(self))
+    }
+
+    fn toggle_top_panel(&mut self) {
+        self.hide_top_panel = !self.hide_top_panel;
     }
 
     // `delta` is in screen terms: negative scrolls towards the top of the panel.
@@ -11955,6 +11999,16 @@ fn handle_event(app: &mut App, ev: Event) {
             app.hscroll_top_panel(1)
         }
 
+        // `²` (the key left of 1 on an AZERTY keyboard) folds the top panel away so the table below
+        // gets the whole screen, and unfolds it again. `=` does the same for keyboards that have no
+        // `²`. Only split views answer: the full-screen modes are the panel, and the prompt modes
+        // above have already consumed their characters.
+        (KeyCode::Char('²' | '='), m, _)
+            if !m.contains(KeyModifiers::CONTROL) && is_split_mode(view_mode(app)) =>
+        {
+            app.toggle_top_panel()
+        }
+
         (KeyCode::Esc, _, Mode::AiPanel) => app.exit_ai_panel(),
         (KeyCode::Char('i'), _, Mode::AiPanel) => app.exit_ai_panel(),
         (KeyCode::Char('q'), _, Mode::AiPanel) => app.exit_ai_panel(),
@@ -12699,7 +12753,17 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         m => m,
     };
 
-    let layout = match draw_mode {
+    // `²` collapses the panel of a split view: the table then gets the whole body, which is exactly
+    // the layout the full-screen modes already use — one branch here rather than a zero-height panel
+    // every draw_* function would have to defend against.
+    let hide_panel = app.hide_top_panel && is_split_mode(draw_mode);
+    let split_full = |area: Rect| {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
+            .split(area)
+    };
+    let layout = if hide_panel { split_full(area) } else { match draw_mode {
         Mode::Selection => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -12736,16 +12800,18 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             ])
             .split(area),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
-    };
+    } };
 
-    let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = match draw_mode {
+    let (header_a, detail_a, table_a, footer_a): (Rect, Option<Rect>, Option<Rect>, Rect) = if hide_panel {
+        (layout[0], None, Some(layout[1]), layout[2])
+    } else { match draw_mode {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
-    };
+    } };
 
     let st = lang::t(app.ai_language);
     let mode_label = match app.mode {
@@ -13469,6 +13535,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         global_spans.push(Span::raw(format!(" {}   ", touch_label)));
         global_spans.push(Span::styled(" ^D ", kbg));
         global_spans.push(Span::raw(format!(" {}   ", st.k_delete)));
+    }
+    // Only a split view can fold its panel away, and the key names the state it would move to.
+    if is_split_mode(draw_mode) {
+        global_spans.push(Span::styled(" ² ", kbg));
+        global_spans.push(Span::raw(format!(
+            " {}   ",
+            if hide_panel { st.k_show_panel } else { st.k_hide_panel }
+        )));
     }
     global_spans.push(Span::styled(" i ", kbg));
     global_spans.push(Span::raw(format!(" {}   ", st.k_ai)));

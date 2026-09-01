@@ -122,6 +122,7 @@ istio-system`) ; `all` (ou `*`/`0`) cible tous les namespaces.
 | `↑` `↓` `PgUp` `PgDn` | Navigation |
 | `Enter` | Détail plein écran (ou plier/déplier dans un arbre) |
 | `Shift-↑/↓`, `g` / `G` | Scroll du panneau de détail |
+| `²` (ou `=`) | Masquer / réafficher le panneau du haut : la table prend tout l'écran |
 | `/` | Recherche (voir plus bas) |
 | `y` | YAML de l'objet sélectionné (`t` : neat ↔ brut) |
 | `e` / `h` / `Ctrl-D` | Éditer / toucher / supprimer l'objet (garde-fous) |

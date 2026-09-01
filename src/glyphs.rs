@@ -15,7 +15,7 @@ use crossterm::{cursor, terminal, ExecutableCommand};
 use unicode_width::UnicodeWidthChar;
 
 /// Les glyphes non-ASCII employés par l'interface.
-pub const UI_GLYPHS: &str = "·»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
+pub const UI_GLYPHS: &str = "²·»×–—•…←↑→↓↡↻⇅≥⊞⊟⊡─│└═█▏░■▲▸►▼▾◂○●◐◑◒◓◔✓✗";
 
 /// Ce que le terminal facture pour un glyphe, face à ce que kdt suppose.
 #[derive(Debug, Clone, Copy)]

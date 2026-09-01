@@ -121,6 +121,7 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `↑` `↓` `PgUp` `PgDn` | Navigate |
 | `Enter` | Full-screen detail (or fold/unfold in a tree) |
 | `Shift-↑/↓`, `g` / `G` | Scroll the detail pane |
+| `²` (or `=`) | Hide / show the top pane: the table takes the whole screen |
 | `/` | Search (see below) |
 | `y` | YAML of the selected object (`t`: neat ↔ raw) |
 | `e` / `h` / `Ctrl-D` | Edit / touch / delete the object (guardrails) |
