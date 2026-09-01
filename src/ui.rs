@@ -16,6 +16,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 const DIM: Color = Color::Rgb(150, 150, 150);
+// Background of the selected row. An RGB value, not `Color::Blue`: the ANSI blue is whatever the
+// terminal theme makes of it — on a violet-leaning theme it came out light enough to swallow DIM
+// text and the green/red status words, which is the one row that has to stay readable.
+const SELECTED_BG: Color = Color::Rgb(40, 48, 100);
 const SYS_DIM: Color = Color::Rgb(95, 95, 95);
 
 use ratatui::text::{Line, Span};
@@ -13013,7 +13017,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             let table = Table::new(rows, widths)
                 .header(header_row)
                 .block(Block::default().borders(Borders::ALL).title("events"))
-                .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+                .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
                 .highlight_symbol("> ");
 
             f.render_stateful_widget(table, ta, &mut app.table_state);
@@ -15019,7 +15023,7 @@ fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &mut App, area: 
     let mut list_state = ListState::default().with_offset(menu.offset);
     list_state.select(Some(menu.cursor));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
     let new_offset = list_state.offset();
@@ -15239,7 +15243,7 @@ fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &mut App, area: Rec
     let mut list_state = ListState::default().with_offset(menu.offset);
     list_state.select(Some(menu.cursor));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
     let new_offset = list_state.offset();
@@ -15375,7 +15379,7 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut list_state = ListState::default();
     list_state.select(Some(menu.cursor));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
@@ -16285,7 +16289,7 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     render_table_keep_offset(f, table, area, Some(app.node_cursor), &mut app.node_offset);
@@ -17105,7 +17109,7 @@ fn draw_pods_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row())
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -17468,7 +17472,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -17566,7 +17570,7 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -17673,7 +17677,7 @@ fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -17968,7 +17972,7 @@ fn draw_argo_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -19221,7 +19225,7 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -20388,7 +20392,7 @@ fn draw_velero_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -21150,7 +21154,7 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -21350,7 +21354,7 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -22387,7 +22391,7 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -22747,7 +22751,7 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -22979,7 +22983,7 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -23506,7 +23510,7 @@ fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     render_table_keep_offset(f, table, area, cursor, &mut app.vuln_offset);
 }
@@ -23768,7 +23772,7 @@ fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     render_table_keep_offset(f, table, area, cursor, &mut app.secrets_offset);
 }
@@ -24199,7 +24203,7 @@ fn draw_certs_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -24252,7 +24256,7 @@ fn draw_certs_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -24388,7 +24392,7 @@ fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
@@ -25480,7 +25484,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -25603,7 +25607,7 @@ fn draw_kyverno_resource_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect)
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -26211,7 +26215,7 @@ fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     render_table_keep_offset(f, table, area, cursor, &mut app.configmaps_offset);
 }
@@ -26341,7 +26345,7 @@ fn draw_namespaces_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     render_table_keep_offset(f, table, area, cursor, &mut app.namespaces_offset);
 }
@@ -26438,7 +26442,7 @@ fn draw_flux_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -26569,7 +26573,7 @@ fn draw_flux_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(flux_tree_header_row())
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -29366,7 +29370,7 @@ mod flux_view_tests {
                 let t = Table::new(rows, widths)
                     .header(flux_header_row())
                     .block(Block::default().borders(Borders::ALL).title("flux"))
-                    .row_highlight_style(Style::default().bg(Color::Blue))
+                    .row_highlight_style(Style::default().bg(SELECTED_BG))
                     .highlight_symbol("> ");
                 f.render_stateful_widget(t, f.area(), &mut state);
             })
@@ -29506,7 +29510,7 @@ mod flux_view_tests {
                 let t = Table::new(rows, widths)
                     .header(flux_tree_header_row())
                     .block(Block::default().borders(Borders::ALL).title("flux tree"))
-                    .row_highlight_style(Style::default().bg(Color::Blue))
+                    .row_highlight_style(Style::default().bg(SELECTED_BG))
                     .highlight_symbol("> ");
                 f.render_stateful_widget(t, f.area(), &mut state);
             })
