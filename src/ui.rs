@@ -337,6 +337,9 @@ struct VelRestoreView {
     // Index into the flattened selectable rows (`VelRestoreView::rows`). Headers are drawn but never
     // land under the cursor.
     cursor: usize,
+    // First body line on screen. Kept across frames so the cursor walks the form and the form only
+    // scrolls once the cursor reaches an edge, like every list view.
+    scroll: usize,
     // True while the row under the cursor is taking keystrokes. Only the three text rows can be in
     // this state, and the field is always visible with its expected shape while it is.
     editing: bool,
@@ -895,6 +898,9 @@ struct SecretsCopyMenu {
     title: String,
     keys: Vec<String>,
     cursor: usize,
+    // First key on screen. Kept across frames so the cursor walks the list and the list only scrolls
+    // once the cursor reaches an edge, like the tables.
+    offset: usize,
 }
 
 // Same idea for ConfigMaps: pick a key to copy its (plain-text) value.
@@ -902,6 +908,7 @@ struct ConfigmapsCopyMenu {
     title: String,
     keys: Vec<String>,
     cursor: usize,
+    offset: usize,
 }
 
 // How the secrets table is filtered (`f`): every secret, only TLS, or only TLS within 30 days of
@@ -1470,6 +1477,7 @@ pub struct App {
     pub return_mode: Mode,
     pub node_list_state: SharedNodeList,
     pub node_cursor: usize,
+    pub node_offset: usize,
     pub last_node_status_key: Option<String>,
     pub node_usage_state: SharedNodeUsage,
     pub node_usage_scroll: usize,
@@ -1597,11 +1605,13 @@ pub struct App {
     last_rbac_sel_uid: Option<String>,
     pub vuln_state: SharedVuln,
     pub vuln_cursor: usize,
+    pub vuln_offset: usize,
     pub vuln_min_sev: VulnSev,
     pub vuln_detail_scroll: usize,
     pub vuln_refresh_handle: Option<JoinHandle<()>>,
     pub secrets_state: SharedSecrets,
     pub secrets_cursor: usize,
+    pub secrets_offset: usize,
     secrets_filter: SecretFilter,
     secrets_reveal: SecretReveal,
     secrets_copy_menu: Option<SecretsCopyMenu>,
@@ -1713,12 +1723,14 @@ pub struct App {
     last_refl_sel_uid: Option<String>,
     pub configmaps_state: SharedConfigMaps,
     pub configmaps_cursor: usize,
+    pub configmaps_offset: usize,
     configmaps_copy_menu: Option<ConfigmapsCopyMenu>,
     pub configmaps_detail_scroll: usize,
     pub configmaps_h_scroll: usize,
     pub configmaps_refresh_handle: Option<JoinHandle<()>>,
     pub namespaces_state: SharedNamespaces,
     pub namespaces_cursor: usize,
+    pub namespaces_offset: usize,
     pub namespaces_detail_scroll: usize,
     pub namespaces_h_scroll: usize,
     pub namespaces_refresh_handle: Option<JoinHandle<()>>,
@@ -1824,6 +1836,7 @@ impl App {
             return_mode: Mode::Selection,
             node_list_state: new_node_list_state(),
             node_cursor: 0,
+            node_offset: 0,
             last_node_status_key: None,
             node_usage_state: new_node_usage_state(),
             node_usage_scroll: 0,
@@ -1911,11 +1924,13 @@ impl App {
             last_rbac_sel_uid: None,
             vuln_state: new_vuln_state(),
             vuln_cursor: 0,
+            vuln_offset: 0,
             vuln_min_sev: VulnSev::Unknown,
             vuln_detail_scroll: 0,
             vuln_refresh_handle: None,
             secrets_state: new_secrets_state(),
             secrets_cursor: 0,
+            secrets_offset: 0,
             secrets_filter: SecretFilter::All,
             secrets_reveal: SecretReveal::Hidden,
             secrets_copy_menu: None,
@@ -1989,12 +2004,14 @@ impl App {
             last_refl_sel_uid: None,
             configmaps_state: new_configmaps_state(),
             configmaps_cursor: 0,
+            configmaps_offset: 0,
             configmaps_copy_menu: None,
             configmaps_detail_scroll: 0,
             configmaps_h_scroll: 0,
             configmaps_refresh_handle: None,
             namespaces_state: new_namespaces_state(),
             namespaces_cursor: 0,
+            namespaces_offset: 0,
             namespaces_detail_scroll: 0,
             namespaces_h_scroll: 0,
             namespaces_refresh_handle: None,
@@ -3841,6 +3858,7 @@ impl App {
     fn enter_nodes_mode(&mut self) {
         self.mode = Mode::Nodes;
         self.node_cursor = 0;
+        self.node_offset = 0;
         self.last_node_status_key = None;
         self.detail_tab = DetailTab::Status;
         self.log_scroll = 0;
@@ -4118,12 +4136,16 @@ impl App {
         // three matches. It only ever grows again from a scroll, so resetting it here is enough.
         *self.table_state.offset_mut() = 0;
         self.vuln_cursor = 0;
+        self.vuln_offset = 0;
         self.secrets_cursor = 0;
+        self.secrets_offset = 0;
         self.configmaps_cursor = 0;
+        self.configmaps_offset = 0;
         // The node cursor follows the same rule, and the status panel underneath has to be told the
         // selection moved or it keeps showing the node the cursor was on before the query.
         if self.node_cursor != 0 {
             self.node_cursor = 0;
+            self.node_offset = 0;
             self.last_node_status_key = None;
         }
         match self.mode {
@@ -6217,6 +6239,7 @@ impl App {
     fn enter_vuln_mode(&mut self) {
         self.mode = Mode::Vuln;
         self.vuln_cursor = 0;
+        self.vuln_offset = 0;
         self.vuln_detail_scroll = 0;
         self.refresh_vulnerabilities();
         self.start_vuln_auto_refresh();
@@ -6329,6 +6352,7 @@ impl App {
             _ => VulnSev::High,
         };
         self.vuln_cursor = 0;
+        self.vuln_offset = 0;
         self.vuln_detail_scroll = 0;
     }
 
@@ -6337,6 +6361,7 @@ impl App {
     fn enter_secrets_mode(&mut self) {
         self.mode = Mode::Secrets;
         self.secrets_cursor = 0;
+        self.secrets_offset = 0;
         self.secrets_detail_scroll = 0;
         self.secrets_reveal = SecretReveal::Hidden;
         self.secrets_copy_menu = None;
@@ -6435,6 +6460,7 @@ impl App {
             SecretFilter::Expiring => SecretFilter::All,
         };
         self.secrets_cursor = 0;
+        self.secrets_offset = 0;
         self.secrets_detail_scroll = 0;
         self.secrets_reveal = SecretReveal::Hidden;
     }
@@ -7799,6 +7825,7 @@ impl App {
             labels: String::new(),
             overwrite: false,
             cursor: 0,
+            scroll: 0,
             editing: false,
             armed: false,
             typed: None,
@@ -9994,6 +10021,7 @@ impl App {
             ),
             keys: s.data_keys.clone(),
             cursor: 0,
+            offset: 0,
         });
     }
 
@@ -10044,6 +10072,7 @@ impl App {
     fn enter_configmaps_mode(&mut self) {
         self.mode = Mode::Configmaps;
         self.configmaps_cursor = 0;
+        self.configmaps_offset = 0;
         self.configmaps_detail_scroll = 0;
         self.configmaps_h_scroll = 0;
         self.configmaps_copy_menu = None;
@@ -10131,6 +10160,7 @@ impl App {
     fn enter_namespaces_mode(&mut self) {
         self.mode = Mode::Namespaces;
         self.namespaces_cursor = 0;
+        self.namespaces_offset = 0;
         self.namespaces_detail_scroll = 0;
         self.namespaces_h_scroll = 0;
         self.refresh_namespaces();
@@ -10224,6 +10254,7 @@ impl App {
             ),
             keys,
             cursor: 0,
+            offset: 0,
         });
     }
 
@@ -13893,6 +13924,24 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
     }
 }
 
+// A table whose scroll offset survives the frame. Building a fresh `TableState` at each draw means
+// an offset of 0 every time, and `Table` then scrolls just enough to show the selection — which
+// pins the cursor to the last visible row and slides the list under it, instead of letting the
+// cursor walk the rows and scrolling only once it reaches an edge. Keeping the offset in `App` is
+// what makes these views behave like the ones backed by `app.table_state`.
+fn render_table_keep_offset(
+    f: &mut ratatui::Frame,
+    table: Table,
+    area: Rect,
+    cursor: Option<usize>,
+    offset: &mut usize,
+) {
+    let mut state = TableState::default().with_offset(*offset);
+    state.select(cursor);
+    f.render_stateful_widget(table, area, &mut state);
+    *offset = state.offset();
+}
+
 // How many rows a line will actually take once wrapped. `Paragraph`'s `Wrap { trim: true }` breaks
 // on word boundaries, so dividing the total width by the available one under-counts as soon as the
 // text holds words that do not fit the remainder — and a panel that under-counts its own height
@@ -14474,6 +14523,7 @@ fn draw_vel_restore_view(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(v) = app.vel_restore_view.as_ref() else { return };
     let rows = v.rows();
     let selected = rows.get(v.cursor).copied();
+    let prev_scroll = v.scroll;
 
     let popup_w = (area.width * 70 / 100).max(56).min(area.width);
 
@@ -14677,14 +14727,19 @@ fn draw_vel_restore_view(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // floor here: a floor above `area.height` would draw the popup off the bottom of a short window.
     let popup_h = area.height.min(28);
     let budget = (popup_h as usize).saturating_sub(2 + head.len() + tail.len());
-    let scroll = if body.len() <= budget {
+    // Scroll only when the cursor would leave the window: it walks the rows on screen first, and the
+    // form slides under it only at the top and bottom edges — the rule every list view follows.
+    let scroll = if body.len() <= budget || budget == 0 {
         0
     } else {
-        // Keep the row under the cursor on screen, with a little of what surrounds it.
-        cursor_line
-            .saturating_sub(budget / 2)
+        prev_scroll
+            .min(cursor_line)
+            .max((cursor_line + 1).saturating_sub(budget))
             .min(body.len() - budget)
     };
+    if let Some(v) = app.vel_restore_view.as_mut() {
+        v.scroll = scroll;
+    }
     let visible: Vec<Line> = body.into_iter().skip(scroll).take(budget.max(1)).collect();
     let lines: Vec<Line> = head.into_iter().chain(visible).chain(tail).collect();
 
@@ -14903,7 +14958,7 @@ fn yaml_value_style(value: &str) -> Style {
 }
 
 // Copy picker over a ConfigMap: a highlighted list of its keys; Enter copies the (text) value.
-fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(menu) = app.configmaps_copy_menu.as_ref() else { return; };
 
     let popup_w = (area.width * 50 / 100).max(40).min(area.width);
@@ -14924,12 +14979,13 @@ fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect
         .split(inner);
 
     let items: Vec<ListItem> = copy_menu_items(&menu.keys);
-    let mut list_state = ListState::default();
+    let mut list_state = ListState::default().with_offset(menu.offset);
     list_state.select(Some(menu.cursor));
     let list = List::new(items)
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
+    let new_offset = list_state.offset();
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -14938,6 +14994,10 @@ fn draw_configmaps_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect
         ))),
         chunks[1],
     );
+
+    if let Some(menu) = app.configmaps_copy_menu.as_mut() {
+        menu.offset = new_offset;
+    }
 }
 
 // Copy picker over a secret: a highlighted list of its data keys; Enter copies the decoded value.
@@ -15118,7 +15178,7 @@ fn pf_list_lines(rows: &[PfRow], cursor: usize, st: &lang::Strings) -> Vec<Line<
     lines
 }
 
-fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(menu) = app.secrets_copy_menu.as_ref() else { return; };
 
     let popup_w = (area.width * 50 / 100).max(40).min(area.width);
@@ -15139,12 +15199,13 @@ fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .split(inner);
 
     let items: Vec<ListItem> = copy_menu_items(&menu.keys);
-    let mut list_state = ListState::default();
+    let mut list_state = ListState::default().with_offset(menu.offset);
     list_state.select(Some(menu.cursor));
     let list = List::new(items)
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
+    let new_offset = list_state.offset();
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -15153,6 +15214,10 @@ fn draw_secrets_copy_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         ))),
         chunks[1],
     );
+
+    if let Some(menu) = app.secrets_copy_menu.as_mut() {
+        menu.offset = new_offset;
+    }
 }
 
 // Picker item list shared by the secrets/configmaps copy popups: the manifest entry then the keys.
@@ -16186,9 +16251,7 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
-    let mut state = TableState::default();
-    state.select(Some(app.node_cursor));
-    f.render_stateful_widget(table, area, &mut state);
+    render_table_keep_offset(f, table, area, Some(app.node_cursor), &mut app.node_offset);
 }
 
 // Adapt a FluxResource into an EventRecord so the Flux view reuses the shared table/detail/AI flow.
@@ -23398,16 +23461,13 @@ fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(5), Constraint::Length(5), Constraint::Length(14), Constraint::Length(6),
     ];
 
-    let mut ts = TableState::default();
-    if !rows_data.is_empty() {
-        ts.select(Some(app.vuln_cursor));
-    }
+    let cursor = (!rows_data.is_empty()).then_some(app.vuln_cursor);
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ts);
+    render_table_keep_offset(f, table, area, cursor, &mut app.vuln_offset);
 }
 
 // Keep the trailing image path + tag-relevant part readable when the registry prefix is long.
@@ -23663,16 +23723,13 @@ fn draw_secrets_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(5), Constraint::Length(28), Constraint::Length(22), Constraint::Length(6),
     ];
 
-    let mut ts = TableState::default();
-    if !rows_data.is_empty() {
-        ts.select(Some(app.secrets_cursor));
-    }
+    let cursor = (!rows_data.is_empty()).then_some(app.secrets_cursor);
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ts);
+    render_table_keep_offset(f, table, area, cursor, &mut app.secrets_offset);
 }
 
 // Detail panel (split top / full screen): the selected secret's decoded certificate plus its
@@ -26109,16 +26166,13 @@ fn draw_configmaps_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(8), Constraint::Length(origin_w), Constraint::Length(6),
     ];
 
-    let mut ts = TableState::default();
-    if !rows_data.is_empty() {
-        ts.select(Some(app.configmaps_cursor));
-    }
+    let cursor = (!rows_data.is_empty()).then_some(app.configmaps_cursor);
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ts);
+    render_table_keep_offset(f, table, area, cursor, &mut app.configmaps_offset);
 }
 
 // Detail panel (split top / full screen): the selected ConfigMap's metadata then every key's value
@@ -26242,16 +26296,13 @@ fn draw_namespaces_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Constraint::Length(origin_w), Constraint::Length(6),
     ];
 
-    let mut ts = TableState::default();
-    if !rows_data.is_empty() {
-        ts.select(Some(app.namespaces_cursor));
-    }
+    let cursor = (!rows_data.is_empty()).then_some(app.namespaces_cursor);
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(table, area, &mut ts);
+    render_table_keep_offset(f, table, area, cursor, &mut app.namespaces_offset);
 }
 
 // Detail panel (split top): the selected Namespace's phase, origin and age, then its labels and
@@ -28543,6 +28594,7 @@ mod velero_view_tests {
             labels: String::new(),
             overwrite: false,
             cursor: 0,
+            scroll: 0,
             editing: false,
             armed: false,
             typed: None,
@@ -29097,6 +29149,49 @@ mod portfwd_view_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod table_scroll_tests {
+    use super::*;
+
+    // Walking back up must move the cursor inside the window, not slide the whole list down under a
+    // cursor stuck on the last row — the shape a `TableState` rebuilt at every frame produces.
+    #[test]
+    fn a_table_scrolls_only_at_its_edges() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        const W: u16 = 20;
+        const H: u16 = 10;
+        // Borders take one row top and bottom: eight rows are on screen.
+        const VISIBLE: usize = H as usize - 2;
+        let mut terminal = Terminal::new(TestBackend::new(W, H)).expect("test terminal");
+        let mut draw = |cursor: usize, offset: &mut usize| {
+            terminal
+                .draw(|f| {
+                    let rows: Vec<Row> =
+                        (0..100).map(|i| Row::new(vec![Cell::from(i.to_string())])).collect();
+                    let table = Table::new(rows, [Constraint::Min(4)])
+                        .block(Block::default().borders(Borders::ALL));
+                    render_table_keep_offset(f, table, f.area(), Some(cursor), offset);
+                })
+                .expect("draw");
+        };
+
+        let mut offset = 0usize;
+        draw(0, &mut offset);
+        assert_eq!(offset, 0);
+        draw(VISIBLE - 1, &mut offset);
+        assert_eq!(offset, 0, "the cursor walks the visible rows without scrolling");
+        draw(20, &mut offset);
+        assert_eq!(offset, 20 - VISIBLE + 1, "past the bottom edge the list scrolls by what it must");
+        draw(19, &mut offset);
+        assert_eq!(offset, 20 - VISIBLE + 1, "coming back up the list stays put: the cursor moves");
+        draw(13, &mut offset);
+        assert_eq!(offset, 13, "still put down to the top row of the window");
+        draw(12, &mut offset);
+        assert_eq!(offset, 12, "and only then does it scroll, by one row");
     }
 }
 
