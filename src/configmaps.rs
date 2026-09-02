@@ -56,14 +56,20 @@ pub fn new_configmaps_state() -> SharedConfigMaps {
     Arc::new(Mutex::new(ConfigMapsState::default()))
 }
 
-pub async fn fetch_configmaps(client: Client, state: SharedConfigMaps) {
+// `namespace` is the active scope: None lists the whole cluster, Some(ns) only that namespace —
+// the list is fetched already scoped rather than filtered afterwards, so a `:cm <ns>` on a big
+// cluster reads one namespace instead of every ConfigMap in it.
+pub async fn fetch_configmaps(client: Client, namespace: Option<String>, state: SharedConfigMaps) {
     {
         let mut s = state.lock().expect("configmaps poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    let api: Api<ConfigMap> = Api::all(client.clone());
+    let api: Api<ConfigMap> = match &namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
     let list = match api.list(&ListParams::default()).await {
         Ok(l) => l,
         Err(e) => return fail(&state, e.to_string()),

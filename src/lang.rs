@@ -1309,6 +1309,7 @@ pub struct Strings {
     pub msg_no_namespace_on_row: &'static str,
     pub msg_already_filtered: &'static str,
     pub msg_already_all_namespaces: &'static str,
+    pub msg_cmd_no_ns_arg: &'static str,
 
     // Synthetic records and popups built from the specialised views.
     pub rec_k8s_cve: &'static str,
@@ -3061,6 +3062,7 @@ pub const FR: Strings = Strings {
     msg_no_namespace_on_row: "aucun namespace sur l'élément sélectionné",
     msg_already_filtered: "déjà filtré sur {ns}",
     msg_already_all_namespaces: "déjà sur tous les namespaces",
+    msg_cmd_no_ns_arg: ":{cmd} ne se restreint pas à un namespace, argument ignoré",
 
     // Synthetic records and popups built from the specialised views.
     rec_k8s_cve: "Kubernetes control-plane\nversion serveur={version}\ncible (dernier patch mineure)={target}\nretard de patch={behind}\nEOL={eol}\nCVEs récentes (feed officiel, non filtrées par version):\n{cves}",
@@ -4809,6 +4811,7 @@ pub const EN: Strings = Strings {
     msg_no_namespace_on_row: "the selected row carries no namespace",
     msg_already_filtered: "already filtered on {ns}",
     msg_already_all_namespaces: "already on every namespace",
+    msg_cmd_no_ns_arg: ":{cmd} does not narrow to a namespace, argument ignored",
 
     // Synthetic records and popups built from the specialised views.
     rec_k8s_cve: "Kubernetes control-plane\nserver version={version}\ntarget (latest patch of the minor)={target}\npatch behind={behind}\nEOL={eol}\nRecent CVEs (official feed, not filtered by version):\n{cves}",

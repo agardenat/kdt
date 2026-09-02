@@ -70,9 +70,12 @@ IPv6 for the API server, IPv4 is tried first. The app starts on the events view.
 
 ## Command palette (`:`)
 
-`:` opens a k9s-style prompt: `Tab` completes, `Enter` runs, `Esc` cancels. `events`, `namespace`
-and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-system`); `all` (or
-`*`/`0`) targets every namespace.
+`:` opens a k9s-style prompt: `Tab` completes, `Enter` runs, `Esc` cancels. Every view whose rows are
+namespaced objects takes a namespace argument (`:cm kube-system`, `:pods istio-system`, `:certs
+prod`) — marked `[ns]` below; `all` (or `*`/`0`) targets every namespace. The namespace picked this
+way becomes the session scope, shown in the `ns=` banner. The cluster-scoped views (`nodes`,
+`capacity`, `pv`, `rancher`) and those built as a graph across namespaces (`flux`, `rbac`,
+`reflector`, `argocd`, `kyverno`) take no argument, and say so if given one.
 
 | Command | Aliases | View |
 |---|---|---|
@@ -83,17 +86,17 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `flux` | `fl`, `ks`, `hr` | FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Aggregated Flux controller logs |
 | `rbac` | `rb`, `roles`, `bindings`, `sec` | RBAC |
-| `vuln` | `cve`, `cves`, `vulns` | Vulnerabilities |
-| `secrets` | `secret`, `se`, `tls` | Secrets and TLS certificates |
-| `certs` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
+| `vuln [ns]` | `cve`, `cves`, `vulns` | Vulnerabilities |
+| `secrets [ns]` | `secret`, `se`, `tls` | Secrets and TLS certificates |
+| `certs [ns]` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
 | `kyverno` | `ky`, `policies`, `polr`, `cpol`, `admission` | Kyverno |
 | `reflector` | `refl`, `mirror`, `miroir` | Reflector |
-| `velero` | `vel`, `backup`, `backups`, `schedules` | Velero, backups and schedules |
-| `restores` | `restore`, `restauration` | Velero, restores |
-| `bsl` | `backupstoragelocation`, `backuprepositories` | Velero, storage and repositories |
-| `k8ssandra` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, ring side |
-| `medusa` | `med`, `medusabackup`, `cassbackup` | K8ssandra, Medusa backup side |
-| `reaper` | `rea`, `repair`, `repairs` | K8ssandra, operations and Reaper |
+| `velero [ns]` | `vel`, `backup`, `backups`, `schedules` | Velero, backups and schedules |
+| `restores [ns]` | `restore`, `restauration` | Velero, restores |
+| `bsl [ns]` | `backupstoragelocation`, `backuprepositories` | Velero, storage and repositories |
+| `k8ssandra [ns]` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, ring side |
+| `medusa [ns]` | `med`, `medusabackup`, `cassbackup` | K8ssandra, Medusa backup side |
+| `reaper [ns]` | `rea`, `repair`, `repairs` | K8ssandra, operations and Reaper |
 | `rancher` | `ranch`, `cattle`, `users`, `identities` | Rancher, accounts and identities |
 | `projects` | `project`, `proj` | Rancher, projects and namespaces |
 | `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, tokens |
@@ -101,15 +104,15 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | `appsets` | `appset`, `applicationsets` | Argo CD, ApplicationSets side |
 | `appprojects` | `appproject`, `appproj` | Argo CD, AppProjects side |
 | `argorepos` | `argorepo`, `argoclusters` | Argo CD, registered repositories and clusters |
-| `configmaps` | `cm`, `config` | ConfigMaps |
-| `services` | `svc`, `service` | Services / Endpoints |
+| `configmaps [ns]` | `cm`, `config` | ConfigMaps |
+| `services [ns]` | `svc`, `service` | Services / Endpoints |
 | `forward` | `pf`, `portforward`, `tunnels` | Running port-forwards (over the current view) |
-| `ingress` | `ing`, `ingressclass` | Ingress / IngressClass |
-| `netpol` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (native, Cilium, Calico) |
-| `storage` | `stockage`, `pvc`, `claims` | Storage, claim side (PVC → PV) |
+| `ingress [ns]` | `ing`, `ingressclass` | Ingress / IngressClass |
+| `netpol [ns]` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (native, Cilium, Calico) |
+| `storage [ns]` | `stockage`, `pvc`, `claims` | Storage, claim side (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Storage, volume side (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacity, node side |
-| `quota` | `quotas`, `rq`, `resourcequota` | Capacity, quota side |
+| `quota [ns]` | `quotas`, `rq`, `resourcequota` | Capacity, quota side |
 | `quit` | `q` | Quit |
 
 ## Keys
@@ -140,10 +143,10 @@ and `workloads` take a namespace argument (`:ns kube-system`, `:pods istio-syste
 | Events | `s` freeze scrolling · `Tab` Logs/Status/Related tab · `a`/`w`/`x` All/Warnings/Errors filter · `p`/`C`/`f` logs previous run/container/follow · `n`/`0` namespace filter · `N` nodes of the pod · `E` shell · `D` diagnostic · `X` PDF export |
 | Workloads | `t` list ↔ tree · `Space` (or `→`/`←`) unfold the pod into its containers · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
 | Nodes | `u` usage view · `s` sort · `o` cordon/uncordon/drain · `p`/`P` PDF export |
-| Capacity | `g` world (nodes → workloads → quotas) · `f` problems only |
+| Capacity | `g` world (nodes → workloads → quotas) · `f` problems only · `n`/`0` namespace (workloads and quotas worlds) |
 | FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `Space` fold/unfold · `a` auto-reveal of the branches reconciling or failing · `←`/`→` pan the message of the selected row (`Home` resets it) · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
-| Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) |
-| cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME |
+| Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) · `n`/`0` namespace |
+| cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME · `n`/`0` namespace |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
@@ -359,7 +362,8 @@ shows the query and its effect (`/coredns  (3)`).
   no default class (or two), `WaitForFirstConsumer` waiting on a pod, class with no provisioner, a
   `ProvisioningFailed` left by the provisioner (its message wins), `Released` PVs,
   `reclaimPolicy: Delete` surfaced on the PVC, `RWO` PVCs mounted by several pods.
-- **Secrets / ConfigMaps** — inventories, with TLS certificate expiry and their consumers.
+- **Secrets / ConfigMaps** — inventories, with TLS certificate expiry and their consumers. Both
+  views follow the session namespace scope (`:cm <ns>`, `n`/`0`) and then list that namespace only.
 - **Diagnostic** (`D`) — a battery of checks: API health, version, nodes, system namespaces,
   `kube-system` pods, CoreDNS, CNI, validating and mutating webhooks, Rancher, failing pods, PVs,
   storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, K8ssandra, RBAC, recent

@@ -144,15 +144,22 @@ pub struct VulnState {
 
 impl VulnState {
     // (critical, high, medium, low) summed across all components.
-    pub fn counts(&self) -> (usize, usize, usize, usize) {
+    // Totals for the title. `ns` restricts them to one namespace, so the header cannot claim the
+    // cluster's CVE count over a list scoped to a single namespace.
+    pub fn counts(&self, ns: Option<&str>) -> (usize, usize, usize, usize) {
         let mut c = (0, 0, 0, 0);
-        for comp in &self.components {
+        for comp in self.components.iter().filter(|x| ns.is_none_or(|n| x.namespace == n)) {
             c.0 += comp.critical;
             c.1 += comp.high;
             c.2 += comp.medium;
             c.3 += comp.low;
         }
         c
+    }
+
+    // How many scanned images the scope holds — the `total` the title shows.
+    pub fn scanned(&self, ns: Option<&str>) -> usize {
+        self.components.iter().filter(|x| ns.is_none_or(|n| x.namespace == n)).count()
     }
 }
 

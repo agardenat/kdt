@@ -1372,9 +1372,34 @@ fn typed_means_pods(typed: &str) -> bool {
     matches!(typed.trim().to_lowercase().as_str(), "pods" | "po" | "pod")
 }
 
-// Commands that take an optional namespace argument (`:ns/pods/events <name>`).
+// Commands that take an optional namespace argument (`:cm kube-system`). Every view whose rows are
+// namespaced objects is here, so a scope can be set on the way in instead of afterwards with `n`.
+// Left out are the views a namespace does not describe: the cluster-scoped ones (`nodes`,
+// `capacity`, `pv`, `rancher`), and the ones built as a graph across namespaces, where hiding the
+// rows of other namespaces would cut the very edges they exist to show (`flux`, `rbac`,
+// `reflector`, `argocd`) or leave counts computed cluster-wide over a partial list (`kyverno`).
 fn command_takes_ns(cmd: &str) -> bool {
-    matches!(cmd, "events" | "namespace" | "workloads")
+    matches!(
+        cmd,
+        "events"
+            | "namespace"
+            | "workloads"
+            | "configmaps"
+            | "secrets"
+            | "certs"
+            | "vuln"
+            | "services"
+            | "ingress"
+            | "netpol"
+            | "storage"
+            | "quota"
+            | "velero"
+            | "restores"
+            | "bsl"
+            | "k8ssandra"
+            | "medusa"
+            | "reaper"
+    )
 }
 
 // Map a namespace argument to a watcher scope: `all`/`*`/`0`/empty mean "all namespaces".
@@ -3973,7 +3998,7 @@ impl App {
         self.command_input.clear();
         self.command_cursor = 0;
         self.mode = Mode::Command;
-        // Prefetch namespaces so `:ns/pods/events <name>` can autocomplete.
+        // Prefetch namespaces so the `<ns>` argument of every namespaced command autocompletes.
         let client = self.client.clone();
         let state = self.ns_pick_state.clone();
         tokio::spawn(async move { fetch_namespaces(client, state).await; });
@@ -4216,6 +4241,14 @@ impl App {
             .as_ref()
             .filter(|a| !a.is_empty() && command_takes_ns(cmd))
             .map(|a| ns_arg_to_opt(a));
+        // A namespace typed at a view that cannot narrow to one used to be dropped in silence,
+        // which reads exactly like a scope that was applied. Say so instead.
+        if ns_arg.is_none() && arg.is_some_and(|a| !a.is_empty()) {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                lang::fill(lang::t(self.ai_language).msg_cmd_no_ns_arg, &[("cmd", cmd)]),
+            ));
+        }
         match cmd {
             "quit" => self.should_quit = true,
             // An overlay, not a view: the mode it was called from keeps refreshing underneath.
@@ -4224,37 +4257,31 @@ impl App {
                 self.open_forwards_view();
             }
             "events" => {
-                self.mode = origin;
-                self.leave_special_modes();
-                if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
+                self.switch_view(origin, ns_arg);
                 self.reset_to_follow();
             }
             "namespace" => {
-                self.mode = origin;
-                self.leave_special_modes();
-                match ns_arg {
-                    Some(ns_opt) => {
-                        self.apply_namespace(ns_opt);
-                        self.mode = Mode::Selection;
-                    }
-                    None => self.enter_namespaces_mode(),
+                // With a name, the scope is already applied by `switch_view` and there is nothing
+                // left to pick; without one, the picker is the command.
+                let picked = ns_arg.is_some();
+                self.switch_view(origin, ns_arg);
+                if picked {
+                    self.mode = Mode::Selection;
+                } else {
+                    self.enter_namespaces_mode();
                 }
             }
             "nodes" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_nodes_mode();
             }
             "workloads" => {
-                self.mode = origin;
-                self.leave_special_modes();
-                if let Some(ns_opt) = ns_arg { self.apply_namespace(ns_opt); }
+                self.switch_view(origin, ns_arg);
                 self.pods_show_workloads = !typed_means_pods(&typed);
                 self.enter_pods_mode();
             }
             "flux" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_flux_mode();
             }
             "flux-logs" => {
@@ -4266,149 +4293,133 @@ impl App {
                 self.enter_flux_logs();
             }
             "rbac" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_rbac_mode();
             }
             "vuln" => {
                 // Always opens: with Trivy Operator it lists scanned images; without it, the view
                 // falls back to the Kubernetes version risk alone (server version + official feed).
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_vuln_mode();
             }
             "secrets" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_secrets_mode();
             }
             "certs" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_certs_mode();
             }
             "kyverno" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_kyverno_mode();
             }
             "reflector" => {
                 // Always opens: without the controller the view says so, which is itself the answer
                 // to "why is nothing being mirrored".
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_reflector_mode();
             }
             "velero" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_velero_mode(VelWorld::Backups);
             }
             "restores" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_velero_mode(VelWorld::Restores);
             }
             "bsl" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_velero_mode(VelWorld::Infra);
             }
             "k8ssandra" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_k8c_mode(K8cWorld::Cluster);
             }
             "medusa" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_k8c_mode(K8cWorld::Backups);
             }
             "reaper" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_k8c_mode(K8cWorld::Ops);
             }
             "rancher" => {
                 // Always opens: on a cluster with no management.cattle.io the view says so, which is
                 // itself the answer to "is this thing Rancher-managed".
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_rancher_mode(RancWorld::Users);
             }
             "projects" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_rancher_mode(RancWorld::Projects);
             }
             "tokens" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_rancher_mode(RancWorld::Tokens);
             }
             "argocd" => {
                 // Always opens: on a cluster with no argoproj.io the view says so, which is itself
                 // the answer to "is Argo CD installed here".
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_argo_mode(ArgoWorld::Apps);
             }
             "appsets" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_argo_mode(ArgoWorld::Sets);
             }
             "appprojects" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_argo_mode(ArgoWorld::Projects);
             }
             "argorepos" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_argo_mode(ArgoWorld::Repos);
             }
             "configmaps" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_configmaps_mode();
             }
             "services" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_network_mode(NetWorld::Services);
             }
             "ingress" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_network_mode(NetWorld::Ingress);
             }
             "netpol" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_network_mode(NetWorld::NetworkPolicy);
             }
             "storage" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_storage_mode(StoWorld::Claims);
             }
             "capacity" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_capacity_mode(CapWorld::Nodes);
             }
             "quota" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_capacity_mode(CapWorld::Quotas);
             }
             "pv" => {
-                self.mode = origin;
-                self.leave_special_modes();
+                self.switch_view(origin, ns_arg);
                 self.enter_storage_mode(StoWorld::Volumes);
             }
             _ => self.exit_command(),
+        }
+    }
+
+    // Common prologue of every view-opening palette command: return to the mode the palette was
+    // called from, shut down whatever view was running, then apply the namespace argument if one was
+    // typed — the scope has to be in force *before* the new view fetches under it.
+    fn switch_view(&mut self, origin: Mode, ns_arg: Option<Option<String>>) {
+        self.mode = origin;
+        self.leave_special_modes();
+        if let Some(ns_opt) = ns_arg {
+            self.apply_namespace(ns_opt);
         }
     }
 
@@ -5677,14 +5688,28 @@ impl App {
     fn refresh_capacity_snapshot(&mut self) {
         let rows: Vec<CapRow> = {
             let s = self.capacity_state.lock().expect("capacity poisoned");
+            // Nodes are cluster-scoped and ignore the namespace filter; the two namespaced worlds
+            // honour it, so `:quota <ns>` lands on that namespace's quotas alone.
+            let ns_filter = self.current_ns_opt();
+            let ns_ok = |ns: &str| ns_filter.as_deref().is_none_or(|f| f == ns);
             match self.cap_world {
                 CapWorld::Nodes => {
                     s.nodes.iter().cloned().map(|n| CapRow::Node(Box::new(n))).collect()
                 }
-                CapWorld::Workloads => {
-                    s.workloads.iter().cloned().map(CapRow::Workload).collect()
-                }
-                CapWorld::Quotas => s.quotas.iter().cloned().map(CapRow::Quota).collect(),
+                CapWorld::Workloads => s
+                    .workloads
+                    .iter()
+                    .filter(|w| ns_ok(&w.namespace))
+                    .cloned()
+                    .map(CapRow::Workload)
+                    .collect(),
+                CapWorld::Quotas => s
+                    .quotas
+                    .iter()
+                    .filter(|q| ns_ok(&q.namespace))
+                    .cloned()
+                    .map(CapRow::Quota)
+                    .collect(),
             }
         };
         let rows: Vec<CapRow> = match self.cap_filter {
@@ -6359,9 +6384,13 @@ impl App {
                 rows.push(VulnRow::K8s(k8s.clone()));
             }
         }
+        // The namespace scope hides the images of other namespaces; the Kubernetes row above is
+        // about the cluster itself and stays whatever the scope.
+        let ns_filter = self.current_ns_opt();
         rows.extend(
             s.components
                 .iter()
+                .filter(|c| ns_filter.as_deref().is_none_or(|ns| c.namespace == ns))
                 .filter(|c| c.max_sev >= self.vuln_min_sev)
                 .filter(|c| match self.search_query.as_deref() {
                     None => true,
@@ -6434,21 +6463,24 @@ impl App {
         }
         let client = self.client.clone();
         let state = self.secrets_state.clone();
-        tokio::spawn(async move { fetch_secrets(client, state).await; });
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move { fetch_secrets(client, ns, state).await; });
     }
 
     // Secrets change rarely; a 60s ticker keeps the expiry countdown fresh without polling pressure.
+    // Captures the namespace scope, so it is restarted whenever that scope changes.
     fn start_secrets_auto_refresh(&mut self) {
         self.stop_secrets_auto_refresh();
         let client = self.client.clone();
         let state = self.secrets_state.clone();
+        let ns = self.current_ns_opt();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                fetch_secrets(client.clone(), state.clone()).await;
+                fetch_secrets(client.clone(), ns.clone(), state.clone()).await;
             }
         });
         self.secrets_refresh_handle = Some(handle);
@@ -6522,8 +6554,13 @@ impl App {
         self.reset_scroll();
         self.refresh_certs();
         // The Secret leaves and the "Secret absent/désynchronisé" hints are joined from the Secrets
-        // view's state, so make sure it has been loaded at least once.
-        if self.secrets_state.lock().expect("secrets poisoned").secrets.is_empty() {
+        // view's state, so make sure it has been loaded — and loaded under *this* scope: a list
+        // fetched for another namespace holds none of the Secrets this view is about.
+        let stale = {
+            let s = self.secrets_state.lock().expect("secrets poisoned");
+            s.secrets.is_empty() || s.scope != self.current_ns_opt()
+        };
+        if stale {
             self.refresh_secrets();
         }
         self.start_certs_auto_refresh();
@@ -6594,18 +6631,30 @@ impl App {
     // Issuer above a failing Certificate would strand it and lose the very context being looked for.
     fn cert_rows(&self) -> Vec<CmResource> {
         let s = self.certs_state.lock().expect("certs poisoned");
+        // The namespace scope only applies to the namespaced kinds: a ClusterIssuer carries no
+        // namespace and is precisely what a Certificate of this one points at — dropping it would
+        // cut the chain the view exists to show.
+        let scoped: Vec<CmResource> = match self.current_ns_opt() {
+            None => s.resources.clone(),
+            Some(ns) => s
+                .resources
+                .iter()
+                .filter(|r| r.namespace.is_empty() || r.namespace == ns)
+                .cloned()
+                .collect(),
+        };
         if self.certs_filter == CertFilter::All {
-            return s.resources.clone();
+            return scoped;
         }
         let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (i, r) in s.resources.iter().enumerate() {
+        for (i, r) in scoped.iter().enumerate() {
             if self.certs_filter.matches(r) {
-                keep.extend(chain_path(i, &s.resources));
+                keep.extend(chain_path(i, &scoped));
             }
         }
         let mut idx: Vec<usize> = keep.into_iter().collect();
         idx.sort_unstable();
-        idx.into_iter().map(|i| s.resources[i].clone()).collect()
+        idx.into_iter().map(|i| scoped[i].clone()).collect()
     }
 
     // Auto-folding: a healthy Certificate's chain is noise, a broken one's is the answer. Recomputed
@@ -10145,20 +10194,24 @@ impl App {
         }
         let client = self.client.clone();
         let state = self.configmaps_state.clone();
-        tokio::spawn(async move { fetch_configmaps(client, state).await; });
+        let ns = self.current_ns_opt();
+        tokio::spawn(async move { fetch_configmaps(client, ns, state).await; });
     }
 
+    // Captures the namespace scope, like the pods ticker: it must be restarted whenever the scope
+    // changes, or the ticker keeps refetching the previous one over the new rows.
     fn start_configmaps_auto_refresh(&mut self) {
         self.stop_configmaps_auto_refresh();
         let client = self.client.clone();
         let state = self.configmaps_state.clone();
+        let ns = self.current_ns_opt();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                fetch_configmaps(client.clone(), state.clone()).await;
+                fetch_configmaps(client.clone(), ns.clone(), state.clone()).await;
             }
         });
         self.configmaps_refresh_handle = Some(handle);
@@ -11511,6 +11564,11 @@ impl App {
             Mode::Velero | Mode::VeleroFull => self.enter_velero_mode(self.vel_world),
             Mode::K8ssandra | Mode::K8ssandraFull => self.enter_k8c_mode(self.k8c_world),
             Mode::Reflector | Mode::ReflectorFull => self.enter_reflector_mode(),
+            Mode::Configmaps | Mode::ConfigmapsFull => self.enter_configmaps_mode(),
+            Mode::Secrets | Mode::SecretsFull => self.enter_secrets_mode(),
+            Mode::Certs | Mode::CertsFull => self.enter_certs_mode(),
+            Mode::Vuln | Mode::VulnFull => self.enter_vuln_mode(),
+            Mode::Capacity | Mode::CapacityFull => self.enter_capacity_mode(self.cap_world),
             _ => self.mode = Mode::Selection,
         }
     }
@@ -12320,6 +12378,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Vuln) => app.refresh_vulnerabilities(),
         (KeyCode::Esc, _, Mode::Vuln) => app.exit_vuln_mode(),
         (KeyCode::Char('i'), _, Mode::Vuln) => app.enter_ai_panel(),
+        (KeyCode::Char('n'), _, Mode::Vuln) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Vuln) => app.clear_namespace_filter(),
         (_, _, Mode::Vuln) => {}
 
         (KeyCode::Up, _, Mode::VulnFull) => app.vuln_detail_scroll = app.vuln_detail_scroll.saturating_sub(1),
@@ -12346,6 +12406,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Secrets) => app.refresh_secrets(),
         (KeyCode::Esc, _, Mode::Secrets) => app.exit_secrets_mode(),
         (KeyCode::Char('i'), _, Mode::Secrets) => app.enter_ai_panel(),
+        (KeyCode::Char('n'), _, Mode::Secrets) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Secrets) => app.clear_namespace_filter(),
         (_, _, Mode::Secrets) => {}
 
         (KeyCode::Up, _, Mode::SecretsFull) => app.secrets_detail_scroll = app.secrets_detail_scroll.saturating_sub(1),
@@ -12377,6 +12439,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Certs) => app.refresh_certs(),
         (KeyCode::Esc, _, Mode::Certs) => app.exit_certs_mode(),
         (KeyCode::Char('i'), _, Mode::Certs) => app.enter_ai_panel(),
+        (KeyCode::Char('n'), _, Mode::Certs) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Certs) => app.clear_namespace_filter(),
         (_, _, Mode::Certs) => {}
 
         (KeyCode::Up, _, Mode::CertsFull) => app.certs_detail_scroll = app.certs_detail_scroll.saturating_sub(1),
@@ -12431,6 +12495,10 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::F(5), _, Mode::Configmaps) => app.refresh_configmaps(),
         (KeyCode::Esc, _, Mode::Configmaps) => app.exit_configmaps_mode(),
         (KeyCode::Char('i'), _, Mode::Configmaps) => app.enter_ai_panel(),
+        // The views whose rows are namespaced objects all answer to the same two keys: the scope
+        // is a property of the session, not of the view one happened to set it from.
+        (KeyCode::Char('n'), _, Mode::Configmaps) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Configmaps) => app.clear_namespace_filter(),
         (_, _, Mode::Configmaps) => {}
 
         (KeyCode::Up, _, Mode::ConfigmapsFull) => app.configmaps_detail_scroll = app.configmaps_detail_scroll.saturating_sub(1),
@@ -12507,6 +12575,8 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('f'), _, Mode::Capacity) => app.cycle_capacity_filter(),
         (KeyCode::F(5), _, Mode::Capacity) => app.refresh_capacity(),
         (KeyCode::Char('i'), _, Mode::Capacity) => app.enter_ai_panel(),
+        (KeyCode::Char('n'), _, Mode::Capacity) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Capacity) => app.clear_namespace_filter(),
         (_, _, Mode::Capacity) => {}
 
         (KeyCode::Up, m, Mode::CapacityFull) if !m.contains(KeyModifiers::SHIFT) => {
@@ -13199,6 +13269,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             footer_sep(),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
@@ -13215,6 +13287,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
             footer_sep(),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
+            footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
             footer_sep(),
@@ -13228,6 +13302,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Certs => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_msg_scroll)),
@@ -13287,6 +13363,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Configmaps => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_h_scroll)),
@@ -13388,6 +13466,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             vec![
                 Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
                 Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
                 footer_sep(),
                 Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
@@ -23404,8 +23484,15 @@ fn vuln_sev_color(s: VulnSev) -> Color {
 fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let st = lang::t(app.ai_language);
     let (loading, error, available, total, counts) = {
+        let ns = app.current_ns_opt();
         let s = app.vuln_state.lock().expect("vuln poisoned");
-        (s.loading, s.error.clone(), s.available, s.components.len(), s.counts())
+        (
+            s.loading,
+            s.error.clone(),
+            s.available,
+            s.scanned(ns.as_deref()),
+            s.counts(ns.as_deref()),
+        )
     };
     let rows_data = app.vuln_rows();
     if !rows_data.is_empty() {
@@ -24314,14 +24401,19 @@ fn draw_certs_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // the fetch. A bar shows the reserved share against the measured one, so "reserved but idle" reads
 // at a glance — that gap *is* the headroom this view is about.
 fn draw_capacity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // The two namespaced worlds are counted under the active scope, like their rows: the title must
+    // not announce the cluster's 300 workloads over the twelve of one namespace. Nodes are
+    // cluster-scoped and keep their own count whatever the scope.
     let (loading, error, n_nodes, n_wl, n_q, metrics) = {
+        let ns = app.current_ns_opt();
+        let in_scope = |x: &str| ns.as_deref().is_none_or(|n| n == x);
         let s = app.capacity_state.lock().expect("capacity poisoned");
         (
             s.loading,
             s.error.clone(),
             s.nodes.len(),
-            s.workloads.len(),
-            s.quotas.len(),
+            s.workloads.iter().filter(|w| in_scope(&w.namespace)).count(),
+            s.quotas.iter().filter(|q| in_scope(&q.namespace)).count(),
             s.metrics_available,
         )
     };
@@ -24937,8 +25029,9 @@ fn cert_secret_facts(app: &App, resources: &[CmResource], idx: usize) -> Option<
     let ns = &resources[cert].namespace;
     let s = app.secrets_state.lock().expect("secrets poisoned");
     // An empty (or errored) secrets state means "unknown", not "absent" — reporting a missing Secret
-    // on the strength of a list that never loaded would be a false alarm.
-    if s.secrets.is_empty() {
+    // on the strength of a list that never loaded would be a false alarm. Same for a list fetched
+    // under another namespace scope: it never listed this namespace at all.
+    if s.secrets.is_empty() || s.scope.as_deref().is_some_and(|sc| sc != ns.as_str()) {
         return None;
     }
     // Keystore passwords live in a *different* Secret of the same namespace, resolved here so the
@@ -28610,6 +28703,40 @@ mod palette_tests {
         // `backupstoragelocation` starts with `backup`, which is velero's exact alias; the exact
         // match still has to win for the shorter word and the longer one must reach the locations.
         assert_eq!(resolve_command("backupstoragelocation"), Some("bsl"));
+    }
+
+    // Every view whose rows are namespaced objects takes a `<ns>` argument, whichever word was typed
+    // to reach it: `:configmap kube-system` has to scope the view, not be swallowed silently.
+    #[test]
+    fn the_namespaced_views_take_a_namespace_argument() {
+        for word in [
+            "configmap", "cm", "secret", "certificates", "svc", "ingress", "netpol", "pvc",
+            "resourcequota", "vulnerabilities", "backups", "restore", "medusabackup", "pods",
+            "deployments",
+        ] {
+            let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
+            assert!(command_takes_ns(cmd), "{word} -> {cmd} refuses a namespace");
+        }
+    }
+
+    // The cluster-scoped views must keep refusing it: an argument that cannot narrow anything would
+    // be accepted and then do nothing, which is worse than a typo.
+    #[test]
+    fn the_cluster_scoped_views_refuse_one() {
+        for word in ["nodes", "capacity", "pv", "rancher", "argocd", "flux", "rbac", "reflector", "kyverno"] {
+            let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
+            assert!(!command_takes_ns(cmd), "{word} -> {cmd} accepts a namespace it cannot apply");
+        }
+    }
+
+    // `all`, `*` and `0` are the three ways to say "every namespace" — the palette maps them to the
+    // same unscoped watcher the `0` key gives.
+    #[test]
+    fn the_all_namespaces_words_clear_the_scope() {
+        assert_eq!(ns_arg_to_opt("all"), None);
+        assert_eq!(ns_arg_to_opt("*"), None);
+        assert_eq!(ns_arg_to_opt("0"), None);
+        assert_eq!(ns_arg_to_opt("kube-system"), Some("kube-system".to_string()));
     }
 }
 

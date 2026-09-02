@@ -131,6 +131,10 @@ pub struct SecretsState {
     pub loading: bool,
     // Whether the cert-manager CRD was present on the last fetch (drives the issuer column hint).
     pub cert_manager_present: bool,
+    // The namespace scope the list was fetched under (None = whole cluster). The certs view joins
+    // its Secret leaves from here, and a list fetched for one namespace says nothing about another:
+    // without this it would read a Secret it never listed as missing.
+    pub scope: Option<String>,
 }
 
 impl SecretsState {
@@ -157,15 +161,20 @@ pub fn new_secrets_state() -> SharedSecrets {
     Arc::new(Mutex::new(SecretsState::default()))
 }
 
-pub async fn fetch_secrets(client: Client, state: SharedSecrets) {
+// `namespace` is the active scope: None lists the whole cluster, Some(ns) only that namespace. The
+// Ingress list is scoped the same way — a TLS reference is namespace-local, so an Ingress from
+// another namespace could never name a Secret of this one.
+pub async fn fetch_secrets(client: Client, namespace: Option<String>, state: SharedSecrets) {
     {
         let mut s = state.lock().expect("secrets poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    let secret_api: Api<Secret> = Api::all(client.clone());
-    let ingress_api: Api<Ingress> = Api::all(client.clone());
+    let (secret_api, ingress_api): (Api<Secret>, Api<Ingress>) = match &namespace {
+        Some(ns) => (Api::namespaced(client.clone(), ns), Api::namespaced(client.clone(), ns)),
+        None => (Api::all(client.clone()), Api::all(client.clone())),
+    };
     let lp = ListParams::default();
 
     let (secrets, ingresses) = tokio::join!(secret_api.list(&lp), ingress_api.list(&lp));
@@ -206,6 +215,7 @@ pub async fn fetch_secrets(client: Client, state: SharedSecrets) {
     s.loading = false;
     s.error = None;
     s.cert_manager_present = cm_present;
+    s.scope = namespace;
     s.secrets = out;
 }
 
