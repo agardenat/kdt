@@ -1081,6 +1081,23 @@ fn view_mode(app: &App) -> Mode {
     }
 }
 
+// The view the command palette draws underneath itself. The palette is an overlay: whichever view
+// `:` was pressed in keeps rendering below the prompt. Naming the modes that have *no* layout of
+// their own — rather than the ones that do — is what makes that hold for a view added later too; the
+// allow-list this replaces had no Rancher branch, so the palette drew the event table over it.
+fn palette_base_mode(from: Mode) -> Mode {
+    match from {
+        Mode::AiPanel
+        | Mode::NodeUsage
+        | Mode::Diagnostic
+        | Mode::Extract
+        | Mode::Command
+        | Mode::Search
+        | Mode::FluxLogs => Mode::Selection,
+        m => m,
+    }
+}
+
 // The split views: a panel on top, a table below. They are the only ones where hiding the panel
 // means anything — in a full-screen detail mode the panel *is* the view, and the panel-less views
 // (diagnostic, extraction, AI, flux logs) have nothing to hide.
@@ -12887,10 +12904,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::NodeUsage => Mode::Nodes,
         Mode::Diagnostic => Mode::Selection,
         Mode::Extract => Mode::Selection,
-        Mode::Command => match app.command_return_mode {
-            Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull => app.command_return_mode,
-            _ => Mode::Selection,
-        },
+        Mode::Command => palette_base_mode(app.command_return_mode),
         // Unreachable: `base_mode` already resolved the prompt to the view underneath it.
         Mode::Search => Mode::Selection,
         m => m,
@@ -29845,6 +29859,46 @@ mod wrapped_panel_rows_tests {
         assert_eq!(wrapped_rows(&Line::from(text), 98), 1, "the word-only measure misses the padding");
         assert_eq!(wrapped_panel_rows(&lines, 98), 2);
         assert_eq!(wrapped_panel_rows(&lines, 198), 1);
+    }
+}
+
+#[cfg(test)]
+mod palette_overlay_tests {
+    use super::*;
+
+    // The palette is drawn over the view it was opened from. Every view that binds `:` must answer
+    // itself here: a mode missing from this resolution is drawn as the event table instead, which is
+    // exactly what the Rancher view did.
+    #[test]
+    fn the_palette_keeps_drawing_the_view_it_was_opened_from() {
+        for mode in [
+            Mode::Selection,
+            Mode::Nodes,
+            Mode::Flux,
+            Mode::Pods,
+            Mode::Rbac,
+            Mode::Vuln,
+            Mode::Secrets,
+            Mode::Certs,
+            Mode::Kyverno,
+            Mode::Reflector,
+            Mode::Velero,
+            Mode::K8ssandra,
+            Mode::Configmaps,
+            Mode::Namespaces,
+            Mode::Services,
+            Mode::Storage,
+            Mode::Capacity,
+            Mode::Rancher,
+            Mode::RancherFull,
+            Mode::Argo,
+            Mode::ArgoFull,
+        ] {
+            assert_eq!(palette_base_mode(mode), mode, "{mode:?} drawn as another view");
+        }
+        // The overlays have no layout of their own to fall back on.
+        assert_eq!(palette_base_mode(Mode::AiPanel), Mode::Selection);
+        assert_eq!(palette_base_mode(Mode::Diagnostic), Mode::Selection);
     }
 }
 
