@@ -249,6 +249,14 @@ shows the query and its effect (`/coredns  (3)`).
   namespace, the composition of aggregated roles (`admin`, `edit`, `view`), bindings naming a
   non-existent ServiceAccount, and roles nobody binds.
 
+  The `SOURCE` column attributes every binding to whatever applied it: Flux (Kustomization or
+  HelmRelease, with the Git/OCI/Helm source chained), Helm, Argo CD, a Kyverno `generate` rule
+  (`kyverno:<policy>`), a binding projected by Rancher (`rancher:<binding>`), the API server's own
+  RBAC defaults (`rbac-defaults`), an addon manager (`addon:<by>`), an owning controller, or
+  `kubectl`. A binding stays `unmanaged` only when nothing claims it; only `unmanaged`, `kubectl`
+  and a bare ownerRef carry the "outside GitOps" finding. `RISK` shows the worst finding and how
+  many others there are (`impersonate +8`); the full list is in the top panel.
+
   `:rbac <ns>` (or `n` on a row, `0` to go back to the cluster) narrows the view to one namespace.
   The whole cluster is still read — otherwise an aggregation edge, a template count or a "nobody
   binds this role" claim would be wrong — and the scope only decides which rows are drawn: the

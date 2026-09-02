@@ -22966,6 +22966,10 @@ fn rbac_title(app: &App) -> String {
 
 // Binding-centric security table: one row per binding, sorted by severity, dangerous grants on top.
 // The `Flat` orientation, unchanged — it is the reading `:rbac` is opened for.
+const RBAC_SCOPE_W: u16 = 22;
+const RBAC_ROLE_W: u16 = 32;
+const RBAC_SOURCE_W: u16 = 30;
+
 fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = rbac_title(app);
 
@@ -22980,8 +22984,8 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let b = app.rbac_view_bindings.get(*idx)?;
         let color = rbac_sev_color(b.severity);
         let subject = match b.subjects.split_first() {
-            Some((first, [])) => first.label(),
-            Some((first, rest)) => format!("{} (+{})", first.label(), rest.len()),
+            Some((first, [])) => first.short_label(),
+            Some((first, rest)) => format!("{} (+{})", first.short_label(), rest.len()),
             None => "—".to_string(),
         };
         let row_style = if b.severity == RbacSeverity::Critical {
@@ -22992,19 +22996,28 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Some(Row::new(vec![
             Cell::from(format!("{} {}", rbac_sev_icon(b.severity), b.severity.label()))
                 .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Cell::from(b.scope.label()).style(Style::default().fg(scope_color(b))),
+            // A namespace tells its environment in its suffix (`…-pprd`, `…-prd`): keep both ends.
+            Cell::from(elide_middle(&b.scope.label(), RBAC_SCOPE_W as usize))
+                .style(Style::default().fg(scope_color(b))),
             Cell::from(subject),
-            Cell::from(b.role_ref.label()).style(Style::default().fg(Color::Cyan)),
-            Cell::from(b.provenance.label()).style(Style::default().fg(provenance_color(&b.provenance))),
-            Cell::from(b.risk_tags()).style(Style::default().fg(color)),
+            // Role names and origins share their head (`ns-dsm-ppl-aks-owner-…`, `kyverno:generate-ns-…`)
+            // and differ by their tail: cut at the end and every row reads the same.
+            Cell::from(elide_middle(&b.role_ref.label(), RBAC_ROLE_W as usize))
+                .style(Style::default().fg(Color::Cyan)),
+            Cell::from(elide_middle(&b.provenance.label(), RBAC_SOURCE_W as usize))
+                .style(Style::default().fg(provenance_color(&b.provenance))),
+            Cell::from(b.risk_top()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
         ])
         .style(row_style))
     }).collect();
 
+    // The flexible column is SUBJECT: it is the only one whose value has no bound, and the one a
+    // reader scans to tell two grants apart. RISK is a fixed width now that it holds one tag.
     let widths = [
-        Constraint::Length(9), Constraint::Length(18), Constraint::Length(26),
-        Constraint::Length(24), Constraint::Length(22), Constraint::Min(20), Constraint::Length(6),
+        Constraint::Length(9), Constraint::Length(RBAC_SCOPE_W), Constraint::Min(30),
+        Constraint::Length(RBAC_ROLE_W), Constraint::Length(RBAC_SOURCE_W),
+        Constraint::Length(20), Constraint::Length(6),
     ];
 
     let table = Table::new(rows, widths)
@@ -23027,7 +23040,12 @@ fn rbac_row_label(app: &App, row: &RbacRow) -> String {
                 .map(|sa| !sa.exists)
                 .unwrap_or(false);
             let mark = if missing { " ✗" } else { "" };
-            format!("{} {}{}", fold_marker(*has_children, *collapsed), n.label, mark)
+            format!(
+                "{} {}{}",
+                fold_marker(*has_children, *collapsed),
+                crate::rbac::short_identity(&n.label),
+                mark
+            )
         }
         RbacRow::Binding { idx, depth, collapsed, has_children } => {
             let Some(b) = app.rbac_view_bindings.get(*idx) else { return String::new() };
@@ -23073,13 +23091,16 @@ fn rbac_row_label(app: &App, row: &RbacRow) -> String {
             else {
                 return String::new();
             };
-            format!("{}· {}", "  ".repeat(*depth), s.label())
+            format!("{}· {}", "  ".repeat(*depth), s.short_label())
         }
     }
 }
 
 // The three tree orientations. Same columns throughout, so a subject, a binding, a role and a rule
 // line up under each other and severity stays readable down the whole column.
+const RBAC_TREE_SCOPE_W: u16 = 18;
+const RBAC_TREE_ORIGIN_W: u16 = 28;
+
 fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = rbac_title(app);
     let header_row = Row::new(vec![
@@ -23118,7 +23139,7 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let sa = n.sa.and_then(|i| app.rbac_view_sas.get(i));
                     let (origin, age) = match sa {
                         Some(s) if s.exists => (
-                            Cell::from(s.provenance.label())
+                            Cell::from(elide_middle(&s.provenance.label(), RBAC_TREE_ORIGIN_W as usize))
                                 .style(Style::default().fg(provenance_color(&s.provenance))),
                             Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
                         ),
@@ -23147,10 +23168,11 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Row::new(vec![
                         Cell::from(label),
                         sev_cell(b.severity),
-                        Cell::from(b.scope.label()).style(Style::default().fg(scope_color(b))),
-                        Cell::from(b.provenance.label())
+                        Cell::from(elide_middle(&b.scope.label(), RBAC_TREE_SCOPE_W as usize))
+                            .style(Style::default().fg(scope_color(b))),
+                        Cell::from(elide_middle(&b.provenance.label(), RBAC_TREE_ORIGIN_W as usize))
                             .style(Style::default().fg(provenance_color(&b.provenance))),
-                        Cell::from(b.risk_tags()).style(Style::default().fg(color)),
+                        Cell::from(b.risk_top()).style(Style::default().fg(color)),
                         Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
                     ])
                 }
@@ -23167,7 +23189,7 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(label).style(Style::default().fg(Color::Cyan)),
                         sev_cell(r.severity),
                         Cell::from(scope).style(Style::default().fg(DIM)),
-                        Cell::from(r.provenance.label())
+                        Cell::from(elide_middle(&r.provenance.label(), RBAC_TREE_ORIGIN_W as usize))
                             .style(Style::default().fg(provenance_color(&r.provenance))),
                         rbac_role_detail(app, r),
                         Cell::from(r.age.clone()).style(Style::default().fg(DIM)),
@@ -23235,8 +23257,8 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .collect();
 
     let widths = [
-        Constraint::Length(name_col), Constraint::Length(9), Constraint::Length(18),
-        Constraint::Length(22), Constraint::Min(20), Constraint::Length(6),
+        Constraint::Length(name_col), Constraint::Length(9), Constraint::Length(RBAC_TREE_SCOPE_W),
+        Constraint::Length(RBAC_TREE_ORIGIN_W), Constraint::Min(20), Constraint::Length(6),
     ];
 
     let table = Table::new(rows, widths)
@@ -23296,7 +23318,9 @@ fn provenance_color(p: &crate::rbac::Provenance) -> Color {
     match p {
         FluxKustomization { .. } | FluxHelmRelease { .. } => Color::Green,
         Helm { .. } | Argo { .. } => Color::Cyan,
-        Owner { .. } => DIM,
+        // A controller owns it and will put it back: attributed, so not the red of an orphan grant.
+        Kyverno { .. } | Rancher { .. } => Color::Magenta,
+        Bootstrap | Addon { .. } | Owner { .. } => DIM,
         Kubectl | Unmanaged => Color::Red,
     }
 }
@@ -23356,9 +23380,11 @@ fn draw_rbac_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(p, area);
 }
 
+// The key column is 9 wide plus a hard space, never 10 flat: `aggregated` fills it exactly, and
+// padding alone would leave the label glued to what it introduces.
 fn rbac_detail_label(k: &str, v: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{k:<10}"), Style::default().fg(DIM)),
+        Span::styled(format!("{k:<9} "), Style::default().fg(DIM)),
         Span::raw(v),
     ])
 }
@@ -23409,7 +23435,7 @@ fn rbac_binding_detail_lines(
         lines.push(rbac_detail_label(st.rbac_lbl_aggregated, st.rbac_aggregated.to_string()));
     }
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+        Span::styled(format!("{:<9} ", st.rbac_lbl_origin), Style::default().fg(DIM)),
         Span::styled(b.provenance.label(), Style::default().fg(provenance_color(&b.provenance))),
     ]));
     if let Some(src) = &b.source {
@@ -23442,9 +23468,7 @@ fn rbac_binding_detail_lines(
     if b.findings.is_empty() {
         lines.push(Line::from(Span::styled(st.rbac_read_only, Style::default().fg(DIM))));
     }
-    for fd in &b.findings {
-        lines.push(rbac_finding_line(fd));
-    }
+    lines.extend(rbac_findings_block(&b.findings));
 
     lines.push(Line::from(""));
     lines.push(rbac_section(st.rbac_sec_rules));
@@ -23475,7 +23499,7 @@ fn rbac_role_detail_lines(
         if r.namespace.is_empty() { "cluster".to_string() } else { format!("ns:{}", r.namespace) },
     ));
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+        Span::styled(format!("{:<9} ", st.rbac_lbl_origin), Style::default().fg(DIM)),
         Span::styled(r.provenance.label(), Style::default().fg(provenance_color(&r.provenance))),
     ]));
     if let Some(src) = &r.source {
@@ -23537,9 +23561,7 @@ fn rbac_role_detail_lines(
     if !r.findings.is_empty() {
         lines.push(Line::from(""));
         lines.push(rbac_section(st.rbac_sec_findings));
-        for fd in &r.findings {
-            lines.push(rbac_finding_line(fd));
-        }
+        lines.extend(rbac_findings_block(&r.findings));
     }
 
     lines.push(Line::from(""));
@@ -23579,7 +23601,7 @@ fn rbac_subject_detail_lines(
         }
         Some(sa) => {
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<10}", st.rbac_lbl_origin), Style::default().fg(DIM)),
+                Span::styled(format!("{:<9} ", st.rbac_lbl_origin), Style::default().fg(DIM)),
                 Span::styled(sa.provenance.label(), Style::default().fg(provenance_color(&sa.provenance))),
             ]));
             if let Some(src) = &sa.source {
@@ -23614,30 +23636,67 @@ fn rbac_subject_detail_lines(
     if n.bindings.is_empty() {
         lines.push(Line::from(Span::styled(st.rbac_no_grant, Style::default().fg(DIM))));
     }
-    for &bi in &n.bindings {
-        let Some(b) = app.rbac_view_bindings.get(bi) else { continue };
+    // Padding alone is not a separator: a role name longer than its column would run straight into
+    // the scope. Both columns are sized from what this subject actually holds, and the explicit gaps
+    // keep the fields apart at any length.
+    let grants: Vec<&RbacBinding> =
+        n.bindings.iter().filter_map(|&bi| app.rbac_view_bindings.get(bi)).collect();
+    let role_w = grants.iter().map(|b| b.role_ref.label().chars().count()).max().unwrap_or(0).max(4);
+    let scope_w = grants.iter().map(|b| b.scope.label().chars().count()).max().unwrap_or(0).max(5);
+    if !grants.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("    {:<5}  {:<role_w$}  {:<scope_w$}  {}", "SEV", "ROLE", "SCOPE", "RISK"),
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        )));
+    }
+    for b in grants {
         lines.push(Line::from(vec![
             Span::styled(format!("  {} ", rbac_sev_icon(b.severity)), Style::default().fg(rbac_sev_color(b.severity))),
             Span::styled(
-                format!("{:<8}", b.severity.label()),
+                format!("{:<5}", b.severity.label()),
                 Style::default().fg(rbac_sev_color(b.severity)).add_modifier(Modifier::BOLD),
             ),
-            // Padding alone is not a separator: a role name longer than its column would run
-            // straight into the scope. The explicit gaps keep the three fields apart at any length.
-            Span::styled(format!("{:<26}", b.role_ref.label()), Style::default().fg(Color::Cyan)),
-            Span::styled(format!("  {:<16}", b.scope.label()), Style::default().fg(DIM)),
-            Span::raw(format!("  {}", b.risk_tags())),
+            Span::styled(format!("  {:<role_w$}", b.role_ref.label()), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  {:<scope_w$}", b.scope.label()), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  {}", b.risk_top()),
+                Style::default().fg(rbac_sev_color(b.severity)),
+            ),
         ]));
     }
     (title, lines)
 }
 
-fn rbac_finding_line(fd: &RbacFinding) -> Line<'static> {
+// The findings of one object as a table: the tag column is sized from the longest tag present, not
+// from a fixed guess — `inert-cluster-rules` is 19 characters and used to run straight into its own
+// explanation. Two spaces after it, so padding is never the only thing separating two fields.
+fn rbac_findings_block(findings: &[RbacFinding]) -> Vec<Line<'static>> {
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let tag_w = findings
+        .iter()
+        .map(|f| f.tag.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("RISK".len());
+    let mut out = vec![Line::from(Span::styled(
+        format!("    {:<5}  {:<tag_w$}  {}", "SEV", "RISK", "WHY"),
+        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+    ))];
+    out.extend(findings.iter().map(|fd| rbac_finding_line(fd, tag_w)));
+    out
+}
+
+fn rbac_finding_line(fd: &RbacFinding, tag_w: usize) -> Line<'static> {
     let color = rbac_sev_color(fd.sev);
     Line::from(vec![
         Span::styled(format!("  {} ", rbac_sev_icon(fd.sev)), Style::default().fg(color)),
-        Span::styled(format!("{:<8}", fd.sev.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<18}", fd.tag), Style::default().fg(color)),
+        Span::styled(format!("{:<5}", fd.sev.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  {:<tag_w$}  ", fd.tag),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(fd.detail.clone()),
     ])
 }
@@ -30147,6 +30206,92 @@ mod rbac_scope_tests {
 
         let other_ns = role(RoleKind::Role, "kube-system", "extension-apiserver");
         assert!(!rbac_role_in_ns(&other_ns, 11, &reached, ns));
+    }
+}
+
+// The detail panel is where the risk is read in full, now that the table's RISK column holds one
+// tag. Its findings block is a table drawn with padding, so the two ways padding fails — a value
+// wider than its column, and a line wider than the frame — are what these check.
+#[cfg(test)]
+mod rbac_detail_tests {
+    use super::*;
+    use crate::rbac::Finding;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn findings() -> Vec<Finding> {
+        vec![
+            Finding {
+                sev: RbacSeverity::Critical,
+                tag: "impersonate",
+                detail: "impersonate verb — can become any user/group/SA".to_string(),
+            },
+            Finding {
+                sev: RbacSeverity::Info,
+                tag: "inert-cluster-rules",
+                detail: "cluster-scoped rules inert in this namespace: namespaces,                          customresourcedefinitions, persistentvolumes, storageclasses"
+                    .to_string(),
+            },
+        ]
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_longest_tag_still_gets_a_gap_before_its_explanation() {
+        let joined = text(&rbac_findings_block(&findings()));
+        assert!(
+            joined.contains("inert-cluster-rules  cluster-scoped"),
+            "a tag as wide as its column must not glue itself to the detail: {joined}"
+        );
+        assert!(joined.contains("impersonate          impersonate verb"), "{joined}");
+        assert!(joined.contains("SEV"), "the block reads as a table: {joined}");
+    }
+
+    #[test]
+    fn no_findings_draws_no_header() {
+        assert!(rbac_findings_block(&[]).is_empty());
+    }
+
+    // `aggregated` is exactly as wide as the key column: padding alone would glue it to its value.
+    #[test]
+    fn a_label_as_wide_as_its_column_keeps_a_space() {
+        let line = rbac_detail_label("aggregated", "rules composed by aggregation".to_string());
+        assert!(text(&[line]).starts_with("aggregated rules composed"));
+        let short = rbac_detail_label("scope", "ns:app".to_string());
+        assert_eq!(text(&[short]), "scope     ns:app");
+    }
+
+    #[test]
+    fn the_right_border_survives_every_width() {
+        let lines = rbac_findings_block(&findings());
+        let border = ratatui::symbols::border::PLAIN;
+        for width in [40_u16, 60, 100, 196] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).expect("test terminal");
+            terminal
+                .draw(|f| {
+                    // Same as the view: the detail panel clips and pans, it never wraps.
+                    let p = Paragraph::new(lines.clone())
+                        .block(Block::default().borders(Borders::ALL).title(" rbac "));
+                    f.render_widget(p, f.area());
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            for y in 0..20 {
+                let cell = buffer.cell((width - 1, y)).expect("right column");
+                let expected = match y {
+                    0 => border.top_right,
+                    19 => border.bottom_right,
+                    _ => border.vertical_right,
+                };
+                assert_eq!(cell.symbol(), expected, "right border eaten at width {width}, row {y}");
+            }
+        }
     }
 }
 

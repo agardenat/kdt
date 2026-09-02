@@ -251,6 +251,15 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   namespace par namespace, la composition des rôles agrégés (`admin`, `edit`, `view`), les bindings
   nommant un ServiceAccount inexistant, les rôles que personne ne lie.
 
+  La colonne `SOURCE` attribue chaque binding à ce qui l'a posé : Flux (Kustomization ou
+  HelmRelease, avec la source Git/OCI/Helm chaînée), Helm, Argo CD, une règle `generate` Kyverno
+  (`kyverno:<policy>`), un binding projeté par Rancher (`rancher:<binding>`), les défauts RBAC de
+  l'API server (`rbac-defaults`), un addon manager (`addon:<by>`), un contrôleur propriétaire,
+  `kubectl`. Un binding ne reste `unmanaged` que si rien ne le revendique ; seuls `unmanaged`,
+  `kubectl` et un simple ownerRef portent le constat « hors GitOps ». `RISK` affiche le constat le
+  plus grave et le nombre des autres (`impersonate +8`) ; la liste complète est dans le panneau du
+  haut.
+
   `:rbac <ns>` (ou `n` sur une ligne, `0` pour revenir au cluster) restreint la vue à un namespace.
   Tout le cluster reste lu — sinon une arête d'agrégation, un compte de template ou un « rôle que
   personne ne lie » serait faux — et la portée ne décide que des lignes affichées : les RoleBindings
