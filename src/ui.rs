@@ -685,6 +685,7 @@ use crate::k8ssandra::{
     new_k8c_state, CassTask, K8cCluster, K8cDatacenter, K8cNode, K8cWrite, MedBackup, MedJob,
     MedRestore, MedSchedule, MedTask, PanelKind, ReaperRec, SharedK8c, SharedK8cPanel,
 };
+use crate::nodetool::NtJob;
 
 // The three questions the k8ssandra view answers, cycled with `g` off a single fetch: is the ring
 // healthy (Cluster), is anything restorable (Backups), and what maintenance is running or has run
@@ -710,6 +711,9 @@ enum K8cRow {
     Restore(Box<MedRestore>),
     Task(Box<MedTask>),
     CassTask(Box<CassTask>),
+    // A `nodetool` Job kdt started: a Job, not a CRD, and the only row here whose object this view
+    // wrote from scratch.
+    Nodetool(Box<NtJob>),
     Reaper(Box<ReaperRec>),
     // Parent rows for what hangs off no schedule: the Medusa catalogue itself, the runs whose
     // schedule is gone, and the restores. They group, they are not objects.
@@ -728,6 +732,7 @@ impl K8cRow {
             K8cRow::Restore(r) => &r.hints,
             K8cRow::Task(t) => &t.hints,
             K8cRow::CassTask(t) => &t.hints,
+            K8cRow::Nodetool(j) => &j.hints,
             K8cRow::Reaper(r) => &r.hints,
             K8cRow::Group { .. } => &[],
         }
@@ -744,6 +749,7 @@ impl K8cRow {
             K8cRow::Restore(r) => r.uid.clone(),
             K8cRow::Task(t) => t.uid.clone(),
             K8cRow::CassTask(t) => t.uid.clone(),
+            K8cRow::Nodetool(j) => j.uid.clone(),
             K8cRow::Reaper(r) => r.uid.clone(),
             K8cRow::Group { key, namespace, .. } => format!("k8c|group|{namespace}|{key}"),
         }
@@ -760,6 +766,7 @@ impl K8cRow {
             K8cRow::Restore(r) => &r.namespace,
             K8cRow::Task(t) => &t.namespace,
             K8cRow::CassTask(t) => &t.namespace,
+            K8cRow::Nodetool(j) => &j.namespace,
             K8cRow::Reaper(r) => &r.namespace,
             K8cRow::Group { namespace, .. } => namespace,
         }
@@ -1019,6 +1026,8 @@ enum MenuAction {
     K8cRestore,
     K8cMedusaTask(&'static str),
     K8cCassandraTask(&'static str),
+    // The one action here whose *content* is typed: a `nodetool` command line, run as a Job.
+    K8cNodetool,
     // `true` cordons, `false` uncordons. The drain has no argument: it opens its own panel.
     NodeCordon(bool),
     NodeDrain,
@@ -1044,6 +1053,16 @@ fn menu_action_takes_input(action: Option<&MenuAction>) -> bool {
             | Some(MenuAction::RanchIssueToken)
             | Some(MenuAction::RanchSetTokenTtl)
             | Some(MenuAction::RanchSetSetting)
+            | Some(MenuAction::K8cNodetool)
+    )
+}
+
+// The entries whose typed value is a line of text rather than a number. They need every printable
+// key while the entry is open, so `j`/`k` must write instead of moving the cursor.
+fn menu_action_free_text(action: Option<&MenuAction>) -> bool {
+    matches!(
+        action,
+        Some(MenuAction::RanchSetSetting) | Some(MenuAction::K8cNodetool)
     )
 }
 
@@ -1240,7 +1259,7 @@ fn vel_keep_ancestors(rows: &[VelRow], keep: &mut [bool]) {
 fn k8c_depth(row: &K8cRow) -> usize {
     match row {
         K8cRow::Cluster(_) | K8cRow::Schedule(_) | K8cRow::Group { .. } => 0,
-        K8cRow::Reaper(_) | K8cRow::CassTask(_) | K8cRow::Task(_) => 0,
+        K8cRow::Reaper(_) | K8cRow::CassTask(_) | K8cRow::Task(_) | K8cRow::Nodetool(_) => 0,
         K8cRow::Datacenter(_) | K8cRow::Job(_) | K8cRow::Backup(_) | K8cRow::Restore(_) => 1,
         K8cRow::Node(_) => 2,
     }
@@ -1542,6 +1561,13 @@ pub struct App {
     pub scroll_frozen: bool,
     pub selected_uid: Option<String>,
     pub command_input: String,
+    // Namespace, pod and datacenter the open `nodetool` entry is aimed at. Captured when the prompt
+    // opens: the answer is about the node that was under the cursor then.
+    k8c_nt_target: Option<(String, String, String)>,
+    // The row to put the cursor on as soon as it exists. A `nodetool` Job is named by the apiserver,
+    // so the name comes back inside the task that created it — hence the shared slot rather than a
+    // plain field.
+    k8c_focus: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub command_cursor: usize,
     pub command_return_mode: Mode,
     // Text search (`/`). One query for the whole app rather than one per view: following an object
@@ -1906,6 +1932,8 @@ impl App {
             scroll_frozen: false,
             selected_uid: None,
             command_input: String::new(),
+            k8c_nt_target: None,
+            k8c_focus: std::sync::Arc::new(std::sync::Mutex::new(None)),
             command_cursor: 0,
             command_return_mode: Mode::Selection,
             search_query: None,
@@ -8435,6 +8463,11 @@ impl App {
                 );
             }
             K8cWorld::Ops => {
+                for j in s.nodetool_jobs.iter().filter(|j| ns_ok(&j.namespace)) {
+                    if problems_only && !worse(&j.hints) { continue; }
+                    recs.push(synthetic_k8c_nodetool_record(j, st));
+                    rows.push(K8cRow::Nodetool(Box::new(j.clone())));
+                }
                 for r in s.reapers.iter().filter(|r| ns_ok(&r.namespace)) {
                     if problems_only && !worse(&r.hints) { continue; }
                     recs.push(synthetic_k8c_reaper_record(r, st));
@@ -8471,11 +8504,26 @@ impl App {
             self.k8c_close_panel();
             return;
         }
-        let idx = prev_uid
-            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
-            .unwrap_or_else(|| {
-                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
-            });
+        // A Job created a moment ago appears one fetch later; when it does, the cursor goes to it
+        // and the slot is cleared. Until then the request survives, and a missing row never steals
+        // the cursor from wherever it is.
+        let focus = {
+            let mut slot = self.k8c_focus.lock().expect("k8c focus poisoned");
+            let found = slot
+                .as_ref()
+                .and_then(|uid| self.snapshot.iter().position(|r| r.uid == *uid));
+            if found.is_some() {
+                *slot = None;
+            }
+            found
+        };
+        let idx = focus.unwrap_or_else(|| {
+            prev_uid
+                .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+                .unwrap_or_else(|| {
+                    self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+                })
+        });
         self.table_state.select(Some(idx));
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
         // The world, the filter, a fold or a namespace change move the cursor onto another row
@@ -8522,6 +8570,7 @@ impl App {
     fn open_k8c_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
         let mut note: Option<String> = None;
+        let mut nt_target: Option<(String, String, String)> = None;
         let items: Vec<ActionItem> = match self.k8c_selected() {
             // Named, not described: "with this schedule's datacenter and type" tells the reader
             // nothing they can check. What they are about to write is a datacenter and a backup
@@ -8619,6 +8668,17 @@ impl App {
             }
             // Re-running a finished maintenance task is the one thing worth doing from its row: a
             // `sync` is how the catalogue catches up after a run the operator never recorded.
+            // A node is a host, which is exactly what `nodetool -h` wants and what no other row
+            // here is. The command itself is typed: this entry opens the line, it does not run one.
+            Some(K8cRow::Node(n)) if !n.datacenter.is_empty() => {
+                note = Some(lang::fill(st.k8c_nodetool_target, &[("pod", &n.name)]));
+                nt_target = Some((n.namespace.clone(), n.name.clone(), n.datacenter.clone()));
+                vec![ActionItem {
+                    label: st.k_k8c_nodetool,
+                    desc: st.desc_k8c_nodetool.to_string(),
+                    action: MenuAction::K8cNodetool,
+                }]
+            }
             Some(K8cRow::Task(t)) if !t.operation.is_empty() => {
                 let op: &'static str = if t.operation == "purge" { "purge" } else { "sync" };
                 vec![ActionItem {
@@ -8638,6 +8698,7 @@ impl App {
                 Some((std::time::Instant::now(), st.k8c_no_action.to_string()));
             return;
         }
+        self.k8c_nt_target = nt_target;
         self.action_menu = Some(ActionMenu {
             title: st.menu_k8c_title,
             items,
@@ -8711,6 +8772,101 @@ impl App {
         self.k8c_run_write(write, st.msg_k8c_task_started, st.msg_k8c_write_failed);
     }
 
+    // `x`: run a `nodetool` command against the node under the cursor. Only a node row: the command
+    // is addressed with `-h <pod>`, and a datacenter is not a host. What runs it is a Job, so it
+    // outlives this session — see [`crate::nodetool`].
+    fn open_k8c_nodetool_prompt(&mut self) {
+        let st = lang::t(self.ai_language);
+        // Resolved into owned values first: the popup this opens writes to `self`, and a row
+        // borrowed out of `self` would still be alive when it does.
+        let target = match self.k8c_selected() {
+            Some(K8cRow::Node(n)) if !n.datacenter.is_empty() => {
+                Some((n.namespace.clone(), n.name.clone(), n.datacenter.clone()))
+            }
+            _ => None,
+        };
+        let Some((namespace, pod, datacenter)) = target else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.k8c_nodetool_no_node.to_string()));
+            return;
+        };
+        let note = lang::fill(st.k8c_nodetool_target, &[("pod", &pod)]);
+        self.k8c_nt_target = Some((namespace, pod, datacenter));
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_k8c_nodetool,
+            items: vec![ActionItem {
+                label: st.k_k8c_nodetool,
+                desc: st.desc_k8c_nodetool.to_string(),
+                action: MenuAction::K8cNodetool,
+            }],
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            // The entry is open on arrival: `x` asks a question whose answer is the command.
+            input: Some(String::new()),
+            note: Some(note),
+        });
+    }
+
+    // Between the two Enters: show the line as it was typed, against the node it will be run on.
+    fn k8c_nodetool_preview(&mut self, raw: &str) {
+        let st = lang::t(self.ai_language);
+        let pod = self
+            .k8c_nt_target
+            .as_ref()
+            .map(|(_, pod, _)| pod.clone())
+            .unwrap_or_default();
+        let note = lang::fill(
+            st.k8c_nodetool_confirm,
+            &[("cmd", raw.trim()), ("pod", &pod)],
+        );
+        if let Some(menu) = self.action_menu.as_mut() {
+            menu.note = Some(note);
+        }
+    }
+
+    fn k8c_nodetool_run(&mut self, raw: &str) {
+        let st = lang::t(self.ai_language);
+        let Some((namespace, pod, datacenter)) = self.k8c_nt_target.take() else { return };
+        let command = crate::nodetool::split_command(raw);
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.k8c_state.clone();
+        let focus = self.k8c_focus.clone();
+        let ns = namespace.clone();
+        // The Jobs are listed in the Ops world, so that is where the answer will appear.
+        self.k8c_world = K8cWorld::Ops;
+        self.k8c_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_k8c_snapshot();
+        tokio::spawn(async move {
+            let message =
+                match crate::nodetool::run(client.clone(), namespace, pod, datacenter, command).await
+                {
+                    Ok((name, warnings)) => {
+                        // The uid `NtJob` will carry, so the row can be found the moment it lands.
+                        *focus.lock().expect("k8c focus poisoned") =
+                            Some(format!("k8c|nodetool|{ns}/{name}"));
+                        let mut msg = lang::fill(st.msg_k8c_nodetool_started, &[("name", &name)]);
+                        // What the plan could not read travels with the confirmation: the Job is
+                        // already running, and these are the reasons it might not answer.
+                        for w in warnings {
+                            msg.push_str(" · ");
+                            msg.push_str(&w);
+                        }
+                        msg
+                    }
+                    Err(e) => lang::fill(st.msg_k8c_write_failed, &[("e", &e)]),
+                };
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((std::time::Instant::now(), message));
+            }
+            fetch_k8ssandra(client, state).await;
+        });
+    }
+
     fn k8c_run_write(&mut self, write: K8cWrite, ok: &'static str, failed: &'static str) {
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
@@ -8739,6 +8895,19 @@ impl App {
     // never in the Cassandra log, and picking the wrong container is picking the wrong answer.
     fn k8c_toggle_log(&mut self) {
         let st = lang::t(self.ai_language);
+        // A `nodetool` Job answers with the log of a pod it does not name: the pod is found from the
+        // Job, which is why this row does not go through the container path below.
+        if let Some(K8cRow::Nodetool(j)) = self.k8c_selected() {
+            let (namespace, job) = (j.namespace.clone(), j.name.clone());
+            let key = format!("nodetool|{namespace}/{job}");
+            if !self.k8c_open_panel(&key) { return; }
+            let client = self.client.clone();
+            let state = self.k8c_panel.clone();
+            tokio::spawn(async move {
+                crate::nodetool::fetch_output(client, namespace, job, key, state).await;
+            });
+            return;
+        }
         let target = match self.k8c_selected() {
             Some(K8cRow::Node(n)) => {
                 Some((n.namespace.clone(), n.name.clone(), "cassandra".to_string()))
@@ -11046,6 +11215,21 @@ impl App {
                         self.action_menu = None;
                         self.ranch_set_setting(raw);
                     }
+                    // Two Enters: the first turns the typed line into the exact command that will
+                    // run and asks about *that*, the second runs it. Asking before the line exists
+                    // would be a question about nothing — `garbagecollect` and `status` are not the
+                    // same decision.
+                    Some(MenuAction::K8cNodetool) => {
+                        if raw.trim().is_empty() { return; }
+                        let confirmed = menu.confirming;
+                        menu.confirming = true;
+                        if confirmed {
+                            self.action_menu = None;
+                            self.k8c_nodetool_run(&raw);
+                        } else {
+                            self.k8c_nodetool_preview(&raw);
+                        }
+                    }
                     _ => self.action_menu = None,
                 }
                 return;
@@ -11056,7 +11240,11 @@ impl App {
             Some(menu)
                 if menu.confirm
                     && !menu.confirming
-                    && menu_action_takes_input(menu.items.get(menu.cursor).map(|it| &it.action)) =>
+                    && menu_action_takes_input(menu.items.get(menu.cursor).map(|it| &it.action))
+                    && !matches!(
+                        menu.items.get(menu.cursor).map(|it| &it.action),
+                        Some(MenuAction::K8cNodetool)
+                    ) =>
             {
                 menu.confirming = true;
                 return;
@@ -11113,6 +11301,7 @@ impl App {
             | Some(MenuAction::RanchIssueToken)
             | Some(MenuAction::RanchSetTokenTtl)
             | Some(MenuAction::RanchSetSetting)
+            | Some(MenuAction::K8cNodetool)
             | None => {}
         }
     }
@@ -11126,17 +11315,34 @@ impl App {
         }
     }
 
+    // Whether the open menu is waiting for a line of text rather than for a choice. The key
+    // dispatch asks before it treats `j`/`k` as movement.
+    fn action_menu_typing(&self) -> bool {
+        let Some(menu) = self.action_menu.as_ref() else { return false };
+        menu.input.is_some()
+            && !menu.confirming
+            && menu_action_free_text(menu.items.get(menu.cursor).map(|it| &it.action))
+    }
+
     // Digit/backspace handling while the numeric replica entry is open. No-op otherwise.
     fn action_menu_input(&mut self, c: char) {
         let Some(menu) = self.action_menu.as_mut() else { return };
-        // Only the setting entry takes anything but digits: `kubeconfig-generate-token` is a bool
-        // and the inactive-user settings are Go durations.
-        let free_text = matches!(
-            menu.items.get(menu.cursor).map(|it| &it.action),
-            Some(MenuAction::RanchSetSetting)
-        );
+        // Two entries take something other than digits: a Rancher setting (`kubeconfig-generate-token`
+        // is a bool, the inactive-user settings are Go durations) and a `nodetool` command line,
+        // which needs spaces, flags and `keyspace table` names.
+        let action = menu.items.get(menu.cursor).map(|it| it.action.clone());
+        let nodetool = matches!(action, Some(MenuAction::K8cNodetool));
+        let free_text = matches!(action, Some(MenuAction::RanchSetSetting));
         let Some(buf) = menu.input.as_mut() else { return };
-        let (ok, max) = if free_text {
+        let (ok, max) = if nodetool {
+            // A whitelist rather than "anything printable": the words become `args` of a process,
+            // never a shell line, and nothing outside this set has a meaning to `nodetool`. It also
+            // keeps `$(` — the form the kubelet expands — out of what the user can type.
+            (
+                c.is_ascii_alphanumeric() || " -_.,:/=+*@".contains(c),
+                200,
+            )
+        } else if free_text {
             (c.is_ascii_alphanumeric(), 16)
         } else {
             (c.is_ascii_digit(), 5)
@@ -12032,6 +12238,11 @@ fn handle_event(app: &mut App, ev: Event) {
             (KeyCode::Enter, _) => app.action_menu_activate(),
             (KeyCode::Esc, _) => app.action_menu_back(),
             (KeyCode::Backspace, _) => app.action_menu_backspace(),
+            (KeyCode::Char(c), m)
+                if !m.contains(KeyModifiers::CONTROL) && app.action_menu_typing() =>
+            {
+                app.action_menu_input(c)
+            }
             (KeyCode::Char(c), _) if c.is_ascii_digit() => app.action_menu_input(c),
             (KeyCode::Up | KeyCode::Char('k'), _) => app.action_menu_move(-1),
             (KeyCode::Down | KeyCode::Char('j'), _) => app.action_menu_move(1),
@@ -12722,6 +12933,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::K8ssandra) => app.k8c_toggle_log(),
         (KeyCode::Char('s'), _, Mode::K8ssandra) => app.k8c_toggle_metrics(),
         (KeyCode::Char('S'), _, Mode::K8ssandra) => app.k8c_toggle_snapshots(),
+        (KeyCode::Char('x'), _, Mode::K8ssandra) => app.open_k8c_nodetool_prompt(),
         (KeyCode::Char('i'), _, Mode::K8ssandra) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandra) => {}
         (KeyCode::Up, _, Mode::Rancher) => app.move_ranch_selection(-1),
@@ -12796,6 +13008,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('l'), _, Mode::K8ssandraFull) => app.k8c_toggle_log(),
         (KeyCode::Char('s'), _, Mode::K8ssandraFull) => app.k8c_toggle_metrics(),
         (KeyCode::Char('S'), _, Mode::K8ssandraFull) => app.k8c_toggle_snapshots(),
+        (KeyCode::Char('x'), _, Mode::K8ssandraFull) => app.open_k8c_nodetool_prompt(),
         (KeyCode::Char('i'), _, Mode::K8ssandraFull) => app.enter_ai_panel(),
         (_, _, Mode::K8ssandraFull) => {}
         (KeyCode::Up, m, Mode::RancherFull) if !m.contains(KeyModifiers::SHIFT) => {
@@ -13675,6 +13888,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
                 Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
                 Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_k8c_snapshots)),
+                Span::styled(" x ", kbg), Span::raw(format!(" {}   ", st.k_k8c_nodetool)),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
@@ -13759,6 +13973,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" l ", kbg), Span::raw(format!(" {}   ", st.k_k8c_log)),
             Span::styled(" s ", kbg), Span::raw(format!(" {}   ", st.k_k8c_metrics)),
             Span::styled(" S ", kbg), Span::raw(format!(" {}   ", st.k_k8c_snapshots)),
+            Span::styled(" x ", kbg), Span::raw(format!(" {}   ", st.k_k8c_nodetool)),
             Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_k8c_ops_menu)),
         ],
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
@@ -15577,21 +15792,22 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let footer = if let Some(buf) = menu.input.as_ref() {
+    let footer = if menu.confirming {
+        Line::from(Span::styled(
+            st.menu_confirm_prompt,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    } else if let Some(buf) = menu.input.as_ref() {
         let tpl = match menu.items.get(menu.cursor).map(|it| &it.action) {
             Some(MenuAction::RanchIssueToken) | Some(MenuAction::RanchSetTokenTtl) => {
                 st.menu_input_minutes
             }
             Some(MenuAction::RanchSetSetting) => st.menu_input_value,
+            Some(MenuAction::K8cNodetool) => st.menu_input_nodetool,
             _ => st.menu_input_prompt,
         };
         Line::from(Span::styled(
             tpl.replace("{n}", buf),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))
-    } else if menu.confirming {
-        Line::from(Span::styled(
-            st.menu_confirm_prompt,
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -20037,6 +20253,36 @@ fn synthetic_k8c_ctask_record(t: &CassTask, st: &'static Strings) -> EventRecord
     )
 }
 
+// `batch/v1 Job` for real: this is the row where `y` and `Ctrl-D` act on the object kdt created,
+// which is how a finished command is read back and thrown away.
+fn synthetic_k8c_nodetool_record(j: &NtJob, st: &'static Strings) -> EventRecord {
+    let reason = if j.failed > 0 {
+        st.k8c_state_failed
+    } else if j.running() {
+        st.k8c_state_running
+    } else if j.succeeded > 0 {
+        st.k8c_state_complete
+    } else {
+        st.k8c_state_pending
+    };
+    k8c_record(
+        &j.uid,
+        "batch/v1",
+        "Job",
+        &j.namespace,
+        &j.name,
+        reason,
+        lang::fill(
+            st.k8c_msg_nodetool,
+            &[
+                ("cmd", if j.command.is_empty() { "—" } else { &j.command }),
+                ("pod", if j.target.is_empty() { "—" } else { &j.target }),
+            ],
+        ),
+        &j.hints,
+    )
+}
+
 fn synthetic_k8c_reaper_record(r: &ReaperRec, st: &'static Strings) -> EventRecord {
     k8c_record(
         &r.uid,
@@ -21061,6 +21307,7 @@ fn k8c_kind_label(row: &K8cRow, st: &'static Strings) -> &'static str {
         K8cRow::Restore(_) => "restore",
         K8cRow::Task(_) => "task",
         K8cRow::CassTask(_) => "cass-task",
+        K8cRow::Nodetool(_) => "nodetool",
         K8cRow::Reaper(_) => "reaper",
         K8cRow::Group { .. } => st.k8c_kind_group,
     }
@@ -21141,6 +21388,19 @@ fn k8c_state_cell(row: &K8cRow, st: &'static Strings) -> Cell<'static> {
                 (st.k8c_state_pending, DIM)
             }
         }
+        K8cRow::Nodetool(j) => {
+            // A `nodetool` that came back non-zero is red, and a Job with no pod yet is pending
+            // rather than running: the command has not reached the node.
+            if j.failed > 0 {
+                (st.k8c_state_failed, Color::Red)
+            } else if j.running() {
+                (st.k8c_state_running, Color::Cyan)
+            } else if j.succeeded > 0 {
+                (st.k8c_state_complete, Color::Green)
+            } else {
+                (st.k8c_state_pending, DIM)
+            }
+        }
         K8cRow::Reaper(r) => {
             if r.ready {
                 (st.k8c_state_ready, Color::Green)
@@ -21192,6 +21452,9 @@ fn k8c_info_text(row: &K8cRow, st: &'static Strings) -> String {
         K8cRow::Restore(r) => r.backup.clone(),
         K8cRow::Task(t) => t.operation.clone(),
         K8cRow::CassTask(t) => t.commands.join(", "),
+        K8cRow::Nodetool(j) => {
+            if j.command.is_empty() { "—".to_string() } else { j.command.clone() }
+        }
         K8cRow::Reaper(r) => r.datacenter.clone(),
         K8cRow::Group { count, .. } => st.plural(*count, st.k8c_objects_one, st.k8c_objects_many),
     }
@@ -21208,6 +21471,7 @@ fn k8c_row_created(row: &K8cRow) -> i64 {
         K8cRow::Restore(r) => r.created,
         K8cRow::Task(t) => t.created,
         K8cRow::CassTask(t) => t.created,
+        K8cRow::Nodetool(j) => j.created,
         K8cRow::Reaper(r) => r.created,
         K8cRow::Group { .. } => 0,
     }
@@ -21224,6 +21488,7 @@ fn k8c_row_name(row: &K8cRow) -> String {
         K8cRow::Restore(r) => r.name.clone(),
         K8cRow::Task(t) => t.name.clone(),
         K8cRow::CassTask(t) => t.name.clone(),
+        K8cRow::Nodetool(j) => j.name.clone(),
         K8cRow::Reaper(r) => r.name.clone(),
         K8cRow::Group { label, .. } => label.clone(),
     }
@@ -21861,6 +22126,20 @@ fn k8ssandra_detail_lines(
             lines.push(label("failed", t.failed.to_string()));
             format!(" {} ", t.name)
         }
+        K8cRow::Nodetool(j) => {
+            lines.push(label(crate::nodetool::ANN_COMMAND, dash(&j.command)));
+            lines.push(label(crate::nodetool::ANN_TARGET, dash(&j.target)));
+            lines.push(label(crate::nodetool::ANN_LINE, dash(&j.line)));
+            lines.push(label("startTime", stamp(j.start)));
+            lines.push(label("completionTime", stamp(j.finish)));
+            lines.push(label("active", j.active.to_string()));
+            lines.push(label("succeeded", j.succeeded.to_string()));
+            lines.push(label("failed", j.failed.to_string()));
+            if !j.reason.is_empty() {
+                lines.push(label("reason", j.reason.clone()));
+            }
+            format!(" {} ", j.name)
+        }
         K8cRow::Reaper(r) => {
             lines.push(label("datacenterRef", dash(&r.datacenter)));
             lines.push(label("progress", dash(&r.progress)));
@@ -21909,7 +22188,7 @@ fn push_k8c_panel(app: &App, lines: &mut Vec<Line<'static>>, st: &'static String
         return;
     }
     match kind {
-        PanelKind::Logs => {
+        PanelKind::Logs | PanelKind::Nodetool => {
             if panel.lines.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  {}", st.k8c_panel_empty),

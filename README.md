@@ -3,7 +3,7 @@
 TUI Rust pour surveiller les évènements Kubernetes en temps réel, inspecter le cluster vue par
 vue, lancer un diagnostic, exporter un rapport PDF et demander une analyse à une IA.
 
-📖 [English version](README.en.md)
+📖 [English version](README.en.md) · 🗒️ [Changelog](CHANGELOG.md)
 
 ![kdt en action : flux d'évènements live, arbre FluxCD, marge de capacité, policies Kyverno et arbre RBAC](demo/hero.gif)
 
@@ -153,7 +153,7 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge des `UpdateRequest` bloqués) |
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
 | Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`0` namespace |
-| K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
+| K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `x` commande nodetool en Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
@@ -303,6 +303,15 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     `truncated-`/`dropped-` est lue dans le tag lui-même.
   - `o` : sauvegarder maintenant, restaurer, purger ou resynchroniser le catalogue Medusa, et les
     `CassandraTask` (cleanup, upgradesstables, compaction, scrub, restart roulant).
+  - `x` sur un node : commande `nodetool` libre (`garbagecollect -g ROW -j 1 <keyspace> <table>`,
+    `flush`, `tablestats`…), lancée dans un Job qui continue après la fermeture de kdt. La ligne est
+    saisie puis confirmée. Le Job est construit à partir du pod et de son `CassandraDatacenter` :
+    image du container `cassandra`, hôte `<pod>.<all-pods-service>`, `--ssl` et `-u/-pw` seulement
+    si `additional-jvm-opts` les demande, keystores repris des volumes du pod, identifiants
+    référencés dans le secret superuser (jamais recopiés). Ce qui n'a pas pu être lu est annoncé
+    (JMX local, magasin introuvable, secret absent) au lieu d'être deviné. Les Jobs apparaissent en
+    tête du monde opérations, `l` affiche leur sortie, `Ctrl-D` les supprime ; sinon ils expirent au
+    bout de 24 h.
 - **Rancher** (`:rancher`, `:projects`, `:tokens`) — quatre mondes par `g`, `f` filtre ALL /
   PROBLEMS. Lecture seule sauf `o` et `h` (touch, sur un Project de ce cluster uniquement) ; `e` et
   `Ctrl-D` sont absents.
@@ -541,7 +550,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `velero.rs` | Velero : backups, schedules (cron évalué), restaurations, locations |
 | `argocd.rs` | Argo CD : Applications, ApplicationSets, AppProjects, repositories et clusters |
 | `rancher.rs` | Rancher : comptes et identités réelles, bindings, projects, tokens et settings de TTL |
-| `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, et l'API de management Cassandra via le proxy apiserver |
+| `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, l'API de management Cassandra via le proxy apiserver, et `nodetool` lancé en Job |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
 | `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, rendu Typst |

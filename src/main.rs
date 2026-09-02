@@ -28,6 +28,7 @@ mod mgmtapi;
 mod namespaces;
 mod netpol;
 mod nodeops;
+mod nodetool;
 mod pdf;
 mod pods;
 mod portfwd;

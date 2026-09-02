@@ -381,6 +381,9 @@ pub struct K8cState {
     pub tasks: Vec<MedTask>,
     pub cass_tasks: Vec<CassTask>,
     pub reapers: Vec<ReaperRec>,
+    /// The `nodetool` Jobs kdt has started, which are Jobs rather than CRDs and so are listed on
+    /// their own rather than going through `analyse`.
+    pub nodetool_jobs: Vec<crate::nodetool::NtJob>,
     pub cluster_hints: Vec<Hint>,
     /// When the newest backup that covers every node finished. The one number the view owes on sight.
     pub last_restorable: Option<i64>,
@@ -427,10 +430,11 @@ pub async fn fetch_k8ssandra(client: Client, state: SharedK8c) {
         s.error = None;
     }
 
-    let (objects, pods, claims) = futures::join!(
+    let (objects, pods, claims, nodetool_jobs) = futures::join!(
         list_kinds(&client),
         list_cassandra_pods(&client),
         list_claims(&client),
+        crate::nodetool::list_jobs(&client, st),
     );
 
     let Listed { mut by_kind, installed } = objects;
@@ -534,6 +538,7 @@ pub async fn fetch_k8ssandra(client: Client, state: SharedK8c) {
         tasks: analysed.tasks,
         cass_tasks: analysed.cass_tasks,
         reapers: analysed.reapers,
+        nodetool_jobs: nodetool_jobs.unwrap_or_default(),
         cluster_hints: analysed.cluster_hints,
         last_restorable: analysed.last_restorable,
         ring_known: analysed.ring_known,
@@ -1669,6 +1674,8 @@ pub enum PanelKind {
     Metrics,
     Repairs,
     Snapshots,
+    /// The output of a `nodetool` Job, which is the log of its pod — see [`crate::nodetool`].
+    Nodetool,
 }
 
 /// The panel appended under the detail of the selected row, on `l` or `m`.

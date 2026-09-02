@@ -3,7 +3,7 @@
 A Rust TUI to watch Kubernetes events live, inspect the cluster view by view, run a diagnostic,
 export a PDF report and ask an AI for an analysis.
 
-📖 [Version française](README.md)
+📖 [Version française](README.md) · 🗒️ [Changelog](CHANGELOG.md) (in French, like the commits)
 
 ![kdt in action: live event stream, FluxCD tree, capacity headroom, Kyverno policies and RBAC tree](demo/hero.gif)
 
@@ -152,7 +152,7 @@ the RBAC view).
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
-| K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `o` actions |
+| K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
@@ -300,6 +300,15 @@ shows the query and its effect (`/coredns  (3)`).
     `truncated-`/`dropped-` tags is read from the tag itself.
   - `o`: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask` jobs
     (cleanup, upgradesstables, compaction, scrub, rolling restart).
+  - `x` on a node: a free `nodetool` command (`garbagecollect -g ROW -j 1 <keyspace> <table>`,
+    `flush`, `tablestats`…), run in a Job that carries on after kdt is closed. The line is typed,
+    then confirmed. The Job is built from the pod and its `CassandraDatacenter`: the `cassandra`
+    container's image, the `<pod>.<all-pods-service>` host, `--ssl` and `-u/-pw` only when
+    `additional-jvm-opts` asks for them, the keystores taken from the pod's own volumes, the
+    credentials referenced from the superuser secret (never copied). What could not be read is
+    stated (local JMX, a store with no volume, a missing secret) instead of guessed. The Jobs are
+    listed at the top of the operations world, `l` shows their output and `Ctrl-D` deletes them;
+    otherwise they expire after 24 h.
 - **Rancher** (`:rancher`, `:projects`, `:tokens`) — four worlds through `g`, `f` filters ALL /
   PROBLEMS. Read-only apart from `o` and `h` (touch, on a Project of this cluster only); `e` and
   `Ctrl-D` are absent.
@@ -533,7 +542,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
 | `argocd.rs` | Argo CD: Applications, ApplicationSets, AppProjects, repositories and clusters |
 | `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens and TTL settings |
-| `k8ssandra.rs` · `mgmtapi.rs` | K8ssandra/Medusa/Reaper, and the Cassandra management API through the apiserver proxy |
+| `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, the Cassandra management API through the apiserver proxy, and `nodetool` run as a Job |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |
 | `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, Typst rendering |
