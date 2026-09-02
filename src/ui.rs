@@ -9005,6 +9005,13 @@ impl App {
         self.ranch_rows.get(self.table_state.selected()?)
     }
 
+    // Whether `h` has something to write to: a Project row backed by a `Project` object of this
+    // cluster. A downstream row carries no namespace — the object it names lives upstream — and the
+    // key stays unbound there rather than firing a patch nothing can answer.
+    fn ranch_project_touchable(&self) -> bool {
+        matches!(self.ranch_selected(), Some(RancRow::Project(p)) if !p.namespace.is_empty())
+    }
+
     fn cycle_ranch_world(&mut self) {
         self.ranch_world = match self.ranch_world {
             RancWorld::Users => RancWorld::Access,
@@ -12663,6 +12670,12 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Esc, _, Mode::Rancher) => app.exit_rancher_mode(),
         (KeyCode::Char('o'), _, Mode::Rancher) => app.open_rancher_action_menu(),
         (KeyCode::Char('i'), _, Mode::Rancher) => app.enter_ai_panel(),
+        // `h` on a Project only. The rest of this view is read-only on purpose — an account, a
+        // binding or a token is changed in Rancher, not here — but a Project is an ordinary object
+        // of this cluster, and touching it is how one makes the admission chain run over it again.
+        (KeyCode::Char('h'), _, Mode::Rancher) if app.ranch_project_touchable() => {
+            app.touch_selected();
+        }
         (_, _, Mode::Rancher) => {}
 
         (KeyCode::Up, _, Mode::Argo) => app.move_argo_selection(-1),
@@ -12737,6 +12750,9 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('g'), _, Mode::RancherFull) => app.ranch_detail_scroll = 0,
         (KeyCode::Char('G'), _, Mode::RancherFull) => app.ranch_detail_scroll = usize::MAX,
         (KeyCode::Char('i'), _, Mode::RancherFull) => app.enter_ai_panel(),
+        (KeyCode::Char('h'), _, Mode::RancherFull) if app.ranch_project_touchable() => {
+            app.touch_selected();
+        }
         (_, _, Mode::RancherFull) => {}
 
         (KeyCode::Up, m, Mode::ArgoFull) if !m.contains(KeyModifiers::SHIFT) => {
@@ -13604,7 +13620,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 RancWorld::Projects => st.k_ranch_tokens,
                 RancWorld::Tokens => st.k_ranch_users,
             };
-            vec![
+            let mut spans = vec![
                 Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
                 Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
                 footer_sep(),
@@ -13615,8 +13631,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_k8c_filter, app.ranch_filter.label())),
                 footer_sep(),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_ranch_actions)),
-                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
-            ]
+            ];
+            // The only write this read-only view offers, and only when the cursor is on a Project
+            // this cluster actually holds — so the key is never advertised where it does nothing.
+            if app.ranch_project_touchable() {
+                spans.push(Span::styled(" h ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_ranch_touch)));
+            }
+            spans.push(Span::styled(" F5 ", kbg));
+            spans.push(Span::raw(format!(" {}   ", st.k_refresh)));
+            spans
         }
         Mode::Argo => {
             // `g` names the world it switches *to*, so the bar reads as the next action.
@@ -13646,12 +13670,19 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_argo_actions)),
         ],
-        Mode::RancherFull => vec![
-            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
-            footer_sep(),
-            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
-            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
-        ],
+        Mode::RancherFull => {
+            let mut spans = vec![
+                Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+                Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            ];
+            if app.ranch_project_touchable() {
+                spans.push(Span::styled(" h ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_ranch_touch)));
+            }
+            spans
+        }
         Mode::K8ssandraFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
@@ -18843,10 +18874,15 @@ fn ranch_project_record(p: &RancherProject) -> EventRecord {
         p.members,
         st.ranch_lbl_members,
     );
+    // On a downstream cluster the row is rebuilt from the `field.cattle.io/projectId` annotations:
+    // the project id is real but the `Project` object lives upstream, and the cluster namespace that
+    // would address it is not known here. Such a row names no kind, so `y`, `h` and `Ctrl-D` say
+    // "no object" instead of aiming a request at something this cluster does not hold.
+    let kind = if p.namespace.is_empty() { "" } else { "Project" };
     ranch_record(
         &p.uid,
         crate::rancher::API_MGMT,
-        "Project",
+        kind,
         &p.namespace,
         &p.name,
         "Project",
@@ -29899,6 +29935,44 @@ mod palette_overlay_tests {
         // The overlays have no layout of their own to fall back on.
         assert_eq!(palette_base_mode(Mode::AiPanel), Mode::Selection);
         assert_eq!(palette_base_mode(Mode::Diagnostic), Mode::Selection);
+    }
+}
+
+#[cfg(test)]
+mod rancher_view_tests {
+    use super::*;
+    use crate::rancher::RancherProject;
+
+    fn project() -> RancherProject {
+        RancherProject {
+            uid: "ranch|project|c-m-abc:p-dfg12".to_string(),
+            id: "p-dfg12".to_string(),
+            display_name: "datasmart".to_string(),
+            cluster: "c-m-abc".to_string(),
+            namespaces: vec!["blanche-prd".to_string()],
+            members: 3,
+            namespace: "c-m-abc".to_string(),
+            name: "p-dfg12".to_string(),
+            ..RancherProject::default()
+        }
+    }
+
+    // `h` writes, so the row has to name an object that exists here. A project rebuilt from the
+    // namespace annotations of a downstream cluster names none: the `Project` is upstream.
+    #[test]
+    fn only_a_project_this_cluster_holds_names_an_object_to_touch() {
+        let local = ranch_project_record(&project());
+        assert_eq!(local.kind, "Project");
+        assert_eq!(local.namespace, "c-m-abc");
+        assert_eq!(local.name, "p-dfg12");
+
+        let upstream = ranch_project_record(&RancherProject {
+            namespace: String::new(),
+            ..project()
+        });
+        assert!(upstream.kind.is_empty(), "kind: {}", upstream.kind);
+        // The row still reads as a project — only the write target is gone.
+        assert!(upstream.message.contains("datasmart"));
     }
 }
 

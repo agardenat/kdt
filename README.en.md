@@ -151,7 +151,7 @@ way becomes the session scope, shown in the `ns=` banner. The cluster-scoped vie
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `o` actions |
-| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `e`, `h`, `Ctrl-D` deliberately absent |
+| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
 | Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
@@ -284,7 +284,8 @@ shows the query and its effect (`/coredns  (3)`).
   - `o`: back up now, restore, purge or resync the Medusa catalogue, and the `CassandraTask` jobs
     (cleanup, upgradesstables, compaction, scrub, rolling restart).
 - **Rancher** (`:rancher`, `:projects`, `:tokens`) — four worlds through `g`, `f` filters ALL /
-  PROBLEMS. Read-only apart from `o`; `e`, `h` and `Ctrl-D` are absent.
+  PROBLEMS. Read-only apart from `o` and `h` (touch, on a Project of this cluster only); `e` and
+  `Ctrl-D` are absent.
   - *users*: the Rancher id (`u-4oivhvq2jk`, the one RoleBindings and audit logs carry) and the real
     identity next to it — the CN of an LDAP/AD distinguished name, the FreeIPA `uid` — read from the
     `User` and `UserAttribute` objects, with the provider, the directory groups, the global roles

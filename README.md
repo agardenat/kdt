@@ -153,7 +153,7 @@ si on leur en donne un.
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
 | Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`0` namespace |
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
-| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `e`, `h`, `Ctrl-D` volontairement absents |
+| Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
@@ -287,7 +287,8 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   - `o` : sauvegarder maintenant, restaurer, purger ou resynchroniser le catalogue Medusa, et les
     `CassandraTask` (cleanup, upgradesstables, compaction, scrub, restart roulant).
 - **Rancher** (`:rancher`, `:projects`, `:tokens`) — quatre mondes par `g`, `f` filtre ALL /
-  PROBLEMS. Lecture seule sauf `o` ; `e`, `h` et `Ctrl-D` sont absents.
+  PROBLEMS. Lecture seule sauf `o` et `h` (touch, sur un Project de ce cluster uniquement) ; `e` et
+  `Ctrl-D` sont absents.
   - *users* : l'identifiant Rancher (`u-4oivhvq2jk`, celui que portent les RoleBindings et les logs
     d'audit) et l'identité réelle en regard — CN d'un DN LDAP/AD, `uid` FreeIPA — lus dans les
     objets `User` et `UserAttribute`, avec le provider, les groupes d'annuaire, les global roles et
