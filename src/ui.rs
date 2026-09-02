@@ -1393,13 +1393,16 @@ fn typed_means_pods(typed: &str) -> bool {
 // namespaced objects is here, so a scope can be set on the way in instead of afterwards with `n`.
 // Left out are the views a namespace does not describe: the cluster-scoped ones (`nodes`,
 // `capacity`, `pv`, `rancher`), and the ones built as a graph across namespaces, where hiding the
-// rows of other namespaces would cut the very edges they exist to show (`flux`, `rbac`,
-// `reflector`, `argocd`) or leave counts computed cluster-wide over a partial list (`kyverno`).
+// rows of other namespaces would cut the very edges they exist to show (`flux`, `reflector`,
+// `argocd`) or leave counts computed cluster-wide over a partial list (`kyverno`). `rbac` is a
+// graph too, but it reads the whole cluster and narrows only the rows it draws — see
+// [`rbac_binding_in_ns`] — so a scope there cuts no edge.
 fn command_takes_ns(cmd: &str) -> bool {
     matches!(
         cmd,
         "events"
             | "namespace"
+            | "rbac"
             | "workloads"
             | "configmaps"
             | "secrets"
@@ -5788,6 +5791,14 @@ impl App {
 
     fn enter_rbac_mode(&mut self) {
         self.mode = Mode::Rbac;
+        // The graph spans every namespace, so a scope on it is a choice of rows rather than the
+        // obvious "only this namespace's objects". The rule is stated on the way in, once.
+        if let Some(ns) = self.rbac_ns_scope() {
+            self.clipboard_status = Some((
+                std::time::Instant::now(),
+                lang::fill(lang::t(self.ai_language).rbac_ns_scope_note, &[("ns", &ns)]),
+            ));
+        }
         self.rbac_detail_scroll = 0;
         self.table_state.select(Some(0));
         *self.table_state.offset_mut() = 0;
@@ -5875,6 +5886,19 @@ impl App {
         self.rbac_view_gen = generation;
     }
 
+    // The namespace `:rbac <ns>` / `n` narrowed to, or `None` for the whole cluster. See
+    // [`rbac_binding_in_ns`] for what a namespace scope means in a graph that spans all of them.
+    fn rbac_ns_scope(&self) -> Option<String> {
+        self.current_ns_opt()
+    }
+
+    fn rbac_binding_shown(&self, b: &RbacBinding) -> bool {
+        match self.rbac_ns_scope() {
+            None => true,
+            Some(ns) => rbac_binding_in_ns(b, &ns),
+        }
+    }
+
     // Rebuilds `rbac_rows` and `App::snapshot` in lockstep, so a selected index means the same row
     // in both. That alignment is what gives this view `y`, `e`, `Ctrl-D`, the AI panel and the
     // shared search without any code of its own.
@@ -5960,7 +5984,7 @@ impl App {
         let mut rows = Vec::new();
         let mut recs = Vec::new();
         for (i, b) in self.rbac_view_bindings.iter().enumerate() {
-            if b.severity < self.rbac_min_sev {
+            if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
                 continue;
             }
             rows.push(RbacRow::Binding { idx: i, depth: 0, collapsed: false, has_children: false });
@@ -5978,6 +6002,18 @@ impl App {
             if n.severity < self.rbac_min_sev {
                 continue;
             }
+            // A ServiceAccount of the namespace is in scope even when nobody binds it — an unused
+            // account with a mounted token is part of what the namespace exposes. A User or a Group
+            // has no namespace of its own: it is in scope through its bindings.
+            if let Some(ns) = self.rbac_ns_scope() {
+                let mine = n.namespace == ns
+                    || n.bindings.iter().any(|&bi| {
+                        self.rbac_view_bindings.get(bi).is_some_and(|b| rbac_binding_in_ns(b, &ns))
+                    });
+                if !mine {
+                    continue;
+                }
+            }
             let root = format!("subj|{}", n.key);
             let collapsed = self.rbac_collapsed(&root);
             rows.push(RbacRow::Subject { idx: si, collapsed, has_children: !n.bindings.is_empty() });
@@ -5987,7 +6023,7 @@ impl App {
             }
             for &bi in &n.bindings {
                 let b = &self.rbac_view_bindings[bi];
-                if b.severity < self.rbac_min_sev {
+                if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
                     continue;
                 }
                 let buid = format!("{root}/{}", rbac_binding_uid(b));
@@ -6016,7 +6052,7 @@ impl App {
         let mut rows = Vec::new();
         let mut recs = Vec::new();
         for (i, b) in self.rbac_view_bindings.iter().enumerate() {
-            if b.severity < self.rbac_min_sev {
+            if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
                 continue;
             }
             let uid = rbac_binding_uid(b);
@@ -6052,10 +6088,17 @@ impl App {
         // Which bindings reach each role, grouped by the namespace they grant it in.
         let mut by_role: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
         for (bi, b) in self.rbac_view_bindings.iter().enumerate() {
+            if !self.rbac_binding_shown(b) {
+                continue;
+            }
             if let Some(ri) = b.role_idx {
                 by_role.entry(ri).or_default().push(bi);
             }
         }
+        let ns_scope = self.rbac_ns_scope();
+        let reached = ns_scope
+            .as_ref()
+            .map(|ns| rbac_roles_reached_in_ns(&self.rbac_view_bindings, ns));
 
         let order = {
             let s = self.rbac_state.lock().expect("rbac poisoned");
@@ -6065,6 +6108,11 @@ impl App {
             let Some(r) = self.rbac_view_roles.get(ri) else { continue };
             if r.severity < self.rbac_min_sev {
                 continue;
+            }
+            if let (Some(ns), Some(reached)) = (ns_scope.as_ref(), reached.as_ref()) {
+                if !rbac_role_in_ns(r, ri, reached, ns) {
+                    continue;
+                }
             }
             let uid = r.uid();
             let collapsed = self.rbac_collapsed(&uid);
@@ -6082,6 +6130,17 @@ impl App {
             // same definition lands in many places, and the namespaces are the answer.
             if r.is_template() {
                 for ns in &r.bound_namespaces {
+                    // Under a scope the group only exists if a binding still shown grants the role
+                    // there: an empty "re-granted in namespace X" node would claim a level the rows
+                    // below it no longer fill.
+                    if ns_scope.is_some()
+                        && !bindings.iter().any(|&bi| {
+                            matches!(&self.rbac_view_bindings[bi].scope,
+                                crate::rbac::Scope::Namespace(n) if n == ns)
+                        })
+                    {
+                        continue;
+                    }
                     let guid = format!("{uid}/ns|{ns}");
                     let gcollapsed = self.rbac_collapsed(&guid);
                     rows.push(RbacRow::NsGroup {
@@ -11592,6 +11651,7 @@ impl App {
             Mode::Secrets | Mode::SecretsFull => self.enter_secrets_mode(),
             Mode::Certs | Mode::CertsFull => self.enter_certs_mode(),
             Mode::Vuln | Mode::VulnFull => self.enter_vuln_mode(),
+            Mode::Rbac | Mode::RbacFull => self.enter_rbac_mode(),
             Mode::Capacity | Mode::CapacityFull => self.enter_capacity_mode(self.cap_world),
             _ => self.mode = Mode::Selection,
         }
@@ -12377,6 +12437,11 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Enter, _, Mode::Rbac) => app.enter_rbac_full(),
         (KeyCode::Char('o'), _, Mode::Rbac) => app.rbac_open_origin(),
         (KeyCode::Char('f'), _, Mode::Rbac) => app.cycle_rbac_filter(),
+        // The namespace of the row under the cursor becomes the scope, and `0` gives the cluster
+        // back — the same pair every namespaced view binds. A row that has no namespace of its own
+        // (a ClusterRoleBinding, a ClusterRole) says so instead of scoping to nothing.
+        (KeyCode::Char('n'), _, Mode::Rbac) => app.filter_ns_to_selected(),
+        (KeyCode::Char('0'), _, Mode::Rbac) => app.clear_namespace_filter(),
         (KeyCode::F(5), _, Mode::Rbac) => app.refresh_rbac(),
         (KeyCode::Esc, _, Mode::Rbac) => app.exit_rbac_mode(),
         (KeyCode::Char('i'), _, Mode::Rbac) => app.enter_ai_panel(),
@@ -13278,6 +13343,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Rbac => vec![
             Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
             Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+            footer_sep(),
+            Span::styled(" n ", kbg), Span::raw(format!(" {}   ", st.k_ns_here)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
             Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
@@ -22546,6 +22613,46 @@ fn rbac_binding_ns(b: &RbacBinding) -> String {
 // Collapse the subject strings scattered across every binding into one node per identity. A
 // ServiceAccount bound five times is one node with five children here, five unrelated rows in the
 // flat list — which is the whole point of the subject orientation.
+// `:rbac <ns>` narrows what is shown, never what is read: the fetch stays cluster-wide because an
+// aggregation edge, a template count or a "nobody binds this role" claim computed over a partial
+// list would be wrong. What the scope decides is which rows are drawn, and the rule is what "the
+// RBAC of a namespace" means — the bindings that grant *in* it, and the bindings that grant *to*
+// it:
+//
+//   * every RoleBinding of that namespace, whatever it grants and to whom;
+//   * every binding, ClusterRoleBinding included, whose subject is a ServiceAccount of that
+//     namespace — a cluster-wide grant handed to one of its accounts is this namespace's business,
+//     and usually the first thing to look at.
+//
+// A ClusterRoleBinding that only names kube-system accounts is left out: it grants in this
+// namespace as it does in every other one, and listing it here would drown the rows that are
+// actually about this namespace. The scope is stated in the title, so a row list nobody can read as
+// exhaustive is never presented as one.
+fn rbac_binding_in_ns(b: &RbacBinding, ns: &str) -> bool {
+    if matches!(&b.scope, crate::rbac::Scope::Namespace(n) if n == ns) {
+        return true;
+    }
+    b.subjects
+        .iter()
+        .any(|s| s.kind == "ServiceAccount" && s.namespace.as_deref() == Some(ns))
+}
+
+// The roles an in-scope binding points at: a ClusterRole granted into the namespace belongs to it,
+// even though the object itself is cluster-wide.
+fn rbac_roles_reached_in_ns(bindings: &[RbacBinding], ns: &str) -> std::collections::HashSet<usize> {
+    bindings
+        .iter()
+        .filter(|b| rbac_binding_in_ns(b, ns))
+        .filter_map(|b| b.role_idx)
+        .collect()
+}
+
+// A role is in scope when it lives in the namespace — an unbound Role there is still its RBAC — or
+// when a binding in scope grants it.
+fn rbac_role_in_ns(r: &RoleEntry, ri: usize, reached: &std::collections::HashSet<usize>, ns: &str) -> bool {
+    r.namespace == ns || reached.contains(&ri)
+}
+
 fn build_rbac_subjects(bindings: &[RbacBinding], sas: &[SaEntry]) -> Vec<RbacSubjectNode> {
     let mut order: Vec<String> = Vec::new();
     let mut by_key: std::collections::HashMap<String, RbacSubjectNode> =
@@ -22794,21 +22901,37 @@ fn rbac_sev_icon(s: RbacSeverity) -> &'static str {
 // the severity floor sits.
 fn rbac_title(app: &App) -> String {
     let st = lang::t(app.ai_language);
+    // Under a namespace scope the counts are of what the scope holds. Announcing the cluster-wide
+    // totals over a narrowed row list would describe a view nobody is looking at.
+    let ns = app.rbac_ns_scope();
     let (loading, error, n_bind, n_roles, n_sa, degraded, counts) = {
         let s = app.rbac_state.lock().expect("rbac poisoned");
         let mut c = [0usize; 5];
-        for b in &s.bindings {
-            c[b.severity as usize] += 1;
-        }
-        (
-            s.loading,
-            s.error.clone(),
-            s.bindings.len(),
-            s.roles.len(),
-            s.service_accounts.len(),
-            s.sa_degraded,
-            c,
-        )
+        let (n_bind, n_roles, n_sa) = match &ns {
+            None => {
+                for b in &s.bindings {
+                    c[b.severity as usize] += 1;
+                }
+                (s.bindings.len(), s.roles.len(), s.service_accounts.len())
+            }
+            Some(ns) => {
+                let mut n_bind = 0usize;
+                for b in s.bindings.iter().filter(|b| rbac_binding_in_ns(b, ns)) {
+                    c[b.severity as usize] += 1;
+                    n_bind += 1;
+                }
+                let reached = rbac_roles_reached_in_ns(&s.bindings, ns);
+                let n_roles = s
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .filter(|(ri, r)| rbac_role_in_ns(r, *ri, &reached, ns))
+                    .count();
+                let n_sa = s.service_accounts.iter().filter(|sa| &sa.namespace == ns).count();
+                (n_bind, n_roles, n_sa)
+            }
+        };
+        (s.loading, s.error.clone(), n_bind, n_roles, n_sa, s.sa_degraded, c)
     };
     if let Some(e) = &error {
         return lang::fill(st.rbac_title_error, &[("e", e)]);
@@ -22828,6 +22951,10 @@ fn rbac_title(app: &App) -> String {
             ("min", app.rbac_min_sev.label()),
         ],
     );
+    // The scope belongs in the title: these rows are a namespace's RBAC, not the cluster's.
+    if let Some(ns) = &ns {
+        title.push_str(&lang::fill(st.rbac_title_ns, &[("ns", ns)]));
+    }
     // An unreadable ServiceAccount list changes what the view can claim, so it says so rather than
     // quietly showing a graph with holes in it.
     if degraded {
@@ -28762,7 +28889,7 @@ mod palette_tests {
         for word in [
             "configmap", "cm", "secret", "certificates", "svc", "ingress", "netpol", "pvc",
             "resourcequota", "vulnerabilities", "backups", "restore", "medusabackup", "pods",
-            "deployments",
+            "deployments", "rbac", "roles", "bindings",
         ] {
             let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
             assert!(command_takes_ns(cmd), "{word} -> {cmd} refuses a namespace");
@@ -28773,7 +28900,7 @@ mod palette_tests {
     // be accepted and then do nothing, which is worse than a typo.
     #[test]
     fn the_cluster_scoped_views_refuse_one() {
-        for word in ["nodes", "capacity", "pv", "rancher", "argocd", "flux", "rbac", "reflector", "kyverno"] {
+        for word in ["nodes", "capacity", "pv", "rancher", "argocd", "flux", "reflector", "kyverno"] {
             let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
             assert!(!command_takes_ns(cmd), "{word} -> {cmd} accepts a namespace it cannot apply");
         }
@@ -29895,6 +30022,131 @@ mod wrapped_panel_rows_tests {
         assert_eq!(wrapped_rows(&Line::from(text), 98), 1, "the word-only measure misses the padding");
         assert_eq!(wrapped_panel_rows(&lines, 98), 2);
         assert_eq!(wrapped_panel_rows(&lines, 198), 1);
+    }
+}
+
+#[cfg(test)]
+mod rbac_scope_tests {
+    use super::*;
+    use crate::rbac::{Provenance, RoleKind, Scope, Subject};
+
+    fn subject(kind: &str, ns: Option<&str>, name: &str) -> Subject {
+        Subject {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace: ns.map(str::to_string),
+        }
+    }
+
+    fn binding(kind: &str, scope: Scope, subjects: Vec<Subject>, role: usize) -> RbacBinding {
+        RbacBinding {
+            scope,
+            binding_kind: kind.to_string(),
+            binding_name: "b".to_string(),
+            subjects,
+            role_ref: crate::rbac::RoleRef { kind: "ClusterRole".to_string(), name: "admin".to_string() },
+            rules: Vec::new(),
+            via_clusterrole: true,
+            aggregated: false,
+            provenance: Provenance::Unmanaged,
+            source: None,
+            severity: RbacSeverity::Info,
+            findings: Vec::new(),
+            age: "1d".to_string(),
+            role_idx: Some(role),
+            sa_idx: Vec::new(),
+        }
+    }
+
+    fn role(kind: RoleKind, ns: &str, name: &str) -> RoleEntry {
+        RoleEntry {
+            kind,
+            namespace: ns.to_string(),
+            name: name.to_string(),
+            rules: Vec::new(),
+            own_rules: 0,
+            aggregated: false,
+            aggregates: Vec::new(),
+            aggregates_into: Vec::new(),
+            aggregation_partial: false,
+            bound_cluster: 0,
+            bound_namespaces: Vec::new(),
+            provenance: Provenance::Unmanaged,
+            source: None,
+            age: "1d".to_string(),
+            severity: RbacSeverity::Info,
+            findings: Vec::new(),
+        }
+    }
+
+    // The two ways a binding belongs to a namespace: it grants there, or it grants to an account
+    // that lives there. A cluster-wide grant to someone else's ServiceAccount is neither.
+    #[test]
+    fn a_namespace_owns_what_grants_in_it_and_what_grants_to_it() {
+        let ns = "blanche-prd";
+
+        let local = binding(
+            "RoleBinding",
+            Scope::Namespace(ns.to_string()),
+            vec![subject("User", None, "alice")],
+            0,
+        );
+        assert!(rbac_binding_in_ns(&local, ns));
+
+        // The one that matters most: this namespace's account, bound cluster-wide.
+        let escalation = binding(
+            "ClusterRoleBinding",
+            Scope::ClusterWide,
+            vec![subject("ServiceAccount", Some(ns), "runner")],
+            0,
+        );
+        assert!(rbac_binding_in_ns(&escalation, ns));
+
+        let elsewhere = binding(
+            "RoleBinding",
+            Scope::Namespace("kube-system".to_string()),
+            vec![subject("ServiceAccount", Some("kube-system"), "coredns")],
+            0,
+        );
+        assert!(!rbac_binding_in_ns(&elsewhere, ns));
+
+        // Cluster-wide, to accounts of another namespace: it applies here as it does everywhere,
+        // and listing it would bury the rows that are about this namespace.
+        let ambient = binding(
+            "ClusterRoleBinding",
+            Scope::ClusterWide,
+            vec![subject("Group", None, "system:masters")],
+            0,
+        );
+        assert!(!rbac_binding_in_ns(&ambient, ns));
+    }
+
+    // A ClusterRole is cluster-scoped as an object, but it is part of a namespace's RBAC as soon as
+    // a binding in scope grants it — and a Role of the namespace stays in scope with no binding at
+    // all, because an unbound Role there is still that namespace's standing offer.
+    #[test]
+    fn a_role_is_in_scope_through_the_namespace_or_through_a_binding() {
+        let ns = "blanche-prd";
+        let bindings = vec![binding(
+            "RoleBinding",
+            Scope::Namespace(ns.to_string()),
+            vec![subject("User", None, "alice")],
+            1,
+        )];
+        let reached = rbac_roles_reached_in_ns(&bindings, ns);
+        assert_eq!(reached.len(), 1);
+
+        let granted = role(RoleKind::ClusterRole, "", "admin");
+        assert!(rbac_role_in_ns(&granted, 1, &reached, ns));
+
+        let unbound_here = role(RoleKind::Role, ns, "leader-election");
+        assert!(rbac_role_in_ns(&unbound_here, 7, &reached, ns));
+
+        let unrelated = role(RoleKind::ClusterRole, "", "view");
+        assert!(!rbac_role_in_ns(&unrelated, 9, &reached, ns));
+
+        let other_ns = role(RoleKind::Role, "kube-system", "extension-apiserver");
+        assert!(!rbac_role_in_ns(&other_ns, 11, &reached, ns));
     }
 }
 

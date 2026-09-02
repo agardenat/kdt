@@ -76,8 +76,9 @@ lignes sont des objets namespacés accepte un namespace en argument (`:cm kube-s
 istio-system`, `:certs prod`) — marquées `[ns]` ci-dessous ; `all` (ou `*`/`0`) cible tous les
 namespaces. Le namespace ainsi choisi devient la portée de la session, affichée dans le bandeau
 `ns=`. Les vues cluster (`nodes`, `capacity`, `pv`, `rancher`) et celles construites en graphe entre
-namespaces (`flux`, `rbac`, `reflector`, `argocd`, `kyverno`) n'acceptent pas d'argument et le disent
-si on leur en donne un.
+namespaces (`flux`, `reflector`, `argocd`, `kyverno`) n'acceptent pas d'argument et le disent
+si on leur en donne un. `rbac` prend un namespace tout en continuant de lire tout le cluster : la
+portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 
 | Commande | Alias | Vue |
 |---|---|---|
@@ -87,7 +88,7 @@ si on leur en donne un.
 | `nodes` | `no`, `node` | Nodes |
 | `flux` | `fl`, `ks`, `hr` | FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Logs agrégés des controllers Flux |
-| `rbac` | `rb`, `roles`, `bindings`, `sec` | RBAC |
+| `rbac [ns]` | `rb`, `roles`, `bindings`, `sec` | RBAC |
 | `vuln [ns]` | `cve`, `cves`, `vulns` | Vulnérabilités |
 | `secrets [ns]` | `secret`, `se`, `tls` | Secrets et certificats TLS |
 | `certs [ns]` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
@@ -155,7 +156,7 @@ si on leur en donne un.
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
-| RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant |
+| RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
@@ -249,6 +250,13 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   en RoleBinding, critique en ClusterRoleBinding. Affiche les ClusterRoles-templates rebindés
   namespace par namespace, la composition des rôles agrégés (`admin`, `edit`, `view`), les bindings
   nommant un ServiceAccount inexistant, les rôles que personne ne lie.
+
+  `:rbac <ns>` (ou `n` sur une ligne, `0` pour revenir au cluster) restreint la vue à un namespace.
+  Tout le cluster reste lu — sinon une arête d'agrégation, un compte de template ou un « rôle que
+  personne ne lie » serait faux — et la portée ne décide que des lignes affichées : les RoleBindings
+  du namespace, et les bindings cluster (ClusterRoleBinding compris) accordés à un ServiceAccount de
+  ce namespace. Un ClusterRoleBinding qui ne nomme que des comptes d'ailleurs n'est pas listé. Les
+  compteurs du titre suivent la portée, qui est rappelée par `ns=` dans ce même titre.
 
   ![Vue RBAC](demo/rbac.gif)
 

@@ -74,8 +74,10 @@ IPv6 for the API server, IPv4 is tried first. The app starts on the events view.
 namespaced objects takes a namespace argument (`:cm kube-system`, `:pods istio-system`, `:certs
 prod`) — marked `[ns]` below; `all` (or `*`/`0`) targets every namespace. The namespace picked this
 way becomes the session scope, shown in the `ns=` banner. The cluster-scoped views (`nodes`,
-`capacity`, `pv`, `rancher`) and those built as a graph across namespaces (`flux`, `rbac`,
-`reflector`, `argocd`, `kyverno`) take no argument, and say so if given one.
+`capacity`, `pv`, `rancher`) and those built as a graph across namespaces (`flux`,
+`reflector`, `argocd`, `kyverno`) take no argument, and say so if given one. `rbac` takes a namespace
+while still reading the whole cluster: the scope picks the rows that are drawn, not what is read (see
+the RBAC view).
 
 | Command | Aliases | View |
 |---|---|---|
@@ -85,7 +87,7 @@ way becomes the session scope, shown in the `ns=` banner. The cluster-scoped vie
 | `nodes` | `no`, `node` | Nodes |
 | `flux` | `fl`, `ks`, `hr` | FluxCD |
 | `flux-logs` | `logs`, `fluxlogs` | Aggregated Flux controller logs |
-| `rbac` | `rb`, `roles`, `bindings`, `sec` | RBAC |
+| `rbac [ns]` | `rb`, `roles`, `bindings`, `sec` | RBAC |
 | `vuln [ns]` | `cve`, `cves`, `vulns` | Vulnerabilities |
 | `secrets [ns]` | `secret`, `se`, `tls` | Secrets and TLS certificates |
 | `certs [ns]` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
@@ -153,7 +155,7 @@ way becomes the session scope, shown in the `ns=` banner. The cluster-scoped vie
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
-| RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object |
+| RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
 | Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
@@ -246,6 +248,13 @@ shows the query and its effect (`/coredns  (3)`).
   RoleBinding and critical in a ClusterRoleBinding. Shows template ClusterRoles rebound namespace by
   namespace, the composition of aggregated roles (`admin`, `edit`, `view`), bindings naming a
   non-existent ServiceAccount, and roles nobody binds.
+
+  `:rbac <ns>` (or `n` on a row, `0` to go back to the cluster) narrows the view to one namespace.
+  The whole cluster is still read — otherwise an aggregation edge, a template count or a "nobody
+  binds this role" claim would be wrong — and the scope only decides which rows are drawn: the
+  RoleBindings of that namespace, and the cluster bindings (ClusterRoleBinding included) granted to a
+  ServiceAccount of that namespace. A ClusterRoleBinding naming only accounts from elsewhere is left
+  out. The title's counts follow the scope, which the same title states as `ns=`.
 
   ![RBAC view](demo/rbac.gif)
 
