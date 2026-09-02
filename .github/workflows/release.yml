@@ -42,8 +42,12 @@ jobs:
           cp $APP_NAME bottle/$APP_NAME/$version/bin/
           tar czf "$APP_NAME-$version.all.bottle.tar.gz" -C bottle $APP_NAME
 
+      - name: Release notes from the CHANGELOG
+        run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             ${{ env.APP_NAME }}-macos-universal.tar.gz
             ${{ env.APP_NAME }}-*.all.bottle.tar.gz
@@ -75,8 +79,12 @@ jobs:
       - name: Package static binary tarball
         run: tar czf $APP_NAME-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release $APP_NAME
 
+      - name: Release notes from the CHANGELOG
+        run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             ${{ env.APP_NAME }}-linux-x86_64.tar.gz
             dist/*.deb
