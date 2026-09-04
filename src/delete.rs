@@ -68,6 +68,10 @@ pub enum Reason {
     // A Medusa run still in flight. Deleting it abandons the operation mid-transfer, leaving partial
     // files in the bucket that the next differential backup will build on.
     MedusaRunning,
+    // A `KdtUser`. Its credential Secret goes with it — an ownerReference sees to that — but its
+    // name stays in the `spec.members` of every KdtGroup that listed it, where the controller then
+    // logs a warning on every reconciliation. Nothing is lost; something is left behind.
+    KdtUserMembership,
     Finalizers,
 }
 
@@ -87,7 +91,7 @@ impl Reason {
             | Reason::VeleroBackup
             | Reason::MedusaBackup
             | Reason::MedusaRunning => Level::Warn,
-            Reason::Finalizers => Level::Info,
+            Reason::KdtUserMembership | Reason::Finalizers => Level::Info,
         }
     }
 }
@@ -250,6 +254,9 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
             if velero_backup_running(obj) {
                 out.push(Reason::VeleroBackupRunning);
             }
+        }
+        "KdtUser" if api_version.starts_with("identity.kdt.sh/") => {
+            out.push(Reason::KdtUserMembership);
         }
         "CassandraDatacenter" | "K8ssandraCluster" => out.push(Reason::CassandraData),
         "MedusaBackup" if api_version.starts_with("medusa.k8ssandra.io/") => {

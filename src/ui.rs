@@ -511,6 +511,179 @@ use crate::rancher::{
     TokenSetting,
 };
 
+use crate::identity::{
+    apply_identity_write, fetch_identity, install_command, invitation_label, new_identity_state,
+    IdentGroup, IdentInvite, IdentUser, IdentityWrite, Invitation, Phase,
+    SharedIdentity, DEFAULT_VALIDITY,
+};
+
+// The two worlds of the identity view: the accounts, and the groups that carry the rights. One
+// fetch, one snapshot; `g` moves between them without refetching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentWorld {
+    Users,
+    Groups,
+}
+
+// One visual row of the identity view, index-aligned with the snapshot.
+#[derive(Debug, Clone)]
+enum IdentRow {
+    User(Box<IdentUser>),
+    Group(Box<IdentGroup>),
+}
+
+// Which object the creation form makes. The two differ by one optional field, so they share a form
+// rather than each growing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentFormKind {
+    User,
+    Group,
+}
+
+// The rows of that form, in drawing order. Enumerated rather than counted so that adding a field
+// cannot silently shift what the cursor lands on — the same reason the velero restore form does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentFormRow {
+    Name,
+    Email,
+    Display,
+    Description,
+}
+
+// Creating a KdtUser or a KdtGroup.
+//
+// The naming rules are not restated here: `metadata.name` is validated by a ValidatingAdmissionPolicy
+// and again by the controller, and a third copy in kdt would drift from both. The form refuses only
+// what it can state on its own — an empty name, a missing email — and shows the apiserver's own
+// refusal for everything else.
+struct IdentFormView {
+    kind: IdentFormKind,
+    cursor: usize,
+    name: String,
+    email: String,
+    display: String,
+    description: String,
+    // While a field is taking keystrokes every printable key is text, which is why submitting is a
+    // chord rather than Enter.
+    editing: bool,
+    error: Option<String>,
+}
+
+impl IdentFormView {
+    fn new(kind: IdentFormKind) -> Self {
+        IdentFormView {
+            kind,
+            cursor: 0,
+            name: String::new(),
+            email: String::new(),
+            display: String::new(),
+            description: String::new(),
+            editing: false,
+            error: None,
+        }
+    }
+
+    fn rows(&self) -> Vec<IdentFormRow> {
+        match self.kind {
+            IdentFormKind::User => {
+                vec![IdentFormRow::Name, IdentFormRow::Email, IdentFormRow::Display]
+            }
+            IdentFormKind::Group => vec![IdentFormRow::Name, IdentFormRow::Description],
+        }
+    }
+
+    fn current(&self) -> IdentFormRow {
+        self.rows().get(self.cursor).copied().unwrap_or(IdentFormRow::Name)
+    }
+
+    fn field_mut(&mut self, row: IdentFormRow) -> &mut String {
+        match row {
+            IdentFormRow::Name => &mut self.name,
+            IdentFormRow::Email => &mut self.email,
+            IdentFormRow::Display => &mut self.display,
+            IdentFormRow::Description => &mut self.description,
+        }
+    }
+
+    fn value(&self, row: IdentFormRow) -> &str {
+        match row {
+            IdentFormRow::Name => &self.name,
+            IdentFormRow::Email => &self.email,
+            IdentFormRow::Display => &self.display,
+            IdentFormRow::Description => &self.description,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let len = self.rows().len() as isize;
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as isize + delta).rem_euclid(len) as usize;
+    }
+
+    // What the form can rule out by itself, and nothing more.
+    fn validate(&self, st: &'static Strings) -> Result<IdentityWrite, String> {
+        if self.name.trim().is_empty() {
+            return Err(st.ident_form_need_name.to_string());
+        }
+        match self.kind {
+            IdentFormKind::User => {
+                if self.email.trim().is_empty() {
+                    return Err(st.ident_form_need_email.to_string());
+                }
+                Ok(IdentityWrite::CreateUser {
+                    name: self.name.trim().to_string(),
+                    email: self.email.trim().to_string(),
+                    display_name: self.display.trim().to_string(),
+                })
+            }
+            IdentFormKind::Group => Ok(IdentityWrite::CreateGroup {
+                name: self.name.trim().to_string(),
+                description: self.description.trim().to_string(),
+            }),
+        }
+    }
+}
+
+// Membership, from whichever side the operator was standing on: from an account it ticks groups,
+// from a group it ticks accounts. Either way the write is the same JSON patch on the group, and
+// picking from a list is what keeps a typo from landing in `unknownMembers`.
+struct IdentPickView {
+    // The row this was opened from.
+    anchor: String,
+    from_user: bool,
+    // (name, currently a member, index in the group's `spec.members` when it is one).
+    items: Vec<(String, bool, usize)>,
+    cursor: usize,
+    error: Option<String>,
+}
+
+impl IdentPickView {
+    fn move_cursor(&mut self, delta: isize) {
+        let len = self.items.len() as isize;
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as isize + delta).rem_euclid(len) as usize;
+    }
+
+    // The write the selected line would run. `None` when the list is empty.
+    fn toggle(&self) -> Option<IdentityWrite> {
+        let (name, member, index) = self.items.get(self.cursor)?;
+        let (group, user) = if self.from_user {
+            (name.clone(), self.anchor.clone())
+        } else {
+            (self.anchor.clone(), name.clone())
+        };
+        Some(if *member {
+            IdentityWrite::RemoveMember { group, user, index: *index }
+        } else {
+            IdentityWrite::AddMember { group, user }
+        })
+    }
+}
+
 // The four worlds of the Rancher view. They share one fetch and one snapshot; `g` moves between
 // them without refetching, as velero and k8ssandra already do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,7 +1155,7 @@ fn is_critical_reason(reason: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull }
 
 // One visual line in the merged workloads view: a workload (parent/group row), one of its pods
 // (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
@@ -1042,6 +1215,17 @@ enum MenuAction {
     ArgoRefresh(bool),
     ArgoSync(bool),
     ArgoTerminate,
+    // kdt-identity: invite (the validity is typed, because "how long does this link live" is the
+    // one thing that changes between an invitation handed over in person and one sent by mail),
+    // create an account or a group, block or unblock issuance, and open the membership picker.
+    IdentInviteUser,
+    IdentCreateUser,
+    IdentCreateGroup,
+    IdentSetDisabled(bool),
+    IdentMembership,
+    IdentCopySubject,
+    // Only offered on a cluster where kdt-identity is absent. It copies, and stops there.
+    IdentCopyInstall,
 }
 
 // The menu actions that ask for a typed value before they run. Each names the unit it expects, and
@@ -1054,6 +1238,7 @@ fn menu_action_takes_input(action: Option<&MenuAction>) -> bool {
             | Some(MenuAction::RanchSetTokenTtl)
             | Some(MenuAction::RanchSetSetting)
             | Some(MenuAction::K8cNodetool)
+            | Some(MenuAction::IdentInviteUser)
     )
 }
 
@@ -1062,7 +1247,11 @@ fn menu_action_takes_input(action: Option<&MenuAction>) -> bool {
 fn menu_action_free_text(action: Option<&MenuAction>) -> bool {
     matches!(
         action,
-        Some(MenuAction::RanchSetSetting) | Some(MenuAction::K8cNodetool)
+        Some(MenuAction::RanchSetSetting)
+            | Some(MenuAction::K8cNodetool)
+            // A validity is `72h`, `3d`, `600s`: digits *and* a unit, so it cannot go through the
+            // numeric entry.
+            | Some(MenuAction::IdentInviteUser)
     )
 }
 
@@ -1142,6 +1331,7 @@ fn is_split_mode(mode: Mode) -> bool {
             | Mode::Capacity
             | Mode::Rancher
             | Mode::Argo
+            | Mode::Identity
     )
 }
 
@@ -1331,10 +1521,11 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("k8ssandra", &["k8c", "cassandra", "cass", "cassandradatacenter", "cassandradatacenters", "dc", "datacenter", "datacenters"]),
     ("medusa", &["med", "medusabackup", "medusabackups", "cassbackup", "cassbackups"]),
     ("reaper", &["rea", "repair", "repairs", "reparation", "reparations"]),
-    // Rancher's own objects. `users` belongs here rather than to RBAC: on a Rancher-managed cluster
-    // the word means a person with a Rancher account, not a ServiceAccount. `projects` likewise —
-    // a Rancher project is what groups the namespaces this cluster shows.
-    ("rancher", &["ranch", "cattle", "users", "user", "identities", "identites"]),
+    // Rancher's own objects. `projects` belongs here: a Rancher project is what groups the
+    // namespaces this cluster shows. The generic words for people — `users`, `identities` — went to
+    // `identity` when kdt gained accounts it can write; Rancher's directory is the one it only
+    // reads, and it answers to its own name.
+    ("rancher", &["ranch", "cattle"]),
     ("projects", &["project", "proj"]),
     ("tokens", &["token", "apikeys", "apikey", "kubeconfigs"]),
     // Argo CD's own objects. `apps`/`app` belong here rather than to the workloads view: on a
@@ -1345,6 +1536,12 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("appsets", &["appset", "applicationset", "applicationsets"]),
     ("appprojects", &["appproject", "appproj"]),
     ("argorepos", &["argorepo", "argoclusters", "argocluster"]),
+    // kdt-identity's local accounts. Each of these three views answers "who is this" from a
+    // different source, so each is named by its source: `identity` for the accounts this cluster
+    // holds and kdt can create, `rancher` for the ones a directory federates, `rbac` for what
+    // either of them may do. The generic words land here because these are the accounts kdt writes.
+    ("identity", &["id", "ident", "users", "user", "identities", "identites", "comptes", "kdtuser", "kdtusers"]),
+    ("groups", &["group", "kdtgroup", "kdtgroups"]),
     ("configmaps", &["configmap", "cm", "config", "configs"]),
     ("services", &["svc", "service", "svcs"]),
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
@@ -1788,6 +1985,18 @@ pub struct App {
     // The one copy of a freshly issued token's secret. Shared because the write that produces it
     // runs off-thread; cleared as soon as the overlay is dismissed, and never persisted.
     ranch_issued: std::sync::Arc<std::sync::Mutex<Option<IssuedToken>>>,
+    pub ident_state: SharedIdentity,
+    ident_world: IdentWorld,
+    ident_filter: StoFilter,
+    ident_rows: Vec<IdentRow>,
+    pub ident_detail_scroll: usize,
+    pub ident_refresh_handle: Option<JoinHandle<()>>,
+    // The one copy of a fresh invitation's link and code. Same discipline as `ranch_issued`: the
+    // write runs off-thread, the overlay is the only place either value is ever rendered, and
+    // dismissing it drops both.
+    ident_invited: std::sync::Arc<std::sync::Mutex<Option<IdentInvite>>>,
+    ident_form: Option<IdentFormView>,
+    ident_pick: Option<IdentPickView>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -2077,6 +2286,15 @@ impl App {
             ranch_detail_scroll: 0,
             ranch_refresh_handle: None,
             ranch_issued: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            ident_state: new_identity_state(),
+            ident_world: IdentWorld::Users,
+            ident_filter: StoFilter::All,
+            ident_rows: Vec::new(),
+            ident_detail_scroll: 0,
+            ident_refresh_handle: None,
+            ident_invited: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            ident_form: None,
+            ident_pick: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -3785,7 +4003,7 @@ impl App {
                 | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces
                 | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
                 | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull
-                | Mode::Argo | Mode::ArgoFull
+                | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull
         ) && !self.top_panel_collapsed()
     }
 
@@ -3826,6 +4044,7 @@ impl App {
             Mode::Capacity | Mode::CapacityFull => step(&mut self.cap_detail_scroll, delta),
             Mode::Rancher | Mode::RancherFull => step(&mut self.ranch_detail_scroll, delta),
             Mode::Argo | Mode::ArgoFull => step(&mut self.argo_detail_scroll, delta),
+            Mode::Identity | Mode::IdentityFull => step(&mut self.ident_detail_scroll, delta),
             _ => {}
         }
     }
@@ -3840,8 +4059,11 @@ impl App {
             *v = if delta < 0 { v.saturating_sub(5) } else { v.saturating_add(5) };
         };
         match view_mode(self) {
+            // These panels wrap their text instead of clipping it, so there is nothing to the
+            // right to reach.
             Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull
-            | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull => {}
+            | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull
+            | Mode::Identity | Mode::IdentityFull => {}
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
             Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
             _ => step(&mut self.detail_h_scroll, delta),
@@ -3865,6 +4087,7 @@ impl App {
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher(),
             Mode::Argo | Mode::ArgoFull => self.refresh_argo(),
+            Mode::Identity | Mode::IdentityFull => self.refresh_identity(),
             Mode::Configmaps | Mode::ConfigmapsFull => self.refresh_configmaps(),
             Mode::Namespaces => self.refresh_namespaces(),
             _ => {}
@@ -4250,6 +4473,7 @@ impl App {
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c_snapshot(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher_snapshot(),
             Mode::Argo | Mode::ArgoFull => self.refresh_argo_snapshot(),
+            Mode::Identity | Mode::IdentityFull => self.refresh_identity_snapshot(),
             _ => {}
         }
     }
@@ -4424,6 +4648,16 @@ impl App {
                 self.switch_view(origin, ns_arg);
                 self.enter_argo_mode(ArgoWorld::Repos);
             }
+            "identity" => {
+                // Always opens: on a cluster with no identity.kdt.sh the view says so — and says
+                // where the accounts live instead, when Rancher answers.
+                self.switch_view(origin, ns_arg);
+                self.enter_identity_mode(IdentWorld::Users);
+            }
+            "groups" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_identity_mode(IdentWorld::Groups);
+            }
             "configmaps" => {
                 self.switch_view(origin, ns_arg);
                 self.enter_configmaps_mode();
@@ -4520,6 +4754,10 @@ impl App {
             }
             Mode::Argo | Mode::ArgoFull => {
                 self.stop_argo_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Identity | Mode::IdentityFull => {
+                self.stop_identity_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Configmaps | Mode::ConfigmapsFull => {
@@ -9445,6 +9683,565 @@ impl App {
         self.refresh_rancher_snapshot();
     }
 
+    // --- kdt-identity view ----------------------------------------------------------------------
+
+    // Open the identity view on the given world. Both worlds share one fetch and one snapshot; `g`
+    // moves between them without refetching.
+    fn enter_identity_mode(&mut self, world: IdentWorld) {
+        self.mode = Mode::Identity;
+        self.ident_world = world;
+        self.ident_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_identity();
+        self.start_identity_auto_refresh();
+        self.refresh_identity_snapshot();
+    }
+
+    fn exit_identity_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_identity_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_identity_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.ident_detail_scroll = 0;
+        self.mode = Mode::IdentityFull;
+    }
+
+    fn exit_identity_full(&mut self) {
+        self.mode = Mode::Identity;
+    }
+
+    fn refresh_identity(&self) {
+        {
+            let mut s = self.ident_state.lock().expect("identity poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.ident_state.clone();
+        tokio::spawn(async move { fetch_identity(client, state).await; });
+    }
+
+    // 60s, like the Rancher directory: accounts are created once and groups change on the scale of
+    // a ticket, not of a rollout. One pass also reads every RoleBinding of the cluster to answer
+    // "does this group grant anything", which is not a read to repeat every few seconds.
+    fn start_identity_auto_refresh(&mut self) {
+        self.stop_identity_auto_refresh();
+        let client = self.client.clone();
+        let state = self.ident_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_identity(client.clone(), state.clone()).await;
+            }
+        });
+        self.ident_refresh_handle = Some(handle);
+    }
+
+    fn stop_identity_auto_refresh(&mut self) {
+        if let Some(h) = self.ident_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds `ident_rows` and `App::snapshot` in lockstep, so a selected index means the same row
+    // in both — which is what gives this view `y`, `Ctrl-D`, the search and the AI panel for free.
+    fn refresh_identity_snapshot(&mut self) {
+        let s = self.ident_state.lock().expect("identity poisoned").clone();
+        let problems_only = self.ident_filter == StoFilter::Problems;
+        let worse = |hints: &[crate::storage::Hint]| {
+            hints.iter().any(|h| h.level >= StoHintLevel::Warn)
+        };
+        let mut rows: Vec<IdentRow> = Vec::new();
+        let mut recs: Vec<EventRecord> = Vec::new();
+
+        match self.ident_world {
+            IdentWorld::Users => {
+                for u in s.users.iter().filter(|u| !problems_only || worse(&u.hints)) {
+                    recs.push(ident_user_record(u));
+                    rows.push(IdentRow::User(Box::new(u.clone())));
+                }
+            }
+            IdentWorld::Groups => {
+                for g in s.groups.iter().filter(|g| !problems_only || worse(&g.hints)) {
+                    recs.push(ident_group_record(g));
+                    rows.push(IdentRow::Group(Box::new(g.clone())));
+                }
+            }
+        }
+
+        self.ident_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.ident_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_ident_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.ident_detail_scroll = 0;
+    }
+
+    fn ident_selected(&self) -> Option<&IdentRow> {
+        self.ident_rows.get(self.table_state.selected()?)
+    }
+
+    fn cycle_ident_world(&mut self) {
+        self.ident_world = match self.ident_world {
+            IdentWorld::Users => IdentWorld::Groups,
+            IdentWorld::Groups => IdentWorld::Users,
+        };
+        self.ident_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_identity_snapshot();
+    }
+
+    fn cycle_ident_filter(&mut self) {
+        self.ident_filter = match self.ident_filter {
+            StoFilter::All => StoFilter::Problems,
+            StoFilter::Problems => StoFilter::All,
+        };
+        self.refresh_identity_snapshot();
+    }
+
+    // `o`: what can be done to the row under the cursor. Creating is offered from either world, so
+    // an empty cluster is not a dead end.
+    fn open_identity_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let controller = self.ident_state.lock().expect("identity poisoned").controller.clone();
+        let row = self.ident_selected().cloned();
+
+        let (title, items) = match &row {
+            Some(IdentRow::User(u)) => {
+                // Inviting needs a pod to run in, and the account has to be able to act on it. Both
+                // are said in the entry rather than discovered after the confirmation.
+                let invite_desc = if u.disabled {
+                    st.ident_invite_disabled.to_string()
+                } else if controller.is_none() {
+                    st.ident_invite_unavailable.to_string()
+                } else {
+                    st.desc_ident_invite.to_string()
+                };
+                let mut items = vec![ActionItem {
+                    label: st.k_ident_invite,
+                    desc: invite_desc,
+                    action: MenuAction::IdentInviteUser,
+                }];
+                items.push(ActionItem {
+                    label: if u.disabled { st.k_ident_enable } else { st.k_ident_disable },
+                    desc: if u.disabled {
+                        st.desc_ident_enable.to_string()
+                    } else {
+                        st.desc_ident_disable.to_string()
+                    },
+                    action: MenuAction::IdentSetDisabled(!u.disabled),
+                });
+                items.push(ActionItem {
+                    label: st.k_ident_membership,
+                    desc: st.desc_ident_membership.to_string(),
+                    action: MenuAction::IdentMembership,
+                });
+                items.push(ActionItem {
+                    label: st.k_ident_create_user,
+                    desc: st.desc_ident_create_user.to_string(),
+                    action: MenuAction::IdentCreateUser,
+                });
+                (st.menu_ident_user_title, items)
+            }
+            Some(IdentRow::Group(g)) => (
+                st.menu_ident_group_title,
+                vec![
+                    ActionItem {
+                        label: st.k_ident_membership,
+                        desc: st.desc_ident_membership.to_string(),
+                        action: MenuAction::IdentMembership,
+                    },
+                    ActionItem {
+                        label: st.k_ident_copy_subject,
+                        desc: lang::fill(
+                            st.desc_ident_copy_subject,
+                            &[("subject", &g.effective_subject())],
+                        ),
+                        action: MenuAction::IdentCopySubject,
+                    },
+                    ActionItem {
+                        label: st.k_ident_create_group,
+                        desc: st.desc_ident_create_group.to_string(),
+                        action: MenuAction::IdentCreateGroup,
+                    },
+                ],
+            ),
+            // Nothing selected — an empty directory, or kdt-identity absent. Creating is still the
+            // useful offer, so the menu opens on it instead of refusing.
+            None => {
+                let installed = self.ident_state.lock().expect("identity poisoned").installed;
+                let mut items = Vec::new();
+                // On a cluster with no kdt-identity, creating a KdtUser is not the next move: the
+                // command that would put it there is, and it is offered first for that reason.
+                if !installed {
+                    items.push(ActionItem {
+                        label: st.k_ident_copy_install,
+                        desc: st.desc_ident_copy_install.to_string(),
+                        action: MenuAction::IdentCopyInstall,
+                    });
+                }
+                items.push(ActionItem {
+                    label: st.k_ident_create_user,
+                    desc: st.desc_ident_create_user.to_string(),
+                    action: MenuAction::IdentCreateUser,
+                });
+                items.push(ActionItem {
+                    label: st.k_ident_create_group,
+                    desc: st.desc_ident_create_group.to_string(),
+                    action: MenuAction::IdentCreateGroup,
+                });
+                (st.menu_ident_user_title, items)
+            }
+        };
+
+        self.action_menu = Some(ActionMenu {
+            title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note: None,
+        });
+    }
+
+    // Run `kdt-identity-server invite` in the controller pod. The link and the code come back once,
+    // land in their own overlay, and are never written anywhere else.
+    fn ident_invite(&mut self, validity: String) {
+        let st = lang::t(self.ai_language);
+        let Some(IdentRow::User(u)) = self.ident_selected().cloned() else { return };
+        let controller = self.ident_state.lock().expect("identity poisoned").controller.clone();
+        let Some(controller) = controller else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ident_invite_unavailable.to_string()));
+            return;
+        };
+        if u.disabled {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ident_invite_disabled.to_string()));
+            return;
+        }
+        let write = IdentityWrite::Invite {
+            user: u.name.clone(),
+            validity,
+            controller: Box::new(controller),
+        };
+        // No success toast: the overlay that opens *is* the outcome, and a line saying "done"
+        // scrolling under it would be the only trace left once it is dismissed.
+        self.ident_run_write(write, st.msg_ident_created, st.msg_ident_write_failed);
+    }
+
+    fn ident_set_disabled(&mut self, disabled: bool) {
+        let st = lang::t(self.ai_language);
+        let Some(IdentRow::User(u)) = self.ident_selected().cloned() else { return };
+        let write = IdentityWrite::SetDisabled { user: u.name.clone(), disabled };
+        let ok = if disabled { st.msg_ident_disabled } else { st.msg_ident_enabled };
+        self.ident_run_write(write, ok, st.msg_ident_write_failed);
+    }
+
+    // The subject as the controller published it, never a string retyped by hand — which is exactly
+    // what the upstream guide asks for.
+    fn ident_copy_subject(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(IdentRow::Group(g)) = self.ident_selected().cloned() else { return };
+        let _ = crate::clip::copy_to_clipboard(&g.effective_subject());
+        self.clipboard_status =
+            Some((std::time::Instant::now(), st.msg_ident_subject_copied.to_string()));
+    }
+
+    // The install sequence, prefilled with this cluster. kdt copies it and stops there: it does not
+    // speak Helm, and a component that is cluster-admin-equivalent is not installed from a
+    // keystroke.
+    fn ident_copy_install(&mut self) {
+        let st = lang::t(self.ai_language);
+        let _ = crate::clip::copy_to_clipboard(&install_command(
+            &self.context_label,
+            &self.api_url,
+        ));
+        self.clipboard_status =
+            Some((std::time::Instant::now(), st.msg_ident_install_copied.to_string()));
+    }
+
+    fn ident_run_write(
+        &mut self,
+        write: IdentityWrite,
+        ok_msg: &'static str,
+        err_msg: &'static str,
+    ) {
+        let target = write.target();
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let invited = self.ident_invited.clone();
+        tokio::spawn(async move {
+            let outcome = apply_identity_write(client, write).await;
+            let text = match outcome {
+                Ok(Some(invite)) => {
+                    *invited.lock().expect("invitation poisoned") = Some(invite);
+                    // The overlay says everything; nothing goes to the toast.
+                    return;
+                }
+                Ok(None) => lang::fill(ok_msg, &[("name", &target)]),
+                Err(e) => lang::fill(err_msg, &[("name", &target), ("e", &e)]),
+            };
+            let mut s = status.lock().expect("reconcile status poisoned");
+            *s = Some((std::time::Instant::now(), text));
+        });
+        self.refresh_identity();
+    }
+
+    fn ident_invited_present(&self) -> bool {
+        self.ident_invited.lock().expect("invitation poisoned").is_some()
+    }
+
+    // The link and the code are copied *separately*, and never together. They are meant to travel
+    // by two different channels — the code dictated out loud — and one clipboard carrying both
+    // would undo the whole point of splitting them.
+    fn ident_copy_link(&mut self) {
+        let value = {
+            let guard = self.ident_invited.lock().expect("invitation poisoned");
+            guard.as_ref().and_then(|i| i.link.clone())
+        };
+        let Some(value) = value else { return };
+        let _ = crate::clip::copy_to_clipboard(&value);
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            lang::t(self.ai_language).msg_ident_link_copied.to_string(),
+        ));
+    }
+
+    fn ident_copy_code(&mut self) {
+        let value = {
+            let guard = self.ident_invited.lock().expect("invitation poisoned");
+            guard.as_ref().and_then(|i| i.code.clone())
+        };
+        let Some(value) = value else { return };
+        let _ = crate::clip::copy_to_clipboard(&value);
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            lang::t(self.ai_language).msg_ident_code_copied.to_string(),
+        ));
+    }
+
+    // The whole output, for when the two fields could not be picked out of it. Offered only then:
+    // otherwise it would be the shortcut that puts both halves in one clipboard.
+    fn ident_copy_raw(&mut self) {
+        let value = {
+            let guard = self.ident_invited.lock().expect("invitation poisoned");
+            guard
+                .as_ref()
+                .filter(|i| i.link.is_none() || i.code.is_none())
+                .map(|i| i.raw.clone())
+        };
+        let Some(value) = value else { return };
+        let _ = crate::clip::copy_to_clipboard(&value);
+        self.clipboard_status = Some((
+            std::time::Instant::now(),
+            lang::t(self.ai_language).msg_ident_raw_copied.to_string(),
+        ));
+    }
+
+    fn ident_clear_invited(&mut self) {
+        *self.ident_invited.lock().expect("invitation poisoned") = None;
+    }
+
+    fn open_ident_form(&mut self, kind: IdentFormKind) {
+        self.ident_form = Some(IdentFormView::new(kind));
+    }
+
+    fn close_ident_form(&mut self) {
+        self.ident_form = None;
+    }
+
+    // Enter starts and stops typing into the row under the cursor; it never creates anything. A
+    // form whose Enter both edits and submits is one where a stray keystroke writes to the cluster.
+    fn ident_form_enter(&mut self) {
+        if let Some(form) = self.ident_form.as_mut() {
+            form.editing = !form.editing;
+            form.error = None;
+        }
+    }
+
+    fn ident_form_move(&mut self, delta: isize) {
+        if let Some(form) = self.ident_form.as_mut() {
+            if form.editing {
+                return;
+            }
+            form.move_cursor(delta);
+        }
+    }
+
+    fn ident_form_input(&mut self, c: char) {
+        if let Some(form) = self.ident_form.as_mut() {
+            let row = form.current();
+            form.field_mut(row).push(c);
+            form.error = None;
+        }
+    }
+
+    fn ident_form_backspace(&mut self) {
+        if let Some(form) = self.ident_form.as_mut() {
+            if !form.editing {
+                return;
+            }
+            let row = form.current();
+            form.field_mut(row).pop();
+            form.error = None;
+        }
+    }
+
+    fn ident_pick_move(&mut self, delta: isize) {
+        if let Some(view) = self.ident_pick.as_mut() {
+            view.move_cursor(delta);
+        }
+    }
+
+    fn ident_form_submit(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(form) = self.ident_form.as_mut() else { return };
+        match form.validate(st) {
+            Err(e) => {
+                form.error = Some(e);
+            }
+            Ok(write) => {
+                self.ident_form = None;
+                self.ident_run_write(write, st.msg_ident_created, st.msg_ident_write_failed);
+            }
+        }
+    }
+
+    // Membership, from whichever side the cursor was on. The list is built from the current
+    // snapshot, so the index carried for a removal is the one the last refresh saw — which is why
+    // the patch guards it with a `test` rather than trusting it.
+    fn open_ident_pick(&mut self) {
+        let st = lang::t(self.ai_language);
+        let s = self.ident_state.lock().expect("identity poisoned").clone();
+        let Some(row) = self.ident_selected().cloned() else { return };
+
+        let view = match row {
+            IdentRow::User(u) => {
+                let items = s
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        let idx = g.members.iter().position(|m| *m == u.name);
+                        (g.name.clone(), idx.is_some(), idx.unwrap_or(0))
+                    })
+                    .collect();
+                IdentPickView {
+                    anchor: u.name.clone(),
+                    from_user: true,
+                    items,
+                    cursor: 0,
+                    error: None,
+                }
+            }
+            IdentRow::Group(g) => {
+                let items = s
+                    .users
+                    .iter()
+                    .map(|u| {
+                        let idx = g.members.iter().position(|m| *m == u.name);
+                        (u.name.clone(), idx.is_some(), idx.unwrap_or(0))
+                    })
+                    .collect();
+                IdentPickView {
+                    anchor: g.name.clone(),
+                    from_user: false,
+                    items,
+                    cursor: 0,
+                    error: None,
+                }
+            }
+        };
+        if view.items.is_empty() {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ident_pick_empty.trim().to_string()));
+            return;
+        }
+        self.ident_pick = Some(view);
+    }
+
+    fn close_ident_pick(&mut self) {
+        self.ident_pick = None;
+    }
+
+    fn ident_pick_toggle(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(view) = self.ident_pick.as_mut() else { return };
+        let Some(write) = view.toggle() else { return };
+        // The tick flips locally so the list answers immediately; the next refresh is what makes it
+        // true, and a refused patch shows in the toast.
+        let (added, group, user) = match &write {
+            IdentityWrite::AddMember { group, user } => (true, group.clone(), user.clone()),
+            IdentityWrite::RemoveMember { group, user, .. } => (false, group.clone(), user.clone()),
+            _ => return,
+        };
+        if let Some(item) = view.items.get_mut(view.cursor) {
+            item.1 = added;
+        }
+        let msg = if added { st.msg_ident_member_added } else { st.msg_ident_member_removed };
+        let target = lang::fill(msg, &[("user", &user), ("group", &group)]);
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let err_msg = st.msg_ident_write_failed;
+        let name = format!("{user} / {group}");
+        tokio::spawn(async move {
+            let text = match apply_identity_write(client, write).await {
+                Ok(_) => target,
+                Err(e) => lang::fill(err_msg, &[("name", &name), ("e", &e)]),
+            };
+            let mut s = status.lock().expect("reconcile status poisoned");
+            *s = Some((std::time::Instant::now(), text));
+        });
+        self.refresh_identity();
+    }
+
     // --- Argo CD view ---------------------------------------------------------------------------
 
     // Open the Argo CD view on the given world. The four worlds share one fetch and one snapshot;
@@ -11219,6 +12016,15 @@ impl App {
                     // run and asks about *that*, the second runs it. Asking before the line exists
                     // would be a question about nothing — `garbagecollect` and `status` are not the
                     // same decision.
+                    // A validity is `72h`, `3d`, `600s`. It is not parsed here: the server owns
+                    // the grammar, and a second parser in kdt would refuse things the server
+                    // accepts. An empty box is refused, everything else goes and the refusal is
+                    // shown verbatim.
+                    Some(MenuAction::IdentInviteUser) => {
+                        if raw.trim().is_empty() { return; }
+                        self.action_menu = None;
+                        self.ident_invite(raw.trim().to_string());
+                    }
                     Some(MenuAction::K8cNodetool) => {
                         if raw.trim().is_empty() { return; }
                         let confirmed = menu.confirming;
@@ -11251,7 +12057,14 @@ impl App {
             }
             Some(menu) if menu_action_takes_input(menu.items.get(menu.cursor).map(|it| &it.action)) => {
                 menu.confirming = false;
-                menu.input = Some(String::new());
+                // The entry opens on the value the server itself defaults to, so the shape a
+                // duration takes is visible before anything is typed and Enter alone does the
+                // ordinary thing. An empty box with no stated unit is how one asks for 72 hours and
+                // gets 72 seconds.
+                menu.input = Some(match menu.items.get(menu.cursor).map(|it| &it.action) {
+                    Some(MenuAction::IdentInviteUser) => DEFAULT_VALIDITY.to_string(),
+                    _ => String::new(),
+                });
                 return;
             }
             // Opening the restore form writes nothing and decides nothing. Arming a confirmation
@@ -11262,7 +12075,15 @@ impl App {
                     && !menu.confirming
                     && !matches!(
                         menu.items.get(menu.cursor).map(|it| &it.action),
+                        // The identity forms and the membership picker are the same case: they
+                        // write nothing until they are submitted, and they ask their own question
+                        // once there is something to answer.
                         Some(MenuAction::VelRestoreOptions)
+                            | Some(MenuAction::IdentCreateUser)
+                            | Some(MenuAction::IdentCreateGroup)
+                            | Some(MenuAction::IdentMembership)
+                            | Some(MenuAction::IdentCopySubject)
+                            | Some(MenuAction::IdentCopyInstall)
                     ) =>
             {
                 menu.confirming = true;
@@ -11297,11 +12118,18 @@ impl App {
             Some(MenuAction::ArgoRefresh(hard)) => self.argo_refresh_app(hard),
             Some(MenuAction::ArgoSync(prune)) => self.argo_sync_app(prune),
             Some(MenuAction::ArgoTerminate) => self.argo_terminate_app(),
+            Some(MenuAction::IdentCreateUser) => self.open_ident_form(IdentFormKind::User),
+            Some(MenuAction::IdentCreateGroup) => self.open_ident_form(IdentFormKind::Group),
+            Some(MenuAction::IdentSetDisabled(v)) => self.ident_set_disabled(v),
+            Some(MenuAction::IdentMembership) => self.open_ident_pick(),
+            Some(MenuAction::IdentCopySubject) => self.ident_copy_subject(),
+            Some(MenuAction::IdentCopyInstall) => self.ident_copy_install(),
             Some(MenuAction::ScaleSet)
             | Some(MenuAction::RanchIssueToken)
             | Some(MenuAction::RanchSetTokenTtl)
             | Some(MenuAction::RanchSetSetting)
             | Some(MenuAction::K8cNodetool)
+            | Some(MenuAction::IdentInviteUser)
             | None => {}
         }
     }
@@ -11990,6 +12818,12 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // The Argo writes report through the same channel as the Flux reconciles.
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::Identity | Mode::IdentityFull) {
+            app.refresh_identity_snapshot();
+            // The identity writes report through the same channel as the Flux reconciles — all
+            // except the invitation, which has an overlay of its own.
+            app.drain_reconcile_status();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -12220,6 +13054,56 @@ fn handle_event(app: &mut App, ev: Event) {
         }
         return;
     }
+    // The invitation grabs all input while shown, for the same reason the issued token does: it is
+    // the only place the link and the code ever appear.
+    //
+    // `l` and `c` copy one each, and there is no key that copies both — they are meant to travel by
+    // two channels, and one clipboard holding the pair would undo that. `y` is the fallback for an
+    // output kdt could not take apart, and exists only then.
+    if app.ident_invited_present() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('l'), _) => app.ident_copy_link(),
+            (KeyCode::Char('c'), _) => app.ident_copy_code(),
+            (KeyCode::Char('y'), _) => app.ident_copy_raw(),
+            (KeyCode::Esc | KeyCode::Enter, _) => app.ident_clear_invited(),
+            _ => {}
+        }
+        return;
+    }
+    // The creation form grabs all input while open. Ctrl-S submits rather than Enter: while a field
+    // has the cursor every printable key belongs to it, so Enter is what starts and stops typing.
+    if app.ident_form.is_some() {
+        let editing = app.ident_form.as_ref().is_some_and(|f| f.editing);
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => app.ident_form_submit(),
+            (KeyCode::Backspace, _) => app.ident_form_backspace(),
+            (KeyCode::Char(c), m) if editing && !m.contains(KeyModifiers::CONTROL) => {
+                app.ident_form_input(c)
+            }
+            (KeyCode::Enter, _) => app.ident_form_enter(),
+            (KeyCode::Esc, _) => app.close_ident_form(),
+            (KeyCode::Up, _) => app.ident_form_move(-1),
+            (KeyCode::Down, _) => app.ident_form_move(1),
+            _ => {}
+        }
+        return;
+    }
+    // The membership picker grabs all input while open.
+    if app.ident_pick.is_some() {
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+            (KeyCode::Enter | KeyCode::Char(' '), _) => app.ident_pick_toggle(),
+            (KeyCode::Esc | KeyCode::Char('q'), _) => app.close_ident_pick(),
+            (KeyCode::Up | KeyCode::Char('k'), _) => app.ident_pick_move(-1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => app.ident_pick_move(1),
+            (KeyCode::PageUp, _) => app.ident_pick_move(-10),
+            (KeyCode::PageDown, _) => app.ident_pick_move(10),
+            _ => {}
+        }
+        return;
+    }
     // The issued token grabs all input while shown. It is the only place that secret ever appears,
     // so nothing may scroll it away or act underneath it.
     if app.ranch_issued_present() {
@@ -12339,13 +13223,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.enter_search();
         }
 
@@ -12368,12 +13252,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.open_edit_view();
         }
 
@@ -12386,12 +13270,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
             app.open_delete_view();
         }
 
@@ -13033,6 +13917,39 @@ fn handle_event(app: &mut App, ev: Event) {
         }
         (_, _, Mode::RancherFull) => {}
 
+        (KeyCode::Up, _, Mode::Identity) => app.move_ident_selection(-1),
+        (KeyCode::Down, _, Mode::Identity) => app.move_ident_selection(1),
+        (KeyCode::PageUp, _, Mode::Identity) => app.move_ident_selection(-10),
+        (KeyCode::PageDown, _, Mode::Identity) => app.move_ident_selection(10),
+        (KeyCode::Char('g'), _, Mode::Identity) => app.cycle_ident_world(),
+        (KeyCode::Char('f'), _, Mode::Identity) => app.cycle_ident_filter(),
+        (KeyCode::Enter, _, Mode::Identity) => app.enter_identity_full(),
+        (KeyCode::F(5), _, Mode::Identity) => app.refresh_identity(),
+        (KeyCode::Esc, _, Mode::Identity) => app.exit_identity_mode(),
+        (KeyCode::Char('o'), _, Mode::Identity) => app.open_identity_action_menu(),
+        (KeyCode::Char('i'), _, Mode::Identity) => app.enter_ai_panel(),
+        (_, _, Mode::Identity) => {}
+
+        (KeyCode::Up, m, Mode::IdentityFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.ident_detail_scroll = app.ident_detail_scroll.saturating_sub(1)
+        }
+        (KeyCode::Down, m, Mode::IdentityFull) if !m.contains(KeyModifiers::SHIFT) => {
+            app.ident_detail_scroll = app.ident_detail_scroll.saturating_add(1)
+        }
+        (KeyCode::PageUp, _, Mode::IdentityFull) => {
+            app.ident_detail_scroll = app.ident_detail_scroll.saturating_sub(10)
+        }
+        (KeyCode::PageDown, _, Mode::IdentityFull) => {
+            app.ident_detail_scroll = app.ident_detail_scroll.saturating_add(10)
+        }
+        (KeyCode::Enter, _, Mode::IdentityFull) => app.exit_identity_full(),
+        (KeyCode::Esc, _, Mode::IdentityFull) => app.exit_identity_full(),
+        (KeyCode::Char('g'), _, Mode::IdentityFull) => app.ident_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::IdentityFull) => app.ident_detail_scroll = usize::MAX,
+        (KeyCode::Char('o'), _, Mode::IdentityFull) => app.open_identity_action_menu(),
+        (KeyCode::Char('i'), _, Mode::IdentityFull) => app.enter_ai_panel(),
+        (_, _, Mode::IdentityFull) => {}
+
         (KeyCode::Up, m, Mode::ArgoFull) if !m.contains(KeyModifiers::SHIFT) => {
             app.argo_detail_scroll = app.argo_detail_scroll.saturating_sub(1)
         }
@@ -13237,11 +14154,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -13259,8 +14176,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     } };
 
@@ -13289,6 +14206,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::K8ssandra | Mode::K8ssandraFull => st.mode_k8ssandra,
         Mode::Rancher | Mode::RancherFull => st.mode_rancher,
         Mode::Argo | Mode::ArgoFull => st.mode_argocd,
+        Mode::Identity | Mode::IdentityFull => st.mode_identity,
         Mode::Configmaps | Mode::ConfigmapsFull => st.mode_configmaps,
         Mode::Namespaces => st.mode_ns,
         Mode::Services | Mode::ServicesFull => st.mode_services,
@@ -13366,6 +14284,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_rancher_table(f, app, ta);
         } else if draw_mode == Mode::Argo {
             draw_argo_table(f, app, ta);
+        } else if draw_mode == Mode::Identity {
+            draw_identity_table(f, app, ta);
         } else if draw_mode == Mode::Configmaps {
             draw_configmaps_table(f, app, ta);
         } else if draw_mode == Mode::Namespaces {
@@ -13379,7 +14299,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -13951,6 +14871,35 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
             Span::styled(" r ", kbg), Span::raw(format!(" {}   ", st.k_argo_actions)),
         ],
+        Mode::Identity => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.ident_world {
+                IdentWorld::Users => st.k_ident_groups,
+                IdentWorld::Groups => st.k_ident_users,
+            };
+            let mut spans = vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_k8c_filter, app.ident_filter.label())),
+                footer_sep(),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_ident_menu)),
+            ];
+            spans.push(Span::styled(" F5 ", kbg));
+            spans.push(Span::raw(format!(" {}   ", st.k_refresh)));
+            spans
+        }
+        Mode::IdentityFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_ident_menu)),
+        ],
         Mode::RancherFull => {
             let mut spans = vec![
                 Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
@@ -14093,6 +15042,17 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
     }
     if app.ranch_issued_present() {
         draw_ranch_issued_popup(f, app, area);
+    }
+    // Mirror image of the key-grab chain above — that one is checked topmost-first, this one draws
+    // topmost-last — so the overlay that answers the keys is the one on top.
+    if app.ident_pick.is_some() {
+        draw_ident_pick_popup(f, app, area);
+    }
+    if app.ident_form.is_some() {
+        draw_ident_form_popup(f, app, area);
+    }
+    if app.ident_invited_present() {
+        draw_ident_invited_popup(f, app, area);
     }
     // Above the menu it was opened from, and grabbing keys ahead of it too: the draw order is the
     // z-order, and the two have to agree.
@@ -14370,6 +15330,7 @@ fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
         DelReason::CassandraData => st.del_cassandra_data.to_string(),
         DelReason::MedusaBackup => st.del_medusa_backup.to_string(),
         DelReason::MedusaRunning => st.del_medusa_running.to_string(),
+        DelReason::KdtUserMembership => st.del_kdtuser_membership.to_string(),
         DelReason::Finalizers => st.del_finalizers.to_string(),
     }
 }
@@ -15738,6 +16699,249 @@ fn draw_ranch_issued_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(p, inner);
 }
 
+// The one and only display of a fresh invitation. Modal for the same reason the issued token is:
+// upstream refuses to log the link and the code or to write them into the status, so this window is
+// where they exist and nowhere else.
+//
+// The two are shown apart and copied apart. They are meant to travel by two different channels —
+// the code dictated out loud — and a single key that put both in one clipboard would hand an
+// interceptor of the mail everything they need.
+fn draw_ident_invited_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let guard = app.ident_invited.lock().expect("invitation poisoned");
+    let Some(invite) = guard.as_ref() else { return };
+    let st = lang::t(app.ai_language);
+
+    let popup_w = (area.width * 80 / 100).max(52).min(area.width);
+    let inner_w = popup_w.saturating_sub(4) as usize;
+    let warning_rows = wrapped_rows(&Line::from(st.ident_invite_warning), inner_w).max(1) as u16;
+    let hint_rows = wrapped_rows(&Line::from(st.ident_invite_hint), inner_w).max(1) as u16;
+    // An activation link carries a 32-byte token: it wraps on any sane terminal, and a link clipped
+    // at the frame edge is a link nobody can use.
+    let body = invite.link.clone().unwrap_or_else(|| invite.raw.clone());
+    let body_rows = wrapped_rows(&Line::from(body.as_str()), inner_w).max(1) as u16;
+    let popup_h = (warning_rows + hint_rows + body_rows + 10)
+        .min(area.height.saturating_sub(2))
+        .max(12);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(lang::fill(st.ident_invite_title, &[("user", &invite.user)]))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{k:<11}"), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let mut lines = Vec::new();
+    if !invite.expires.is_empty() {
+        lines.push(label(st.ident_lbl_expires, invite.expires.clone()));
+        lines.push(Line::from(""));
+    }
+    match (&invite.link, &invite.code) {
+        (Some(link), Some(code)) => {
+            lines.push(Line::from(Span::styled(st.ident_lbl_link, Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                link.clone(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(st.ident_lbl_code, Style::default().fg(DIM))));
+            lines.push(Line::from(Span::styled(
+                code.clone(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+        }
+        // The output could not be taken apart. It is shown verbatim rather than summarised: kdt
+        // never announces a code it did not find, and what the command printed is still the whole
+        // answer.
+        _ => {
+            for line in invite.raw.lines() {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        st.ident_invite_warning,
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(st.ident_invite_hint, Style::default().fg(DIM))));
+    lines.push(Line::from(""));
+
+    let kbg = Style::default().fg(Color::Black).bg(Color::White);
+    let mut keys = Vec::new();
+    if invite.link.is_some() && invite.code.is_some() {
+        keys.push(Span::styled(" l ", kbg));
+        keys.push(Span::raw(format!(" {}   ", st.k_ident_copy_link)));
+        keys.push(Span::styled(" c ", kbg));
+        keys.push(Span::raw(format!(" {}   ", st.k_ident_copy_code)));
+    } else {
+        keys.push(Span::styled(" y ", kbg));
+        keys.push(Span::raw(format!(" {}   ", st.k_ident_copy_all)));
+    }
+    keys.push(Span::styled(" Esc ", kbg));
+    keys.push(Span::raw(format!(" {}", st.k_back)));
+    lines.push(Line::from(keys));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+// The creation form. Two or three fields, one of which has the cursor.
+fn draw_ident_form_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(form) = app.ident_form.as_ref() else { return };
+    let st = lang::t(app.ai_language);
+
+    let rows = form.rows();
+    let popup_w = (area.width * 70 / 100).max(48).min(area.width);
+    let popup_h = (rows.len() as u16 * 2 + 8).min(area.height.saturating_sub(2)).max(10);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let title = match form.kind {
+        IdentFormKind::User => st.ident_form_user_title,
+        IdentFormKind::Group => st.ident_form_group_title,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let label = match row {
+            IdentFormRow::Name => st.ident_form_name,
+            IdentFormRow::Email => st.ident_form_email,
+            IdentFormRow::Display => st.ident_form_display,
+            IdentFormRow::Description => st.ident_form_description,
+        };
+        let selected = i == form.cursor;
+        let editing = selected && form.editing;
+        // The caret only shows on the field actually taking keys, so there is never a prompt
+        // waiting for input the keyboard is not going to.
+        let value = if editing {
+            format!("{}▏", form.value(*row))
+        } else {
+            form.value(*row).to_string()
+        };
+        let marker = if selected { "> " } else { "  " };
+        let value_style = if editing {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{label:<26}"), Style::default().fg(DIM)),
+            Span::styled(value, value_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    // The identity the apiserver will see, built the way the controller builds it. Shown while the
+    // name is being typed so nobody has to remember the prefix is added.
+    if form.kind == IdentFormKind::User && !form.name.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<28}", st.ident_lbl_subject), Style::default().fg(DIM)),
+            Span::styled(
+                format!("kdt:{}", form.name.trim()),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+    if let Some(e) = &form.error {
+        lines.push(Line::from(Span::styled(
+            e.clone(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(st.ident_form_hint, Style::default().fg(DIM))));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+// The membership picker: one line per candidate, ticked when it is already a member.
+fn draw_ident_pick_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(view) = app.ident_pick.as_ref() else { return };
+    let st = lang::t(app.ai_language);
+
+    let popup_w = (area.width * 60 / 100).max(40).min(area.width);
+    let popup_h = ((view.items.len() as u16).min(14) + 6)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let popup_area = centered_rect(popup_w, popup_h, area);
+    f.render_widget(Clear, popup_area);
+
+    let title = if view.from_user {
+        lang::fill(st.ident_pick_groups_title, &[("name", &view.anchor)])
+    } else {
+        lang::fill(st.ident_pick_members_title, &[("name", &view.anchor)])
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+
+    let items: Vec<ListItem> = view
+        .items
+        .iter()
+        .map(|(name, member, _)| {
+            let mark = if *member { "[x] " } else { "[ ] " };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    mark.to_string(),
+                    if *member {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+                Span::raw(name.clone()),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(view.cursor.min(view.items.len().saturating_sub(1))));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, body[0], &mut list_state);
+
+    let mut lines = Vec::new();
+    if let Some(e) = &view.error {
+        lines.push(Line::from(Span::styled(
+            e.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(st.ident_pick_hint, Style::default().fg(DIM))));
+    f.render_widget(Paragraph::new(lines), body[1]);
+}
+
 fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(menu) = app.action_menu.as_ref() else { return; };
     let st = lang::t(app.ai_language);
@@ -15804,6 +17008,7 @@ fn draw_action_menu_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
             }
             Some(MenuAction::RanchSetSetting) => st.menu_input_value,
             Some(MenuAction::K8cNodetool) => st.menu_input_nodetool,
+            Some(MenuAction::IdentInviteUser) => st.menu_input_validity,
             _ => st.menu_input_prompt,
         };
         Line::from(Span::styled(
@@ -19057,6 +20262,61 @@ fn argo_detail_lines(
     (title, lines)
 }
 
+// The identity rows stand in for their real object through apiVersion/kind/name, so `y`, `Ctrl-D`,
+// `e`, the search and the AI panel all work on them with no code of their own. Both kinds are
+// cluster-scoped, hence the empty namespace.
+fn ident_user_record(u: &IdentUser) -> EventRecord {
+    let st = lang::active();
+    let mut parts: Vec<String> = vec![u.subject()];
+    if !u.email.is_empty() {
+        parts.push(u.email.clone());
+    }
+    if !u.display_name.is_empty() {
+        parts.push(u.display_name.clone());
+    }
+    if !u.member_of.is_empty() {
+        parts.push(format!("{}={}", st.ident_lbl_groups, u.member_of.join(",")));
+    }
+    ranch_record(
+        &u.uid,
+        crate::identity::API_IDENTITY,
+        crate::identity::KIND_USER,
+        "",
+        &u.name,
+        u.phase.label(st),
+        parts.join(" · "),
+        &u.hints,
+    )
+}
+
+fn ident_group_record(g: &IdentGroup) -> EventRecord {
+    let st = lang::active();
+    let mut parts: Vec<String> = vec![g.effective_subject()];
+    if !g.description.is_empty() {
+        parts.push(g.description.clone());
+    }
+    if !g.members.is_empty() {
+        parts.push(format!("{}={}", st.ident_lbl_members, g.members.join(",")));
+    }
+    // The bindings go in the message so `/` finds the group from a ClusterRole name — which is how
+    // one asks "who has edit here" starting from the role.
+    for b in &g.bindings {
+        parts.push(b.label());
+    }
+    ranch_record(
+        &g.uid,
+        crate::identity::API_IDENTITY,
+        crate::identity::KIND_GROUP,
+        "",
+        &g.name,
+        // The reason column answers the question the view exists for: does this group grant
+        // anything at all.
+        if g.bindings.is_empty() { "Unbound" } else { "Bound" },
+        parts.join(" · "),
+        &g.hints,
+    )
+}
+
 fn ranch_severity(hints: &[crate::storage::Hint]) -> Severity {
     match hints.iter().map(|h| h.level).max() {
         Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
@@ -19646,6 +20906,235 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+// The phase colour. `Locked` is amber rather than red: it clears by itself, unlike a disabled
+// account, which stays blocked until someone lifts it.
+fn ident_phase_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
+    let style = match u.phase {
+        Phase::Active => Style::default().fg(Color::Green),
+        Phase::Pending => Style::default().fg(Color::Cyan),
+        Phase::Locked => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Phase::Disabled => Style::default().fg(Color::Red),
+        Phase::Unknown => Style::default().fg(DIM),
+    };
+    Cell::from(u.phase.label(st)).style(style)
+}
+
+// The INVITATION column. An expired invitation is the one state worth colouring: it looks like a
+// working invitation from the outside, and the person on the other end sees a link that refuses.
+fn ident_invite_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
+    let text = invitation_label(&u.invitation, st);
+    let style = match u.invitation {
+        Invitation::Expired { .. } => Style::default().fg(Color::Yellow),
+        Invitation::Pending { .. } => Style::default().fg(Color::Cyan),
+        _ => Style::default().fg(DIM),
+    };
+    Cell::from(text).style(style)
+}
+
+fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (loading, error, creds_error, totals, operator) = {
+        let s = app.ident_state.lock().expect("identity poisoned");
+        let totals = IdentTotals {
+            users: s.users.len(),
+            active: s.active_users(),
+            pending: s.users.iter().filter(|u| u.phase == Phase::Pending).count(),
+            groups: s.groups.len(),
+            unbound: s.unbound_groups(),
+        };
+        let operator = s
+            .controller
+            .as_ref()
+            .map(|c| c.namespace.clone())
+            .unwrap_or_else(|| "—".to_string());
+        (s.loading, s.error.clone(), s.creds_error.clone(), totals, operator)
+    };
+
+    let st = lang::t(app.ai_language);
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "identity"), ("e", e)])
+    } else if loading && app.ident_rows.is_empty() {
+        lang::fill(st.ui_title_loading, &[("view", "identity")])
+    } else {
+        match app.ident_world {
+            IdentWorld::Users => {
+                let mut t = lang::fill(
+                    st.ident_title_users,
+                    &[
+                        ("total", &totals.users.to_string()),
+                        ("active", &totals.active.to_string()),
+                        ("pending", &totals.pending.to_string()),
+                        ("ns", &operator),
+                    ],
+                );
+                // Said in the title, once, rather than as a dash on every row: the two columns it
+                // silences are the ones nothing else can answer.
+                if let Some(e) = &creds_error {
+                    t.push_str(" · ");
+                    t.push_str(&lang::fill(st.ident_creds_unreadable, &[("e", e)]));
+                }
+                t
+            }
+            IdentWorld::Groups => lang::fill(
+                st.ident_title_groups,
+                &[
+                    ("total", &totals.groups.to_string()),
+                    ("unbound", &totals.unbound.to_string()),
+                ],
+            ),
+        }
+    };
+
+    let (header, rows, widths) = ident_table_parts(app.ident_world, &app.ident_rows, st);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// The table itself, split out of the draw so a test can render it at several widths and check that
+// nothing eats the right border.
+fn ident_table_parts(
+    world: IdentWorld,
+    src: &[IdentRow],
+    st: &'static Strings,
+) -> (Row<'static>, Vec<Row<'static>>, Vec<Constraint>) {
+    let header_style =
+        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    match world {
+        IdentWorld::Users => {
+            let header = Row::new(vec![
+                Cell::from("NAME"), Cell::from("EMAIL"), Cell::from("PHASE"),
+                Cell::from("GROUPS"), Cell::from("INVITE"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    IdentRow::User(u) => Row::new(vec![
+                        Cell::from(u.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                        Cell::from(u.email.clone()).style(Style::default().fg(DIM)),
+                        ident_phase_cell(u, st),
+                        // The groups are what decides what the account can do, so they take the
+                        // slack rather than being cut first.
+                        Cell::from(if u.member_of.is_empty() {
+                            "—".to_string()
+                        } else {
+                            u.member_of.join(",")
+                        })
+                        .style(if u.member_of.is_empty() {
+                            Style::default().fg(DIM)
+                        } else {
+                            Style::default()
+                        }),
+                        ident_invite_cell(u, st),
+                        Cell::from(u.age.clone()).style(Style::default().fg(DIM)),
+                    ]),
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let name_w = col_width(
+                src.iter().map(|r| match r {
+                    IdentRow::User(u) => u.name.as_str(),
+                    _ => "",
+                }),
+                "NAME",
+                12,
+                30,
+            );
+            let email_w = col_width(
+                src.iter().map(|r| match r {
+                    IdentRow::User(u) => u.email.as_str(),
+                    _ => "",
+                }),
+                "EMAIL",
+                16,
+                34,
+            );
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(email_w),
+                Constraint::Length(9), Constraint::Min(14), Constraint::Length(8),
+                Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+        IdentWorld::Groups => {
+            let header = Row::new(vec![
+                Cell::from("NAME"), Cell::from("MEM"), Cell::from("UNKNOWN"),
+                Cell::from("RIGHTS"), Cell::from("DESCRIPTION"), Cell::from("AGE"),
+            ])
+            .style(header_style);
+            let rows = src
+                .iter()
+                .map(|row| match row {
+                    IdentRow::Group(g) => {
+                        // A group with no binding is the trap this view exists to show: everything
+                        // reconciles, and its members get 403 everywhere.
+                        let rights = if g.bindings.is_empty() {
+                            Cell::from("—").style(Style::default().fg(Color::Yellow))
+                        } else {
+                            Cell::from(g.bindings.len().to_string())
+                                .style(Style::default().fg(Color::Green))
+                        };
+                        let unknown = if g.unknown.is_empty() {
+                            Cell::from("").style(Style::default().fg(DIM))
+                        } else {
+                            Cell::from(g.unknown.join(","))
+                                .style(Style::default().fg(Color::Yellow))
+                        };
+                        Row::new(vec![
+                            Cell::from(g.name.clone())
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
+                            Cell::from(count_cell(g.resolved.len())),
+                            unknown,
+                            rights,
+                            Cell::from(g.description.clone()).style(Style::default().fg(DIM)),
+                            Cell::from(g.age.clone()).style(Style::default().fg(DIM)),
+                        ])
+                    }
+                    _ => Row::new(vec![Cell::from("")]),
+                })
+                .collect();
+            let name_w = col_width(
+                src.iter().map(|r| match r {
+                    IdentRow::Group(g) => g.name.as_str(),
+                    _ => "",
+                }),
+                "NAME",
+                12,
+                30,
+            );
+            let unknown_w = col_width(
+                src.iter().map(|r| match r {
+                    IdentRow::Group(g) => g.unknown.first().map(String::as_str).unwrap_or(""),
+                    _ => "",
+                }),
+                "UNKNOWN",
+                7,
+                24,
+            );
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(3),
+                Constraint::Length(unknown_w), Constraint::Length(6), Constraint::Min(16),
+                Constraint::Length(5),
+            ];
+            (header, rows, widths)
+        }
+    }
+}
+
+// The counters the two identity titles are built from, read under one lock.
+struct IdentTotals {
+    users: usize,
+    active: usize,
+    pending: usize,
+    groups: usize,
+    unbound: usize,
+}
+
 // The counters the four titles are built from, read under one lock.
 struct RanchTotals {
     users: usize,
@@ -19742,6 +21231,202 @@ fn draw_rancher_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .scroll((app.ranch_detail_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
+}
+
+fn draw_identity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let width = area.width.saturating_sub(2) as usize;
+    let Some(row) = app.ident_selected().cloned() else {
+        // With nothing selected the panel answers what the view is for: whether this cluster has
+        // local accounts at all, and where the operator lives when it does.
+        let s = app.ident_state.lock().expect("identity poisoned").clone();
+        let mut lines = Vec::new();
+        if let Some(e) = &s.error {
+            lines.push(Line::from(Span::styled(
+                e.clone(),
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(""));
+        }
+        if let Some(c) = &s.controller {
+            lines.push(ident_label_line(st.ident_lbl_operator, c.namespace.clone()));
+        }
+        if let Some(e) = &s.creds_error {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                lang::fill(st.ident_creds_unreadable, &[("e", e)]),
+                Style::default().fg(DIM),
+            )));
+        }
+        // On a cluster with nothing installed, the useful next move is the command — and `o` is
+        // where it lives, so the panel says so rather than leaving a blank frame.
+        if !s.installed {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                st.desc_ident_copy_install,
+                Style::default().fg(DIM),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(st.ident_empty_select, Style::default().fg(DIM))));
+        let p = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" identity "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let (title, mut lines) = ident_detail_lines(&row, st, width);
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.ident_detail_scroll > max_scroll {
+        app.ident_detail_scroll = max_scroll;
+    }
+    app.ident_detail_scroll = text_search_top(
+        app,
+        Mode::IdentityFull,
+        &mut lines,
+        visible,
+        app.ident_detail_scroll,
+        max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.ident_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+// 17 columns, because `unknown members` is 15 and a label flush against its value reads as one word.
+fn ident_label_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<17}"), Style::default().fg(DIM)),
+        Span::raw(value),
+    ])
+}
+
+fn ident_detail_lines(
+    row: &IdentRow,
+    st: &'static lang::Strings,
+    width: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let banner = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let label = ident_label_line;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let title = match row {
+        IdentRow::User(u) => {
+            // The identity the apiserver sees, first: the prefix is what keeps a `kdt:` account
+            // from inheriting a binding meant for someone of the same name in another directory.
+            lines.push(label(st.ident_lbl_subject, u.subject()));
+            lines.push(label(st.ident_lbl_email, u.email.clone()));
+            if !u.display_name.is_empty() {
+                lines.push(label(st.ident_lbl_display, u.display_name.clone()));
+            }
+            // kdt's phase and the controller's are shown side by side whenever they differ, so a
+            // `Locked` that exists only here is never mistaken for something the CRD says.
+            if !u.raw_phase.is_empty() && u.phase.label(st) != u.raw_phase {
+                lines.push(label(st.ident_lbl_status_phase, u.raw_phase.clone()));
+            }
+            lines.push(label(
+                st.ident_lbl_groups,
+                if u.member_of.is_empty() {
+                    st.ident_none.to_string()
+                } else {
+                    u.member_of.join(", ")
+                },
+            ));
+            if let Some(creds) = &u.creds {
+                match u.invitation {
+                    Invitation::Pending { expires } | Invitation::Expired { expires } => {
+                        lines.push(label(
+                            st.ident_lbl_invitation,
+                            format!(
+                                "{} ({})",
+                                crate::identity::format_stamp(expires),
+                                invitation_label(&u.invitation, st)
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(until) = creds.locked_until {
+                    lines.push(label(
+                        st.ident_lbl_locked_until,
+                        crate::identity::format_stamp(until),
+                    ));
+                }
+                if creds.failed_attempts > 0 {
+                    lines.push(label(
+                        st.ident_lbl_attempts,
+                        creds.failed_attempts.to_string(),
+                    ));
+                }
+            }
+            lines.push(label(st.lbl_age, u.age.clone()));
+            if !u.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    st.lbl_diagnostic,
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(hint_lines(&u.hints, width));
+            }
+            banner(format!(" {} · {} ", u.name, u.phase.label(st)))
+        }
+        IdentRow::Group(g) => {
+            // The subject verbatim, because the upstream guide asks that a binding reference this
+            // string rather than one retyped by hand.
+            lines.push(label(st.ident_lbl_subject, g.effective_subject()));
+            if !g.description.is_empty() {
+                lines.push(label(st.ident_lbl_description, g.description.clone()));
+            }
+            lines.push(label(
+                st.ident_lbl_members,
+                if g.resolved.is_empty() {
+                    st.ident_none.to_string()
+                } else {
+                    g.resolved.join(", ")
+                },
+            ));
+            if !g.unknown.is_empty() {
+                lines.push(label(st.ident_lbl_unknown, g.unknown.join(", ")));
+            }
+            // What the group actually grants. An empty list is the answer to "why do they get 403
+            // everywhere", so it is spelled out rather than left blank.
+            lines.push(label(
+                st.ident_lbl_bindings,
+                if g.bindings.is_empty() {
+                    st.ident_none.to_string()
+                } else {
+                    String::new()
+                },
+            ));
+            for b in &g.bindings {
+                lines.push(Line::from(vec![
+                    Span::styled("  · ".to_string(), Style::default().fg(DIM)),
+                    Span::raw(b.label()),
+                ]));
+            }
+            lines.push(label(st.lbl_age, g.age.clone()));
+            if !g.hints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    st.lbl_diagnostic,
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(hint_lines(&g.hints, width));
+            }
+            banner(format!(" {} ", g.name))
+        }
+    };
+
+    (title, lines)
 }
 
 // 13 columns, because `global roles` is 12 and a label flush against its value reads as one word.
@@ -27818,6 +29503,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_argo_detail(f, app, area);
         return;
     }
+    let is_identity_mode = matches!(view_mode(app), Mode::Identity | Mode::IdentityFull);
+    if is_identity_mode {
+        draw_identity_detail(f, app, area);
+        return;
+    }
     let is_configmaps_mode = matches!(view_mode(app), Mode::Configmaps | Mode::ConfigmapsFull);
     if is_configmaps_mode {
         draw_configmaps_detail(f, app, area);
@@ -30605,12 +32295,247 @@ mod palette_overlay_tests {
             Mode::RancherFull,
             Mode::Argo,
             Mode::ArgoFull,
+            Mode::Identity,
+            Mode::IdentityFull,
         ] {
             assert_eq!(palette_base_mode(mode), mode, "{mode:?} drawn as another view");
         }
         // The overlays have no layout of their own to fall back on.
         assert_eq!(palette_base_mode(Mode::AiPanel), Mode::Selection);
         assert_eq!(palette_base_mode(Mode::Diagnostic), Mode::Selection);
+    }
+}
+
+#[cfg(test)]
+mod identity_view_tests {
+    use super::*;
+    use crate::identity::{BindingRef, CredentialFacts};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // A row shaped like the ones a real cluster produces: a long name, a long address, several
+    // groups — everything that competes for the width the border needs.
+    fn user() -> IdentUser {
+        IdentUser {
+            name: "alice-martin.consultant".to_string(),
+            email: "alice.martin@a-rather-long-domain.example.com".to_string(),
+            display_name: "Alice Martin".to_string(),
+            disabled: false,
+            phase: Phase::Locked,
+            raw_phase: "Active".to_string(),
+            member_of: vec![
+                "lecteurs".to_string(),
+                "ops".to_string(),
+                "plateforme-astreinte".to_string(),
+            ],
+            invitation: Invitation::Expired { expires: 1_756_000_000 },
+            creds: Some(CredentialFacts {
+                invite_expires: Some(1_756_000_000),
+                locked_until: Some(1_900_000_000),
+                failed_attempts: 7,
+            }),
+            age: "142d".to_string(),
+            hints: vec![
+                crate::identity::Hint {
+                    level: crate::identity::HintLevel::Warn,
+                    text: "verrouillé après 7 échecs, et une phrase assez longue pour se replier \
+                           plusieurs fois dans un panneau étroit"
+                        .to_string(),
+                },
+            ],
+            uid: "ident|user|alice".to_string(),
+        }
+    }
+
+    fn group() -> IdentGroup {
+        IdentGroup {
+            name: "plateforme-astreinte".to_string(),
+            subject: "kdt:plateforme-astreinte".to_string(),
+            description: "astreinte plateforme, lecture seule hors incident".to_string(),
+            members: vec!["alice-martin.consultant".to_string(), "fantome".to_string()],
+            resolved: vec!["alice-martin.consultant".to_string()],
+            unknown: vec!["fantome".to_string()],
+            bindings: vec![BindingRef {
+                kind: "ClusterRoleBinding".to_string(),
+                namespace: String::new(),
+                name: "kdt-plateforme-astreinte-view".to_string(),
+                role: "ClusterRole/view".to_string(),
+            }],
+            age: "89d".to_string(),
+            hints: vec![crate::identity::Hint {
+                level: crate::identity::HintLevel::Warn,
+                text: "members sans compte : fantome".to_string(),
+            }],
+            uid: "ident|group|plateforme".to_string(),
+        }
+    }
+
+    fn rows() -> Vec<(IdentWorld, Vec<IdentRow>)> {
+        vec![
+            (IdentWorld::Users, vec![IdentRow::User(Box::new(user()))]),
+            (IdentWorld::Groups, vec![IdentRow::Group(Box::new(group()))]),
+        ]
+    }
+
+    #[test]
+    fn the_right_border_survives_every_width_in_both_worlds() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let border = ratatui::symbols::border::PLAIN;
+        for (world, src) in rows() {
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, 12)).expect("test terminal");
+                terminal
+                    .draw(|f| {
+                        let (header, rows, widths) = ident_table_parts(world, &src, st);
+                        let table = Table::new(rows, widths)
+                            .header(header)
+                            .block(Block::default().borders(Borders::ALL).title(" identity "))
+                            .highlight_symbol("> ");
+                        f.render_widget(table, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                for y in 0..12 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        11 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(
+                        cell.symbol(),
+                        expected,
+                        "right border eaten at width {width}, row {y}, world {world:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_detail_panel_keeps_its_frame_at_every_width() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let border = ratatui::symbols::border::PLAIN;
+        for (_, src) in rows() {
+            let row = src.into_iter().next().expect("one row");
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+                let (title, lines) = ident_detail_lines(&row, st, width.saturating_sub(2) as usize);
+                terminal
+                    .draw(|f| {
+                        let p = Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(title.clone()),
+                            );
+                        f.render_widget(p, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                for y in 0..24 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        23 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(cell.symbol(), expected, "frame eaten at width {width}, row {y}");
+                }
+            }
+        }
+    }
+
+    // The whole point of showing `Locked`: the controller never writes it, so the panel has to keep
+    // the phase the CRD *does* carry next to it rather than replacing it silently.
+    #[test]
+    fn the_detail_panel_shows_the_controllers_own_phase_beside_kdts() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let row = IdentRow::User(Box::new(user()));
+        let (_, lines) = ident_detail_lines(&row, st, 100);
+        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("status.phase"), "the CRD's own phase is not shown: {text}");
+        assert!(text.contains("Active"));
+        // And the subject, which is what a binding has to reference.
+        assert!(text.contains("kdt:alice-martin.consultant"));
+    }
+
+    // A group with no binding grants nothing. The panel has to say so in words, because a blank
+    // line reads as "nothing to report" — which is the opposite of the truth.
+    #[test]
+    fn a_group_with_no_binding_says_so_rather_than_leaving_the_line_blank() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let bare = IdentGroup { bindings: Vec::new(), ..group() };
+        let (_, lines) = ident_detail_lines(&IdentRow::Group(Box::new(bare)), st, 100);
+        let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains(st.ident_none), "an unbound group renders as blank: {text}");
+    }
+
+    // The form's own refusals, and only those: everything else is the apiserver's to say.
+    #[test]
+    fn the_form_refuses_only_what_it_can_rule_out_by_itself() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let mut form = IdentFormView::new(IdentFormKind::User);
+        assert!(form.validate(st).is_err());
+        form.name = "alice".to_string();
+        assert!(form.validate(st).is_err(), "a user with no email must not be sent");
+        form.email = "alice@example.com".to_string();
+        assert!(form.validate(st).is_ok());
+        // A name kdt has no business judging goes to the apiserver, which owns the rules.
+        form.name = "Alice_Martin".to_string();
+        assert!(form.validate(st).is_ok());
+        // A group needs a name and nothing else.
+        let mut g = IdentFormView::new(IdentFormKind::Group);
+        assert!(g.validate(st).is_err());
+        g.name = "ops".to_string();
+        assert!(g.validate(st).is_ok());
+    }
+
+    // The picker writes on the group either way round, and carries the index a removal needs.
+    #[test]
+    fn the_picker_writes_on_the_group_from_whichever_side_it_was_opened() {
+        let from_user = IdentPickView {
+            anchor: "alice".to_string(),
+            from_user: true,
+            items: vec![("ops".to_string(), false, 0)],
+            cursor: 0,
+            error: None,
+        };
+        match from_user.toggle() {
+            Some(IdentityWrite::AddMember { group, user }) => {
+                assert_eq!(group, "ops");
+                assert_eq!(user, "alice");
+            }
+            other => panic!("expected an add on the group, got {other:?}"),
+        }
+
+        let from_group = IdentPickView {
+            anchor: "ops".to_string(),
+            from_user: false,
+            items: vec![("alice".to_string(), true, 3)],
+            cursor: 0,
+            error: None,
+        };
+        match from_group.toggle() {
+            Some(IdentityWrite::RemoveMember { group, user, index }) => {
+                assert_eq!(group, "ops");
+                assert_eq!(user, "alice");
+                assert_eq!(index, 3, "the index the guarded patch tests against is lost");
+            }
+            other => panic!("expected a removal on the group, got {other:?}"),
+        }
+    }
+
+    // Only the invitation opens the entry prefilled: an empty box that expects `72h` is how one
+    // asks for three days and gets seventy-two seconds.
+    #[test]
+    fn the_validity_entry_opens_on_the_value_the_server_itself_defaults_to() {
+        assert!(menu_action_takes_input(Some(&MenuAction::IdentInviteUser)));
+        assert!(menu_action_free_text(Some(&MenuAction::IdentInviteUser)));
+        assert_eq!(DEFAULT_VALIDITY, "72h");
     }
 }
 

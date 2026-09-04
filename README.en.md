@@ -74,7 +74,7 @@ IPv6 for the API server, IPv4 is tried first. The app starts on the events view.
 namespaced objects takes a namespace argument (`:cm kube-system`, `:pods istio-system`, `:certs
 prod`) — marked `[ns]` below; `all` (or `*`/`0`) targets every namespace. The namespace picked this
 way becomes the session scope, shown in the `ns=` banner. The cluster-scoped views (`nodes`,
-`capacity`, `pv`, `rancher`) and those built as a graph across namespaces (`flux`,
+`capacity`, `pv`, `rancher`, `identity`) and those built as a graph across namespaces (`flux`,
 `reflector`, `argocd`, `kyverno`) take no argument, and say so if given one. `rbac` takes a namespace
 while still reading the whole cluster: the scope picks the rows that are drawn, not what is read (see
 the RBAC view).
@@ -99,13 +99,15 @@ the RBAC view).
 | `k8ssandra [ns]` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, ring side |
 | `medusa [ns]` | `med`, `medusabackup`, `cassbackup` | K8ssandra, Medusa backup side |
 | `reaper [ns]` | `rea`, `repair`, `repairs` | K8ssandra, operations and Reaper |
-| `rancher` | `ranch`, `cattle`, `users`, `identities` | Rancher, accounts and identities |
+| `rancher` | `ranch`, `cattle` | Rancher, accounts and identities |
 | `projects` | `project`, `proj` | Rancher, projects and namespaces |
 | `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, tokens |
 | `argocd` | `argo`, `acd`, `apps`, `applications` | Argo CD, Applications side |
 | `appsets` | `appset`, `applicationsets` | Argo CD, ApplicationSets side |
 | `appprojects` | `appproject`, `appproj` | Argo CD, AppProjects side |
 | `argorepos` | `argorepo`, `argoclusters` | Argo CD, registered repositories and clusters |
+| `identity` | `id`, `ident`, `users`, `identities`, `comptes` | kdt-identity, local accounts |
+| `groups` | `group`, `kdtgroup`, `kdtgroups` | kdt-identity, groups |
 | `configmaps [ns]` | `cm`, `config` | ConfigMaps |
 | `services [ns]` | `svc`, `service` | Services / Endpoints |
 | `forward` | `pf`, `portforward`, `tunnels` | Running port-forwards (over the current view) |
@@ -155,6 +157,7 @@ the RBAC view).
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
+| kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
 | Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
@@ -336,6 +339,30 @@ shows the query and its effect (`/coredns  (3)`).
     shown once and written nowhere), **change the TTL** of a token, **revoke** it (deleting the
     `Token` object is the only real revocation), **set** a lifetime setting. These are the same
     objects one would `kubectl apply` by hand; kdt adds no privilege.
+- **kdt-identity** (`:identity`, `:groups`) — local cluster accounts and groups
+  (`identity.kdt.sh/v1alpha1`, the `KdtUser` and `KdtGroup` CRDs, both cluster-scoped). Two worlds
+  through `g`, `f` filters ALL / PROBLEMS. When `identity.kdt.sh` is absent the view says so — and
+  points at `:rancher` when Rancher does answer on this cluster.
+  - *users*: name, email, phase, groups, invitation, age. The phase comes from `status.phase`,
+    except `Locked`, which kdt establishes itself: the controller never writes it, and the lockout
+    lives in the credential Secret. The INVITE column says what the `Pending` phase cannot tell
+    apart — an account never invited from an invitation in flight — and flags the ones that expired.
+  - *groups*: resolved members, unknown members (`status.unknownMembers`, the ones the controller
+    logs on every reconciliation), and **RIGHTS** — the number of RoleBindings and
+    ClusterRoleBindings targeting `status.subject`. A yellow `—` there marks a group nothing
+    references: its members authenticate and then get 403 everywhere, while everything reconciles.
+    The detail names each binding and the role it grants.
+  - kdt reads the `kdt-identity-cred-<user>` Secret **by name, never with `list`** — the chart's
+    Role deliberately withholds that verb so accounts cannot be enumerated — and takes only three
+    non-secret facts from it: when the pending invitation expires, whether the account is locked,
+    and how many attempts failed. An RBAC refusal is stated once in the title, not repeated as a
+    dash on every row.
+  - `o`: **invite** (see below), **disable / enable** (`spec.disabled`), **membership** (a picker:
+    from an account it ticks its groups, from a group it ticks its accounts), **create** a user or a
+    group, **copy the RBAC subject** as the controller publishes it. On a cluster with no
+    kdt-identity, `o` offers to **copy the install sequence**, prefilled with the current context
+    and the kubeconfig's `server`; kdt installs nothing itself.
+
 - **Argo CD** (`:argocd`, `:appsets`, `:appprojects`, `:argorepos`) — four worlds through `g`, `f`
   filters ALL / PROBLEMS.
   - *apps*: every `Application` with **both of its states side by side**, `sync` and `health`. A
@@ -393,8 +420,8 @@ shows the query and its effect (`/coredns  (3)`).
   views follow the session namespace scope (`:cm <ns>`, `n`/`0`) and then list that namespace only.
 - **Diagnostic** (`D`) — a battery of checks: API health, version, nodes, system namespaces,
   `kube-system` pods, CoreDNS, CNI, validating and mutating webhooks, Rancher, failing pods, PVs,
-  storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, K8ssandra, RBAC, recent
-  warnings. A module absent from the cluster is reported as Info. `r` re-runs, `p`/`P` export the
+  storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, Argo CD, kdt-identity,
+  K8ssandra, RBAC, recent warnings. A module absent from the cluster is reported as Info. `r` re-runs, `p`/`P` export the
   PDF.
 - **Extract** (`X`) — full PDF report of the cluster state into `~/Downloads`.
 - **AI** (`i`) — sends the current context to an OpenAI-compatible API; the answer is streamed (SSE)
@@ -415,6 +442,7 @@ through guardrails.
 | `Ctrl-R` | Delete an admission config, strip finalizers | Type the object's exact name |
 | `r` (Argo CD) | The `argocd.argoproj.io/refresh` annotation, the `.operation` field, `status.operationState.phase` | Armed confirmation in the menu; prune is its own entry, never a checkbox |
 | `o` (Rancher) | Create a `Token`, patch its `.ttl`, delete a `Token`, patch a `Setting` | Armed confirmation, then an entry whose unit is shown; refused on a downstream cluster; the issued secret is shown once and written nowhere |
+| `o` (identity) | Create a `KdtUser` / `KdtGroup`, patch `spec.disabled`, JSON patch on `spec.members`, exec `kdt-identity-server invite` in the controller pod | Armed confirmation; membership is **always** a JSON patch (a merge patch would replace the array and drop the other members), and a removal is guarded by a `test` on the value; the invitation link and code are shown once and written nowhere |
 
 **No warning blocks**, but **the default answer is no**: `Enter` and `Esc` both cancel, and only the
 key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, drain) requires
@@ -437,6 +465,20 @@ key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, 
 - **`E`** — shell into a pod: kdt **hands the terminal to `kubectl exec -it`** and takes it back
   afterwards, exactly as `e` hands it to `$EDITOR`. It is the only feature depending on an external
   binary, and a missing one is reported before the screen is given away.
+- **Inviting (kdt-identity)** — `kdt-identity-server invite` needs the operator's own configuration
+  and credential store: it only runs inside the controller pod. kdt locates that pod by its labels
+  (`app.kubernetes.io/name=kdt-identity`, `component=controller`) rather than by the
+  `<release>-controller` name, which `fullnameOverride` changes. The exec is **native** (the API's
+  websocket, not `kubectl`) and the command is passed as argv: the image is `FROM scratch` and has
+  neither a shell nor a `PATH`. The output is captured, never handed to the terminal — the link and
+  the code would otherwise land in the scrollback and the tmux history, which is exactly what
+  kdt-identity avoids elsewhere by never logging them.
+  The link and the code appear in a modal overlay, once, and are **copied separately** (`l` and
+  `c`): they are meant to travel through two different channels, the code by voice, and one
+  clipboard holding both would undo that separation. If kdt could not recognise the two fields in
+  the output, it shows that output as-is and offers only the whole-output copy (`y`) — it never
+  announces a code it did not find. The validity is typed, prefilled with the server's own default
+  (`72h`).
 
 ## Configuration
 
@@ -542,6 +584,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
 | `argocd.rs` | Argo CD: Applications, ApplicationSets, AppProjects, repositories and clusters |
 | `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens and TTL settings |
+| `identity.rs` | kdt-identity: local accounts and groups, invitation by exec into the controller pod |
 | `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, the Cassandra management API through the apiserver proxy, and `nodetool` run as a Job |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |

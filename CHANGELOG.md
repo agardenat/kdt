@@ -8,6 +8,29 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [1.26.0] — 2026-09-04
+
+- **feat(identity)** — vue `:identity` : comptes et groups locaux de kdt-identity, avec la colonne
+  RIGHTS qui dit ce que le système ne dit nulle part — un group que rien ne référence authentifie
+  ses membres et ne leur accorde rien, alors que tous les objets réconcilient
+- **feat(identity)** — `o` invite : `kdt-identity-server invite` exécuté nativement dans le pod
+  contrôleur (localisé par ses labels, pas par le nom `<release>-controller` que `fullnameOverride`
+  change), sortie capturée et jamais rendue au terminal. Le lien et le code s'affichent une seule
+  fois et se copient **séparément** : ils sont faits pour voyager par deux canaux différents
+- **feat(identity)** — création de user et de group, `spec.disabled`, et appartenance par sélecteur.
+  L'appartenance est toujours un JSON patch, jamais un merge : un merge patch remplace
+  `spec.members` en entier et efface les autres membres
+- **feat(identity)** — la phase `Locked` est établie par kdt depuis le Secret de credentials, que le
+  contrôleur ne renseigne jamais dans le status ; la colonne INVITE distingue un compte jamais
+  invité d'une invitation en cours ou expirée
+- **feat(diagnostic)** — module kdt-identity : groups sans binding, members sans compte, comptes
+  verrouillés. Absent du cluster ⇒ Info
+- **feat(delete)** — supprimer un `KdtUser` annonce que son nom restera dans les `members` des
+  groups qui le citent
+- **change(palette)** — `users`, `user`, `identities`, `identites` ouvrent désormais `:identity` et
+  non plus `:rancher`, qui garde `ranch` et `cattle` : chaque vue est nommée par sa source, et
+  celle-ci est la seule que kdt peut écrire
+
 ## [1.25.0] — 2026-09-02
 
 - **feat(k8ssandra)** — `x` sur un node : commande `nodetool` libre lancée dans un Job qui survit à la fermeture de kdt

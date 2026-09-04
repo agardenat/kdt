@@ -29,6 +29,7 @@ use crate::storage::{fetch_storage, new_storage_state};
 use crate::capacity::{fetch_capacity, new_capacity_state};
 use crate::rbac::{critical_namespaces, fetch_rbac, new_rbac_state, Severity};
 use crate::argocd::{fetch_argocd, new_argo_state};
+use crate::identity::{fetch_identity, new_identity_state, Phase};
 use crate::reflector::{fetch_reflector, new_reflector_state};
 use crate::k8ssandra::{fetch_k8ssandra, new_k8c_state};
 
@@ -146,6 +147,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     check_velero(&client, &state, run_id).await;
     check_reflector(&client, &state, run_id).await;
     check_argocd(&client, &state, run_id).await;
+    check_identity(&client, &state, run_id).await;
     check_k8ssandra(&client, &state, run_id).await;
     check_rbac(&client, &state, run_id).await;
     check_recent_warnings(&client, &state, run_id).await;
@@ -1821,6 +1823,76 @@ async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 ),
             ));
             status = worse(status, DiagStatus::Err);
+        }
+        status
+    };
+    finish_step(state, run_id, idx, status, lines);
+}
+
+// kdt-identity, through the very fetch the view uses: a second set of queries here would be a
+// second thing to keep true.
+//
+// The finding worth the step is the one nothing else surfaces: a group nobody bound. Its members
+// authenticate and then get 403 everywhere, and every object involved reconciles perfectly.
+async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(
+        state,
+        run_id,
+        active().diag_step_identity,
+        "kubectl get kdtusers,kdtgroups",
+    ) else {
+        return;
+    };
+    let ident = new_identity_state();
+    fetch_identity(client.clone(), ident.clone()).await;
+    let s = ident.lock().expect("identity poisoned");
+    let mut lines = Vec::new();
+    let status = if !s.installed {
+        // Absence is not a problem to report: most clusters have no local accounts at all.
+        lines.push((LineColor::Info, active().diag_identity_absent.into()));
+        DiagStatus::Info
+    } else {
+        let mut status = DiagStatus::Info;
+        let unbound = s.unbound_groups();
+        let locked = s.users.iter().filter(|u| u.phase == Phase::Locked).count();
+        lines.push((
+            if unbound > 0 { LineColor::Warn } else { LineColor::Ok },
+            fill(
+                active().diag_identity_summary,
+                &[
+                    ("users", &s.users.len().to_string()),
+                    ("active", &s.active_users().to_string()),
+                    ("groups", &s.groups.len().to_string()),
+                    ("unbound", &unbound.to_string()),
+                ],
+            ),
+        ));
+        if locked > 0 {
+            lines.push((
+                LineColor::Warn,
+                fill(active().diag_identity_locked, &[("n", &locked.to_string())]),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        for g in s.groups.iter().filter(|g| g.bindings.is_empty()).take(8) {
+            lines.push((
+                LineColor::Warn,
+                fill(
+                    active().diag_identity_unbound,
+                    &[("group", &g.name), ("subject", &g.effective_subject())],
+                ),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        for g in s.groups.iter().filter(|g| !g.unknown.is_empty()).take(8) {
+            lines.push((
+                LineColor::Warn,
+                fill(
+                    active().diag_identity_unknown,
+                    &[("group", &g.name), ("members", &g.unknown.join(", "))],
+                ),
+            ));
+            status = worse(status, DiagStatus::Warn);
         }
         status
     };

@@ -75,7 +75,7 @@ vue évènements.
 lignes sont des objets namespacés accepte un namespace en argument (`:cm kube-system`, `:pods
 istio-system`, `:certs prod`) — marquées `[ns]` ci-dessous ; `all` (ou `*`/`0`) cible tous les
 namespaces. Le namespace ainsi choisi devient la portée de la session, affichée dans le bandeau
-`ns=`. Les vues cluster (`nodes`, `capacity`, `pv`, `rancher`) et celles construites en graphe entre
+`ns=`. Les vues cluster (`nodes`, `capacity`, `pv`, `rancher`, `identity`) et celles construites en graphe entre
 namespaces (`flux`, `reflector`, `argocd`, `kyverno`) n'acceptent pas d'argument et le disent
 si on leur en donne un. `rbac` prend un namespace tout en continuant de lire tout le cluster : la
 portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
@@ -100,13 +100,15 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | `k8ssandra [ns]` | `k8c`, `cassandra`, `cass`, `datacenter` | K8ssandra / Cassandra, côté ring |
 | `medusa [ns]` | `med`, `medusabackup`, `cassbackup` | K8ssandra, côté sauvegardes Medusa |
 | `reaper [ns]` | `rea`, `repair`, `réparation` | K8ssandra, côté opérations et Reaper |
-| `rancher` | `ranch`, `cattle`, `users`, `identities` | Rancher, côté comptes et identités |
+| `rancher` | `ranch`, `cattle` | Rancher, côté comptes et identités |
 | `projects` | `project`, `proj` | Rancher, côté projects et namespaces |
 | `tokens` | `token`, `apikey`, `kubeconfigs` | Rancher, côté jetons |
 | `argocd` | `argo`, `acd`, `apps`, `applications` | Argo CD, côté Applications |
 | `appsets` | `appset`, `applicationsets` | Argo CD, côté ApplicationSets |
 | `appprojects` | `appproject`, `appproj` | Argo CD, côté AppProjects |
 | `argorepos` | `argorepo`, `argoclusters` | Argo CD, côté repositories et clusters enregistrés |
+| `identity` | `id`, `ident`, `users`, `identities`, `comptes` | kdt-identity, côté comptes locaux |
+| `groups` | `group`, `kdtgroup`, `kdtgroups` | kdt-identity, côté groups |
 | `configmaps [ns]` | `cm`, `config` | ConfigMaps |
 | `services [ns]` | `svc`, `service` | Services / Endpoints |
 | `forward` | `pf`, `portforward`, `tunnels` | Port-forwards en cours (superposé à la vue courante) |
@@ -156,6 +158,7 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `x` commande nodetool en Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
+| kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (inviter, désactiver/réactiver, appartenance, créer, copier le subject) · dans l'overlay d'invitation : `l` copier le lien, `c` copier le code |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
@@ -339,6 +342,29 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     affiché une seule fois et écrit nulle part), **changer le TTL** d'un token, **le révoquer**
     (supprimer l'objet `Token` est la seule révocation réelle), **régler un setting** de durée de
     vie. Ce sont les mêmes objets qu'un `kubectl apply` à la main ; kdt n'ajoute aucun privilège.
+- **kdt-identity** (`:identity`, `:groups`) — comptes et groups locaux de cluster
+  (`identity.kdt.sh/v1alpha1`, CRD `KdtUser` et `KdtGroup`, tous deux cluster-scoped). Deux mondes
+  par `g`, `f` filtre ALL / PROBLEMS. Quand `identity.kdt.sh` est absent, la vue le dit — et renvoie
+  vers `:rancher` si Rancher répond sur ce cluster.
+  - *users* : nom, email, phase, groups, invitation, âge. La phase vient de `status.phase`, sauf
+    `Locked` que kdt établit lui-même : le contrôleur ne l'écrit jamais, l'état de verrouillage vit
+    dans le Secret de credentials. La colonne INVITE dit ce que la phase `Pending` ne distingue pas,
+    un compte jamais invité d'une invitation en cours, et signale celle qui a expiré.
+  - *groups* : membres résolus, membres inconnus (`status.unknownMembers`, ceux que le contrôleur
+    journalise à chaque réconciliation), et **RIGHTS** — le nombre de RoleBindings et
+    ClusterRoleBindings qui visent `status.subject`. Un `—` jaune y signale un group que rien ne
+    référence : ses membres s'authentifient et prennent des 403 partout, alors que tout réconcilie.
+    Le détail nomme chaque binding et le rôle qu'il accorde.
+  - kdt lit le Secret `kdt-identity-cred-<user>` **par son nom, jamais en `list`** — le Role du
+    chart retire délibérément ce verbe pour empêcher l'énumération des comptes — et n'en tire que
+    trois faits non secrets : expiration de l'invitation en cours, verrouillage, nombre d'échecs.
+    Un refus RBAC est annoncé une fois dans le titre, pas répété en tirets sur chaque ligne.
+  - `o` : **inviter** (voir plus bas), **désactiver / réactiver** (`spec.disabled`), **appartenance**
+    (sélecteur : depuis un compte il coche ses groups, depuis un group il coche ses comptes),
+    **créer** un user ou un group, **copier le subject** RBAC tel que le contrôleur le publie. Sur un
+    cluster sans kdt-identity, `o` propose de **copier la séquence d'installation**, préremplie avec
+    le contexte courant et le `server` du kubeconfig ; kdt n'installe rien lui-même.
+
 - **Argo CD** (`:argocd`, `:appsets`, `:appprojects`, `:argorepos`) — quatre mondes par `g`, `f`
   filtre ALL / PROBLEMS.
   - *apps* : chaque `Application` avec **ses deux états côte à côte**, `sync` et `health`. Un
@@ -399,8 +425,8 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   ne listent alors que ce namespace.
 - **Diagnostic** (`D`) — batterie de vérifications : santé de l'API, version, nodes, namespaces
   système, pods de `kube-system`, CoreDNS, CNI, webhooks validating et mutating, Rancher, pods en
-  erreur, PV, stockage, capacité, Flux, cert-manager, Kyverno, Velero, Reflector, K8ssandra, RBAC,
-  warnings récents. Un module absent du cluster est rapporté en Info. `r` relance, `p`/`P`
+  erreur, PV, stockage, capacité, Flux, cert-manager, Kyverno, Velero, Reflector, Argo CD,
+  kdt-identity, K8ssandra, RBAC, warnings récents. Un module absent du cluster est rapporté en Info. `r` relance, `p`/`P`
   exportent en PDF.
 - **Extraction** (`X`) — rapport PDF complet de l'état du cluster dans `~/Downloads`.
 - **IA** (`i`) — envoie le contexte courant à une API compatible OpenAI ; la réponse est streamée
@@ -421,6 +447,7 @@ déclenche explicitement, et elles passent par des garde-fous.
 | `Ctrl-R` | Suppression d'une config d'admission, retrait de finalizers | Saisie du nom exact de l'objet |
 | `r` (Argo CD) | Annotation `argocd.argoproj.io/refresh`, champ `.operation`, `status.operationState.phase` | Confirmation armée dans le menu ; le prune est une entrée distincte, jamais une option cochée |
 | `o` (Rancher) | Création d'un `Token`, patch de son `.ttl`, suppression d'un `Token`, patch d'un `Setting` | Confirmation armée, puis saisie dont l'unité est affichée ; refusé sur un cluster downstream ; le secret émis n'est montré qu'une fois et n'est écrit nulle part |
+| `o` (identity) | Création d'un `KdtUser` / `KdtGroup`, patch de `spec.disabled`, JSON patch sur `spec.members`, exec de `kdt-identity-server invite` dans le pod contrôleur | Confirmation armée ; l'appartenance est **toujours** un JSON patch (un merge patch remplacerait le tableau et effacerait les autres membres), le retrait est gardé par un `test` sur la valeur ; le lien et le code d'invitation ne sont montrés qu'une fois et ne sont écrits nulle part |
 
 **Aucun avertissement ne bloque**, mais **la réponse par défaut est non** : `Entrée` et `Esc`
 annulent, seule la touche qui a ouvert le panneau avance vers l'écriture. Un constat ⛔ (`e`,
@@ -443,6 +470,20 @@ annulent, seule la touche qui a ouvert le panneau avance vers l'écriture. Un co
 - **`E`** — shell dans un pod : kdt **rend le terminal à `kubectl exec -it`** puis le reprend, comme
   `e` le rend à `$EDITOR`. C'est la seule fonction qui dépend d'un binaire externe ; son absence est
   dite avant que l'écran ne soit rendu.
+- **Inviter (kdt-identity)** — `kdt-identity-server invite` a besoin de la configuration et du
+  magasin de credentials de l'opérateur : elle ne s'exécute que dans le pod contrôleur. kdt le
+  localise par ses labels (`app.kubernetes.io/name=kdt-identity`, `component=controller`) et non par
+  le nom `<release>-controller`, que `fullnameOverride` change. L'exécution est **native** (websocket
+  de l'API, pas `kubectl`) et la commande passe en argv : l'image est `FROM scratch`, elle n'a ni
+  shell ni `PATH`. La sortie est capturée, jamais rendue au terminal — le lien et le code
+  atterriraient sinon dans le scrollback et l'historique tmux, ce que kdt-identity s'interdit
+  par ailleurs en ne les journalisant pas.
+  Le lien et le code s'affichent dans un overlay modal, une seule fois, et **se copient séparément**
+  (`l` et `c`) : ils sont faits pour voyager par deux canaux différents, le code de vive voix, et un
+  presse-papier portant les deux annulerait cette séparation. Si kdt n'a pas su reconnaître les deux
+  champs dans la sortie, il affiche celle-ci telle quelle et n'offre que la copie intégrale (`y`) —
+  il n'annonce jamais un code qu'il n'a pas trouvé. La durée de validité se saisit, préremplie sur
+  le défaut du serveur (`72h`).
 
 ## Configuration
 
@@ -550,6 +591,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `velero.rs` | Velero : backups, schedules (cron évalué), restaurations, locations |
 | `argocd.rs` | Argo CD : Applications, ApplicationSets, AppProjects, repositories et clusters |
 | `rancher.rs` | Rancher : comptes et identités réelles, bindings, projects, tokens et settings de TTL |
+| `identity.rs` | kdt-identity : comptes et groups locaux, invitation par exec dans le pod contrôleur |
 | `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, l'API de management Cassandra via le proxy apiserver, et `nodetool` lancé en Job |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |

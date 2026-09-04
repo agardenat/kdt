@@ -21,6 +21,7 @@ mod exec;
 mod extract;
 mod flux;
 mod glyphs;
+mod identity;
 mod k8ssandra;
 mod kyverno;
 mod lang;
