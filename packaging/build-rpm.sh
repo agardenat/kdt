@@ -12,8 +12,8 @@ install -Dm755 "$BIN" "$TOP/SOURCES/$NAME"
 
 cat > "$TOP/SPECS/$NAME.spec" <<EOF
 Name:           $NAME
-Version:        $VERSION
-Release:        1%{?dist}
+Version:        $RPM_VERSION
+Release:        $RPM_RELEASE%{?dist}
 Summary:        $SUMMARY
 License:        $LICENSE
 BuildArch:      $ARCH
@@ -30,7 +30,7 @@ install -Dm755 %{_sourcedir}/$NAME %{buildroot}%{_bindir}/$NAME
 %{_bindir}/$NAME
 
 %changelog
-* $(LC_ALL=C date '+%a %b %d %Y') $MAINTAINER - $VERSION-1
+* $(LC_ALL=C date '+%a %b %d %Y') $MAINTAINER - $RPM_VERSION-$RPM_RELEASE
 - Build $VERSION
 EOF
 
@@ -40,4 +40,4 @@ rpmbuild \
     --define "_build_id_links none" \
     -bb "$TOP/SPECS/$NAME.spec"
 
-echo ">> $(find "$DIST" -maxdepth 2 -name "${NAME}-${VERSION}-1*.rpm" | head -n1)"
+echo ">> $(find "$DIST" -maxdepth 2 -name "${NAME}-${RPM_VERSION}-${RPM_RELEASE}*.rpm" | head -n1)"

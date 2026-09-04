@@ -8,7 +8,7 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
-## [1.26.0] — 2026-09-04
+## [1.26.0-beta.1] — 2026-09-04
 
 - **feat(identity)** — vue `:identity` : comptes et groups locaux de kdt-identity, avec la colonne
   RIGHTS qui dit ce que le système ne dit nulle part — un group que rien ne référence authentifie
