@@ -1997,6 +1997,12 @@ pub struct App {
     ident_invited: std::sync::Arc<std::sync::Mutex<Option<IdentInvite>>>,
     ident_form: Option<IdentFormView>,
     ident_pick: Option<IdentPickView>,
+    // The object a creation is waiting for, by name. A `KdtGroup` created from the accounts world
+    // is invisible until the view moves to the groups, and its uid does not exist yet — so the
+    // landing is held by name until the refresh that carries the row arrives. Any deliberate move
+    // of the cursor drops it: the operator went somewhere else, and hijacking the selection a tick
+    // later would be a surprise.
+    ident_pending: Option<String>,
     pub reflector_state: SharedReflector,
     refl_world: ReflWorld,
     refl_filter: ReflFilter,
@@ -2295,6 +2301,7 @@ impl App {
             ident_invited: std::sync::Arc::new(std::sync::Mutex::new(None)),
             ident_form: None,
             ident_pick: None,
+            ident_pending: None,
             reflector_state: new_reflector_state(),
             refl_world: ReflWorld::Sources,
             refl_filter: ReflFilter::All,
@@ -9690,6 +9697,7 @@ impl App {
     fn enter_identity_mode(&mut self, world: IdentWorld) {
         self.mode = Mode::Identity;
         self.ident_world = world;
+        self.ident_pending = None;
         self.ident_detail_scroll = 0;
         self.snapshot.clear();
         self.table_state.select(None);
@@ -9705,6 +9713,7 @@ impl App {
 
     fn exit_identity_mode(&mut self) {
         self.mode = Mode::Selection;
+        self.ident_pending = None;
         self.stop_identity_auto_refresh();
         self.snapshot.clear();
         self.table_state.select(None);
@@ -9804,8 +9813,19 @@ impl App {
             self.table_state.select(None);
             return;
         }
-        let idx = prev_uid
-            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+        // A freshly created object wins over the previous selection, once and only once: it is the
+        // row the operator just asked for, and it is in this snapshot or in no snapshot at all.
+        let pending = self
+            .ident_pending
+            .as_ref()
+            .and_then(|name| self.snapshot.iter().position(|r| r.name == *name));
+        if pending.is_some() {
+            self.ident_pending = None;
+        }
+        let idx = pending
+            .or_else(|| {
+                prev_uid.and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            })
             .unwrap_or_else(|| {
                 self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
             });
@@ -9814,6 +9834,7 @@ impl App {
     }
 
     fn move_ident_selection(&mut self, delta: i32) {
+        self.ident_pending = None;
         if self.snapshot.is_empty() { return; }
         let cur = self.table_state.selected().unwrap_or(0) as i32;
         let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
@@ -9827,6 +9848,7 @@ impl App {
     }
 
     fn cycle_ident_world(&mut self) {
+        self.ident_pending = None;
         self.ident_world = match self.ident_world {
             IdentWorld::Users => IdentWorld::Groups,
             IdentWorld::Groups => IdentWorld::Users,
@@ -9882,10 +9904,19 @@ impl App {
                     desc: st.desc_ident_membership.to_string(),
                     action: MenuAction::IdentMembership,
                 });
+                // Both creations, from either world. A group is created while looking at the
+                // account it is meant to hold, and the menu is the only way in — asking the
+                // operator to leave the row, switch worlds and clear the selection first would
+                // hide a write behind a navigation trick.
                 items.push(ActionItem {
                     label: st.k_ident_create_user,
                     desc: st.desc_ident_create_user.to_string(),
                     action: MenuAction::IdentCreateUser,
+                });
+                items.push(ActionItem {
+                    label: st.k_ident_create_group,
+                    desc: st.desc_ident_create_group.to_string(),
+                    action: MenuAction::IdentCreateGroup,
                 });
                 (st.menu_ident_user_title, items)
             }
@@ -9909,6 +9940,11 @@ impl App {
                         label: st.k_ident_create_group,
                         desc: st.desc_ident_create_group.to_string(),
                         action: MenuAction::IdentCreateGroup,
+                    },
+                    ActionItem {
+                        label: st.k_ident_create_user,
+                        desc: st.desc_ident_create_user.to_string(),
+                        action: MenuAction::IdentCreateUser,
                     },
                 ],
             ),
@@ -10149,7 +10185,18 @@ impl App {
                 form.error = Some(e);
             }
             Ok(write) => {
+                let landing = ident_creation_landing(&write);
                 self.ident_form = None;
+                if let Some((world, name)) = landing {
+                    if world != self.ident_world {
+                        self.ident_world = world;
+                        self.ident_detail_scroll = 0;
+                        self.table_state.select(None);
+                        self.selected_uid = None;
+                        self.refresh_identity_snapshot();
+                    }
+                    self.ident_pending = Some(name);
+                }
                 self.ident_run_write(write, st.msg_ident_created, st.msg_ident_write_failed);
             }
         }
@@ -20265,6 +20312,18 @@ fn argo_detail_lines(
 // The identity rows stand in for their real object through apiVersion/kind/name, so `y`, `Ctrl-D`,
 // `e`, the search and the AI panel all work on them with no code of their own. Both kinds are
 // cluster-scoped, hence the empty namespace.
+// Where a creation lands. A `KdtGroup` made while looking at the accounts is invisible where the
+// cursor stands, and its uid does not exist yet — so the world moves first and the row is claimed
+// by name, which is the only handle a not-yet-created object has. Every other write leaves the view
+// where it is: it changed a row that is already on screen.
+fn ident_creation_landing(write: &IdentityWrite) -> Option<(IdentWorld, String)> {
+    match write {
+        IdentityWrite::CreateUser { name, .. } => Some((IdentWorld::Users, name.clone())),
+        IdentityWrite::CreateGroup { name, .. } => Some((IdentWorld::Groups, name.clone())),
+        _ => None,
+    }
+}
+
 fn ident_user_record(u: &IdentUser) -> EventRecord {
     let st = lang::active();
     let mut parts: Vec<String> = vec![u.subject()];
@@ -32527,6 +32586,36 @@ mod identity_view_tests {
             }
             other => panic!("expected a removal on the group, got {other:?}"),
         }
+    }
+
+    // Creating a group from the accounts world is the whole point of offering it there: the view
+    // has to follow, or the object lands out of sight and reads as a failed write.
+    #[test]
+    fn a_creation_lands_on_the_world_the_new_object_lives_in() {
+        assert_eq!(
+            ident_creation_landing(&IdentityWrite::CreateGroup {
+                name: "ops".to_string(),
+                description: String::new(),
+            }),
+            Some((IdentWorld::Groups, "ops".to_string())),
+        );
+        assert_eq!(
+            ident_creation_landing(&IdentityWrite::CreateUser {
+                name: "alice".to_string(),
+                email: "alice@example.com".to_string(),
+                display_name: String::new(),
+            }),
+            Some((IdentWorld::Users, "alice".to_string())),
+        );
+        // A membership change touches a row already on screen; moving the cursor for it would take
+        // the operator away from the list they are working through.
+        assert_eq!(
+            ident_creation_landing(&IdentityWrite::AddMember {
+                group: "ops".to_string(),
+                user: "alice".to_string(),
+            }),
+            None,
+        );
     }
 
     // Only the invitation opens the entry prefilled: an empty box that expects `72h` is how one

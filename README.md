@@ -361,9 +361,11 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     Un refus RBAC est annoncé une fois dans le titre, pas répété en tirets sur chaque ligne.
   - `o` : **inviter** (voir plus bas), **désactiver / réactiver** (`spec.disabled`), **appartenance**
     (sélecteur : depuis un compte il coche ses groups, depuis un group il coche ses comptes),
-    **créer** un user ou un group, **copier le subject** RBAC tel que le contrôleur le publie. Sur un
-    cluster sans kdt-identity, `o` propose de **copier la séquence d'installation**, préremplie avec
-    le contexte courant et le `server` du kubeconfig ; kdt n'installe rien lui-même.
+    **créer** un user ou un group, **copier le subject** RBAC tel que le contrôleur le publie. Les
+    deux créations sont proposées depuis les deux mondes, et la vue bascule sur le monde de l'objet
+    créé pour se poser dessus. Sur un cluster sans kdt-identity, `o` propose de **copier la séquence
+    d'installation**, préremplie avec le contexte courant et le `server` du kubeconfig ; kdt
+    n'installe rien lui-même.
 
 - **Argo CD** (`:argocd`, `:appsets`, `:appprojects`, `:argorepos`) — quatre mondes par `g`, `f`
   filtre ALL / PROBLEMS.

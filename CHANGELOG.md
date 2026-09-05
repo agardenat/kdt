@@ -20,6 +20,9 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 - **feat(identity)** — création de user et de group, `spec.disabled`, et appartenance par sélecteur.
   L'appartenance est toujours un JSON patch, jamais un merge : un merge patch remplace
   `spec.members` en entier et efface les autres membres
+- **feat(identity)** — les deux créations sont proposées depuis les deux mondes : un `KdtGroup` se
+  crée en regardant le compte qu'il doit porter, sans passer par `g` et une sélection vide. La vue
+  bascule sur le monde de l'objet créé et se pose sur sa ligne
 - **feat(identity)** — la phase `Locked` est établie par kdt depuis le Secret de credentials, que le
   contrôleur ne renseigne jamais dans le status ; la colonne INVITE distingue un compte jamais
   invité d'une invitation en cours ou expirée

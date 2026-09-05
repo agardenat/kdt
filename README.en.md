@@ -359,9 +359,10 @@ shows the query and its effect (`/coredns  (3)`).
     dash on every row.
   - `o`: **invite** (see below), **disable / enable** (`spec.disabled`), **membership** (a picker:
     from an account it ticks its groups, from a group it ticks its accounts), **create** a user or a
-    group, **copy the RBAC subject** as the controller publishes it. On a cluster with no
-    kdt-identity, `o` offers to **copy the install sequence**, prefilled with the current context
-    and the kubeconfig's `server`; kdt installs nothing itself.
+    group, **copy the RBAC subject** as the controller publishes it. Both creations are offered from
+    both worlds, and the view moves to the world of the object it just made and lands on it. On a
+    cluster with no kdt-identity, `o` offers to **copy the install sequence**, prefilled with the
+    current context and the kubeconfig's `server`; kdt installs nothing itself.
 
 - **Argo CD** (`:argocd`, `:appsets`, `:appprojects`, `:argorepos`) — four worlds through `g`, `f`
   filters ALL / PROBLEMS.
