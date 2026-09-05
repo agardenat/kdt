@@ -157,7 +157,7 @@ the RBAC view).
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
-| kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
+| kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, close the sessions, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
 | Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
@@ -340,13 +340,21 @@ shows the query and its effect (`/coredns  (3)`).
     `Token` object is the only real revocation), **set** a lifetime setting. These are the same
     objects one would `kubectl apply` by hand; kdt adds no privilege.
 - **kdt-identity** (`:identity`, `:groups`) — local cluster accounts and groups
-  (`identity.kdt.sh/v1alpha1`, the `KdtUser` and `KdtGroup` CRDs, both cluster-scoped). Two worlds
+  (`identity.kdt.sh/v1alpha1`, the `KdtUser` and `KdtGroup` CRDs, both cluster-scoped). The
+  component lives in its own repository:
+  [github.com/agardenat/kdt-identity](https://github.com/agardenat/kdt-identity). Two worlds
   through `g`, `f` filters ALL / PROBLEMS. When `identity.kdt.sh` is absent the view says so — and
   points at `:rancher` when Rancher does answer on this cluster.
-  - *users*: name, email, phase, groups, invitation, age. The phase comes from `status.phase`,
+  - *users*: name, email, phase, groups, invitation, sessions, age. The phase comes from `status.phase`,
     except `Locked`, which kdt establishes itself: the controller never writes it, and the lockout
     lives in the credential Secret. The INVITE column says what the `Pending` phase cannot tell
-    apart — an account never invited from an invitation in flight — and flags the ones that expired.
+    apart — an account never invited from an invitation in flight — and flags the ones that
+    expired. **SESS** counts the open renewal sessions, read from the `kdt-identity-oidc-<user>`
+    Secret: it is the only column that says whether the account is holding an access right now, and
+    therefore whether there is anything to revoke. `?` is not `0` — a Secret that cannot be read
+    does not say nobody is connected. A disabled account still holding sessions is coloured amber:
+    since 1.0 the controller closes them itself, so finding them open says it is not reconciling
+    that account.
   - *groups*: resolved members, unknown members (`status.unknownMembers`, the ones the controller
     logs on every reconciliation), and **RIGHTS** — the number of RoleBindings and
     ClusterRoleBindings targeting `status.subject`. A yellow `—` there marks a group nothing
@@ -356,8 +364,20 @@ shows the query and its effect (`/coredns  (3)`).
     Role deliberately withholds that verb so accounts cannot be enumerated — and takes only three
     non-secret facts from it: when the pending invitation expires, whether the account is locked,
     and how many attempts failed. An RBAC refusal is stated once in the title, not repeated as a
-    dash on every row.
-  - `o`: **invite** (see below), **disable / enable** (`spec.disabled`), **membership** (a picker:
+    dash on every row. The sessions Secret is read the same way, and its failure is stated
+    separately: the two reads silence different columns.
+  - The **delivery mode** is a property of the deployment, not of a row: `certificate` or `oidc`,
+    read from the controller pod's environment (`KDT_IDENTITY_CREDENTIAL_MODE`) and stated once in
+    the title with the revocation window it implies (`<= 10m` for certificates, `<= 5m` for OIDC).
+    Variable absent ⇒ kdt claims nothing: that is also what a pre-1.0 deployment looks like, and it
+    revokes nothing. The detail panel adds the session grant (`refreshTtl`) and, in certificate
+    mode only, the state of `portal.kubeconfigDownload` — the one access neither `revoke` nor
+    `spec.disabled` reaches.
+  - `o`: **invite** (see below), **close the sessions** (`kdt-identity-server revoke` in the
+    controller pod: logs every machine out, the account stays entitled and can open a session
+    again — cutting it off is `spec.disabled`), **disable / enable** (`spec.disabled`: the
+    controller closes the sessions and the portal refuses the login, access in flight stops at the
+    next renewal), **membership** (a picker:
     from an account it ticks its groups, from a group it ticks its accounts), **create** a user or a
     group, **copy the RBAC subject** as the controller publishes it. Both creations are offered from
     both worlds, and the view moves to the world of the object it just made and lands on it. On a
@@ -443,7 +463,7 @@ through guardrails.
 | `Ctrl-R` | Delete an admission config, strip finalizers | Type the object's exact name |
 | `r` (Argo CD) | The `argocd.argoproj.io/refresh` annotation, the `.operation` field, `status.operationState.phase` | Armed confirmation in the menu; prune is its own entry, never a checkbox |
 | `o` (Rancher) | Create a `Token`, patch its `.ttl`, delete a `Token`, patch a `Setting` | Armed confirmation, then an entry whose unit is shown; refused on a downstream cluster; the issued secret is shown once and written nowhere |
-| `o` (identity) | Create a `KdtUser` / `KdtGroup`, patch `spec.disabled`, JSON patch on `spec.members`, exec `kdt-identity-server invite` in the controller pod | Armed confirmation; membership is **always** a JSON patch (a merge patch would replace the array and drop the other members), and a removal is guarded by a `test` on the value; the invitation link and code are shown once and written nowhere |
+| `o` (identity) | Create a `KdtUser` / `KdtGroup`, patch `spec.disabled`, JSON patch on `spec.members`, exec `kdt-identity-server invite` and `revoke` in the controller pod | Armed confirmation; membership is **always** a JSON patch (a merge patch would replace the array and drop the other members), and a removal is guarded by a `test` on the value; the invitation link and code are shown once and written nowhere |
 
 **No warning blocks**, but **the default answer is no**: `Enter` and `Esc` both cancel, and only the
 key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, drain) requires
@@ -480,6 +500,12 @@ key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, 
   the output, it shows that output as-is and offers only the whole-output copy (`y`) — it never
   announces a code it did not find. The validity is typed, prefilled with the server's own default
   (`72h`).
+- **Closing the sessions (kdt-identity)** — `kdt-identity-server revoke <user>` goes through the
+  same path for the same reason: the command needs the operator's own session store. Its output
+  holds nothing secret and becomes the toast verbatim — how many sessions it closed, and within
+  what window the access it did not close stops. kdt does not paraphrase it. The gesture logs
+  machines out; it withdraws no entitlement, and the account can open a session again right away.
+  Cutting someone off is `spec.disabled`.
 
 ## Configuration
 

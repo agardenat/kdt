@@ -1894,6 +1894,28 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             ));
             status = worse(status, DiagStatus::Warn);
         }
+        // Sessions still open on a disabled account: since 1.0 the controller closes them itself,
+        // so finding them says it is not reconciling — and the person is still renewing access.
+        let stuck: Vec<&str> = s
+            .users
+            .iter()
+            .filter(|u| u.disabled && u.sessions.as_ref().is_some_and(|x| x.open > 0))
+            .map(|u| u.name.as_str())
+            .take(8)
+            .collect();
+        if !stuck.is_empty() {
+            lines.push((
+                LineColor::Warn,
+                fill(active().diag_identity_stuck_sessions, &[("users", &stuck.join(", "))]),
+            ));
+            status = worse(status, DiagStatus::Warn);
+        }
+        // The one access revocation cannot reach. Stated once for the cluster, and only as Info:
+        // it is the chart's default and a deliberate trade, not a fault — but it is the fact that
+        // decides whether "sessions closed" means the person is actually out.
+        if s.delivery.download_open() {
+            lines.push((LineColor::Info, active().diag_identity_download.into()));
+        }
         status
     };
     finish_step(state, run_id, idx, status, lines);

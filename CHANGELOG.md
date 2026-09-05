@@ -26,6 +26,22 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 - **feat(identity)** — la phase `Locked` est établie par kdt depuis le Secret de credentials, que le
   contrôleur ne renseigne jamais dans le status ; la colonne INVITE distingue un compte jamais
   invité d'une invitation en cours ou expirée
+- **feat(identity)** — alignement sur kdt-identity 1.0 : colonne **SESS**, le nombre de sessions de
+  renouvellement ouvertes lues dans le Secret `kdt-identity-oidc-<user>`. C'est la seule colonne qui
+  dise si un compte tient un accès en ce moment, donc s'il y a quelque chose à révoquer — et `?`
+  n'est pas `0`, un Secret illisible ne dit pas que personne n'est connecté
+- **feat(identity)** — `o` **fermer les sessions** : `kdt-identity-server revoke` exécuté dans le pod
+  contrôleur par le même chemin que l'invitation. Sa sortie devient le toast telle quelle — combien
+  de sessions fermées, sous quel délai s'arrête le reste — plutôt qu'une reformulation par kdt
+- **feat(identity)** — le **mode de délivrance** (`certificate` / `oidc`) est lu dans l'environnement
+  du pod contrôleur et dit une fois dans le titre, avec la fenêtre de révocation qu'il implique.
+  Variable absente ⇒ aucune affirmation : c'est aussi ce à quoi ressemble un déploiement antérieur à
+  1.0. Le détail ajoute le droit de session et, en mode certificat, l'état de
+  `portal.kubeconfigDownload` — le seul accès que ni `revoke` ni `spec.disabled` n'atteignent
+- **change(identity)** — `spec.disabled` ne se décrit plus comme « les certificats déjà émis vivent
+  jusqu'à leur expiration » : depuis 1.0 le contrôleur ferme les sessions et l'accès s'arrête au
+  prochain renouvellement. Un compte désactivé qui garde des sessions est désormais un warning — le
+  contrôleur ne réconcilie pas ce compte
 - **feat(diagnostic)** — module kdt-identity : groups sans binding, members sans compte, comptes
   verrouillés. Absent du cluster ⇒ Info
 - **feat(delete)** — supprimer un `KdtUser` annonce que son nom restera dans les `members` des

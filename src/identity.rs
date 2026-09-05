@@ -18,9 +18,21 @@
 //!   someone is a JSON patch on `spec.members`; a merge patch replaces the whole array, which is
 //!   how one silently deletes the other members.
 //!
+//! * **Revocation is a second Secret, and it is what makes the rest legible.** Since 1.0 a
+//!   credential lives minutes and is renewed against a *session* held in the cluster, one Secret
+//!   per account. Closing those sessions is the revocation, and it is the only reason an operator
+//!   can act on someone's access at all — so the count of live sessions is a column, not a detail.
+//! * **The delivery mode belongs to the deployment, not to a row.** `certificate` or `oidc` is a
+//!   chart value, readable off the controller pod's environment, and it decides how long a
+//!   revocation takes to bite and whether the non-revocable kubeconfig download exists at all.
+//!   Absent variable, absent statement: kdt reads what the deployment declares and invents no
+//!   default, because a missing variable also describes a pre-1.0 deployment.
+//!
 //! Nothing secret is carried into a row. The credential Secret is read by name for three
 //! non-secret facts — when the pending invitation expires, whether the account is locked, and how
 //! many attempts failed — and `password-hash` and `totp-secret` are never taken out of the map.
+//! The sessions Secret is parsed into two timestamps per entry: `secretHash` has no field to land
+//! in, so it cannot reach a row even by accident.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -72,6 +84,20 @@ const CRED_SECRET_PREFIX: &str = "kdt-identity-cred-";
 const K_INVITE_EXPIRES: &str = "invite-expires-at";
 const K_LOCKED_UNTIL: &str = "locked-until";
 const K_FAILED_ATTEMPTS: &str = "failed-attempts";
+
+/// Name prefix of the per-user *sessions* Secret. `oidc-` in both delivery modes: upstream named
+/// it when sessions were an OIDC detail, then found the mechanism was not OIDC at all and kept the
+/// name. Reading it under another name would find nothing on a certificate-mode cluster.
+const SESSION_SECRET_PREFIX: &str = "kdt-identity-oidc-";
+const K_SESSIONS: &str = "sessions";
+
+/// What the chart puts on both Deployments. The controller carries them too — the admin commands
+/// run there — which is why one pod answers for the whole deployment.
+const ENV_MODE: &str = "KDT_IDENTITY_CREDENTIAL_MODE";
+const ENV_CERT_TTL: &str = "KDT_IDENTITY_CERT_TTL";
+const ENV_TOKEN_TTL: &str = "KDT_IDENTITY_OIDC_TOKEN_TTL";
+const ENV_REFRESH_TTL: &str = "KDT_IDENTITY_REFRESH_TTL";
+const ENV_KUBECONFIG_DOWNLOAD: &str = "KDT_IDENTITY_KUBECONFIG_DOWNLOAD";
 
 /// Default validity offered for a new invitation, matching the upstream default.
 pub const DEFAULT_VALIDITY: &str = "72h";
@@ -127,6 +153,74 @@ pub struct CredentialFacts {
     pub failed_attempts: u32,
 }
 
+/// How this deployment hands out credentials. A property of the cluster, chosen once at install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialMode {
+    /// X.509 signed by the cluster CA. Needs nothing of the apiserver, and offers a downloadable
+    /// kubeconfig that no revocation reaches.
+    Certificate,
+    /// A token kdt-identity signs and the apiserver validates. Needs the control plane configured,
+    /// and has no downloadable kubeconfig at all.
+    Oidc,
+}
+
+impl CredentialMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CredentialMode::Certificate => "certificate",
+            CredentialMode::Oidc => "oidc",
+        }
+    }
+}
+
+/// What the deployment declares about delivery, read off the controller pod's environment.
+///
+/// Every field is an `Option` on purpose. Upstream defaults `credentialMode` to `certificate` when
+/// the variable is unset, but an unset variable also describes a 0.1 deployment that had no modes,
+/// no sessions and no `revoke` — so kdt reports the absence rather than restating a default that
+/// would make a pre-1.0 cluster look like a configured one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Delivery {
+    pub mode: Option<CredentialMode>,
+    pub cert_ttl: Option<String>,
+    pub token_ttl: Option<String>,
+    pub refresh_ttl: Option<String>,
+    /// Only rendered by the chart in certificate mode; `None` in OIDC, where the path does not
+    /// exist.
+    pub kubeconfig_download: Option<bool>,
+}
+
+impl Delivery {
+    /// How long an access survives its revocation: the TTL of whatever is handed out in this mode.
+    /// `None` when the deployment says neither, in which case kdt states no window at all.
+    pub fn revocation_window(&self) -> Option<&str> {
+        match self.mode? {
+            CredentialMode::Certificate => self.cert_ttl.as_deref(),
+            CredentialMode::Oidc => self.token_ttl.as_deref(),
+        }
+    }
+
+    /// Whether the one access revocation cannot reach is open. Certificate mode only, and only
+    /// when the download was left on.
+    pub fn download_open(&self) -> bool {
+        self.mode == Some(CredentialMode::Certificate) && self.kubeconfig_download == Some(true)
+    }
+}
+
+/// The sessions of one account, as far as its sessions Secret says.
+///
+/// Only the two timestamps of each entry are parsed. The identifier and the hash of the refresh
+/// secret have no field to land in, which is a stronger guarantee than a rule not to display them.
+#[derive(Debug, Clone, Default)]
+pub struct SessionFacts {
+    pub open: usize,
+    /// Entries past their expiry. Upstream prunes them on the next write, so they are stale rows,
+    /// not access — and counting them as open would overstate what a revocation would close.
+    pub stale: usize,
+    /// When the last session standing runs out on its own.
+    pub last_expiry: Option<i64>,
+}
+
 /// A binding whose subject is one of this system's groups.
 #[derive(Debug, Clone)]
 pub struct BindingRef {
@@ -165,6 +259,9 @@ pub struct IdentUser {
     pub member_of: Vec<String>,
     pub invitation: Invitation,
     pub creds: Option<CredentialFacts>,
+    /// `None` when the sessions Secret could not be read at all, which is not the same news as an
+    /// account that has never opened one — that is `Some` with a zero count.
+    pub sessions: Option<SessionFacts>,
     pub age: String,
     pub hints: Vec<Hint>,
     pub uid: String,
@@ -223,9 +320,14 @@ pub struct IdentityState {
     pub groups: Vec<IdentGroup>,
     /// Resolved controller pod, or `None` — in which case inviting is unavailable and says so.
     pub controller: Option<ControllerRef>,
+    /// What the deployment declares about how it delivers and revokes access.
+    pub delivery: Delivery,
     /// Why the credential Secrets could not be read, when that is the case. One statement for the
     /// whole view rather than a dash on every row.
     pub creds_error: Option<String>,
+    /// Same, for the sessions Secrets. Kept apart from `creds_error`: the two are different reads
+    /// and silence one column each, so merging them would blame the wrong column.
+    pub sessions_error: Option<String>,
     pub installed: bool,
     pub error: Option<String>,
     pub loading: bool,
@@ -240,6 +342,14 @@ impl IdentityState {
     /// all.
     pub fn unbound_groups(&self) -> usize {
         self.groups.iter().filter(|g| g.bindings.is_empty()).count()
+    }
+
+    /// Accounts holding at least one live session — the ones a revocation would actually cut.
+    pub fn connected_users(&self) -> usize {
+        self.users
+            .iter()
+            .filter(|u| u.sessions.as_ref().is_some_and(|s| s.open > 0))
+            .count()
     }
 }
 
@@ -323,22 +433,42 @@ pub async fn fetch_identity(client: Client, state: SharedIdentity) {
     let user_objs = listed.remove(KIND_USER).unwrap_or_default();
     let group_objs = listed.remove(KIND_GROUP).unwrap_or_default();
 
-    // Credentials only once the operator namespace is known — it comes from the controller pod, and
-    // there is nowhere else to read it from.
-    let (creds, creds_error) = match &controller {
-        Some(c) => {
+    // Credentials and sessions only once the operator namespace is known — it comes from the
+    // controller pod, and there is nowhere else to read it from. Both Secrets are fetched in one
+    // wave: they are two `get`s per account, and doing them in turn doubles the wait on a
+    // directory of any size.
+    let (creds, creds_error, sessions, sessions_error) = match &controller {
+        Some((c, _)) => {
             let names: Vec<String> =
                 user_objs.iter().filter_map(|o| o.metadata.name.clone()).collect();
-            read_credentials(&client, &c.namespace, &names).await
+            let (creds, sessions) = futures::join!(
+                read_credentials(&client, &c.namespace, &names),
+                read_sessions(&client, &c.namespace, &names),
+            );
+            (creds.0, creds.1, sessions.0, sessions.1)
         }
-        None => (BTreeMap::new(), None),
+        None => (BTreeMap::new(), None, BTreeMap::new(), None),
+    };
+
+    let (controller, delivery) = match controller {
+        Some((c, d)) => (Some(c), d),
+        None => (None, Delivery::default()),
     };
 
     let mut next = IdentityState {
         groups: build_groups(st, &group_objs, &user_objs, &bindings),
-        users: build_users(st, &user_objs, &group_objs, &creds, creds_error.is_some()),
+        users: build_users(
+            st,
+            &user_objs,
+            &group_objs,
+            &creds,
+            creds_error.is_some(),
+            &sessions,
+        ),
         controller,
+        delivery,
         creds_error,
+        sessions_error,
         installed: true,
         error: list_error,
         loading: false,
@@ -410,8 +540,9 @@ pub fn is_group_subject(kind: &str, name: &str) -> bool {
 }
 
 /// The controller pod, by the chart's labels. Everything about it is read: the namespace, the pod
-/// name, and the container. Nothing is defaulted into a plausible value.
-async fn find_controller(client: &Client) -> Option<ControllerRef> {
+/// name, the container, and the delivery settings the chart wrote into its environment. Nothing is
+/// defaulted into a plausible value.
+async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery)> {
     let pods: Api<Pod> = Api::all(client.clone());
     let list = pods
         .list(&ListParams::default().labels(CONTROLLER_SELECTOR))
@@ -434,12 +565,48 @@ async fn find_controller(client: &Client) -> Option<ControllerRef> {
             .iter()
             .find(|c| c.name == CONTROLLER_CONTAINER)
             .or_else(|| if containers.len() == 1 { containers.first() } else { None })?;
-        Some(ControllerRef {
-            namespace: p.metadata.namespace.clone().unwrap_or_default(),
-            pod: p.metadata.name.clone().unwrap_or_default(),
-            container: container.name.clone(),
-        })
+        let delivery = delivery_from_env(container);
+        Some((
+            ControllerRef {
+                namespace: p.metadata.namespace.clone().unwrap_or_default(),
+                pod: p.metadata.name.clone().unwrap_or_default(),
+                container: container.name.clone(),
+            },
+            delivery,
+        ))
     })
+}
+
+/// The delivery settings, from the container's literal `env` values.
+///
+/// Only plain values are read: a `valueFrom` carries no value here, and resolving one would mean
+/// guessing at a Secret kdt has no reason to open. An unreadable variable is an absent one.
+fn delivery_from_env(container: &k8s_openapi::api::core::v1::Container) -> Delivery {
+    let get = |key: &str| -> Option<String> {
+        container
+            .env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == key)
+            .and_then(|e| e.value.clone())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Delivery {
+        mode: get(ENV_MODE).and_then(|v| match v.as_str() {
+            "certificate" => Some(CredentialMode::Certificate),
+            "oidc" => Some(CredentialMode::Oidc),
+            _ => None,
+        }),
+        cert_ttl: get(ENV_CERT_TTL),
+        token_ttl: get(ENV_TOKEN_TTL),
+        refresh_ttl: get(ENV_REFRESH_TTL),
+        kubeconfig_download: get(ENV_KUBECONFIG_DOWNLOAD).and_then(|v| match v.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }),
+    }
 }
 
 /// The three non-secret facts of each credential Secret.
@@ -481,6 +648,75 @@ async fn read_credentials(
     (out, error)
 }
 
+/// The sessions of each account, read the same way as the credentials: by name, one `get` per
+/// account, never a `list`.
+///
+/// A 404 is an answer and the honest one: that account has never opened a session, which is a zero
+/// count and not an unknown. Only an actual failure leaves an account without facts.
+async fn read_sessions(
+    client: &Client,
+    namespace: &str,
+    users: &[String],
+) -> (BTreeMap<String, SessionFacts>, Option<String>) {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let now = now_secs();
+    let gets = users.iter().map(|u| {
+        let api = api.clone();
+        let user = u.clone();
+        async move {
+            let name = format!("{SESSION_SECRET_PREFIX}{user}");
+            (user, api.get_opt(&name).await)
+        }
+    });
+
+    let mut out = BTreeMap::new();
+    let mut error = None;
+    for (user, res) in futures::future::join_all(gets).await {
+        match res {
+            Ok(Some(secret)) => {
+                out.insert(user, session_facts(&secret, now));
+            }
+            Ok(None) => {
+                out.insert(user, SessionFacts::default());
+            }
+            Err(e) => {
+                error.get_or_insert_with(|| crate::edit::api_error_text(e));
+            }
+        }
+    }
+    (out, error)
+}
+
+/// One session entry, cut down to what a row may show.
+///
+/// The upstream entry also carries `id` and `secretHash`; neither is declared here, so no amount
+/// of later editing can leak them into a cell. Unparseable JSON yields no entries rather than an
+/// invented count.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionEntry {
+    expires_at: String,
+}
+
+pub fn session_facts(secret: &Secret, now: i64) -> SessionFacts {
+    let raw = secret.data.as_ref().and_then(|d| d.get(K_SESSIONS));
+    let entries: Vec<SessionEntry> = raw
+        .and_then(|b| serde_json::from_slice(&b.0).ok())
+        .unwrap_or_default();
+
+    let mut facts = SessionFacts::default();
+    for e in &entries {
+        let Some(expires) = parse_rfc3339(&e.expires_at) else { continue };
+        if expires > now {
+            facts.open += 1;
+            facts.last_expiry = Some(facts.last_expiry.map_or(expires, |cur: i64| cur.max(expires)));
+        } else {
+            facts.stale += 1;
+        }
+    }
+    facts
+}
+
 /// Only the three fields that are not credentials. `password-hash` and `totp-secret` are in the
 /// same map and are never touched.
 fn credential_facts(secret: &Secret) -> CredentialFacts {
@@ -516,6 +752,7 @@ fn build_users(
     groups: &[DynamicObject],
     creds: &BTreeMap<String, CredentialFacts>,
     creds_unreadable: bool,
+    sessions: &BTreeMap<String, SessionFacts>,
 ) -> Vec<IdentUser> {
     // Who is listed where, straight off `spec.members` — the source of truth. `status.memberOf` is
     // derived and can lag a reconciliation behind, so it is not what the "still a member" checks
@@ -589,6 +826,7 @@ fn build_users(
                 member_of,
                 invitation,
                 creds: facts,
+                sessions: sessions.get(&name).cloned(),
                 age,
                 uid: o.metadata.uid.clone().unwrap_or_default(),
                 hints: Vec::new(),
@@ -603,7 +841,11 @@ fn build_users(
     out
 }
 
-fn user_hints(st: &'static Strings, u: &IdentUser, listed_in: Option<&[String]>) -> Vec<Hint> {
+fn user_hints(
+    st: &'static Strings,
+    u: &IdentUser,
+    listed_in: Option<&[String]>,
+) -> Vec<Hint> {
     let mut out = Vec::new();
 
     if u.phase == Phase::Locked && !u.disabled {
@@ -642,6 +884,18 @@ fn user_hints(st: &'static Strings, u: &IdentUser, listed_in: Option<&[String]>)
                 &[("groups", &groups.join(", "))],
             )));
         }
+    }
+
+    let open = u.sessions.as_ref().map(|s| s.open).unwrap_or(0);
+
+    // Since 1.0 the controller closes the sessions of a disabled account by itself. Finding them
+    // still open is not a state to explain away: it says the controller has not reconciled this
+    // account, and the person is still renewing access every few minutes.
+    if u.disabled && open > 0 {
+        out.push(warn(fill(
+            st.ident_hint_disabled_sessions,
+            &[("n", &open.to_string())],
+        )));
     }
 
     out
@@ -804,6 +1058,13 @@ pub enum IdentityWrite {
     RemoveMember { group: String, user: String, index: usize },
     /// Runs `kdt-identity-server invite` inside the controller pod.
     Invite { user: String, validity: String, controller: Box<ControllerRef> },
+    /// Closes every open session of an account, on every machine. Runs
+    /// `kdt-identity-server revoke` inside the controller pod, for the same reason the invitation
+    /// does: the command needs the operator's own configuration and session store.
+    ///
+    /// This is not `spec.disabled`. It logs someone out — a lost laptop — and leaves them free to
+    /// sign in again from anywhere. Cutting an account off is the field on the spec.
+    Revoke { user: String, controller: Box<ControllerRef> },
 }
 
 impl IdentityWrite {
@@ -813,9 +1074,9 @@ impl IdentityWrite {
             IdentityWrite::CreateUser { name, .. } | IdentityWrite::CreateGroup { name, .. } => {
                 name.clone()
             }
-            IdentityWrite::SetDisabled { user, .. } | IdentityWrite::Invite { user, .. } => {
-                user.clone()
-            }
+            IdentityWrite::SetDisabled { user, .. }
+            | IdentityWrite::Invite { user, .. }
+            | IdentityWrite::Revoke { user, .. } => user.clone(),
             IdentityWrite::AddMember { group, user } => format!("{user} → {group}"),
             IdentityWrite::RemoveMember { group, user, .. } => format!("{user} ✗ {group}"),
         }
@@ -838,20 +1099,33 @@ pub struct IdentInvite {
     pub raw: String,
 }
 
+/// What a write hands back.
+///
+/// Three shapes rather than one, because the three outcomes are not interchangeable: an API write
+/// says nothing, an invitation carries values that exist once and must land in their own overlay,
+/// and a command run in the pod has its own words — how many sessions it closed, and how long the
+/// access it did not close still lives — which kdt reports rather than paraphrases.
+#[derive(Debug, Clone)]
+pub enum WriteOutcome {
+    Done,
+    Invited(Box<IdentInvite>),
+    Said(String),
+}
+
 pub async fn apply_identity_write(
     client: Client,
     write: IdentityWrite,
-) -> Result<Option<IdentInvite>, String> {
+) -> Result<WriteOutcome, String> {
     match write {
         IdentityWrite::CreateUser { name, email, display_name } => {
             let body = user_payload(&name, &email, &display_name);
             create(&client, KIND_USER, body).await?;
-            Ok(None)
+            Ok(WriteOutcome::Done)
         }
         IdentityWrite::CreateGroup { name, description } => {
             let body = group_payload(&name, &description);
             create(&client, KIND_GROUP, body).await?;
-            Ok(None)
+            Ok(WriteOutcome::Done)
         }
         IdentityWrite::SetDisabled { user, disabled } => {
             // A scalar: a merge patch is the right shape here, unlike on `members`.
@@ -860,19 +1134,23 @@ pub async fn apply_identity_write(
             api.patch(&user, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
                 .await
                 .map_err(crate::edit::api_error_text)?;
-            Ok(None)
+            Ok(WriteOutcome::Done)
         }
         IdentityWrite::AddMember { group, user } => {
             json_patch_members(&client, &group, add_member_patch(&user)).await?;
-            Ok(None)
+            Ok(WriteOutcome::Done)
         }
         IdentityWrite::RemoveMember { group, user, index } => {
             json_patch_members(&client, &group, remove_member_patch(index, &user)).await?;
-            Ok(None)
+            Ok(WriteOutcome::Done)
         }
         IdentityWrite::Invite { user, validity, controller } => {
             let invite = run_invite(&client, &controller, &user, &validity).await?;
-            Ok(Some(invite))
+            Ok(WriteOutcome::Invited(Box::new(invite)))
+        }
+        IdentityWrite::Revoke { user, controller } => {
+            let said = run_in_controller(&client, &controller, &["revoke", &user]).await?;
+            Ok(WriteOutcome::Said(said))
         }
     }
 }
@@ -958,21 +1236,35 @@ pub fn remove_member_patch(index: usize, user: &str) -> Value {
     ])
 }
 
-// --- Invitation ----------------------------------------------------------------------------------
+// --- Commands run in the controller pod ---------------------------------------------------------
 
 /// Runs `kdt-identity-server invite` in the controller pod and captures what it printed.
-///
-/// kdt does not shell out to `kubectl` here, the way [`crate::exec`] does for an interactive
-/// shell: that hands the terminal away, which would put the activation link and the code into the
-/// scrollback and the tmux history — precisely what upstream refuses to do by never logging them.
-/// The command is passed as argv, never through a shell: the image is `FROM scratch` and has
-/// neither.
 async fn run_invite(
     client: &Client,
     controller: &ControllerRef,
     user: &str,
     validity: &str,
 ) -> Result<IdentInvite, String> {
+    let stdout =
+        run_in_controller(client, controller, &["invite", user, "--validity", validity]).await?;
+    Ok(parse_invite_output(user, &stdout))
+}
+
+/// Runs one `kdt-identity-server` subcommand in the controller pod and hands back its stdout.
+///
+/// kdt does not shell out to `kubectl` here, the way [`crate::exec`] does for an interactive
+/// shell: that hands the terminal away, which would put the activation link and the code into the
+/// scrollback and the tmux history — precisely what upstream refuses to do by never logging them.
+/// `revoke` prints nothing secret, but it goes through the same path: one way in means one place
+/// where that property is enforced.
+///
+/// The command is passed as argv, never through a shell: the image is `FROM scratch` and has
+/// neither.
+async fn run_in_controller(
+    client: &Client,
+    controller: &ControllerRef,
+    args: &[&str],
+) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
 
     let st = crate::lang::active();
@@ -984,7 +1276,8 @@ async fn run_invite(
         .stderr(true)
         .tty(false);
 
-    let command = vec![SERVER_BIN, "invite", user, "--validity", validity];
+    let mut command = vec![SERVER_BIN];
+    command.extend_from_slice(args);
     let mut process = pods
         .exec(&controller.pod, command, &params)
         .await
@@ -1009,8 +1302,9 @@ async fn run_invite(
     let stdout = String::from_utf8_lossy(&so).to_string();
     let stderr = String::from_utf8_lossy(&se).to_string();
 
-    // The command writes its traces to stderr and the invitation to stdout, on purpose. A failure
-    // is therefore an empty stdout plus a reason on stderr.
+    // The binary writes its traces to stderr and its result to stdout, on purpose — an `issue`
+    // whose logs landed on stdout would produce a kubeconfig kubectl refuses. A failure is
+    // therefore an empty stdout plus a reason on stderr.
     let failed = code.map(|s| s.status.as_deref() != Some("Success")).unwrap_or(false);
     if failed || stdout.trim().is_empty() {
         let reason = if stderr.trim().is_empty() {
@@ -1021,7 +1315,7 @@ async fn run_invite(
         return Err(fill(st.ident_invite_failed, &[("e", &reason)]));
     }
 
-    Ok(parse_invite_output(user, &stdout))
+    Ok(stdout)
 }
 
 /// Picks the link and the code out of what `invite` printed.
@@ -1275,7 +1569,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Active", false, &["ops"])];
-        let rows = build_users(&FR, &users, &[], &creds, false);
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new());
         assert_eq!(rows[0].phase, Phase::Locked);
         // The controller's own word is kept, so the detail panel can show both.
         assert_eq!(rows[0].raw_phase, "Active");
@@ -1290,16 +1584,16 @@ mod tests {
             CredentialFacts { locked_until: Some(now_secs() + 600), ..CredentialFacts::default() },
         );
         let users = vec![user_obj("alice", "Active", true, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false);
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new());
         assert_eq!(rows[0].phase, Phase::Disabled);
     }
 
     #[test]
     fn an_unreadable_secret_does_not_read_as_never_invited() {
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true);
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true, &BTreeMap::new());
         assert_eq!(rows[0].invitation, Invitation::Unreadable);
-        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false);
+        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new());
         assert_eq!(readable[0].invitation, Invitation::None);
     }
 
@@ -1314,7 +1608,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false);
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new());
         assert!(matches!(rows[0].invitation, Invitation::Expired { .. }));
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Warn));
 
@@ -1325,7 +1619,7 @@ mod tests {
                 ..CredentialFacts::default()
             },
         );
-        let live = build_users(&FR, &users, &[], &creds, false);
+        let live = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new());
         assert!(matches!(live[0].invitation, Invitation::Pending { .. }));
         assert!(live[0].hints.is_empty());
         assert_eq!(invitation_label(&live[0].invitation, &FR), "1h");
@@ -1347,14 +1641,14 @@ mod tests {
         // `status.memberOf` can lag; `spec.members` is the source of truth for "still listed".
         let users = vec![user_obj("alice", "Active", true, &[])];
         let groups = vec![group_obj("ops", &["alice"], Some(&["alice"]))];
-        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false);
+        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false, &BTreeMap::new());
         assert!(rows[0].hints.iter().any(|h| h.text.contains("ops")));
     }
 
     #[test]
     fn an_active_account_in_no_group_is_noted_without_alarm() {
         let users = vec![user_obj("alice", "Active", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false);
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new());
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Info));
         assert!(rows[0].hints.iter().all(|h| h.level != HintLevel::Warn));
     }
@@ -1369,6 +1663,121 @@ mod tests {
             ..IdentGroup::default()
         };
         assert_eq!(published.effective_subject(), "kdt:ops");
+    }
+
+    fn sessions_secret(entries: serde_json::Value) -> Secret {
+        Secret {
+            data: Some(std::collections::BTreeMap::from([(
+                K_SESSIONS.to_string(),
+                k8s_openapi::ByteString(serde_json::to_vec(&entries).unwrap()),
+            )])),
+            ..Secret::default()
+        }
+    }
+
+    // An expired session is not access. Counting it as open would say a revocation has work to do
+    // when it has none, and would make the SESS column disagree with what `revoke` then prints.
+    #[test]
+    fn an_expired_session_is_stale_not_open() {
+        let now = 1_700_000_000;
+        let secret = sessions_secret(serde_json::json!([
+            { "id": "a", "secretHash": "deadbeef",
+              "issuedAt": "2023-11-14T22:13:20Z", "expiresAt": "2023-11-21T22:13:20Z" },
+            { "id": "b", "secretHash": "deadbeef",
+              "issuedAt": "2023-10-14T22:13:20Z", "expiresAt": "2023-10-21T22:13:20Z" },
+        ]));
+        let facts = session_facts(&secret, now);
+        assert_eq!(facts.open, 1);
+        assert_eq!(facts.stale, 1);
+        assert_eq!(facts.last_expiry, Some(1_700_604_800));
+    }
+
+    // Unreadable content yields no count rather than a zero: "nobody is connected" is a claim, and
+    // kdt has no basis for it here.
+    #[test]
+    fn unparseable_sessions_count_nothing() {
+        let secret = Secret {
+            data: Some(std::collections::BTreeMap::from([(
+                K_SESSIONS.to_string(),
+                k8s_openapi::ByteString(b"not json".to_vec()),
+            )])),
+            ..Secret::default()
+        };
+        let facts = session_facts(&secret, 1_700_000_000);
+        assert_eq!(facts.open, 0);
+        assert_eq!(facts.stale, 0);
+        assert_eq!(facts.last_expiry, None);
+    }
+
+    // The window is the TTL of what this mode hands out, and nothing is stated when the deployment
+    // declared neither — a default restated here would describe a cluster kdt has not read.
+    #[test]
+    fn the_revocation_window_follows_the_declared_mode() {
+        let mut d = Delivery {
+            mode: Some(CredentialMode::Certificate),
+            cert_ttl: Some("10m".to_string()),
+            token_ttl: Some("5m".to_string()),
+            refresh_ttl: Some("7d".to_string()),
+            kubeconfig_download: Some(true),
+        };
+        assert_eq!(d.revocation_window(), Some("10m"));
+        assert!(d.download_open());
+
+        d.mode = Some(CredentialMode::Oidc);
+        assert_eq!(d.revocation_window(), Some("5m"));
+        // No download exists in OIDC, whatever the leftover variable says.
+        assert!(!d.download_open());
+
+        d.mode = None;
+        assert_eq!(d.revocation_window(), None, "a window without a mode is a guess");
+        assert!(!d.download_open());
+    }
+
+    // A mode kdt does not know is an absent mode, not a certificate one: a deployment that says
+    // something unexpected must not be reported as the default.
+    #[test]
+    fn the_delivery_is_read_off_literal_env_values_only() {
+        use k8s_openapi::api::core::v1::{Container, EnvVar, EnvVarSource, SecretKeySelector};
+        let container = Container {
+            name: "controller".to_string(),
+            env: Some(vec![
+                EnvVar {
+                    name: ENV_MODE.to_string(),
+                    value: Some("oidc".to_string()),
+                    ..EnvVar::default()
+                },
+                EnvVar {
+                    name: ENV_TOKEN_TTL.to_string(),
+                    value: Some("5m".to_string()),
+                    ..EnvVar::default()
+                },
+                // A value that lives in a Secret carries none here, and kdt does not go opening it.
+                EnvVar {
+                    name: ENV_REFRESH_TTL.to_string(),
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(SecretKeySelector::default()),
+                        ..EnvVarSource::default()
+                    }),
+                    ..EnvVar::default()
+                },
+            ]),
+            ..Container::default()
+        };
+        let d = delivery_from_env(&container);
+        assert_eq!(d.mode, Some(CredentialMode::Oidc));
+        assert_eq!(d.token_ttl.as_deref(), Some("5m"));
+        assert_eq!(d.refresh_ttl, None);
+        assert_eq!(d.kubeconfig_download, None);
+
+        let unknown = Container {
+            env: Some(vec![EnvVar {
+                name: ENV_MODE.to_string(),
+                value: Some("certificat".to_string()),
+                ..EnvVar::default()
+            }]),
+            ..Container::default()
+        };
+        assert_eq!(delivery_from_env(&unknown).mode, None);
     }
 
     #[test]

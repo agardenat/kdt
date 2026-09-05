@@ -513,8 +513,8 @@ use crate::rancher::{
 
 use crate::identity::{
     apply_identity_write, fetch_identity, install_command, invitation_label, new_identity_state,
-    IdentGroup, IdentInvite, IdentUser, IdentityWrite, Invitation, Phase,
-    SharedIdentity, DEFAULT_VALIDITY,
+    CredentialMode, Delivery, IdentGroup, IdentInvite, IdentUser, IdentityWrite, Invitation, Phase,
+    SharedIdentity, WriteOutcome, DEFAULT_VALIDITY,
 };
 
 // The two worlds of the identity view: the accounts, and the groups that carry the rights. One
@@ -1221,6 +1221,7 @@ enum MenuAction {
     IdentInviteUser,
     IdentCreateUser,
     IdentCreateGroup,
+    IdentRevoke,
     IdentSetDisabled(bool),
     IdentMembership,
     IdentCopySubject,
@@ -9890,6 +9891,22 @@ impl App {
                     desc: invite_desc,
                     action: MenuAction::IdentInviteUser,
                 }];
+                // Closing the sessions sits next to inviting, because both run in the pod and
+                // both are about access rather than about the object. It is named for what it
+                // does — log every machine out — never as "revoke the account", which is the
+                // other gesture entirely.
+                let revoke_desc = if controller.is_none() {
+                    st.ident_revoke_unavailable.to_string()
+                } else if u.sessions.as_ref().is_some_and(|s| s.open == 0) {
+                    st.ident_revoke_idle.to_string()
+                } else {
+                    st.desc_ident_revoke.to_string()
+                };
+                items.push(ActionItem {
+                    label: st.k_ident_revoke,
+                    desc: revoke_desc,
+                    action: MenuAction::IdentRevoke,
+                });
                 items.push(ActionItem {
                     label: if u.disabled { st.k_ident_enable } else { st.k_ident_disable },
                     desc: if u.disabled {
@@ -10013,6 +10030,23 @@ impl App {
         self.ident_run_write(write, st.msg_ident_created, st.msg_ident_write_failed);
     }
 
+    // Close every session of the account. The command's own output is the outcome: it says how
+    // many it closed and how long what it did not close still lives, and kdt would only lose
+    // precision by restating either.
+    fn ident_revoke(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(IdentRow::User(u)) = self.ident_selected().cloned() else { return };
+        let controller = self.ident_state.lock().expect("identity poisoned").controller.clone();
+        let Some(controller) = controller else {
+            self.clipboard_status =
+                Some((std::time::Instant::now(), st.ident_revoke_unavailable.to_string()));
+            return;
+        };
+        let write =
+            IdentityWrite::Revoke { user: u.name.clone(), controller: Box::new(controller) };
+        self.ident_run_write(write, st.msg_ident_created, st.msg_ident_write_failed);
+    }
+
     fn ident_set_disabled(&mut self, disabled: bool) {
         let st = lang::t(self.ai_language);
         let Some(IdentRow::User(u)) = self.ident_selected().cloned() else { return };
@@ -10057,12 +10091,21 @@ impl App {
         tokio::spawn(async move {
             let outcome = apply_identity_write(client, write).await;
             let text = match outcome {
-                Ok(Some(invite)) => {
-                    *invited.lock().expect("invitation poisoned") = Some(invite);
+                Ok(WriteOutcome::Invited(invite)) => {
+                    *invited.lock().expect("invitation poisoned") = Some(*invite);
                     // The overlay says everything; nothing goes to the toast.
                     return;
                 }
-                Ok(None) => lang::fill(ok_msg, &[("name", &target)]),
+                // A command's own words, on one line. `revoke` says how many sessions it closed
+                // and how long what it did not close still lives — two facts kdt would only
+                // degrade by restating them.
+                Ok(WriteOutcome::Said(said)) => said
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                Ok(WriteOutcome::Done) => lang::fill(ok_msg, &[("name", &target)]),
                 Err(e) => lang::fill(err_msg, &[("name", &target), ("e", &e)]),
             };
             let mut s = status.lock().expect("reconcile status poisoned");
@@ -12128,6 +12171,7 @@ impl App {
                         Some(MenuAction::VelRestoreOptions)
                             | Some(MenuAction::IdentCreateUser)
                             | Some(MenuAction::IdentCreateGroup)
+                            | Some(MenuAction::IdentRevoke)
                             | Some(MenuAction::IdentMembership)
                             | Some(MenuAction::IdentCopySubject)
                             | Some(MenuAction::IdentCopyInstall)
@@ -12167,6 +12211,7 @@ impl App {
             Some(MenuAction::ArgoTerminate) => self.argo_terminate_app(),
             Some(MenuAction::IdentCreateUser) => self.open_ident_form(IdentFormKind::User),
             Some(MenuAction::IdentCreateGroup) => self.open_ident_form(IdentFormKind::Group),
+            Some(MenuAction::IdentRevoke) => self.ident_revoke(),
             Some(MenuAction::IdentSetDisabled(v)) => self.ident_set_disabled(v),
             Some(MenuAction::IdentMembership) => self.open_ident_pick(),
             Some(MenuAction::IdentCopySubject) => self.ident_copy_subject(),
@@ -20990,13 +21035,33 @@ fn ident_invite_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
     Cell::from(text).style(style)
 }
 
+// The SESS column: how many accesses this account is renewing right now. It is the only column
+// that says whether there is anything to revoke — the phase says what the account may do, not
+// whether anyone is currently using it.
+//
+// `?` is not `0`. An unreadable sessions Secret means kdt does not know, and rendering that as
+// "nobody is connected" is exactly the mistake that would make a revocation look unnecessary.
+fn ident_sessions_cell(u: &IdentUser) -> Cell<'static> {
+    match &u.sessions {
+        None => Cell::from("?").style(Style::default().fg(DIM)),
+        Some(s) if s.open == 0 => Cell::from("—").style(Style::default().fg(DIM)),
+        // Sessions on a disabled account are the one state worth colouring: the controller is
+        // supposed to have closed them, and it has not.
+        Some(s) if u.disabled => {
+            Cell::from(s.open.to_string()).style(Style::default().fg(Color::Yellow))
+        }
+        Some(s) => Cell::from(s.open.to_string()).style(Style::default().fg(Color::Green)),
+    }
+}
+
 fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, creds_error, totals, operator) = {
+    let (loading, error, creds_error, sessions_error, totals, operator, delivery) = {
         let s = app.ident_state.lock().expect("identity poisoned");
         let totals = IdentTotals {
             users: s.users.len(),
             active: s.active_users(),
             pending: s.users.iter().filter(|u| u.phase == Phase::Pending).count(),
+            connected: s.connected_users(),
             groups: s.groups.len(),
             unbound: s.unbound_groups(),
         };
@@ -21005,7 +21070,15 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|c| c.namespace.clone())
             .unwrap_or_else(|| "—".to_string());
-        (s.loading, s.error.clone(), s.creds_error.clone(), totals, operator)
+        (
+            s.loading,
+            s.error.clone(),
+            s.creds_error.clone(),
+            s.sessions_error.clone(),
+            totals,
+            operator,
+            s.delivery.clone(),
+        )
     };
 
     let st = lang::t(app.ai_language);
@@ -21022,14 +21095,30 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         ("total", &totals.users.to_string()),
                         ("active", &totals.active.to_string()),
                         ("pending", &totals.pending.to_string()),
+                        ("open", &totals.connected.to_string()),
                         ("ns", &operator),
                     ],
                 );
-                // Said in the title, once, rather than as a dash on every row: the two columns it
-                // silences are the ones nothing else can answer.
+                // The delivery mode belongs to the deployment, not to a row: it is stated once,
+                // next to the counters it explains — the SESS column only means something once the
+                // reader knows how long an access survives its revocation.
+                if let Some(mode) = delivery.mode {
+                    t.push_str(" · ");
+                    t.push_str(mode.label());
+                    if let Some(window) = delivery.revocation_window() {
+                        t.push_str(" <=");
+                        t.push_str(window);
+                    }
+                }
+                // Said in the title, once, rather than as a dash on every row: the columns they
+                // silence are the ones nothing else can answer.
                 if let Some(e) = &creds_error {
                     t.push_str(" · ");
                     t.push_str(&lang::fill(st.ident_creds_unreadable, &[("e", e)]));
+                }
+                if let Some(e) = &sessions_error {
+                    t.push_str(" · ");
+                    t.push_str(&lang::fill(st.ident_sessions_unreadable, &[("e", e)]));
                 }
                 t
             }
@@ -21067,7 +21156,8 @@ fn ident_table_parts(
         IdentWorld::Users => {
             let header = Row::new(vec![
                 Cell::from("NAME"), Cell::from("EMAIL"), Cell::from("PHASE"),
-                Cell::from("GROUPS"), Cell::from("INVITE"), Cell::from("AGE"),
+                Cell::from("GROUPS"), Cell::from("INVITE"), Cell::from("SESS"),
+                Cell::from("AGE"),
             ])
             .style(header_style);
             let rows = src
@@ -21090,6 +21180,7 @@ fn ident_table_parts(
                             Style::default()
                         }),
                         ident_invite_cell(u, st),
+                        ident_sessions_cell(u),
                         Cell::from(u.age.clone()).style(Style::default().fg(DIM)),
                     ]),
                     _ => Row::new(vec![Cell::from("")]),
@@ -21116,7 +21207,7 @@ fn ident_table_parts(
             let widths = vec![
                 Constraint::Length(name_w), Constraint::Length(email_w),
                 Constraint::Length(9), Constraint::Min(14), Constraint::Length(8),
-                Constraint::Length(5),
+                Constraint::Length(4), Constraint::Length(5),
             ];
             (header, rows, widths)
         }
@@ -21190,6 +21281,9 @@ struct IdentTotals {
     users: usize,
     active: usize,
     pending: usize,
+    /// Accounts holding a live session. Not the same number as `active`: an account may be
+    /// entitled and connected from nowhere, which is what makes a revocation pointless.
+    connected: usize,
     groups: usize,
     unbound: usize,
 }
@@ -21309,6 +21403,7 @@ fn draw_identity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
         if let Some(c) = &s.controller {
             lines.push(ident_label_line(st.ident_lbl_operator, c.namespace.clone()));
+            lines.extend(ident_delivery_lines(&s.delivery, st));
         }
         if let Some(e) = &s.creds_error {
             lines.push(Line::from(""));
@@ -21335,7 +21430,8 @@ fn draw_identity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let (title, mut lines) = ident_detail_lines(&row, st, width);
+    let delivery = app.ident_state.lock().expect("identity poisoned").delivery.clone();
+    let (title, mut lines) = ident_detail_lines(&row, st, width, &delivery);
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     if app.ident_detail_scroll > max_scroll {
@@ -21364,10 +21460,50 @@ fn ident_label_line(label: &str, value: String) -> Line<'static> {
     ])
 }
 
+// What the deployment declares about delivery. Rendered from the `Delivery` alone so a test can
+// walk every combination without an App: the interesting cases are the ones where a field is
+// missing, and those are exactly the ones a live cluster will not produce on demand.
+fn ident_delivery_lines(delivery: &Delivery, st: &'static lang::Strings) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let Some(mode) = delivery.mode else {
+        // No statement about revocation without a declared mode: the window depends on it, and a
+        // deployment that declares nothing may well be a pre-1.0 one that revokes nothing at all.
+        out.push(ident_label_line(st.ident_lbl_mode, st.ident_mode_unknown.to_string()));
+        return out;
+    };
+    out.push(ident_label_line(st.ident_lbl_mode, mode.label().to_string()));
+    if let Some(window) = delivery.revocation_window() {
+        out.push(ident_label_line(st.ident_lbl_revocation, format!("<= {window}")));
+    }
+    if let Some(refresh) = &delivery.refresh_ttl {
+        out.push(ident_label_line(st.ident_lbl_refresh, refresh.clone()));
+    }
+    // Certificate mode only: in OIDC the portal has no download to offer, and a line saying
+    // "closed" would suggest someone closed it.
+    if mode == CredentialMode::Certificate {
+        match delivery.kubeconfig_download {
+            Some(true) => out.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<17}", st.ident_lbl_download),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(st.ident_download_open, Style::default().fg(Color::Yellow)),
+            ])),
+            Some(false) => out.push(ident_label_line(
+                st.ident_lbl_download,
+                st.ident_download_closed.to_string(),
+            )),
+            None => {}
+        }
+    }
+    out
+}
+
 fn ident_detail_lines(
     row: &IdentRow,
     st: &'static lang::Strings,
     width: usize,
+    delivery: &Delivery,
 ) -> (Line<'static>, Vec<Line<'static>>) {
     let banner = |text: String| {
         Line::from(Span::styled(
@@ -21427,6 +21563,43 @@ fn ident_detail_lines(
                     ));
                 }
             }
+            // Sessions and delivery together, because neither answers on its own. "Three open" is
+            // not actionable without "and closing them stops the access within ten minutes", and
+            // the downloadable kubeconfig is the exception that would make both readings wrong.
+            match &u.sessions {
+                None => lines.push(label(
+                    st.ident_lbl_sessions,
+                    st.ident_sessions_unknown.to_string(),
+                )),
+                Some(sess) if sess.open == 0 => lines.push(label(
+                    st.ident_lbl_sessions,
+                    st.ident_sessions_none.to_string(),
+                )),
+                Some(sess) => {
+                    let mut text = lang::fill(
+                        st.ident_sessions_line,
+                        &[
+                            ("n", &sess.open.to_string()),
+                            (
+                                "date",
+                                &sess
+                                    .last_expiry
+                                    .map(crate::identity::format_stamp)
+                                    .unwrap_or_default(),
+                            ),
+                        ],
+                    );
+                    if sess.stale > 0 {
+                        text.push_str(" · ");
+                        text.push_str(&lang::fill(
+                            st.ident_sessions_stale,
+                            &[("n", &sess.stale.to_string())],
+                        ));
+                    }
+                    lines.push(label(st.ident_lbl_sessions, text));
+                }
+            }
+            lines.extend(ident_delivery_lines(delivery, st));
             lines.push(label(st.lbl_age, u.age.clone()));
             if !u.hints.is_empty() {
                 lines.push(Line::from(""));
@@ -32372,6 +32545,18 @@ mod identity_view_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    // A deployment that declares everything, so the delivery block renders at full height — the
+    // case that competes hardest with the rest of the panel for room.
+    fn delivery() -> Delivery {
+        Delivery {
+            mode: Some(CredentialMode::Certificate),
+            cert_ttl: Some("10m".to_string()),
+            token_ttl: None,
+            refresh_ttl: Some("7d".to_string()),
+            kubeconfig_download: Some(true),
+        }
+    }
+
     // A row shaped like the ones a real cluster produces: a long name, a long address, several
     // groups — everything that competes for the width the border needs.
     fn user() -> IdentUser {
@@ -32388,6 +32573,11 @@ mod identity_view_tests {
                 "plateforme-astreinte".to_string(),
             ],
             invitation: Invitation::Expired { expires: 1_756_000_000 },
+            sessions: Some(crate::identity::SessionFacts {
+                open: 2,
+                stale: 1,
+                last_expiry: Some(1_900_000_000),
+            }),
             creds: Some(CredentialFacts {
                 invite_expires: Some(1_756_000_000),
                 locked_until: Some(1_900_000_000),
@@ -32481,7 +32671,8 @@ mod identity_view_tests {
             for width in [40_u16, 60, 100, 196] {
                 let mut terminal =
                     Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
-                let (title, lines) = ident_detail_lines(&row, st, width.saturating_sub(2) as usize);
+                let (title, lines) =
+                    ident_detail_lines(&row, st, width.saturating_sub(2) as usize, &delivery());
                 terminal
                     .draw(|f| {
                         let p = Paragraph::new(lines.clone())
@@ -32514,7 +32705,7 @@ mod identity_view_tests {
     fn the_detail_panel_shows_the_controllers_own_phase_beside_kdts() {
         let st = lang::t(crate::ai::AiLanguage::Fr);
         let row = IdentRow::User(Box::new(user()));
-        let (_, lines) = ident_detail_lines(&row, st, 100);
+        let (_, lines) = ident_detail_lines(&row, st, 100, &delivery());
         let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("status.phase"), "the CRD's own phase is not shown: {text}");
         assert!(text.contains("Active"));
@@ -32528,7 +32719,7 @@ mod identity_view_tests {
     fn a_group_with_no_binding_says_so_rather_than_leaving_the_line_blank() {
         let st = lang::t(crate::ai::AiLanguage::Fr);
         let bare = IdentGroup { bindings: Vec::new(), ..group() };
-        let (_, lines) = ident_detail_lines(&IdentRow::Group(Box::new(bare)), st, 100);
+        let (_, lines) = ident_detail_lines(&IdentRow::Group(Box::new(bare)), st, 100, &delivery());
         let text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains(st.ident_none), "an unbound group renders as blank: {text}");
     }
@@ -32616,6 +32807,60 @@ mod identity_view_tests {
             }),
             None,
         );
+    }
+
+    // A deployment that declares no mode gets no statement about revocation. The window depends on
+    // the mode, and an undeclared mode is also what a pre-1.0 deployment looks like — one that
+    // revokes nothing at all.
+    #[test]
+    fn an_undeclared_mode_produces_no_revocation_claim() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let silent = text(ident_delivery_lines(&Delivery::default(), st));
+        assert!(silent.contains(st.ident_mode_unknown), "the absence must be named");
+        assert!(!silent.contains("<="), "no window without a mode: {silent}");
+        assert!(!silent.contains(st.ident_download_open));
+
+        let declared = text(ident_delivery_lines(&delivery(), st));
+        assert!(declared.contains("certificate"));
+        assert!(declared.contains("<= 10m"));
+        assert!(declared.contains(st.ident_download_open), "the non-revocable path must be named");
+
+        // OIDC has no download at all, so neither line about it may appear.
+        let oidc = text(ident_delivery_lines(
+            &Delivery {
+                mode: Some(CredentialMode::Oidc),
+                token_ttl: Some("5m".to_string()),
+                kubeconfig_download: Some(true),
+                ..Delivery::default()
+            },
+            st,
+        ));
+        assert!(oidc.contains("<= 5m"));
+        assert!(!oidc.contains(st.ident_download_open));
+        assert!(!oidc.contains(st.ident_download_closed));
+    }
+
+    // `?` and `0` are different answers, and the column that carries the case for revoking must not
+    // turn "I could not read it" into "nobody is connected".
+    #[test]
+    fn an_unreadable_sessions_secret_is_not_an_empty_one() {
+        let unknown = IdentUser { sessions: None, ..user() };
+        let none = IdentUser {
+            sessions: Some(crate::identity::SessionFacts::default()),
+            ..user()
+        };
+        let cell = |u: &IdentUser| format!("{:?}", ident_sessions_cell(u));
+        assert!(cell(&unknown).contains('?'));
+        assert!(!cell(&none).contains('?'));
+        assert_ne!(cell(&unknown), cell(&none));
     }
 
     // Only the invitation opens the entry prefilled: an empty box that expects `72h` is how one
