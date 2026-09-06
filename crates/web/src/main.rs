@@ -1,0 +1,137 @@
+//! kdt-web : l'interface web de kdt, adossée à kdt-identity.
+//!
+//! Le serveur ne détient aucun accès au cluster qui lui soit propre. Chaque requête est servie
+//! avec le credential de la personne connectée, obtenu du portail : l'apiserver voit `kdt:alice`
+//! et ses groupes, et le RBAC du cluster s'applique tel quel.
+//!
+//! Le compte de service du pod n'a donc besoin d'aucun droit sur les ressources. Ce qui rend
+//! kdt-web sensible, ce sont les credentials qu'on lui confie — pas ses propres pouvoirs, qui
+//! sont nuls.
+
+mod api;
+mod auth;
+mod config;
+mod portal;
+mod session;
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::routing::{get, post};
+use axum::Router;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
+
+use config::WebConfig;
+use portal::Portal;
+use session::Sessions;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<WebConfig>,
+    pub portal: Arc<Portal>,
+    pub sessions: Arc<Sessions>,
+    /// La configuration de base du client : l'adresse de l'apiserver et sa CA, sans identité.
+    ///
+    /// C'est le squelette dont chaque session tire son propre client en y posant son credential.
+    /// Il vient du compte de service du pod, ou du kubeconfig hors cluster — dans les deux cas on
+    /// ne garde **que** l'adresse et la CA, jamais l'identité qu'il portait.
+    pub kube: kube::Config,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("installation du fournisseur cryptographique rustls");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+
+    let config = WebConfig::from_env().context("configuration")?;
+
+    // L'identité du compte de service est retirée : elle ne doit jamais servir à répondre à une
+    // requête. Ce qu'on garde est l'adresse de l'apiserver et la CA qui le valide.
+    let mut kube = kube::Config::infer()
+        .await
+        .context("adresse de l'apiserver et CA du cluster")?;
+    kube.auth_info = Default::default();
+
+    info!(
+        apiserver = %kube.cluster_url,
+        portail = %config.portal_url,
+        "kdt-web démarre"
+    );
+    if config.assets.is_none() {
+        info!("aucun bundle à servir : seule l'API répond (mode développement)");
+    }
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        portal: Arc::new(Portal::new(&config.portal_url)),
+        sessions: Arc::new(Sessions::new(config.session_ttl)),
+        kube,
+    };
+
+    let mut app = Router::new()
+        .route("/auth/login", get(auth::login))
+        .route(
+            kdt_identity_api::portal::AUTHORIZE_CALLBACK_PATH,
+            get(auth::callback),
+        )
+        .route("/auth/logout", post(auth::logout))
+        .route("/api/v1/me", get(auth::me))
+        .route("/api/v1/events", get(api::events))
+        .route("/healthz", get(|| async { "ok" }));
+
+    // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de
+    // session est `SameSite=Strict`, et une origine séparée pour le front ne le recevrait pas.
+    if let Some(dir) = &config.assets {
+        let index = format!("{dir}/index.html");
+        app = app.fallback_service(
+            tower_http::services::ServeDir::new(dir)
+                // Une SPA a des routes que le disque ne connaît pas : `/events` n'est pas un
+                // fichier. Tout ce qui n'existe pas retombe sur la page, qui saura quoi faire.
+                .not_found_service(tower_http::services::ServeFile::new(index)),
+        );
+    }
+
+    let app = app.with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&config.listen)
+        .await
+        .with_context(|| format!("écoute sur {}", config.listen))?;
+    info!(adresse = %config.listen, "kdt-web écoute");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown())
+        .await
+        .context("service HTTP")?;
+
+    Ok(())
+}
+
+/// Arrêt propre sur SIGTERM et Ctrl-C.
+///
+/// Les sessions vivent en mémoire : les perdre est sans gravité, chacun se reconnecte. Ce qui
+/// compte est de ne pas couper une requête en cours au milieu.
+async fn shutdown() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => warn!(erreur = %e, "SIGTERM non écouté"),
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("arrêt demandé, les sessions ouvertes sont perdues");
+}

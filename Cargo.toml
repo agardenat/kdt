@@ -1,8 +1,18 @@
-[package]
-name = "kdt"
-version = "1.26.0"
+# Deux binaires, une seule version : le dépôt n'a qu'un tag et qu'un CHANGELOG, et deux versions
+# indépendantes le rendraient illisible. `packaging/common.sh` lit celle-ci.
+[workspace]
+members = ["crates/web"]
+
+[workspace.package]
+version = "2.0.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
+
+[package]
+name = "kdt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 # Le binaire est le TUI : sans la feature, il n'y a rien à en faire, et `required-features`
 # l'exclut de la compilation plutôt que de la faire échouer.

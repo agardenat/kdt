@@ -5,7 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$ROOT/dist"
 
 NAME="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
-VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
+# La version vit sous [workspace.package] : les deux binaires la partagent, le dépôt n'a qu'un
+# tag et qu'un CHANGELOG. Le repli couvre un Cargo.toml sans workspace.
+VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' "$ROOT/Cargo.toml" | head -n1)"
+[[ -n "$VERSION" ]] || VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
 SUMMARY="kdt — Kubernetes Diagnostic Tools"
 MAINTAINER="Antoine Gardenat <agardenat@leisambro.net>"
 LICENSE="proprietary"
@@ -32,8 +35,9 @@ else
 fi
 
 build_binary() {
-    echo ">> cargo build --release ($TARGET_TRIPLE)"
-    ( cd "$ROOT" && cargo build --release )
+    echo ">> cargo build --release -p kdt ($TARGET_TRIPLE)"
+    # `-p kdt` : le workspace porte aussi kdt-web, qui n'a rien à faire dans un paquet du TUI.
+    ( cd "$ROOT" && cargo build --release -p kdt )
     BIN="$ROOT/target/$TARGET_TRIPLE/release/$NAME"
     if [[ ! -x "$BIN" ]]; then
         BIN="$(find "$ROOT/target" -type f -name "$NAME" -path '*release*' ! -name '*.d' 2>/dev/null | head -n1)"

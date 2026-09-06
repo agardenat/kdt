@@ -8,6 +8,43 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-alpha.1] — non publiée
+
+Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-web`, une interface web
+qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
+rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
+
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne et une première
+vue répond, le reste n'existe pas.
+
+- **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
+  C'est ce qui permet à `kdt-web` de réutiliser les modules métier au lieu d'en copier les règles :
+  les verdicts sont ce que kdt apporte, et deux implémentations divergeraient. Les trois modules
+  qui dessinent dans un terminal — `ui`, `splash`, `glyphs` — passent derrière la feature `tui`,
+  active par défaut, pour qu'un serveur ne compile pas `ratatui`.
+
+- **feat(web)** — `kdt-web` s'authentifie par le flow d'autorisation de kdt-identity 1.0 : il
+  n'a jamais accès au mot de passe ni au code TOTP, et obtient un droit de session que `revoke` et
+  `spec.disabled` ferment comme celui d'un poste.
+
+  Chaque requête est servie avec **le credential de la personne connectée** : l'apiserver voit
+  `kdt:alice` et ses groupes, donc le RBAC du cluster s'applique tel quel. Le compte de service du
+  pod n'a besoin d'aucun droit sur les ressources — c'est ce qui distingue kdt-web d'un tableau de
+  bord classique, et ce qui fait qu'obtenir l'exécution de code dedans n'ouvre aucun accès.
+
+  Le droit de session vit en mémoire, jamais sur disque ni dans un `Secret`. Un redémarrage le
+  perd et chacun se reconnecte ; en échange, il n'existe aucun fichier contenant de quoi agir au
+  nom de tout le monde. Corollaire assumé pour l'instant : **une seule réplique**.
+
+- **feat(web)** — première vue : les évènements, dans la portée de namespaces demandée. Un refus
+  de l'apiserver est rendu tel quel plutôt que traduit en liste vide, qui ferait croire à un
+  cluster calme.
+
+- **fix(ci)** — un tag de pré-version ne publiait pas ce qu'il annonçait : `action-gh-release` a
+  `prerelease` à `false` par défaut, sans détection SemVer, et le job Homebrew n'avait aucune
+  condition — une `v2.0.0-alpha.1` aurait été marquée « dernière version » et poussée dans la
+  formule du tap, basculant tout le monde sur une alpha.
+
 ## [1.26.0] — 2026-09-05
 
 - **feat(identity)** — vue `:identity` : comptes et groups locaux de kdt-identity, avec la colonne

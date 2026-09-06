@@ -21,13 +21,16 @@ use kube::runtime::{watcher, WatchStreamExt};
 use kube::{Api, Client};
 use tokio::task::JoinHandle;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Normal,
     Warning,
 }
 
-#[derive(Debug, Clone)]
+// `Serialize` parce que kdt-web sert ces enregistrements tels quels : le TUI et l'interface web
+// doivent parler du même objet, pas de deux projections qui divergeront.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EventRecord {
     pub uid: String,
     pub time: Timestamp,

@@ -47,6 +47,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
+          # une v2.0.0-alpha.1 serait publiée comme la dernière version stable.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: RELEASE_NOTES.md
           files: |
             ${{ env.APP_NAME }}-macos-universal.tar.gz
@@ -84,6 +87,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
+          # une v2.0.0-alpha.1 serait publiée comme la dernière version stable.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: RELEASE_NOTES.md
           files: |
             ${{ env.APP_NAME }}-linux-x86_64.tar.gz
@@ -95,6 +101,9 @@ jobs:
   update-homebrew:
     runs-on: ubuntu-latest
     needs: [build-macos, build-linux]
+    # La formule du tap est ce que `brew upgrade` suit : une pré-version n'a rien à y faire, elle
+    # basculerait tout le monde sur une alpha.
+    if: ${{ !contains(github.ref_name, '-') }}
     permissions:
       contents: read
     steps:
