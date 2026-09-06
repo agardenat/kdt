@@ -4,7 +4,14 @@
 // c'est un aller au portail. Le distinguer évite qu'un droit de session expiré ressemble à une
 // panne du cluster.
 
-import type { EventsPayload, Identity } from "./types";
+import type {
+  EventRecord,
+  EventsPayload,
+  Identity,
+  PodLogs,
+  RelatedSection,
+  StatusPayload,
+} from "./types";
 
 /** Le serveur demande de repasser par le portail : la session n'est plus valide. */
 export class NeedsAuth extends Error {}
@@ -36,6 +43,29 @@ async function get<T>(path: string): Promise<T> {
   throw new ApiError(detail);
 }
 
+/** Même traitement des refus que `get`, pour un corps posté. */
+async function send<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(body),
+  });
+  if (response.ok) return (await response.json()) as T;
+
+  let detail = `le serveur a répondu ${response.status}`;
+  let reauthenticate = false;
+  try {
+    const parsed = await response.json();
+    if (typeof parsed?.error === "string") detail = parsed.error;
+    reauthenticate = parsed?.reauthenticate === true;
+  } catch {
+    // Pas de JSON : le statut nomme déjà l'erreur.
+  }
+  if (reauthenticate || response.status === 401) throw new NeedsAuth(detail);
+  throw new ApiError(detail);
+}
+
 export function identity(): Promise<Identity> {
   return get<Identity>("/api/v1/me");
 }
@@ -54,4 +84,29 @@ export function login(): void {
 export async function logout(): Promise<void> {
   await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
   window.location.href = "/";
+}
+
+export function related(record: EventRecord): Promise<{ sections: RelatedSection[] }> {
+  return send<{ sections: RelatedSection[] }>("/api/v1/related", record);
+}
+
+export function logs(
+  namespace: string,
+  pod: string,
+  options: { container?: string; previous?: boolean } = {},
+): Promise<PodLogs> {
+  const params = new URLSearchParams({ namespace, pod });
+  if (options.container) params.set("container", options.container);
+  if (options.previous) params.set("previous", "true");
+  return get<PodLogs>(`/api/v1/logs?${params.toString()}`);
+}
+
+export function status(record: EventRecord): Promise<StatusPayload> {
+  const params = new URLSearchParams({
+    apiVersion: record.api_version,
+    kind: record.kind,
+    namespace: record.namespace,
+    name: record.name,
+  });
+  return get<StatusPayload>(`/api/v1/status?${params.toString()}`);
 }

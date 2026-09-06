@@ -175,7 +175,7 @@ button, input { font: inherit; color: inherit; }
 
 /* ---------------------------------------------------------------- ossature */
 .chrome { display: grid; grid-template-columns: var(--rail) 1fr; min-height: 0; }
-.chrome.open { grid-template-columns: var(--rail) 1fr var(--drawer); }
+
 
 .rail {
   border-right: 1px solid var(--line); background: var(--card); overflow-y: auto;
@@ -305,9 +305,157 @@ button, input { font: inherit; color: inherit; }
 .statusbar .err { color: var(--err); }
 
 @media (max-width: 1080px) {
-  .chrome.open { grid-template-columns: var(--rail) 1fr; }
-  .chrome.open .drawer {
-    position: fixed; top: 0; right: 0; bottom: 0; width: min(392px, 92vw); z-index: 60;
-  }
   .who .grp, .brand .ctx { display: none; }
 }
+
+/* ---------------------------------------------------------------- tons du verdict
+
+   Les trois niveaux du TUI, aux mêmes endroits : l'étiquette, la raison, et un liseré sur la
+   ligne. Le ton arrive calculé du serveur ; le CSS ne fait que le peindre. */
+.st.ok { color: var(--ok); }
+.st.warn { color: var(--warn); }
+.st.err { color: var(--err); }
+
+.reason-err { color: var(--err); font-weight: 600; }
+.reason-warn { color: var(--warn); }
+.reason-ok { color: var(--info); }
+
+.tbody .tr.sev-warn { border-left-color: var(--warn); }
+/* Un évènement critique porte un fond, comme la ligne rouge du TUI : à la différence d'un
+   warning ordinaire, il dit que quelque chose est déjà cassé. */
+.tbody .tr.sev-err {
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.tbody .tr.sev-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+
+/* ---------------------------------------------------------------- onglets du drawer */
+.dtabs { display: flex; gap: .1rem; margin: .55rem -.2rem -.55rem; }
+.dtabs button {
+  position: relative; padding: .4rem .55rem; background: none; border: 0;
+  color: var(--muted); font-size: 12px; cursor: pointer;
+}
+.dtabs button:hover:not(:disabled) { color: var(--fg); }
+.dtabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; }
+.dtabs button[aria-selected="true"]::after {
+  content: ""; position: absolute; left: .4rem; right: .4rem; bottom: -1px; height: 2px;
+  background: var(--accent); border-radius: 2px 2px 0 0;
+}
+.dtabs button:disabled { opacity: .38; cursor: default; }
+
+.pane-wait, .pane-err { color: var(--muted); font-size: 12px; margin: .2rem 0; }
+.pane-err { color: var(--err); white-space: pre-wrap; word-break: break-word; }
+
+.related { border-bottom: 1px solid var(--line-soft); }
+.related summary {
+  padding: .45rem .1rem; cursor: pointer; font-size: 12px; font-weight: 600;
+  list-style-position: outside;
+}
+.related summary:hover { color: var(--accent); }
+.related .json {
+  margin: 0 0 .6rem; padding: .55rem .6rem; background: var(--sunk);
+  border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  max-height: 320px; overflow: auto; white-space: pre;
+}
+
+.logbar { display: flex; align-items: center; gap: .7rem; margin-bottom: .55rem; }
+.logbar select {
+  height: 26px; padding: 0 .4rem; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 11.5px;
+}
+.logbar label { display: flex; align-items: center; gap: .3rem; color: var(--muted); font-size: 11.5px; }
+
+.logs {
+  margin: 0; padding: .55rem .6rem; background: var(--sunk);
+  border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  white-space: pre; overflow: auto; max-height: calc(100dvh - 210px);
+}
+
+/* ---------------------------------------------------------------- panneau d'inspection
+
+   Au-dessus de la table, comme le panneau du haut de kdt. Sa hauteur est bornée en `dvh` pour
+   qu'il ne mange jamais la table entière : on inspecte une ligne tout en gardant les autres
+   sous les yeux, ce qui est la raison d'être du double panneau. */
+.panel {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--card);
+  flex: none;
+}
+
+.phd {
+  display: flex; align-items: center; gap: .8rem; padding: 0 .85rem;
+  border-bottom: 1px solid var(--line-soft); flex: none;
+}
+.ptabs { display: flex; gap: .1rem; }
+.ptabs button {
+  position: relative; padding: .5rem .6rem; background: none; border: 0;
+  color: var(--muted); font-size: 12.5px; cursor: pointer;
+}
+.ptabs button:hover:not(:disabled) { color: var(--fg); }
+.ptabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; }
+.ptabs button[aria-selected="true"]::after {
+  content: ""; position: absolute; left: .5rem; right: .5rem; bottom: -1px; height: 2px;
+  background: var(--accent); border-radius: 2px 2px 0 0;
+}
+.ptabs button:disabled { opacity: .38; cursor: default; }
+
+.pid {
+  display: flex; align-items: center; gap: .55rem; min-width: 0;
+  font-size: 12px; color: var(--muted);
+}
+.pid .mono { font-family: var(--mono); color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pid .reason { font-family: var(--mono); }
+.pclose {
+  margin-left: auto; background: none; border: 0; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: .2rem .35rem; flex: none;
+}
+.pclose:hover { color: var(--fg); }
+
+.pbody { flex: 1; min-height: 0; overflow: auto; padding: .6rem .85rem .8rem; }
+
+.panel-toggle {
+  background: none; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--muted); cursor: pointer; font-size: 11px; padding: .12rem .4rem;
+}
+.panel-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Les lignes de status portent le ton que kdt leur a donné. `Plain` n'en est pas un : c'est du
+   texte ordinaire, et lui donner une couleur reviendrait à inventer un verdict. */
+.statuslines { margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.55; }
+.statuslines .ln { white-space: pre-wrap; word-break: break-word; }
+.statuslines .ln.ok { color: var(--ok); }
+.statuslines .ln.warn { color: var(--warn); }
+.statuslines .ln.err { color: var(--err); }
+.statuslines .ln.info { color: var(--info); }
+.statuslines .ln.dim { color: var(--dim); }
+
+/* Le panneau occupe toute la largeur : les sections tiennent en colonnes plutôt qu'en une
+   colonne unique de 1600 px de long. */
+.relgrid { columns: 2; column-gap: 1.2rem; }
+@media (max-width: 1100px) { .relgrid { columns: 1; } }
+.related { break-inside: avoid; }
+.logs { max-height: none; }
+
+/* ---------------------------------------------------------------- poignée du double panneau
+
+   Le trait fait 1 px mais la zone d'accroche en fait 9 : viser un trait d'un pixel à la souris
+   est un exercice, pas une interaction. Le trait reste fin, la cible est large. */
+.splitter {
+  flex: none; height: 9px; margin-top: -4px; margin-bottom: -4px;
+  position: relative; z-index: 10;
+  cursor: row-resize; background: transparent;
+}
+.splitter::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 4px; height: 1px;
+  background: var(--line);
+}
+.splitter:hover::after, .splitter.dragging::after, .splitter:focus-visible::after {
+  background: var(--accent); height: 2px; top: 3.5px;
+}
+.splitter:focus-visible { outline: none; }
+/* Pendant le glissement, le curseur reste celui du redimensionnement partout, et rien ne se
+   sélectionne au passage — sans quoi on surligne la moitié de la page en tirant. */
+.splitter.dragging { touch-action: none; }
+body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }

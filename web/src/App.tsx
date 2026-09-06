@@ -10,7 +10,15 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { storedLang, storeLang, strings, type Lang } from "./i18n";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
-import { age, toneOf, type EventRecord, type Identity } from "./types";
+import {
+  age,
+  toneLabel,
+  type EventRecord,
+  type Identity,
+  type PodLogs,
+  type RelatedSection,
+  type StatusPayload,
+} from "./types";
 
 /** Les vues, dans l'ordre du rail. `ready` dit celles qui répondent aujourd'hui. */
 const VIEWS: Array<{ id: string; label: string; key: string; ready?: boolean }> = [
@@ -29,10 +37,31 @@ const VIEWS: Array<{ id: string; label: string; key: string; ready?: boolean }> 
   { id: "diagnostic", label: "Diagnostic", key: "d" },
 ];
 
-/** Les colonnes de la vue évènements, et leur piste de grille. */
-const COLUMNS = "64px 96px 150px 120px minmax(160px,.9fr) minmax(280px,2fr) 54px";
+/**
+ * Les colonnes de la vue évènements : mêmes colonnes, même ordre et mêmes proportions que le TUI.
+ *
+ * Côté Rust les largeurs sont en caractères — 5, 4, 20, 14, 40, 22, 4, puis le reste pour le
+ * message. Transposées ici en pistes de grille, avec un minimum pour que rien ne s'écrase et un
+ * `fr` sur les deux colonnes qui méritent la place restante.
+ */
+const COLUMNS =
+  "52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch) 40px minmax(240px,2fr)";
 
 type Filter = "all" | "warnings";
+
+/** Hauteur du panneau au premier affichage, et celle que le double-clic sur la poignée rétablit. */
+const DEFAULT_PANEL_HEIGHT = 300;
+
+/**
+ * Bornes du panneau, calculées à chaque fois plutôt que figées.
+ *
+ * Le plancher garde les onglets et deux lignes lisibles ; le plafond garde toujours quelques
+ * lignes de table sous les yeux, sans quoi le double panneau ne servirait plus à rien.
+ */
+function clampPanelHeight(height: number): number {
+  const ceiling = Math.max(160, window.innerHeight - 260);
+  return Math.min(Math.max(height, 120), ceiling);
+}
 
 export default function App() {
   const [lang, setLang] = useState<Lang>(storedLang);
@@ -49,11 +78,57 @@ export default function App() {
   const [needsAuth, setNeedsAuth] = useState(false);
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
 
+  const [tab, setTab] = useState<PanelTab>("status");
+  // Hauteur du panneau, en pixels et retenue d'une session à l'autre. Lire des logs et lire une
+  // table ne demandent pas le même partage de l'écran, et ce partage est affaire de goût — donc
+  // il se règle plutôt qu'il ne se décrète.
+  const [panelHeight, setPanelHeight] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem("kdt-panel-h"));
+      if (Number.isFinite(stored) && stored > 0) return stored;
+    } catch {
+      // Stockage bloqué : la hauteur par défaut fait l'affaire.
+    }
+    return DEFAULT_PANEL_HEIGHT;
+  });
+  // Replié, le panneau laisse toute la hauteur à la table. Le choix est retenu, comme le
+  // `hide_top_panel` que kdt écrit dans sa configuration.
+  const [panelOpen, setPanelOpen] = useState(() => {
+    try {
+      return localStorage.getItem("kdt-panel") !== "closed";
+    } catch {
+      return true;
+    }
+  });
   const [scopeOpen, setScopeOpen] = useState(false);
   const filterRef = useRef<HTMLInputElement>(null);
   const st = strings(lang);
 
   useEffect(() => applyTheme(theme), [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("kdt-panel", panelOpen ? "open" : "closed");
+    } catch {
+      // Stockage bloqué : le choix vaut pour l'onglet ouvert, ce n'est pas une erreur.
+    }
+  }, [panelOpen]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("kdt-panel-h", String(panelHeight));
+    } catch {
+      // Idem : sans persistance, la hauteur vaut pour l'onglet ouvert.
+    }
+  }, [panelHeight]);
+
+  // Une fenêtre rétrécie peut rendre la hauteur retenue plus grande que ce qui tient : la
+  // ramener dans les bornes évite un panneau qui recouvre toute la table au redimensionnement.
+  useEffect(() => {
+    const onResize = () => setPanelHeight((h) => clampPanelHeight(h));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // Qui est connecté. Tant qu'on ne le sait pas, on n'affiche ni l'application ni l'invitation à
   // se connecter : montrer l'une puis l'autre ferait clignoter la page à chaque chargement.
@@ -105,17 +180,18 @@ export default function App() {
       } else if (e.key === "Escape") {
         if (scopeOpen) setScopeOpen(false);
         else if (document.activeElement === filterRef.current) filterRef.current?.blur();
+        else if (panelOpen && selected) setPanelOpen(false);
         else if (selected) setSelected(null);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [scopeOpen, selected]);
+  }, [scopeOpen, selected, panelOpen]);
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return rows.filter((r) => {
-      if (filter === "warnings" && r.severity !== "warning") return false;
+      if (filter === "warnings" && r.tone === "ok") return false;
       if (!needle) return true;
       return [r.reason, r.kind, r.namespace, r.name, r.message, r.component]
         .join(" ")
@@ -143,7 +219,7 @@ export default function App() {
     );
   }
 
-  const warnings = rows.filter((r) => r.severity === "warning").length;
+  const warnings = rows.filter((r) => r.tone !== "ok").length;
 
   return (
     <div className="app">
@@ -227,7 +303,7 @@ export default function App() {
         </button>
       </header>
 
-      <div className={selected ? "chrome open" : "chrome"}>
+      <div className="chrome">
         <nav className="rail">
           <div className="rail-hd">{st.views}</div>
           {VIEWS.map((v) => (
@@ -244,6 +320,20 @@ export default function App() {
         </nav>
 
         <section className="pane">
+          {selected && panelOpen && (
+            <>
+              <InspectPanel
+                record={selected}
+                tab={tab}
+                onTab={setTab}
+                onClose={() => setPanelOpen(false)}
+                height={panelHeight}
+                lang={lang}
+              />
+              <Splitter height={panelHeight} onHeight={setPanelHeight} lang={lang} />
+            </>
+          )}
+
           <div className="worlds" role="tablist">
             <button role="tab" aria-selected={filter === "all"} onClick={() => setFilter("all")}>
               {lang === "fr" ? "Tous" : "All"}
@@ -258,6 +348,21 @@ export default function App() {
               <span className="count">{warnings}</span>
             </button>
             <div className="right">
+              {selected && (
+                <button
+                  className="panel-toggle"
+                  onClick={() => setPanelOpen((v) => !v)}
+                  title={lang === "fr" ? "Panneau d'inspection" : "Inspection panel"}
+                >
+                  {panelOpen
+                    ? lang === "fr"
+                      ? "▾ replier"
+                      : "▾ collapse"
+                    : lang === "fr"
+                      ? "▸ panneau"
+                      : "▸ panel"}
+                </button>
+              )}
               {refreshedAt && <span>{st.refreshed}</span>}
             </div>
           </div>
@@ -284,7 +389,14 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <EventTable rows={visible} selected={selected} onSelect={setSelected} />
+              <EventTable
+                rows={visible}
+                selected={selected}
+                onSelect={(r) => {
+                  setSelected(r);
+                  setPanelOpen(true);
+                }}
+              />
             )}
           </div>
 
@@ -303,9 +415,6 @@ export default function App() {
           </div>
         </section>
 
-        {selected && (
-          <Detail record={selected} onClose={() => setSelected(null)} labels={st} lang={lang} />
-        )}
       </div>
     </div>
   );
@@ -325,19 +434,20 @@ function EventTable({
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
           <div className="cell num">AGE</div>
-          <div className="cell">TYPE</div>
-          <div className="cell">REASON</div>
+          <div className="cell">SEV</div>
+          <div className="cell">NS</div>
           <div className="cell">KIND</div>
-          <div className="cell">OBJECT</div>
-          <div className="cell">MESSAGE</div>
+          <div className="cell">NAME</div>
+          <div className="cell">REASON</div>
           <div className="cell num">CNT</div>
+          <div className="cell">MESSAGE</div>
         </div>
       </div>
       <div className="tbody">
         {rows.map((r) => (
           <div
             key={r.uid || `${r.namespace}/${r.name}/${r.time}`}
-            className={`tr sev-${toneOf(r.severity)}`}
+            className={`tr sev-${r.tone}`}
             style={{ gridTemplateColumns: COLUMNS }}
             aria-selected={selected?.uid === r.uid}
             tabIndex={0}
@@ -348,15 +458,14 @@ function EventTable({
           >
             <div className="cell num">{age(r.time)}</div>
             <div className="cell">
-              <span className={`st ${toneOf(r.severity)}`}>{r.severity}</span>
+              <span className={`st ${r.tone}`}>{toneLabel(r.tone)}</span>
             </div>
-            <div className="cell id">{r.reason}</div>
+            <div className="cell mono">{r.namespace}</div>
             <div className="cell mono">{r.kind}</div>
-            <div className="cell mono">
-              {r.namespace ? `${r.namespace}/${r.name}` : r.name}
-            </div>
+            <div className="cell id">{r.name}</div>
+            <div className={`cell reason-${r.tone}`}>{r.reason}</div>
+            <div className="cell num">{r.count > 1 ? `x${r.count}` : ""}</div>
             <div className="cell">{r.message}</div>
-            <div className="cell num">{r.count}</div>
           </div>
         ))}
       </div>
@@ -364,61 +473,310 @@ function EventTable({
   );
 }
 
-function Detail({
+/**
+ * Les onglets du panneau, dans l'ordre et sous les noms du TUI.
+ *
+ * `DetailTab { Logs, Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail »
+ * en plus n'existerait que sur le web, et les deux interfaces ne se ressembleraient plus.
+ */
+type PanelTab = "logs" | "status" | "related";
+
+/**
+ * Le panneau d'inspection, **au-dessus** de la table comme dans le TUI.
+ *
+ * Un panneau latéral paraissait plus moderne ; il est surtout trop étroit pour ce qu'on y met.
+ * Des logs sur 390 px se lisent en accordéon, alors que la largeur entière de l'écran les rend
+ * comme un terminal. C'est aussi la disposition que kdt a déjà, donc celle que quelqu'un qui
+ * passe de l'un à l'autre n'a pas à réapprendre.
+ */
+function InspectPanel({
   record,
+  tab,
+  onTab,
   onClose,
-  labels,
+  height,
   lang,
 }: {
   record: EventRecord;
+  tab: PanelTab;
+  onTab: (t: PanelTab) => void;
   onClose: () => void;
-  labels: ReturnType<typeof strings>;
+  height: number;
   lang: Lang;
 }) {
+  // Les logs ne sont à une requête que sur un Pod : y remonter depuis un Deployment demande de
+  // choisir quels pods lire, et ce choix a des règles qu'on ne réinvente pas ici.
+  const isPod = record.kind === "Pod" && record.namespace !== "" && record.name !== "";
+
   return (
-    <aside className="drawer">
-      <div className="dhd">
-        <div className="top">
-          <div>
-            <h2>{record.namespace ? `${record.namespace}/${record.name}` : record.name}</h2>
-            <p className="sub">
-              {record.kind} · {record.api_version || "v1"}
-            </p>
-          </div>
-          <button className="close" aria-label={labels.detailClose} onClick={onClose}>
-            ✕
+    <section className="panel" style={{ height }}>
+      <div className="phd">
+        <div className="ptabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={tab === "logs"}
+            disabled={!isPod}
+            title={
+              isPod
+                ? undefined
+                : lang === "fr"
+                  ? "Les logs ne sont lisibles que sur un Pod"
+                  : "Logs are only available on a Pod"
+            }
+            onClick={() => onTab("logs")}
+          >
+            Logs
+          </button>
+          <button role="tab" aria-selected={tab === "status"} onClick={() => onTab("status")}>
+            Status
+          </button>
+          <button role="tab" aria-selected={tab === "related"} onClick={() => onTab("related")}>
+            Related
           </button>
         </div>
-      </div>
-      <div className="dbody">
-        <div className="sect">Message</div>
-        <p className="message">{record.message}</p>
 
-        <div className="sect">{labels.sectionFields}</div>
-        <dl className="facts">
-          <dt>Reason</dt>
-          <dd>{record.reason}</dd>
-          <dt>{lang === "fr" ? "Type" : "Type"}</dt>
-          <dd>{record.severity}</dd>
-          <dt>{lang === "fr" ? "Horodatage" : "Timestamp"}</dt>
-          <dd>{record.time}</dd>
-          <dt>{lang === "fr" ? "Occurrences" : "Count"}</dt>
-          <dd>{record.count}</dd>
-          {record.component && (
-            <>
-              <dt>{lang === "fr" ? "Émis par" : "Reported by"}</dt>
-              <dd>{record.component}</dd>
-            </>
-          )}
-          {record.host && (
-            <>
-              <dt>Node</dt>
-              <dd>{record.host}</dd>
-            </>
-          )}
-        </dl>
+        <div className="pid">
+          <span className={`st ${record.tone}`}>{toneLabel(record.tone)}</span>
+          <span className="mono">
+            {record.kind} {record.namespace ? `${record.namespace}/${record.name}` : record.name}
+          </span>
+          <span className="reason">{record.reason}</span>
+        </div>
+
+        <button
+          className="pclose"
+          title={lang === "fr" ? "Replier le panneau" : "Collapse the panel"}
+          onClick={onClose}
+        >
+          ▾
+        </button>
       </div>
-    </aside>
+
+      <div className="pbody">
+        {tab === "logs" &&
+          (isPod ? (
+            <LogsPane namespace={record.namespace} pod={record.name} lang={lang} />
+          ) : (
+            <p className="pane-wait">
+              {lang === "fr"
+                ? "Cet évènement ne porte pas sur un Pod."
+                : "This event is not about a Pod."}
+            </p>
+          ))}
+        {tab === "status" && <StatusPane record={record} lang={lang} />}
+        {tab === "related" && <RelatedPane record={record} lang={lang} />}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * La poignée entre le panneau et la table.
+ *
+ * `setPointerCapture` plutôt que des écouteurs sur `window` : le glissement continue de suivre le
+ * curseur même s'il sort de la poignée ou passe au-dessus d'une iframe, et il s'arrête tout seul
+ * quand le bouton est relâché n'importe où.
+ *
+ * Elle est aussi au clavier — c'est un `separator` focusable — parce qu'une poignée qui n'existe
+ * qu'à la souris exclut ceux qui n'en utilisent pas.
+ */
+function Splitter({
+  height,
+  onHeight,
+  lang,
+}: {
+  height: number;
+  onHeight: (h: number) => void;
+  lang: Lang;
+}) {
+  const [dragging, setDragging] = useState(false);
+
+  return (
+    <div
+      className={dragging ? "splitter dragging" : "splitter"}
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={lang === "fr" ? "Hauteur du panneau" : "Panel height"}
+      aria-valuenow={Math.round(height)}
+      tabIndex={0}
+      title={
+        lang === "fr"
+          ? "Glisser pour redimensionner, double-clic pour réinitialiser"
+          : "Drag to resize, double-click to reset"
+      }
+      onPointerDown={(e) => {
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setDragging(true);
+      }}
+      onPointerMove={(e) => {
+        if (!dragging) return;
+        // La hauteur se lit sur la position du curseur, pas sur un cumul de deltas : un cumul
+        // dérive dès que la valeur est bornée, et la poignée finit décalée du curseur.
+        const top = e.currentTarget.parentElement?.getBoundingClientRect().top ?? 0;
+        onHeight(clampPanelHeight(e.clientY - top));
+      }}
+      onPointerUp={(e) => {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+        setDragging(false);
+      }}
+      onDoubleClick={() => onHeight(DEFAULT_PANEL_HEIGHT)}
+      onKeyDown={(e) => {
+        const step = e.shiftKey ? 60 : 16;
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          onHeight(clampPanelHeight(height - step));
+        } else if (e.key === "ArrowDown") {
+          e.preventDefault();
+          onHeight(clampPanelHeight(height + step));
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          onHeight(DEFAULT_PANEL_HEIGHT);
+        }
+      }}
+    />
+  );
+}
+
+/** L'état de l'objet, mis en forme par kdt et peint avec le ton de chaque ligne. */
+function StatusPane({ record, lang }: { record: EventRecord; lang: Lang }) {
+  const [payload, setPayload] = useState<StatusPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setPayload(null);
+    setError(null);
+    api
+      .status(record)
+      .then((r) => live && setPayload(r))
+      .catch((e) => live && setError(String(e.message ?? e)));
+    return () => {
+      live = false;
+    };
+  }, [record]);
+
+  if (error) return <p className="pane-err">{error}</p>;
+  if (!payload) return <p className="pane-wait">{lang === "fr" ? "Lecture…" : "Reading…"}</p>;
+  if (payload.error) return <p className="pane-err">{payload.error}</p>;
+
+  return (
+    <pre className="statuslines">
+      {payload.lines.map((line, i) => (
+        <div key={i} className={`ln ${line.tone}`}>
+          {line.text || "\u00a0"}
+        </div>
+      ))}
+    </pre>
+  );
+}
+
+/**
+ * Le contexte autour de l'évènement, tel que `gather_extra_context` le rassemble côté serveur.
+ *
+ * Les sondes partent avec l'identité de la personne connectée : une section absente veut souvent
+ * dire « pas le droit de la lire », pas « rien à voir ».
+ */
+function RelatedPane({ record, lang }: { record: EventRecord; lang: Lang }) {
+  const [sections, setSections] = useState<RelatedSection[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setSections(null);
+    setError(null);
+    api
+      .related(record)
+      .then((r) => live && setSections(r.sections))
+      .catch((e) => live && setError(String(e.message ?? e)));
+    return () => {
+      live = false;
+    };
+  }, [record]);
+
+  if (error) return <p className="pane-err">{error}</p>;
+  if (!sections) return <p className="pane-wait">{lang === "fr" ? "Recherche…" : "Gathering…"}</p>;
+  if (sections.length === 0)
+    return (
+      <p className="pane-wait">
+        {lang === "fr"
+          ? "Aucun objet lié trouvé, ou aucun que vos droits laissent lire."
+          : "No related object found, or none your rights allow reading."}
+      </p>
+    );
+
+  return (
+    <div className="relgrid">
+      {sections.map((section) => (
+        <details key={section.title} className="related">
+          <summary>{section.title}</summary>
+          <pre className="json">{prettyJson(section.body)}</pre>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+/** Le JSON compact du serveur, ré-indenté pour la lecture. Illisible, il est rendu tel quel. */
+function prettyJson(body: string): string {
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    return body;
+  }
+}
+
+function LogsPane({ namespace, pod, lang }: { namespace: string; pod: string; lang: Lang }) {
+  const [logs, setLogs] = useState<PodLogs | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [container, setContainer] = useState<string>("");
+  const [previous, setPrevious] = useState(false);
+
+  // Le pod change : le choix de container ne vaut plus, celui-ci n'existe pas forcément ailleurs.
+  useEffect(() => setContainer(""), [namespace, pod]);
+
+  useEffect(() => {
+    let live = true;
+    setLogs(null);
+    setError(null);
+    api
+      .logs(namespace, pod, { container, previous })
+      .then((r) => live && setLogs(r))
+      .catch((e) => live && setError(String(e.message ?? e)));
+    return () => {
+      live = false;
+    };
+  }, [namespace, pod, container, previous]);
+
+  return (
+    <>
+      <div className="logbar">
+        <select value={container} onChange={(e) => setContainer(e.target.value)}>
+          <option value="">{lang === "fr" ? "tous les containers" : "all containers"}</option>
+          {(logs?.containers ?? []).map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+        <label>
+          <input
+            type="checkbox"
+            checked={previous}
+            onChange={(e) => setPrevious(e.target.checked)}
+          />
+          {lang === "fr" ? "run précédent" : "previous run"}
+        </label>
+      </div>
+
+      {error ? (
+        <p className="pane-err">{error}</p>
+      ) : !logs ? (
+        <p className="pane-wait">{lang === "fr" ? "Lecture…" : "Reading…"}</p>
+      ) : (
+        <pre className="logs">{logs.lines.join("\n")}</pre>
+      )}
+    </>
   );
 }
 

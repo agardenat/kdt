@@ -7,6 +7,16 @@
 /** Sévérité d'un évènement, telle que Kubernetes la donne. */
 export type Severity = "normal" | "warning";
 
+/**
+ * Le verdict, calculé par kdt côté serveur.
+ *
+ * Kubernetes n'a que deux sévérités ; le troisième niveau est une règle de kdt — un
+ * `CrashLoopBackOff` n'est pas la même nouvelle qu'une sonde qui a hoqueté. Il arrive tout
+ * calculé : le front le peint, il ne le rejuge pas, sinon les deux interfaces finiraient par
+ * dire deux choses du même évènement.
+ */
+export type ToneVerdict = "ok" | "warn" | "err";
+
 /** Un évènement, aplati par `EventRecord::from_k8s`. */
 export interface EventRecord {
   uid: string;
@@ -22,6 +32,7 @@ export interface EventRecord {
   component: string;
   host: string;
   count: number;
+  tone: ToneVerdict;
 }
 
 export interface EventsPayload {
@@ -46,11 +57,37 @@ export interface ApiRefusal {
   reauthenticate?: boolean;
 }
 
-/** Les tons d'affichage, repris de `LineColor` côté Rust. */
-export type Tone = "ok" | "warn" | "err" | "info" | "dim";
+/** L'étiquette que le TUI affiche pour ce ton, reprise telle quelle. */
+export function toneLabel(tone: ToneVerdict): string {
+  return tone === "err" ? "ERR" : tone === "warn" ? "WARN" : "OK";
+}
 
-export function toneOf(severity: Severity): Tone {
-  return severity === "warning" ? "warn" : "dim";
+/** Une section de contexte autour d'un évènement, rendue par `gather_extra_context`. */
+export interface RelatedSection {
+  title: string;
+  /** JSON compact, ré-indenté à l'affichage. */
+  body: string;
+}
+
+/** Le ton d'une ligne de status, tel que kdt le donne. */
+export type LineTone = "plain" | "ok" | "warn" | "err" | "info" | "dim";
+
+/** Une ligne de l'onglet Status, avec le ton que le TUI lui donne. */
+export interface StatusLine {
+  tone: LineTone;
+  text: string;
+}
+
+export interface StatusPayload {
+  lines: StatusLine[];
+  /** L'objet a disparu, ou sa lecture est refusée. Ce n'est pas « aucun état ». */
+  error?: string;
+}
+
+/** Les logs d'un pod, et les containers qu'il contient. */
+export interface PodLogs {
+  lines: string[];
+  containers: string[];
 }
 
 /** L'âge d'un horodatage, dans la forme compacte du TUI : `3s`, `12m`, `4h`, `6d`. */

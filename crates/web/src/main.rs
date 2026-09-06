@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/me", get(auth::me))
         .route("/api/v1/events", get(api::events))
+        .route("/api/v1/logs", get(api::logs))
+        .route("/api/v1/status", get(api::status))
+        .route("/api/v1/related", post(api::related))
         .route("/healthz", get(|| async { "ok" }));
 
     // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de

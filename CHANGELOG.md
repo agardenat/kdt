@@ -40,6 +40,23 @@ vue répond, le reste n'existe pas.
   de l'apiserver est rendu tel quel plutôt que traduit en liste vide, qui ferait croire à un
   cluster calme.
 
+  Mêmes colonnes et même ordre que le TUI, et le même panneau d'inspection **au-dessus** de la
+  table — `Logs`, `Status`, `Related`, les trois onglets de `DetailTab`. Repliable comme le `²`
+  de kdt, et redimensionnable à la poignée, au double-clic ou au clavier : le web a une souris,
+  le terminal n'en a pas.
+
+- **refactor** — trois règles qui jugeaient le cluster vivaient dans `ui.rs`, donc derrière la
+  feature `tui` et hors de portée de kdt-web : `is_critical_reason` — celle qui sépare un
+  `CrashLoopBackOff` d'une sonde qui a hoqueté — descend dans `events.rs` avec le verdict à trois
+  niveaux qu'elle produit, et `pod_logs`/`object_status` rendent désormais leur résultat au lieu
+  de le déposer dans l'état que le TUI redessine. Une seule implémentation de chaque, appelée des
+  deux côtés : deux interfaces qui jugent séparément finissent par ne plus dire la même chose du
+  même évènement.
+
+- **change(tui)** — la colonne `TIME` des évènements devient `AGE` : `12:34:56` demandait de
+  calculer soi-même la fraîcheur d'une ligne, `3m` la donne. Le panneau de détail suit, et la
+  colonne se resserre de huit caractères à cinq.
+
 - **fix(ci)** — un tag de pré-version ne publiait pas ce qu'il annonçait : `action-gh-release` a
   `prerelease` à `false` par défaut, sans détection SemVer, et le job Homebrew n'avait aucune
   condition — une `v2.0.0-alpha.1` aurait été marquée « dernière version » et poussée dans la
