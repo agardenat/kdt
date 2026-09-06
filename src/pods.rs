@@ -16,7 +16,7 @@ use kube::{discovery, Client};
 
 use crate::events::{
     fetch_container_usage, format_age, parse_quantity_cpu_milli, parse_quantity_memory_bytes,
-    ContainerUsageMap,
+    ContainerUsageMap, EventRecord, LineColor, Severity,
 };
 use crate::flux::SharedReconcile;
 
@@ -24,7 +24,7 @@ use crate::flux::SharedReconcile;
 type UsageMap = HashMap<(String, String), (i64, i64)>;
 
 // The workload a pod ultimately belongs to, after resolving ReplicaSet → Deployment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OwnerRef {
     pub kind: String,
     pub name: String,
@@ -35,7 +35,8 @@ pub struct OwnerRef {
 // Where a container sits in the pod's lifecycle. It decides how a row reads more than how it is
 // fetched: an init container that says "Completed" did its job, a regular one that says the same is
 // gone, and only a running one can be exec'd into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ContainerKind { Init, Regular, Ephemeral }
 
 impl ContainerKind {
@@ -53,7 +54,7 @@ impl ContainerKind {
 // joined with the status side (ready, state, restarts) and its own slice of the metrics-server read.
 // It is a display row, not an API object — a container has no manifest of its own, so `y`/`e`/delete
 // on such a row keep acting on the owning pod.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ContainerResource {
     pub namespace: String,
     pub pod: String,
@@ -89,9 +90,35 @@ impl ContainerResource {
     pub fn display_name(&self) -> String {
         format!("{}{}", self.kind.tag(), self.name)
     }
+
+    /// Le ton de ce container, jugé comme l'est le statut d'un pod, à une exception près.
+    ///
+    /// Un container qui tourne sans être `ready` est jaune : il démarre, ou sa sonde échoue — dans
+    /// les deux cas le pod n'est pas prêt et ce n'est pas encore une panne. Un **init** qui tourne
+    /// est vert malgré tout : il n'a pas de `readinessProbe`, et le juger sur `ready` peindrait en
+    /// jaune un container qui fait exactement son travail.
+    pub fn tone(&self) -> LineColor {
+        match self.state.as_str() {
+            "Running" => {
+                if self.ready || self.kind == ContainerKind::Init {
+                    LineColor::Ok
+                } else {
+                    LineColor::Warn
+                }
+            }
+            "Completed" => LineColor::Dim,
+            "Pending" | "ContainerCreating" | "PodInitializing" | "Waiting" => LineColor::Warn,
+            _ => LineColor::Err,
+        }
+    }
+
+    /// Même lecture que sur un pod.
+    pub fn restarts_tone(&self) -> LineColor {
+        if self.restarts > 0 { LineColor::Warn } else { LineColor::Dim }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PodResource {
     pub namespace: String,
     pub name: String,
@@ -115,6 +142,44 @@ pub struct PodResource {
 }
 
 impl PodResource {
+    /// Le ton du statut de ce pod.
+    ///
+    /// Éteint sur un pod terminé avec succès, comme k9s : il est sain mais n'est plus actif, et le
+    /// peindre en vert le ferait compter parmi ce qui tourne. Tout ce qui n'est ni un état
+    /// d'attente connu ni un succès est rouge — la liste des états sains est courte et fermée,
+    /// celle des pannes ne l'est pas.
+    pub fn status_tone(&self) -> LineColor {
+        status_tone(&self.status)
+    }
+
+    /// Le ton de la ligne entière : un pod en panne se trouve en balayant la page, pas en la
+    /// lisant, et un pod terminé s'efface pour ne pas encombrer ce qui tourne encore.
+    pub fn row_tone(&self) -> LineColor {
+        match self.status_tone() {
+            LineColor::Err => LineColor::Err,
+            LineColor::Dim => LineColor::Dim,
+            _ => LineColor::Plain,
+        }
+    }
+
+    /// Un redémarrage n'est pas une panne — le pod tourne — mais c'est le seul chiffre de la ligne
+    /// qui raconte une histoire passée. Zéro reste éteint pour que les autres se voient.
+    pub fn restarts_tone(&self) -> LineColor {
+        if self.restarts > 0 { LineColor::Warn } else { LineColor::Dim }
+    }
+
+    /// Ce pod est-il rattaché à ce workload ?
+    ///
+    /// La comparaison porte sur les trois champs : deux workloads de kinds différents peuvent
+    /// porter le même nom dans le même namespace, et rattacher un pod au mauvais parent le ferait
+    /// disparaître de son vrai groupe.
+    pub fn belongs_to(&self, w: &WorkloadResource) -> bool {
+        self.owner
+            .as_ref()
+            .map(|o| o.kind == w.kind && o.name == w.name && o.namespace == w.namespace)
+            .unwrap_or(false)
+    }
+
     // Stable order by namespace/name so pods keep their natural place (problems are not hoisted up).
     fn sort_key(&self) -> (&str, &str) {
         (self.namespace.as_str(), self.name.as_str())
@@ -123,7 +188,8 @@ impl PodResource {
 
 // Where a Job stands, read from its conditions like `kubectl get jobs` reads them: a finished Job
 // has no pod left, so the row is all there is to tell a success from a failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Complete,
     Failed,
@@ -144,7 +210,7 @@ impl JobStatus {
 
 // A Job counts completions, not ready replicas. `completions` is `spec.completions`, left None when
 // the spec does not set it rather than guessed at 1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct JobState {
     pub succeeded: i32,
     pub completions: Option<i32>,
@@ -152,7 +218,8 @@ pub struct JobState {
 }
 
 // What the STATUS column says about a workload row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WorkloadStatus {
     Ready,
     Scaling,
@@ -162,7 +229,7 @@ pub enum WorkloadStatus {
 }
 
 // The "object" row shown at the top of the hierarchical view.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkloadResource {
     pub kind: String,
     pub api_version: String,
@@ -208,6 +275,50 @@ impl WorkloadResource {
             Some(_) => WorkloadStatus::Scaling,
             None => WorkloadStatus::Unknown,
         }
+    }
+
+    /// Ce que la colonne STATUS affiche.
+    ///
+    /// `Unknown` rend le **kind** plutôt qu'un verdict : sans compteur de référence, la ligne se
+    /// nomme au lieu de se juger. Dire « Unknown » laisserait croire à un problème là où il n'y a
+    /// qu'un kind qui ne se compte pas en répliques.
+    pub fn status_label(&self) -> &str {
+        match self.status() {
+            WorkloadStatus::Ready => "Ready",
+            WorkloadStatus::Scaling => "Scaling",
+            WorkloadStatus::Job(j) => j.label(),
+            WorkloadStatus::Unknown => self.kind.as_str(),
+        }
+    }
+
+    /// Le ton de cette étiquette.
+    ///
+    /// Un Job qui tourne est cyan et non jaune : il n'est pas en retard sur une cible, il fait ce
+    /// pour quoi il existe. Un Job suspendu est éteint — un choix, pas une panne. Un workload qui
+    /// n'a pas atteint sa cible est jaune : c'est peut-être un déploiement en cours.
+    pub fn status_tone(&self) -> LineColor {
+        match self.status() {
+            WorkloadStatus::Ready => LineColor::Ok,
+            WorkloadStatus::Scaling => LineColor::Warn,
+            WorkloadStatus::Job(JobStatus::Complete) => LineColor::Ok,
+            WorkloadStatus::Job(JobStatus::Failed) => LineColor::Err,
+            WorkloadStatus::Job(JobStatus::Suspended) => LineColor::Dim,
+            WorkloadStatus::Job(JobStatus::Running) => LineColor::Info,
+            WorkloadStatus::Unknown => LineColor::Info,
+        }
+    }
+
+    /// Ce kind se scale-t-il ?
+    ///
+    /// `spec.replicas` est le seul témoin : un DaemonSet a bien un nombre désiré, mais il est
+    /// décidé par le scheduler et non par nous, et un Job se relance plutôt qu'il ne se scale.
+    pub fn is_scalable(&self) -> bool {
+        self.replicas.is_some()
+    }
+
+    /// `rollout restart` n'existe que pour les kinds qui portent un template de pod.
+    pub fn is_restartable(&self) -> bool {
+        matches!(self.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet")
     }
 
     pub fn as_owner(&self) -> OwnerRef {
@@ -257,19 +368,43 @@ pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: S
         s.loading = true;
         s.error = None;
     }
+
+    let result = workloads(client, namespace).await;
+
+    let mut s = state.lock().expect("pods poisoned");
+    s.loading = false;
+    match result {
+        Ok(inv) => {
+            s.workloads = inv.workloads;
+            s.missing_kinds = inv.missing_kinds;
+            s.pods = inv.pods;
+            s.error = None;
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
+
+/// L'inventaire des workloads et des pods, rendu plutôt que déposé dans un état partagé.
+///
+/// Même partage que [`crate::flux::flux_resources`] : le TUI redessine un état à chaque tick, un
+/// appelant HTTP veut la réponse. Même sonde, même tri, mêmes verdicts.
+pub struct WorkloadInventory {
+    pub pods: Vec<PodResource>,
+    pub workloads: Vec<WorkloadResource>,
+    /// Les kinds que l'apiserver a refusés, avec leur raison. Les passer sous silence ferait dire
+    /// à la vue « aucun Job » là où la vérité est « pas le droit de regarder ».
+    pub missing_kinds: Vec<String>,
+}
+
+pub async fn workloads(
+    client: Client,
+    namespace: Option<String>,
+) -> Result<WorkloadInventory, String> {
     let api: Api<Pod> = match &namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
     };
-    let list = match api.list(&ListParams::default()).await {
-        Ok(l) => l,
-        Err(e) => {
-            let mut s = state.lock().expect("pods poisoned");
-            s.loading = false;
-            s.error = Some(e.to_string());
-            return;
-        }
-    };
+    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
 
     // One metrics read serves both levels: the container rows use it as it comes, the pod rows use
     // the sum of it, so expanding a pod costs no extra API call.
@@ -294,12 +429,7 @@ pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: S
             .cmp(&(b.namespace.as_str(), b.kind.as_str(), b.name.as_str()))
     });
 
-    let mut s = state.lock().expect("pods poisoned");
-    s.loading = false;
-    s.workloads = workloads;
-    s.missing_kinds = missing_kinds;
-    s.pods = pods;
-    s.error = None;
+    Ok(WorkloadInventory { pods, workloads, missing_kinds })
 }
 
 // Returns the workloads found, and the kinds that could not be listed at all (discovery or list
@@ -768,35 +898,65 @@ async fn patch_replicas(client: &Client, owner: &OwnerRef, replicas: i32) -> Res
 
 // Scale to an absolute replica count.
 pub async fn run_scale(client: Client, owner: OwnerRef, replicas: i32, status: SharedReconcile) {
-    let msg = match patch_replicas(&client, &owner, replicas).await {
-        Ok(()) => format!("⇅ scale {}/{} → {}", owner.kind, owner.name, replicas),
+    let msg = match scale_once(&client, &owner, replicas).await {
+        Ok(m) => m,
         Err(e) => format!("✗ scale : {}", e),
     };
     publish(&status, msg);
 }
 
+/// Le même scale, rendu plutôt que posté dans un toast — voir [`workloads`].
+pub async fn scale_once(
+    client: &Client,
+    owner: &OwnerRef,
+    replicas: i32,
+) -> Result<String, String> {
+    patch_replicas(client, owner, replicas).await?;
+    Ok(format!("⇅ scale {}/{} → {}", owner.kind, owner.name, replicas))
+}
+
 // Hard recycle that bypasses a rolling update: scale to 0, wait briefly, then back to `replicas`.
 pub async fn run_force_recycle(client: Client, owner: OwnerRef, replicas: i32, status: SharedReconcile) {
-    let msg = match patch_replicas(&client, &owner, 0).await {
-        Ok(()) => {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match patch_replicas(&client, &owner, replicas).await {
-                Ok(()) => format!("↻ recycle {}/{} (0 → {})", owner.kind, owner.name, replicas),
-                Err(e) => fill(active().pods_recycle_failed, &[("e", &e)]),
-            }
-        }
-        Err(e) => format!("✗ recycle (descente) : {}", e),
+    let msg = match recycle_once(&client, &owner, replicas).await {
+        Ok(m) => m,
+        Err(e) => e,
     };
     publish(&status, msg);
 }
 
+/// Le même recyclage, rendu plutôt que posté.
+///
+/// Une descente réussie suivie d'une remontée en échec laisse le workload **à zéro**, ce qui est
+/// pire que de n'avoir rien fait : le message de l'erreur doit donc le dire, et c'est ce que porte
+/// `pods_recycle_failed`.
+pub async fn recycle_once(
+    client: &Client,
+    owner: &OwnerRef,
+    replicas: i32,
+) -> Result<String, String> {
+    patch_replicas(client, owner, 0)
+        .await
+        .map_err(|e| format!("✗ recycle (descente) : {}", e))?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    patch_replicas(client, owner, replicas)
+        .await
+        .map_err(|e| fill(active().pods_recycle_failed, &[("e", &e)]))?;
+    Ok(format!("↻ recycle {}/{} (0 → {})", owner.kind, owner.name, replicas))
+}
+
 // Rollout restart via the standard restartedAt template annotation.
 pub async fn run_restart(client: Client, owner: OwnerRef, status: SharedReconcile) {
-    let msg = match patch_restart(&client, &owner).await {
-        Ok(()) => format!("↻ restart {}/{}", owner.kind, owner.name),
+    let msg = match restart_once(&client, &owner).await {
+        Ok(m) => m,
         Err(e) => format!("✗ restart : {}", e),
     };
     publish(&status, msg);
+}
+
+/// Le même redémarrage, rendu plutôt que posté.
+pub async fn restart_once(client: &Client, owner: &OwnerRef) -> Result<String, String> {
+    patch_restart(client, owner).await?;
+    Ok(format!("↻ restart {}/{}", owner.kind, owner.name))
 }
 
 async fn patch_restart(client: &Client, owner: &OwnerRef) -> Result<(), String> {
@@ -814,6 +974,111 @@ async fn patch_restart(client: &Client, owner: &OwnerRef) -> Result<(), String> 
         .await
         .map(|_| ())
         .map_err(|e| format!("{}/{} : {}", owner.kind, owner.name, e))
+}
+
+/// Le ton d'un statut de pod, à partir de la seule chaîne.
+///
+/// La règle est celle de [`PodResource::status_tone`] ; cette forme existe pour les appelants qui
+/// n'ont que le libellé sous la main.
+pub fn status_tone(status: &str) -> LineColor {
+    match status {
+        "Running" => LineColor::Ok,
+        "Succeeded" | "Completed" => LineColor::Dim,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => LineColor::Warn,
+        _ => LineColor::Err,
+    }
+}
+
+/// Le pod vu comme un enregistrement d'évènement.
+///
+/// Même raison que pour Flux : le TUI s'en sert pour réutiliser la table et le panneau de détail,
+/// kdt-web pour ouvrir le même panneau `Logs`/`Status`/`Related` sur la ligne. La conversion porte
+/// un verdict — elle décide qu'un pod terminé est `Normal` et qu'un `CrashLoopBackOff` ne l'est
+/// pas — donc elle vit ici et non dans l'affichage.
+pub fn synthetic_pod_record(p: &PodResource) -> EventRecord {
+    let severity = match p.status_tone() {
+        LineColor::Ok | LineColor::Dim => Severity::Normal,
+        _ => Severity::Warning,
+    };
+    let owner = p
+        .owner
+        .as_ref()
+        .map(|o| format!("  ◂ {}/{}", o.kind, o.name))
+        .unwrap_or_default();
+    EventRecord {
+        uid: p.uid.clone(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: p.status.clone(),
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: p.namespace.clone(),
+        name: p.name.clone(),
+        message: format!("ready={} restarts={} node={}{}", p.ready, p.restarts, p.node, owner),
+        component: String::new(),
+        host: p.node.clone(),
+        count: 1,
+    }
+}
+
+/// Le container vu comme un enregistrement d'évènement.
+///
+/// L'identité reste celle du **pod** : un container n'a pas d'objet à lui, donc le YAML, l'édition,
+/// la suppression, `Status` et `Related` continuent de porter sur le pod qui le contient. Seuls
+/// l'uid et le message sont ceux du container — c'est ce que lisent la recherche et le panneau IA.
+pub fn synthetic_container_record(c: &ContainerResource) -> EventRecord {
+    let severity = match c.tone() {
+        LineColor::Ok | LineColor::Dim => Severity::Normal,
+        _ => Severity::Warning,
+    };
+    EventRecord {
+        uid: c.uid.clone(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: c.state.clone(),
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: c.namespace.clone(),
+        name: c.pod.clone(),
+        message: format!(
+            "container {} · ready={} restarts={} image={}",
+            c.display_name(),
+            c.ready,
+            c.restarts,
+            c.image
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// Le workload vu comme un enregistrement d'évènement.
+///
+/// `Status` et `Related` fonctionnent par le vrai kind et la vraie apiVersion ; `Logs` n'a rien à
+/// montrer pour un kind qui n'est pas un Pod, et le dit.
+pub fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
+    let replicas = w.ready_label();
+    EventRecord {
+        uid: format!("workload|{}", w.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Workload".to_string(),
+        api_version: w.api_version.clone(),
+        kind: w.kind.clone(),
+        namespace: w.namespace.clone(),
+        name: w.name.clone(),
+        message: match w.status() {
+            WorkloadStatus::Job(j) => format!(
+                "{} {}/{}  {}  completions={}  age={}",
+                w.kind, w.namespace, w.name, j.label(), replicas, w.age
+            ),
+            _ => format!("{} {}/{}  replicas={}  age={}", w.kind, w.namespace, w.name, replicas, w.age),
+        },
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
 }
 
 fn publish(status: &SharedReconcile, msg: String) {

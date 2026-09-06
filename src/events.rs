@@ -440,16 +440,46 @@ pub async fn fetch_flux_logs(
     state: SharedLog,
     tail: i64,
 ) {
+    let outcome = flux_logs(client, &controllers, filter.as_ref(), tail).await;
+
+    let mut s = state.lock().expect("log state poisoned");
+    if s.current_key.as_deref() != Some(&key) { return; }
+    s.loading = false;
+    match outcome {
+        Ok(lines) => {
+            s.error = if lines.is_empty() {
+                Some(crate::lang::active().ev_no_matching_line.to_string())
+            } else {
+                None
+            };
+            s.lines = lines;
+        }
+        Err(e) => {
+            s.lines.clear();
+            s.error = Some(e);
+        }
+    }
+}
+
+/// Les mêmes lignes, rendues plutôt que déposées dans un état partagé.
+///
+/// Même partage que [`pod_logs`] : le TUI redessine un état, un appelant HTTP veut la réponse.
+/// Une liste vide n'est pas une erreur ici — c'est au TUI de dire « aucune ligne ne correspond »,
+/// parce que la réponse à une requête distingue déjà « rien à dire » de « impossible à lire ».
+pub async fn flux_logs(
+    client: Client,
+    controllers: &[String],
+    filter: Option<&(String, String)>,
+    tail: i64,
+) -> Result<Vec<String>, String> {
     let api: Api<Pod> = Api::namespaced(client, "flux-system");
     let pods = match api.list(&ListParams::default()).await {
         Ok(l) => l.items,
         Err(e) => {
-            let mut s = state.lock().expect("log state poisoned");
-            if s.current_key.as_deref() != Some(&key) { return; }
-            s.loading = false;
-            s.lines.clear();
-            s.error = Some(fill(crate::lang::active().ev_flux_system_missing, &[("e", &e.to_string())]));
-            return;
+            return Err(fill(
+                crate::lang::active().ev_flux_system_missing,
+                &[("e", &e.to_string())],
+            ))
         }
     };
 
@@ -469,17 +499,7 @@ pub async fn fetch_flux_logs(
     }
 
     collected.sort_by(|a, b| a.0.cmp(&b.0));
-    let lines: Vec<String> = collected.into_iter().map(|(_, l)| l).collect();
-
-    let mut s = state.lock().expect("log state poisoned");
-    if s.current_key.as_deref() != Some(&key) { return; }
-    s.loading = false;
-    s.error = if lines.is_empty() {
-        Some(crate::lang::active().ev_no_matching_line.to_string())
-    } else {
-        None
-    };
-    s.lines = lines;
+    Ok(collected.into_iter().map(|(_, l)| l).collect())
 }
 
 // True if a controller log line refers to the given object, either via top-level name/namespace

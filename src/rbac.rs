@@ -92,7 +92,11 @@ impl Scope {
 
 // Where a binding came from, derived from its own metadata (labels/annotations/ownerRefs). Flux and
 // Helm label every object they apply, so attribution needs no correlation guessing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Serialize` parce que kdt-web affiche la même attribution : Kyverno, Rancher, les défauts du
+// cluster et les addons posent des objets sans passer par kubectl, et les dire « hors GitOps »
+// serait faux. Le verdict est celui de kdt, pas une déduction du navigateur.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
 pub enum Provenance {
     FluxKustomization { namespace: String, name: String },
     FluxHelmRelease { namespace: String, name: String },

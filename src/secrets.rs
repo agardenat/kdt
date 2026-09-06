@@ -37,7 +37,8 @@ const CM_KIND: &str = "Certificate";
 // Expiry urgency band of a TLS certificate, derived from the days left until `notAfter`. Drives both
 // the table colour and the sort order (most urgent first). Thresholds: <0 expired, <15 critical,
 // <30 warning, otherwise healthy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Expiry {
     Expired,
     Critical,
@@ -46,6 +47,19 @@ pub enum Expiry {
 }
 
 impl Expiry {
+    /// Le ton de cette bande.
+    ///
+    /// `Critical` partage le rouge d'`Expired` : un certificat qui expire dans moins de quinze
+    /// jours demande la même action qu'un certificat déjà expiré, et l'attente n'est plus une
+    /// option. La nuance entre les deux se lit sur le nombre de jours, pas sur la couleur.
+    pub fn tone(self) -> crate::events::LineColor {
+        match self {
+            Expiry::Expired | Expiry::Critical => crate::events::LineColor::Err,
+            Expiry::Warn => crate::events::LineColor::Warn,
+            Expiry::Ok => crate::events::LineColor::Ok,
+        }
+    }
+
     pub fn from_days(days: i64) -> Expiry {
         if days < 0 {
             Expiry::Expired
@@ -60,7 +74,7 @@ impl Expiry {
 }
 
 // CN + expiry of the CA found in the bundle (`ca.crt`), shown alongside the leaf for chain context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CaBundle {
     pub subject_cn: String,
     pub not_after: String,
@@ -69,7 +83,7 @@ pub struct CaBundle {
 
 // Decoded leaf certificate of a TLS secret. All fields are owned so the borrowed parser output can be
 // dropped immediately after decoding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TlsCert {
     pub subject_cn: String,
     pub issuer_cn: String,
@@ -85,7 +99,7 @@ pub struct TlsCert {
     pub ca_bundle: Option<CaBundle>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SecretInfo {
     pub namespace: String,
     pub name: String,
@@ -93,6 +107,13 @@ pub struct SecretInfo {
     pub data_keys: Vec<String>,
     // Raw (already base64-decoded by the API) value of every data key, sorted by key. Held so the
     // detail panel can reveal the content on demand, in base64 or decoded form.
+    //
+    // **Jamais sérialisé.** Dans le TUI ces octets sont déjà dans le processus qui dessine, et
+    // révéler n'est qu'un basculement d'affichage. Sur le web, les mettre dans la liste les ferait
+    // traverser le réseau à chaque rafraîchissement, pour tous les secrets de la portée, et rester
+    // dans la mémoire du navigateur et l'onglet réseau des devtools. Un consommateur qui veut une
+    // valeur la demande secret par secret — voir [`secret_values`].
+    #[serde(skip)]
     pub data: Vec<(String, Vec<u8>)>,
     pub age: String,
     pub provenance: Provenance,
@@ -105,6 +126,10 @@ pub struct SecretInfo {
     // Name of the cert-manager Certificate that owns/produces this secret, when found.
     pub cert_manager: Option<String>,
     // Full object serialized to YAML (managedFields stripped), for "copy manifest".
+    //
+    // Pas sérialisé non plus, et pour la même raison : le manifeste d'un Secret **contient** ses
+    // valeurs. Le champ est le contenu, pas seulement sa description.
+    #[serde(skip)]
     pub manifest: String,
 }
 
@@ -171,6 +196,33 @@ pub async fn fetch_secrets(client: Client, namespace: Option<String>, state: Sha
         s.error = None;
     }
 
+    match secrets(client, namespace.clone()).await {
+        Ok(inv) => {
+            let mut s = state.lock().expect("secrets poisoned");
+            s.loading = false;
+            s.error = None;
+            s.cert_manager_present = inv.cert_manager_present;
+            s.scope = namespace;
+            s.secrets = inv.secrets;
+        }
+        Err(e) => fail(&state, e),
+    }
+}
+
+/// L'inventaire des Secrets, rendu plutôt que déposé dans un état partagé.
+pub struct SecretsInventory {
+    pub secrets: Vec<SecretInfo>,
+    /// cert-manager était-il présent lors de cette lecture ? Absent, la colonne « émetteur » n'a
+    /// rien à dire, ce qui n'est pas la même chose qu'un certificat sans émetteur connu.
+    pub cert_manager_present: bool,
+}
+
+/// Même partage que [`crate::pods::workloads`] : le TUI redessine un état, un appelant HTTP veut
+/// la réponse.
+pub async fn secrets(
+    client: Client,
+    namespace: Option<String>,
+) -> Result<SecretsInventory, String> {
     let (secret_api, ingress_api): (Api<Secret>, Api<Ingress>) = match &namespace {
         Some(ns) => (Api::namespaced(client.clone(), ns), Api::namespaced(client.clone(), ns)),
         None => (Api::all(client.clone()), Api::all(client.clone())),
@@ -179,10 +231,7 @@ pub async fn fetch_secrets(client: Client, namespace: Option<String>, state: Sha
 
     let (secrets, ingresses) = tokio::join!(secret_api.list(&lp), ingress_api.list(&lp));
 
-    let secrets = match secrets {
-        Ok(l) => l,
-        Err(e) => return fail(&state, e.to_string()),
-    };
+    let secrets = secrets.map_err(|e| e.to_string())?;
 
     // (namespace, secretName) → Ingresses consuming it. Ingress TLS references are namespace-local.
     let mut ingress_map: HashMap<(String, String), Vec<String>> = HashMap::new();
@@ -211,12 +260,33 @@ pub async fn fetch_secrets(client: Client, namespace: Option<String>, state: Sha
     }
     out.sort_by_key(|a| a.sort_key());
 
-    let mut s = state.lock().expect("secrets poisoned");
-    s.loading = false;
-    s.error = None;
-    s.cert_manager_present = cm_present;
-    s.scope = namespace;
-    s.secrets = out;
+    Ok(SecretsInventory { secrets: out, cert_manager_present: cm_present })
+}
+
+/// Les valeurs d'**un** Secret, lues à la demande.
+///
+/// Existe pour que la liste n'ait jamais à les porter : révéler une valeur est un geste délibéré
+/// sur un objet précis, et c'est une requête de plus — refusable par le RBAC comme les autres —
+/// plutôt qu'une donnée que tout le monde promène. L'objet est relu au passage, donc ce qui revient
+/// est ce que le cluster contient maintenant, et non ce qu'une liste vieille de dix secondes disait.
+pub async fn secret_values(
+    client: Client,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let api: Api<Secret> = Api::namespaced(client, namespace);
+    let sec = api
+        .get(name)
+        .await
+        .map_err(|e| format!("Secret/{} : {}", name, crate::edit::api_error_text(e)))?;
+    let mut out: Vec<(String, Vec<u8>)> = sec
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, v.0))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 fn build_secret_info(

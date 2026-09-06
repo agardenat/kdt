@@ -21,6 +21,7 @@
 
 pub mod ai;
 pub mod argocd;
+pub mod capabilities;
 pub mod capacity;
 pub mod certmanager;
 pub mod cli;

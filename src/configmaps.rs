@@ -14,7 +14,9 @@ use kube::Client;
 use crate::events::format_age;
 use crate::rbac::{detect_provenance, Provenance};
 
-#[derive(Debug, Clone)]
+// `Serialize` : une ConfigMap est du texte en clair, et c'est ce qui la distingue d'un Secret —
+// pas de bascule de révélation, la valeur s'affiche. Voir `secrets.rs`, où c'est l'inverse.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigMapInfo {
     pub namespace: String,
     pub name: String,
@@ -27,6 +29,10 @@ pub struct ConfigMapInfo {
     // Sum of all text + binary value sizes, for the SIZE column.
     pub total_bytes: usize,
     // Full object serialized to YAML (managedFields stripped), for "copy manifest".
+    //
+    // Pas sérialisé : il répète mot pour mot `data` et `binaryData`, qui voyagent déjà. C'est du
+    // poids inutile sur chaque ligne, pas un secret à protéger.
+    #[serde(skip)]
     pub manifest: String,
 }
 
@@ -66,25 +72,37 @@ pub async fn fetch_configmaps(client: Client, namespace: Option<String>, state: 
         s.error = None;
     }
 
+    match configmaps(client, namespace).await {
+        Ok(items) => {
+            let mut s = state.lock().expect("configmaps poisoned");
+            s.loading = false;
+            s.error = None;
+            s.items = items;
+        }
+        Err(e) => fail(&state, e),
+    }
+}
+
+/// Le même inventaire, rendu plutôt que déposé dans un état partagé.
+pub async fn configmaps(
+    client: Client,
+    namespace: Option<String>,
+) -> Result<Vec<ConfigMapInfo>, String> {
     let api: Api<ConfigMap> = match &namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
     };
-    let list = match api.list(&ListParams::default()).await {
-        Ok(l) => l,
-        Err(e) => return fail(&state, e.to_string()),
-    };
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut out: Vec<ConfigMapInfo> = Vec::with_capacity(list.items.len());
     for cm in &list.items {
         out.push(build_info(cm));
     }
     out.sort_by_key(|a| a.sort_key());
-
-    let mut s = state.lock().expect("configmaps poisoned");
-    s.loading = false;
-    s.error = None;
-    s.items = out;
+    Ok(out)
 }
 
 fn build_info(cm: &ConfigMap) -> ConfigMapInfo {

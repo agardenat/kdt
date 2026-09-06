@@ -146,8 +146,8 @@ use crate::lang;
 use crate::lang::Strings;
 use crate::pdf;
 use crate::pods::{
-    fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale, ContainerKind,
-    ContainerResource, JobStatus, PodResource, SharedPods, WorkloadResource, WorkloadStatus,
+    fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale,
+    ContainerResource, PodResource, SharedPods, WorkloadResource,
 };
 use crate::rbac::{
     critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, PolicyRule as RbacRule,
@@ -17995,64 +17995,16 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 // Adapt a FluxResource into an EventRecord so the Flux view reuses the shared table/detail/AI flow.
+// The conversion itself lives in `flux.rs`: it decides that a failed reconcile is a Warning, which
+// is a judgement about the cluster, and kdt-web reaches for the same one to open the same panes.
 fn synthetic_flux_record(r: &FluxResource) -> EventRecord {
-    let (severity, reason) = match (r.suspended, r.ready) {
-        (true, _) => (Severity::Normal, "Suspended".to_string()),
-        (false, FluxReady::Ready) => (Severity::Normal, "Ready".to_string()),
-        (false, FluxReady::Reconciling) => (Severity::Normal, "Reconciling".to_string()),
-        (false, FluxReady::Failed) => (Severity::Warning, "ReconciliationFailed".to_string()),
-        (false, FluxReady::Unknown) => (Severity::Warning, "Unknown".to_string()),
-        (false, FluxReady::NotApplicable) => (Severity::Normal, "N/A".to_string()),
-    };
-    let message = if r.message.is_empty() {
-        format!("{} {}/{}", r.kind, r.namespace, r.name)
-    } else {
-        r.message.clone()
-    };
-    EventRecord {
-        uid: format!("flux|{}|{}/{}", r.kind, r.namespace, r.name),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason,
-        api_version: r.api_version.clone(),
-        kind: r.kind.clone(),
-        namespace: r.namespace.clone(),
-        name: r.name.clone(),
-        message,
-        component: "flux".to_string(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::flux::synthetic_record(r)
 }
 
 // Snapshot record for one applied inventory object, so selecting it in the tree drives the shared
 // Logs/Status/Related detail panes against that real object.
 fn synthetic_inventory_record(ks_uid: &str, it: &InventoryItem) -> EventRecord {
-    let (severity, reason) = match (it.reconciling, it.ready) {
-        (true, _) => (Severity::Normal, "Reconciling".to_string()),
-        (_, Some(true)) => (Severity::Normal, "Ready".to_string()),
-        (_, Some(false)) => (Severity::Warning, "NotReady".to_string()),
-        (_, None) => (Severity::Normal, "Applied".to_string()),
-    };
-    let message = if it.msg.is_empty() {
-        format!("{} {}/{}", it.kind, it.namespace, it.name)
-    } else {
-        it.msg.clone()
-    };
-    EventRecord {
-        uid: format!("inv|{}|{}|{}/{}", ks_uid, it.kind, it.namespace, it.name),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason,
-        api_version: it.api_version.clone(),
-        kind: it.kind.clone(),
-        namespace: it.namespace.clone(),
-        name: it.name.clone(),
-        message,
-        component: "flux".to_string(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::flux::inventory_record(ks_uid, it)
 }
 
 // Snapshot record for a cert-manager object, so every row of the chain drives the shared YAML,
@@ -18220,109 +18172,33 @@ fn pod_row_style(status_color: Color) -> Style {
     }
 }
 
+// The rule is `pods::status_tone`; this only paints it.
 fn pod_status_color(status: &str) -> Color {
-    match status {
-        "Running" => Color::Green,
-        // Finished successfully: faded, like k9s — healthy but no longer active.
-        "Succeeded" | "Completed" => DIM,
-        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => Color::Yellow,
-        _ => Color::Red,
-    }
+    line_color(crate::pods::status_tone(status))
 }
 
 // Adapt a PodResource into an EventRecord so the Pods view reuses the shared table/detail/AI flow.
-// kind="Pod"/apiVersion="v1" make the Logs/Status/Related tabs work for the selected pod.
+// The conversion lives in `pods.rs`: it decides which states read as a warning, which is a
+// judgement about the cluster, and kdt-web reaches for the same one to open the same panes.
 fn synthetic_pod_record(p: &PodResource) -> EventRecord {
-    let severity = match pod_status_color(&p.status) {
-        Color::Green | DIM => Severity::Normal,
-        _ => Severity::Warning,
-    };
-    let owner = p
-        .owner
-        .as_ref()
-        .map(|o| format!("  ◂ {}/{}", o.kind, o.name))
-        .unwrap_or_default();
-    EventRecord {
-        uid: p.uid.clone(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason: p.status.clone(),
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        namespace: p.namespace.clone(),
-        name: p.name.clone(),
-        message: format!("ready={} restarts={} node={}{}", p.ready, p.restarts, p.node, owner),
-        component: String::new(),
-        host: p.node.clone(),
-        count: 1,
-    }
+    crate::pods::synthetic_pod_record(p)
 }
 
-// A container's state, judged the way the pod status column is: waiting/terminated reasons that mean
-// trouble are red, a finished init container is faded, a running one is green.
+// A container's state, judged the way the pod status column is. The rule is
+// `ContainerResource::tone` — the same verdict on both interfaces — and this only paints it.
 fn container_state_color(c: &ContainerResource) -> Color {
-    match c.state.as_str() {
-        "Running" => if c.ready || c.kind == ContainerKind::Init { Color::Green } else { Color::Yellow },
-        "Completed" => DIM,
-        "Pending" | "ContainerCreating" | "PodInitializing" | "Waiting" => Color::Yellow,
-        _ => Color::Red,
-    }
+    line_color(c.tone())
 }
 
-// Adapt a ContainerResource into an EventRecord. The identity stays the *pod*: a container has no
-// object of its own, so `y`, `e`, Ctrl-D, Status and Related keep acting on the pod that holds it,
-// while the uid and the message are the container's — which is what the search and the AI panel read.
+// Adapt a ContainerResource into an EventRecord. The identity stays the *pod* — see
+// `pods::synthetic_container_record`, which holds the rule.
 fn synthetic_container_record(c: &ContainerResource) -> EventRecord {
-    let severity = match container_state_color(c) {
-        Color::Green | DIM => Severity::Normal,
-        _ => Severity::Warning,
-    };
-    EventRecord {
-        uid: c.uid.clone(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason: c.state.clone(),
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        namespace: c.namespace.clone(),
-        name: c.pod.clone(),
-        message: format!(
-            "container {} · ready={} restarts={} image={}",
-            c.display_name(),
-            c.ready,
-            c.restarts,
-            c.image
-        ),
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::pods::synthetic_container_record(c)
 }
 
-// Adapt a WorkloadResource (the focused object) into an EventRecord. Status/Related tabs work via the
-// real kind/apiVersion; Logs shows "n/a" for non-Pod kinds, which is the existing behaviour.
+// Adapt a WorkloadResource (the focused object) into an EventRecord.
 fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
-    let replicas = w.ready_label();
-    EventRecord {
-        uid: format!("workload|{}", w.uid),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "Workload".to_string(),
-        api_version: w.api_version.clone(),
-        kind: w.kind.clone(),
-        namespace: w.namespace.clone(),
-        name: w.name.clone(),
-        message: match w.status() {
-            WorkloadStatus::Job(j) => format!(
-                "{} {}/{}  {}  completions={}  age={}",
-                w.kind, w.namespace, w.name, j.label(), replicas, w.age
-            ),
-            _ => format!("{} {}/{}  replicas={}  age={}", w.kind, w.namespace, w.name, replicas, w.age),
-        },
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::pods::synthetic_workload_record(w)
 }
 
 // Adapt a network row into an EventRecord so the shared Status/Related tabs work via the real
@@ -18762,10 +18638,7 @@ fn elide_middle(s: &str, max: usize) -> String {
 
 // Does pod `p` resolve up to workload `w` (so it nests under it in the merged view)?
 fn pod_belongs_to(p: &PodResource, w: &WorkloadResource) -> bool {
-    p.owner
-        .as_ref()
-        .map(|o| o.kind == w.kind && o.name == w.name && o.namespace == w.namespace)
-        .unwrap_or(false)
+    p.belongs_to(w)
 }
 
 // Merged workloads/pods view: each workload is a parent row, its pods nest under it (depth 1), and
@@ -18914,15 +18787,7 @@ fn pods_table_parts<'a>(
         .map(|(i, row)| match row {
             PodRow::Workload(w) => {
                 let ready = w.ready_label();
-                let (status, status_color) = match w.status() {
-                    WorkloadStatus::Ready => ("Ready", Color::Green),
-                    WorkloadStatus::Scaling => ("Scaling", Color::Yellow),
-                    WorkloadStatus::Job(JobStatus::Complete) => ("Complete", Color::Green),
-                    WorkloadStatus::Job(JobStatus::Failed) => ("Failed", Color::Red),
-                    WorkloadStatus::Job(JobStatus::Suspended) => ("Suspended", DIM),
-                    WorkloadStatus::Job(JobStatus::Running) => ("Running", Color::Cyan),
-                    WorkloadStatus::Unknown => (w.kind.as_str(), Color::Cyan),
-                };
+                let (status, status_color) = (w.status_label(), line_color(w.status_tone()));
                 let (cpu, mem, has_cpu, has_mem) = agg[i];
                 Row::new(vec![
                     Cell::from(w.namespace.clone()).style(Style::default().fg(DIM)),
@@ -29010,25 +28875,8 @@ fn flux_table_parts(
     );
 
     let rows: Vec<Row> = resources.iter().enumerate().map(|(i, r)| {
-        let (ready_txt, ready_color) = if r.suspended {
-            ("Suspended", Color::Yellow)
-        } else {
-            match r.ready {
-                FluxReady::Ready => ("Ready", Color::Green),
-                FluxReady::Reconciling => ("Reconciling", Color::Cyan),
-                FluxReady::Failed => ("Failed", Color::Red),
-                FluxReady::Unknown => ("Unknown", Color::Yellow),
-                FluxReady::NotApplicable => ("N/A", DIM),
-            }
-        };
-        let row_style = match (r.suspended, r.ready) {
-            (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
-            (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
-            (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
-            (true, _) => Style::default().fg(DIM),
-            (false, FluxReady::Ready) => Style::default(),
-            (false, FluxReady::NotApplicable) => Style::default(),
-        };
+        let (ready_txt, ready_color) = (r.ready_label(), line_color(r.ready_tone()));
+        let row_style = flux_row_style(r);
         let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
         // The focused row pans its message with ←/→; every row stays one line high. It goes through
         // the window even at offset 0, so the trailing `…` says there is something to pan to.
@@ -29181,25 +29029,8 @@ fn flux_tree_table_parts(
             let built = match row {
                 TreeRow::Res(n) => {
                     let r = resources.get(n.idx)?;
-                    let (ready_txt, ready_color) = if r.suspended {
-                        ("Suspended", Color::Yellow)
-                    } else {
-                        match r.ready {
-                            FluxReady::Ready => ("Ready", Color::Green),
-                            FluxReady::Reconciling => ("Reconciling", Color::Cyan),
-                            FluxReady::Failed => ("Failed", Color::Red),
-                            FluxReady::Unknown => ("Unknown", Color::Yellow),
-                            FluxReady::NotApplicable => ("N/A", DIM),
-                        }
-                    };
-                    let row_style = match (r.suspended, r.ready) {
-                        (false, FluxReady::Failed) => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
-                        (false, FluxReady::Unknown) => Style::default().fg(Color::Yellow),
-                        (false, FluxReady::Reconciling) => Style::default().fg(Color::Cyan),
-                        (true, _) => Style::default().fg(DIM),
-                        (false, FluxReady::Ready) => Style::default(),
-                        (false, FluxReady::NotApplicable) => Style::default(),
-                    };
+                    let (ready_txt, ready_color) = (r.ready_label(), line_color(r.ready_tone()));
+                    let row_style = flux_row_style(r);
                     let msg_color = if r.ready == FluxReady::Failed && !r.suspended { Color::Red } else { DIM };
                     // The focused row pans its message with ←/→ and stays one line high.
                     let msg_cell = if selected == Some(this_idx) {
@@ -29218,15 +29049,7 @@ fn flux_tree_table_parts(
                 }
                 TreeRow::Inv { item, .. } => {
                     let (_, color) = inventory_glyph(item);
-                    let ready_txt = if item.reconciling {
-                        "Reconciling"
-                    } else {
-                        match item.ready {
-                            Some(true) => "Ready",
-                            Some(false) => "NotReady",
-                            None => "—",
-                        }
-                    };
+                    let ready_txt = item.ready_label();
                     Row::new(vec![
                         Cell::from(label).style(Style::default().fg(color)),
                         Cell::from(ready_txt).style(Style::default().fg(color)),
@@ -29294,7 +29117,21 @@ const NO_PRUNE_BADGE: &str = "⊡ no-prune ";
 // Empty for the kinds that have no spec.prune at all (everything but Kustomization) as well as for
 // the pruning ones: only `false` says something the message does not already say.
 fn prune_badge(prune: Option<bool>) -> &'static str {
+    // Same reading as `FluxResource::no_prune`, which is what kdt-web badges on: `prune` is passed
+    // rather than the resource because the callers below already hold just the field.
     if prune == Some(false) { NO_PRUNE_BADGE } else { "" }
+}
+
+// The style of a whole Flux row, from the tone the resource carries. A failure gets a background
+// rather than a foreground: it is the one state that has to be findable by scanning, not by
+// reading. Everything else is a plain colour, and a healthy row is left alone — painting the
+// normal is what lets the abnormal blend into it.
+fn flux_row_style(r: &FluxResource) -> Style {
+    match r.row_tone() {
+        LineColor::Err => Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0)),
+        LineColor::Plain => Style::default(),
+        tone => Style::default().fg(line_color(tone)),
+    }
 }
 
 fn no_prune_badge_style() -> Style {
@@ -31315,6 +31152,7 @@ mod velero_view_tests {
 // up under the pod's and must not push the table past its own frame.
 #[cfg(test)]
 mod pods_container_rows_tests {
+    use crate::pods::ContainerKind;
     use super::*;
     use crate::pods::OwnerRef;
     use ratatui::backend::TestBackend;

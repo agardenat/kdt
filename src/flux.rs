@@ -10,7 +10,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams}
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 
-use crate::events::format_age;
+use crate::events::{EventRecord, LineColor, Severity, format_age};
 
 // Annotation `flux reconcile` sets to request an immediate reconcile: changing its value is enough
 // for the controller to re-run its loop instead of waiting for the next interval.
@@ -21,7 +21,10 @@ const RECONCILE_ANNOTATION: &str = "reconcile.fluxcd.io/requestedAt";
 const FORCE_ANNOTATION: &str = "reconcile.fluxcd.io/forceAt";
 const RESET_ANNOTATION: &str = "reconcile.fluxcd.io/resetAt";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Serialize` parce que kdt-web sert cet état tel quel : le verdict est celui de kdt, calculé
+// une fois ici, et non redéduit d'un `status` brut côté navigateur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FluxReady {
     Ready,
     // Actively reconciling (Ready not yet True but a reconcile is in progress) — not a failure.
@@ -33,7 +36,7 @@ pub enum FluxReady {
     NotApplicable,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FluxResource {
     pub kind: String,
     pub api_version: String,
@@ -45,8 +48,14 @@ pub struct FluxResource {
     pub revision: String,
     pub age: String,
     // (kind, name, namespace) of the referenced source — used to build the tree view.
+    //
+    // Not serialised, here and for `depends_on` below: these are the raw material the tree is
+    // resolved from, and a consumer that got them would be tempted to re-resolve the edges itself.
+    // What travels is the tree kdt built, not the ingredients for a second one.
+    #[serde(skip)]
     pub source_ref: Option<(String, String, String)>,
     // (namespace, name) of each spec.dependsOn entry, for nesting dependent Kustomizations.
+    #[serde(skip)]
     pub depends_on: Vec<(String, String)>,
     // spec.prune for a Kustomization (None for other kinds). When false, objects removed from git
     // are not garbage-collected, so the row is badged.
@@ -55,6 +64,7 @@ pub struct FluxResource {
     // status.helmChart. The chart is what the release actually pulls from, so it is the real edge
     // between a HelmRelease and its repository — and its namespace is the source's, not the
     // release's, which is why it is read rather than derived from the name.
+    #[serde(skip)]
     pub helm_chart: Option<(String, String)>,
 }
 
@@ -71,6 +81,137 @@ impl FluxResource {
         };
         (bucket, self.kind.as_str(), self.namespace.as_str(), self.name.as_str())
     }
+
+    /// Ce que la colonne READY affiche.
+    ///
+    /// Suspendu passe devant l'état de réconciliation : une ressource suspendue garde la dernière
+    /// condition qu'elle avait, et l'afficher reviendrait à annoncer un état que plus rien ne
+    /// tient à jour. Le jargon reste en anglais des deux côtés, comme partout ailleurs.
+    pub fn ready_label(&self) -> &'static str {
+        if self.suspended {
+            return "Suspended";
+        }
+        match self.ready {
+            FluxReady::Ready => "Ready",
+            FluxReady::Reconciling => "Reconciling",
+            FluxReady::Failed => "Failed",
+            FluxReady::Unknown => "Unknown",
+            FluxReady::NotApplicable => "N/A",
+        }
+    }
+
+    /// Le ton de cette étiquette.
+    ///
+    /// Jaune sur `Suspended` : l'état saute aux yeux parce qu'il explique pourquoi rien ne bouge,
+    /// alors que la ligne entière, elle, reste éteinte — voir [`FluxResource::row_tone`]. Un
+    /// réglage délibéré n'est pas une alerte, mais il doit se voir.
+    pub fn ready_tone(&self) -> LineColor {
+        if self.suspended {
+            return LineColor::Warn;
+        }
+        match self.ready {
+            FluxReady::Ready => LineColor::Ok,
+            FluxReady::Reconciling => LineColor::Info,
+            FluxReady::Failed => LineColor::Err,
+            FluxReady::Unknown => LineColor::Warn,
+            FluxReady::NotApplicable => LineColor::Dim,
+        }
+    }
+
+    /// Le ton de la ligne entière, qui n'est pas celui de l'étiquette.
+    ///
+    /// Une ressource suspendue est éteinte et non jaune : c'est un choix qu'on a fait, pas un
+    /// problème à traiter. Une ressource saine n'est pas verte non plus — peindre la normale
+    /// laisse l'anormale se fondre dedans.
+    pub fn row_tone(&self) -> LineColor {
+        if self.suspended {
+            return LineColor::Dim;
+        }
+        match self.ready {
+            FluxReady::Failed => LineColor::Err,
+            FluxReady::Unknown => LineColor::Warn,
+            FluxReady::Reconciling => LineColor::Info,
+            FluxReady::Ready | FluxReady::NotApplicable => LineColor::Plain,
+        }
+    }
+
+    /// Cette Kustomization laisse derrière elle ce qui a disparu de git (`spec.prune: false`).
+    ///
+    /// C'est l'écart à la norme qui se signale, pas la norme : le pruning est le défaut de Flux et
+    /// ce qu'un lecteur GitOps suppose. Faux pour tous les autres kinds, qui n'ont pas ce champ —
+    /// seul `false` dit quelque chose que le message ne dit pas déjà.
+    pub fn no_prune(&self) -> bool {
+        self.prune == Some(false)
+    }
+}
+
+/// La ressource Flux vue comme un enregistrement d'évènement.
+///
+/// Le TUI s'en sert pour que la vue Flux réutilise la table, le panneau de détail et le prompt IA
+/// partagés ; kdt-web s'en sert pour que le même panneau d'inspection — Logs, Status, Related —
+/// s'ouvre sur une ligne Flux comme il s'ouvre sur un évènement. La conversion vit ici, dans le
+/// métier, parce qu'elle porte un verdict : elle décide qu'un `Failed` est un `Warning` et qu'un
+/// `Reconciling` n'en est pas un. Deux copies finiraient par ne plus dire la même chose.
+pub fn synthetic_record(r: &FluxResource) -> EventRecord {
+    let (severity, reason) = match (r.suspended, r.ready) {
+        (true, _) => (Severity::Normal, "Suspended".to_string()),
+        (false, FluxReady::Ready) => (Severity::Normal, "Ready".to_string()),
+        (false, FluxReady::Reconciling) => (Severity::Normal, "Reconciling".to_string()),
+        (false, FluxReady::Failed) => (Severity::Warning, "ReconciliationFailed".to_string()),
+        (false, FluxReady::Unknown) => (Severity::Warning, "Unknown".to_string()),
+        (false, FluxReady::NotApplicable) => (Severity::Normal, "N/A".to_string()),
+    };
+    let message = if r.message.is_empty() {
+        format!("{} {}/{}", r.kind, r.namespace, r.name)
+    } else {
+        r.message.clone()
+    };
+    EventRecord {
+        uid: format!("flux|{}|{}/{}", r.kind, r.namespace, r.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: r.api_version.clone(),
+        kind: r.kind.clone(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "flux".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// Un objet appliqué par une Kustomization, vu comme un enregistrement d'évènement.
+///
+/// Même raison que ci-dessus : sélectionner une feuille d'inventaire doit ouvrir les panneaux
+/// Logs/Status/Related sur l'objet réel, pas sur la Kustomization qui l'a posé.
+pub fn inventory_record(ks_uid: &str, it: &InventoryItem) -> EventRecord {
+    let (severity, reason) = match (it.reconciling, it.ready) {
+        (true, _) => (Severity::Normal, "Reconciling".to_string()),
+        (_, Some(true)) => (Severity::Normal, "Ready".to_string()),
+        (_, Some(false)) => (Severity::Warning, "NotReady".to_string()),
+        (_, None) => (Severity::Normal, "Applied".to_string()),
+    };
+    let message = if it.msg.is_empty() {
+        format!("{} {}/{}", it.kind, it.namespace, it.name)
+    } else {
+        it.msg.clone()
+    };
+    EventRecord {
+        uid: format!("inv|{}|{}|{}/{}", ks_uid, it.kind, it.namespace, it.name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason,
+        api_version: it.api_version.clone(),
+        kind: it.kind.clone(),
+        namespace: it.namespace.clone(),
+        name: it.name.clone(),
+        message,
+        component: "flux".to_string(),
+        host: String::new(),
+        count: 1,
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -83,26 +224,34 @@ pub struct FluxState {
 impl FluxState {
     // (ready, failed, unknown, suspended, reconciling)
     pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
-        let mut ready = 0;
-        let mut failed = 0;
-        let mut unknown = 0;
-        let mut suspended = 0;
-        let mut reconciling = 0;
-        for r in &self.resources {
-            if r.suspended {
-                suspended += 1;
-            }
-            match r.ready {
-                FluxReady::Ready => ready += 1,
-                FluxReady::Reconciling => reconciling += 1,
-                FluxReady::Failed => failed += 1,
-                FluxReady::Unknown => unknown += 1,
-                // Counted as ready: a static OCI reference is neutral, not a pending/unknown problem.
-                FluxReady::NotApplicable => ready += 1,
-            }
-        }
-        (ready, failed, unknown, suspended, reconciling)
+        counts(&self.resources)
     }
+}
+
+/// Le décompte par état, sur une tranche : `(ready, failed, unknown, suspended, reconciling)`.
+///
+/// Hors de [`FluxState`] pour qu'un appelant qui n'en a pas — kdt-web, qui tient sa liste dans une
+/// variable — puisse compter sans s'en fabriquer un.
+pub fn counts(resources: &[FluxResource]) -> (usize, usize, usize, usize, usize) {
+    let mut ready = 0;
+    let mut failed = 0;
+    let mut unknown = 0;
+    let mut suspended = 0;
+    let mut reconciling = 0;
+    for r in resources {
+        if r.suspended {
+            suspended += 1;
+        }
+        match r.ready {
+            FluxReady::Ready => ready += 1,
+            FluxReady::Reconciling => reconciling += 1,
+            FluxReady::Failed => failed += 1,
+            FluxReady::Unknown => unknown += 1,
+            // Counted as ready: a static OCI reference is neutral, not a pending/unknown problem.
+            FluxReady::NotApplicable => ready += 1,
+        }
+    }
+    (ready, failed, unknown, suspended, reconciling)
 }
 
 pub type SharedFlux = Arc<Mutex<FluxState>>;
@@ -326,7 +475,8 @@ pub fn new_reconcile_status() -> SharedReconcile {
 }
 
 // Reconcile scope, from the most targeted to the widest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReconcileScope {
     // Annotate only the selected resource.
     Resource,
@@ -356,13 +506,27 @@ const CANDIDATES: &[(&str, &[&str], &str)] = &[
 // List every Flux resource kind present on the cluster. `found_crd` distinguishes "Flux not
 // installed" from "installed but empty/errored" for a clearer message in the UI.
 pub async fn fetch_flux(client: Client, state: SharedFlux) {
-    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("flux poisoned");
         s.loading = true;
         s.error = None;
     }
 
+    let (resources, error) = flux_resources(client).await;
+
+    let mut s = state.lock().expect("flux poisoned");
+    s.loading = false;
+    s.resources = resources;
+    s.error = error;
+}
+
+/// Le même inventaire, rendu plutôt que déposé dans un état partagé.
+///
+/// Même partage que `events::pod_logs` : le TUI écrit dans l'état qu'il redessine à chaque tick,
+/// alors qu'un appelant qui répond à une requête HTTP veut la réponse. Même sonde, même tri, même
+/// verdict — pas de seconde implémentation qui divergerait.
+pub async fn flux_resources(client: Client) -> (Vec<FluxResource>, Option<String>) {
+    let st = crate::lang::active();
     let mut resources: Vec<FluxResource> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut found_crd = false;
@@ -392,19 +556,17 @@ pub async fn fetch_flux(client: Client, state: SharedFlux) {
 
     resources.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
-    let mut s = state.lock().expect("flux poisoned");
-    s.loading = false;
-    s.resources = resources;
     // A kind that failed to list is reported even when the others succeeded: the view is then missing
     // rows (an RBAC-denied kind is the common case), and a silently incomplete inventory is exactly
     // what makes someone conclude a resource does not exist when it merely could not be read.
-    s.error = if !found_crd {
+    let error = if !found_crd {
         Some(st.flux_crds_missing.to_string())
     } else if !errors.is_empty() {
         Some(errors.join(" · "))
     } else {
         None
     };
+    (resources, error)
 }
 
 fn parse_flux(
@@ -888,7 +1050,7 @@ async fn resolve_ar(
 }
 
 // One object owned by a Kustomization (from status.inventory), with its live readiness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InventoryItem {
     pub api_version: String,
     pub kind: String,
@@ -898,6 +1060,37 @@ pub struct InventoryItem {
     // True when the object is actively reconciling/progressing (Ready not yet True but not a failure).
     pub reconciling: bool,
     pub msg: String,
+}
+
+impl InventoryItem {
+    /// Ce que la colonne READY affiche pour une feuille d'inventaire.
+    ///
+    /// `—` et non « Unknown » quand rien ne répond : l'objet existe — le GET a abouti — mais son
+    /// kind n'a pas de notion d'état. Dire « inconnu » ferait chercher un problème là où il n'y en
+    /// a pas.
+    pub fn ready_label(&self) -> &'static str {
+        if self.reconciling {
+            return "Reconciling";
+        }
+        match self.ready {
+            Some(true) => "Ready",
+            Some(false) => "NotReady",
+            None => "—",
+        }
+    }
+
+    /// Le ton de cette ligne, celui du glyphe que le TUI met devant : ↻ cyan, ✓ vert, ✗ rouge,
+    /// · éteint.
+    pub fn tone(&self) -> LineColor {
+        if self.reconciling {
+            return LineColor::Info;
+        }
+        match self.ready {
+            Some(true) => LineColor::Ok,
+            Some(false) => LineColor::Err,
+            None => LineColor::Dim,
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -930,27 +1123,50 @@ pub async fn fetch_inventory(
     key: String,
     state: SharedInventory,
 ) {
-    if kind != "Kustomization" {
-        let mut s = state.lock().expect("inventory poisoned");
-        if s.current_key.as_deref() != Some(&key) { return; }
-        s.loading = false;
-        s.items.clear();
-        s.error = Some("inventaire : Kustomization uniquement".to_string());
-        return;
-    }
+    let outcome = flux_inventory(&client, &api_version, &kind, &ns, &name).await;
 
-    let Ok((group, version)) = split_api_version(&api_version) else { return };
-    let obj = match get_obj(&client, group, &[version], &kind, &ns, &name).await {
-        Ok(o) => o,
+    let mut s = state.lock().expect("inventory poisoned");
+    if s.current_key.as_deref() != Some(&key) { return; }
+    s.loading = false;
+    match outcome {
+        Ok(inv) => {
+            s.items = inv.items;
+            s.prune = Some(inv.prune);
+            s.error = None;
+        }
         Err(e) => {
-            let mut s = state.lock().expect("inventory poisoned");
-            if s.current_key.as_deref() != Some(&key) { return; }
-            s.loading = false;
             s.items.clear();
             s.error = Some(e);
-            return;
         }
-    };
+    }
+}
+
+/// Ce qu'une Kustomization a appliqué, avec l'état vivant de chaque objet.
+#[derive(Debug, Clone)]
+pub struct Inventory {
+    pub items: Vec<InventoryItem>,
+    /// `spec.prune` de la Kustomization inspectée : à `false`, ce qu'elle a posé survit à sa
+    /// disparition de git.
+    pub prune: bool,
+}
+
+/// Le même inventaire, rendu plutôt que déposé dans un état partagé — voir [`flux_resources`].
+///
+/// L'objet est relu au passage : la Kustomization vient d'une liste vieille d'un rafraîchissement,
+/// et c'est son `status.inventory` d'*maintenant* qui dit ce qui est appliqué.
+pub async fn flux_inventory(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    ns: &str,
+    name: &str,
+) -> Result<Inventory, String> {
+    if kind != "Kustomization" {
+        return Err("inventaire : Kustomization uniquement".to_string());
+    }
+
+    let (group, version) = split_api_version(api_version)?;
+    let obj = get_obj(client, group, &[version], kind, ns, name).await?;
 
     let prune = obj
         .data
@@ -989,6 +1205,7 @@ pub async fn fetch_inventory(
         let client = client.clone();
         async move { fetch_item_status(client, egroup, ever, ekind, ens, ename).await }
     });
+
     let mut items: Vec<InventoryItem> = futures::future::join_all(futs).await;
     // Surface problems first (failed, reconciling, unknown, ready), then by kind/name.
     items.sort_by(|a, b| {
@@ -1004,12 +1221,7 @@ pub async fn fetch_inventory(
             .then(a.name.cmp(&b.name))
     });
 
-    let mut s = state.lock().expect("inventory poisoned");
-    if s.current_key.as_deref() != Some(&key) { return; }
-    s.loading = false;
-    s.items = items;
-    s.prune = Some(prune);
-    s.error = None;
+    Ok(Inventory { items, prune })
 }
 
 async fn fetch_item_status(
@@ -1182,7 +1394,7 @@ pub async fn toggle_suspend(
     status: SharedReconcile,
 ) {
     let st = crate::lang::active();
-    let msg = match run_toggle_suspend(&client, &api_version, &kind, &ns, &name).await {
+    let msg = match toggle_suspend_once(&client, &api_version, &kind, &ns, &name).await {
         Ok(true) => fill(st.flux_suspended_ok, &[("kind", &kind), ("name", &name)]),
         Ok(false) => fill(st.flux_resumed_ok, &[("kind", &kind), ("name", &name)]),
         Err(e) => fill(st.flux_toggle_failed, &[("e", &e)]),
@@ -1192,8 +1404,12 @@ pub async fn toggle_suspend(
     }
 }
 
-// Returns the value that was written, so the toast reports what actually happened.
-async fn run_toggle_suspend(
+/// Bascule `spec.suspend` et rend la valeur écrite, plutôt que de la poster dans un toast.
+///
+/// Même partage que [`reconcile_once`] : l'appelant qui répond à une requête HTTP a besoin de
+/// savoir ce qui a été écrit, pas d'un message déposé quelque part. La direction se décide
+/// toujours sur l'objet vivant, ici comme là-bas.
+pub async fn toggle_suspend_once(
     client: &Client,
     api_version: &str,
     kind: &str,
