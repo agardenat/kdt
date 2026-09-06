@@ -13,21 +13,45 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, Splitter, type PanelTab } from "./panel";
-import type { ContainerRow, EventRecord, PodRow, WorkloadRow } from "./types";
+import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
 
 /**
- * Les colonnes, dans l'ordre du TUI : le nom, puis ce qui se compte, puis ce qui se consomme.
+ * Les quatorze colonnes du TUI, dans le même ordre :
+ * `NAMESPACE NAME READY STATUS RST CPU MEM %CPU/R %CPU/L %MEM/R %MEM/L IP NODE AGE`.
  *
- * NAME prend la place restante parce que c'est lui qui porte l'indentation des trois niveaux.
- * CPU et MEM restent étroites : ce sont des chiffres courts, et les élargir volerait la place au
- * seul champ qui distingue deux lignes voisines.
+ * Les quatre ratios sont le cœur de la vue et non un supplément : c'est là qu'on voit un container
+ * throttlé contre sa limite ou un pod qui a réservé dix fois ce qu'il consomme. Ils restent
+ * étroits — quatre chiffres et un `%` — pour laisser NAME porter l'indentation des trois niveaux.
+ *
+ * La table déborde horizontalement sur un écran étroit ; `.tbl` est déjà en `width: max-content`
+ * dans un conteneur qui défile, donc rien ne s'écrase.
  */
 const COLUMNS =
-  "minmax(260px,1.6fr) 88px minmax(110px,14ch) 64px 56px minmax(110px,16ch) 74px 74px";
+  "minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
+  " 60px 60px 60px 60px minmax(110px,14ch) minmax(120px,16ch) 52px";
+
+/**
+ * Ce que consomme un workload : la somme de ses pods.
+ *
+ * `null` quand aucun pod n'a de mesure — un workload à zéro réplique, ou pas de metrics-server.
+ * Somme des valeurs connues, pas des zéros : un pod sans mesure ne compte pas pour rien.
+ */
+interface Agg {
+  cpu: number | null;
+  mem: number | null;
+}
+
+function aggregate(pods: PodRow[]): Agg {
+  const sum = (pick: (p: PodRow) => number | null) => {
+    const known = pods.map(pick).filter((v): v is number => v !== null);
+    return known.length > 0 ? known.reduce((a, b) => a + b, 0) : null;
+  };
+  return { cpu: sum((p) => p.cpu_milli), mem: sum((p) => p.mem_bytes) };
+}
 
 /** Une ligne affichée : un des trois niveaux, avec sa profondeur. */
 type Row =
-  | { level: "workload"; row: WorkloadRow }
+  | { level: "workload"; row: WorkloadRow; agg: Agg }
   | { level: "pod"; row: PodRow; indent: boolean }
   | { level: "container"; row: ContainerRow };
 
@@ -61,7 +85,7 @@ export default function WorkloadsView({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
-  const [menuFor, setMenuFor] = useState<WorkloadRow | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -101,16 +125,16 @@ export default function WorkloadsView({
   }, [toast]);
 
   useEffect(() => {
-    if (!menuFor) return;
+    if (!menuOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        setMenuFor(null);
+        setMenuOpen(false);
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [menuFor]);
+  }, [menuOpen]);
 
   const needle = query.trim().toLowerCase();
 
@@ -143,7 +167,7 @@ export default function WorkloadsView({
       const keptPods = mine.filter(podMatches);
       // Le workload reste si lui-même correspond, ou si l'un de ses pods correspond.
       if (!workloadMatches(w) && keptPods.length === 0) continue;
-      out.push({ level: "workload", row: w });
+      out.push({ level: "workload", row: w, agg: aggregate(mine) });
       // Un workload qui correspond garde **tout** son groupe : on cherche un workload pour voir
       // ses pods, pas pour n'en voir que ceux dont le nom répète le sien.
       for (const p of workloadMatches(w) ? mine : keptPods) pushPod(p, true);
@@ -153,6 +177,13 @@ export default function WorkloadsView({
     for (const p of pods) if (p.group === null && podMatches(p)) pushPod(p, false);
     return out;
   }, [grouped, workloads, pods, expanded, needle]);
+
+  // Un pod ou un container n'a ni `scale` ni `restart` : le menu ne s'ouvre que sur un workload,
+  // et le dit plutôt que de proposer des entrées qui échoueraient.
+  const selectedWorkload = useMemo(
+    () => workloads.find((w) => w.uid === selected) ?? null,
+    [workloads, selected],
+  );
 
   const selectedRecord = useMemo<EventRecord | null>(() => {
     for (const entry of rows) if (entry.row.uid === selected) return entry.row.record;
@@ -170,7 +201,7 @@ export default function WorkloadsView({
 
   const run = useCallback(
     async (action: () => Promise<{ message: string }>) => {
-      setMenuFor(null);
+      setMenuOpen(false);
       setBusy(true);
       try {
         const { message } = await action();
@@ -228,6 +259,22 @@ export default function WorkloadsView({
 
         <div className="right">
           {busy && <span>{st.wlWorking}</span>}
+          {/* Les actions vivent dans la barre et portent sur la ligne sélectionnée — la même
+              convention que la vue Flux. Ce qui est attaché à l'objet, ce sont les plis. */}
+          <div className="menu-anchor">
+            <button
+              className="panel-toggle action"
+              disabled={!selectedWorkload}
+              title={selectedWorkload ? undefined : st.wlSelectWorkload}
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen((v) => !v)}
+            >
+              {st.wlActions} ▾
+            </button>
+            {menuOpen && selectedWorkload && (
+              <WorkloadMenu w={selectedWorkload} st={st} onRun={run} />
+            )}
+          </div>
           {selectedRecord && (
             <button className="panel-toggle" onClick={() => onPanelOpen(!panelOpen)}>
               {panelOpen
@@ -259,14 +306,30 @@ export default function WorkloadsView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+                <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">READY</div>
                 <div className="cell">STATUS</div>
-                <div className="cell num">RESTARTS</div>
-                <div className="cell num">AGE</div>
-                <div className="cell">NODE</div>
+                <div className="cell num" title={st.wlRestarts}>
+                  RST
+                </div>
                 <div className="cell num">CPU</div>
                 <div className="cell num">MEM</div>
+                <div className="cell num" title={st.wlCpuReq}>
+                  %CPU/R
+                </div>
+                <div className="cell num" title={st.wlCpuLim}>
+                  %CPU/L
+                </div>
+                <div className="cell num" title={st.wlMemReq}>
+                  %MEM/R
+                </div>
+                <div className="cell num" title={st.wlMemLim}>
+                  %MEM/L
+                </div>
+                <div className="cell">IP</div>
+                <div className="cell">NODE</div>
+                <div className="cell num">AGE</div>
               </div>
             </div>
             <div className="tbody">
@@ -275,15 +338,12 @@ export default function WorkloadsView({
                   <WorkloadLine
                     key={entry.row.uid}
                     w={entry.row}
-                    st={st}
+                    agg={entry.agg}
                     selected={selected === entry.row.uid}
-                    menuOpen={menuFor?.uid === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
                       onPanelOpen(true);
                     }}
-                    onMenu={() => setMenuFor((m) => (m?.uid === entry.row.uid ? null : entry.row))}
-                    onRun={run}
                   />
                 ) : entry.level === "pod" ? (
                   <PodLine
@@ -342,20 +402,14 @@ export default function WorkloadsView({
 
 function WorkloadLine({
   w,
-  st,
+  agg,
   selected,
-  menuOpen,
   onSelect,
-  onMenu,
-  onRun,
 }: {
   w: WorkloadRow;
-  st: Strings;
+  agg: Agg;
   selected: boolean;
-  menuOpen: boolean;
   onSelect: () => void;
-  onMenu: () => void;
-  onRun: (action: () => Promise<{ message: string }>) => void;
 }) {
   return (
     <div
@@ -368,36 +422,30 @@ function WorkloadLine({
         if (e.key === "Enter") onSelect();
       }}
     >
+      <div className="cell mono dim">{w.namespace}</div>
       <div className="cell id">
         <span className="kind">{w.kind}</span> {w.name}
         {/* Les actions vivent sur la ligne qu'elles visent, et non dans une barre où il faudrait
             d'abord sélectionner puis chercher : c'est là que la souris est déjà. */}
-        {(w.scalable || w.restartable) && (
-          <span className="menu-anchor">
-            <button
-              className="inv-pill"
-              aria-expanded={menuOpen}
-              title={st.wlActions}
-              onClick={(e) => {
-                e.stopPropagation();
-                onMenu();
-              }}
-            >
-              ⋯
-            </button>
-            {menuOpen && <WorkloadMenu w={w} st={st} onRun={onRun} />}
-          </span>
-        )}
+
       </div>
       <div className="cell mono">{w.ready_label}</div>
       <div className="cell">
         <span className={`st ${w.status_tone}`}>{w.status_label}</span>
       </div>
       <div className="cell num dim" />
+      {/* CPU et MEM d'un workload sont la somme de ses pods, agrégée à l'affichage. Les ratios,
+          eux, restent vides : additionner des pourcentages de bases différentes ne veut rien
+          dire, et le TUI les laisse vides pour la même raison. */}
+      <div className="cell num">{cpu(agg.cpu)}</div>
+      <div className="cell num">{mem(agg.mem)}</div>
+      <div className="cell num dim" />
+      <div className="cell num dim" />
+      <div className="cell num dim" />
+      <div className="cell num dim" />
+      <div className="cell dim" />
+      <div className="cell dim" />
       <div className="cell num dim">{w.age}</div>
-      <div className="cell dim">{w.namespace}</div>
-      <div className="cell num dim" />
-      <div className="cell num dim" />
     </div>
   );
 }
@@ -552,12 +600,17 @@ function PodLine({
         <span className={`st ${p.status_tone}`}>{p.status}</span>
       </div>
       <div className={`cell num ${p.restarts_tone}`}>{p.restarts}</div>
-      <div className="cell num dim">{p.age}</div>
-      <div className="cell dim" title={p.ip}>
-        {p.node}
-      </div>
       <div className="cell num">{cpu(p.cpu_milli)}</div>
       <div className="cell num">{mem(p.mem_bytes)}</div>
+      <Pct v={p.cpu_req_pct} />
+      <Pct v={p.cpu_lim_pct} />
+      <Pct v={p.mem_req_pct} />
+      <Pct v={p.mem_lim_pct} />
+      <div className="cell mono dim">{p.ip}</div>
+      <div className="cell dim" title={p.node}>
+        {p.node}
+      </div>
+      <div className="cell num dim">{p.age}</div>
     </div>
   );
 }
@@ -582,10 +635,13 @@ function ContainerLine({
         if (e.key === "Enter") onSelect();
       }}
     >
+      <div className="cell" />
       <div className="cell id" style={{ paddingLeft: "2.6rem" }}>
         <span className={`gl ${c.tone}`}>{c.ready ? "✓" : "✗"}</span>
         {c.display_name}
       </div>
+      {/* Un container n'a pas de compte `prêts/total` : il est prêt ou non, et le glyphe le dit
+          déjà. La colonne porte donc son image, qui est ce qui le distingue de son voisin. */}
       <div className="cell mono dim" title={c.image}>
         {c.image.split("/").pop()}
       </div>
@@ -593,12 +649,28 @@ function ContainerLine({
         <span className={`st ${c.tone}`}>{c.state}</span>
       </div>
       <div className={`cell num ${c.restarts_tone}`}>{c.restarts}</div>
-      <div className="cell num dim">{c.age}</div>
-      <div className="cell" />
       <div className="cell num">{cpu(c.cpu_milli)}</div>
       <div className="cell num">{mem(c.mem_bytes)}</div>
+      <Pct v={c.cpu_req_pct} />
+      <Pct v={c.cpu_lim_pct} />
+      <Pct v={c.mem_req_pct} />
+      <Pct v={c.mem_lim_pct} />
+      <div className="cell" />
+      <div className="cell" />
+      <div className="cell num dim">{c.age}</div>
     </div>
   );
+}
+
+/**
+ * Un ratio d'usage, peint par sa bande de pression.
+ *
+ * `—` quand il n'y en a pas : pas de metrics-server, ou pas de requête ni de limite déclarée. Un
+ * `0 %` se lirait comme une consommation nulle, ce qui est une tout autre nouvelle.
+ */
+function Pct({ v }: { v: UsagePct | null }) {
+  if (!v) return <div className="cell num dim">—</div>;
+  return <div className={`cell num pr-${v.pressure}`}>{v.pct}%</div>;
 }
 
 /** Millicores, dans la forme du TUI : `250m` en dessous du cœur, `1.5` au-dessus. */

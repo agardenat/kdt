@@ -105,6 +105,7 @@ fn workload_json(w: &WorkloadResource) -> serde_json::Value {
 fn pod_json(p: &PodResource, workloads: &[WorkloadResource]) -> serde_json::Value {
     let mut value = serde_json::to_value(p).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
+        usage_json(object, p.cpu_milli, p.mem_bytes, p.cpu_req, p.cpu_lim, p.mem_req, p.mem_lim);
         object.insert("status_tone".to_string(), tone_json(p.status_tone()));
         object.insert("row_tone".to_string(), tone_json(p.row_tone()));
         object.insert("restarts_tone".to_string(), tone_json(p.restarts_tone()));
@@ -132,8 +133,42 @@ fn pod_json(p: &PodResource, workloads: &[WorkloadResource]) -> serde_json::Valu
     value
 }
 
+/// Les quatre ratios de la ligne : la consommation rapportée à ce qui a été demandé, puis à ce qui
+/// est permis. Calculés ici parce que la bande de pression est un verdict de `kdt` — dépasser une
+/// limite n'est pas dépasser une requête — et non une division que le navigateur referait.
+fn usage_json(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    cpu: Option<i64>,
+    mem: Option<i64>,
+    cpu_req: Option<i64>,
+    cpu_lim: Option<i64>,
+    mem_req: Option<i64>,
+    mem_lim: Option<i64>,
+) {
+    for (field, usage, base) in [
+        ("cpu_req_pct", cpu, cpu_req),
+        ("cpu_lim_pct", cpu, cpu_lim),
+        ("mem_req_pct", mem, mem_req),
+        ("mem_lim_pct", mem, mem_lim),
+    ] {
+        object.insert(
+            field.to_string(),
+            match kdt::pods::usage_pct(usage, base) {
+                Some((pct, pressure)) => serde_json::json!({
+                    "pct": pct,
+                    "pressure": pressure,
+                }),
+                // Pas de mesure, ou pas de base : la colonne n'a rien à dire, et un zéro se
+                // lirait comme une consommation nulle.
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+}
+
 fn enrich_container(slot: &mut serde_json::Value, c: &ContainerResource) {
     let Some(object) = slot.as_object_mut() else { return };
+    usage_json(object, c.cpu_milli, c.mem_bytes, c.cpu_req, c.cpu_lim, c.mem_req, c.mem_lim);
     object.insert("tone".to_string(), tone_json(c.tone()));
     object.insert("restarts_tone".to_string(), tone_json(c.restarts_tone()));
     object.insert("display_name".to_string(), c.display_name().into());

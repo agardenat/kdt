@@ -270,7 +270,7 @@ export default function FluxView({
           )}
           <div className="menu-anchor">
             <button
-              className="panel-toggle"
+              className="panel-toggle action"
               disabled={!selectedRow}
               title={selectedRow ? undefined : st.fluxSelectRow}
               aria-expanded={menuOpen}

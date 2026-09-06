@@ -180,6 +180,40 @@ impl SecretsState {
     }
 }
 
+/// Le filtre de la vue, cyclé par `f` dans le TUI.
+///
+/// `Expiring` est le seul qui porte un jugement : « tout ce qui n'est pas sain », donc expiré
+/// **et** urgent **et** proche — les trois se traitent, la nuance entre eux est dans le nombre de
+/// jours et non dans le fait d'apparaître ou non.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretFilter {
+    All,
+    Tls,
+    Expiring,
+}
+
+impl SecretFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            SecretFilter::All => "ALL",
+            SecretFilter::Tls => "TLS",
+            SecretFilter::Expiring => "EXPIRING",
+        }
+    }
+
+    pub fn matches(self, s: &SecretInfo) -> bool {
+        match self {
+            SecretFilter::All => true,
+            SecretFilter::Tls => s.is_tls(),
+            // Un secret TLS illisible ne passe pas : on ne sait pas s'il expire. Le dire autrement
+            // — le faire passer par prudence — remplirait la liste des urgences de lignes dont on
+            // ignore tout.
+            SecretFilter::Expiring => s.tls.as_ref().map(|c| c.expiry != Expiry::Ok).unwrap_or(false),
+        }
+    }
+}
+
 pub type SharedSecrets = Arc<Mutex<SecretsState>>;
 
 pub fn new_secrets_state() -> SharedSecrets {

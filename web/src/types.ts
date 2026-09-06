@@ -41,11 +41,34 @@ export interface EventsPayload {
   rows: EventRecord[];
 }
 
+/**
+ * La pression d'une consommation sur sa base, telle que kdt la juge.
+ *
+ * `over` sur une **limite** veut dire throttlé (CPU) ou tué (mémoire) ; sur une *requête*, c'est
+ * banal — la requête est une réservation, pas un plafond. La bande dit la pression, c'est la base
+ * qui dit comment la lire.
+ */
+export type Pressure = "ok" | "high" | "very-high" | "over";
+
+/** Un ratio d'usage, ou `null` quand la mesure ou la base manque. */
+export interface UsagePct {
+  pct: number;
+  pressure: Pressure;
+}
+
+/** Les quatre ratios que porte une ligne de pod ou de container. */
+export interface UsageRatios {
+  cpu_req_pct: UsagePct | null;
+  cpu_lim_pct: UsagePct | null;
+  mem_req_pct: UsagePct | null;
+  mem_lim_pct: UsagePct | null;
+}
+
 /** Où un container se situe dans le cycle de vie du pod. */
 export type ContainerKind = "init" | "regular" | "ephemeral";
 
 /** Un container d'un pod, tel que la vue le montre : le spec joint au status, plus les métriques. */
-export interface ContainerRow {
+export interface ContainerRow extends UsageRatios {
   uid: string;
   namespace: string;
   pod: string;
@@ -79,7 +102,7 @@ export interface OwnerRef {
   api_version: string;
 }
 
-export interface PodRow {
+export interface PodRow extends UsageRatios {
   uid: string;
   namespace: string;
   name: string;
@@ -197,6 +220,9 @@ export interface SecretRow {
   expiry_tone: LineTone | null;
   record: EventRecord;
 }
+
+/** Le filtre de la vue, tel que kdt le cycle : tout, TLS seulement, ou ce qui n'est pas sain. */
+export type SecretFilter = "all" | "tls" | "expiring";
 
 export interface SecretsPayload {
   secrets: SecretRow[];

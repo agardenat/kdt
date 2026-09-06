@@ -976,6 +976,52 @@ async fn patch_restart(client: &Client, owner: &OwnerRef) -> Result<(), String> 
         .map_err(|e| format!("{}/{} : {}", owner.kind, owner.name, e))
 }
 
+/// La pression d'une consommation sur ce qu'elle a demandé ou sur ce qu'elle a le droit de
+/// prendre.
+///
+/// Quatre bandes et non trois : dépasser sa **limite** (`Over`) n'est pas la même nouvelle que
+/// s'en approcher. Au-delà de 100 % d'une limite CPU le container est throttlé, au-delà d'une
+/// limite mémoire il se fait tuer — alors que 90 % annonce seulement que ça vient. Contre une
+/// *requête*, en revanche, dépasser est banal : la requête est une réservation, pas un plafond.
+/// La colonne dit donc la pression, et c'est en connaissant la base qu'on la lit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Pressure {
+    Ok,
+    High,
+    VeryHigh,
+    Over,
+}
+
+impl Pressure {
+    pub fn from_pct(pct: i64) -> Pressure {
+        if pct >= 100 {
+            Pressure::Over
+        } else if pct >= 90 {
+            Pressure::VeryHigh
+        } else if pct >= 70 {
+            Pressure::High
+        } else {
+            Pressure::Ok
+        }
+    }
+}
+
+/// Le pourcentage d'une consommation rapportée à sa base, et la bande où il tombe.
+///
+/// `None` quand la mesure manque (pas de metrics-server) **ou** quand la base est absente ou nulle
+/// — un container sans requête ni limite n'a pas de pourcentage, et en inventer un à partir de
+/// zéro donnerait un infini qu'on prendrait pour une alerte.
+pub fn usage_pct(usage: Option<i64>, base: Option<i64>) -> Option<(i64, Pressure)> {
+    match (usage, base) {
+        (Some(u), Some(b)) if b > 0 => {
+            let pct = (u * 100) / b;
+            Some((pct, Pressure::from_pct(pct)))
+        }
+        _ => None,
+    }
+}
+
 /// Le ton d'un statut de pod, à partir de la seule chaîne.
 ///
 /// La règle est celle de [`PodResource::status_tone`] ; cette forme existe pour les appelants qui

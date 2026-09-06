@@ -465,7 +465,7 @@ enum VulnRow {
     K8s(K8sVersionRisk),
     Image(VulnComponent),
 }
-use crate::secrets::{
+use crate::secrets::{SecretFilter, 
     fetch_secrets, new_secrets_state, Expiry, SecretInfo, SharedSecrets,
 };
 use crate::configmaps::{
@@ -1096,27 +1096,6 @@ struct ConfigmapsCopyMenu {
     offset: usize,
 }
 
-// How the secrets table is filtered (`f`): every secret, only TLS, or only TLS within 30 days of
-// expiry (or already expired).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecretFilter { All, Tls, Expiring }
-
-impl SecretFilter {
-    fn label(self) -> &'static str {
-        match self { SecretFilter::All => "ALL", SecretFilter::Tls => "TLS", SecretFilter::Expiring => "EXPIRING" }
-    }
-    fn matches(self, s: &SecretInfo) -> bool {
-        match self {
-            SecretFilter::All => true,
-            SecretFilter::Tls => s.is_tls(),
-            SecretFilter::Expiring => s
-                .tls
-                .as_ref()
-                .map(|c| c.expiry != Expiry::Ok)
-                .unwrap_or(false),
-        }
-    }
-}
 use crate::events::{is_critical_reason, 
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
     fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
@@ -18576,23 +18555,20 @@ fn usage_cell(v: Option<i64>, fmt: fn(i64) -> String) -> Cell<'static> {
     }
 }
 
-// Usage as a percentage of a request/limit, coloured by pressure (green→yellow→orange→red).
+// Usage as a percentage of a request/limit, coloured by pressure. The bands are
+// `pods::Pressure`, shared with kdt-web; this only paints them.
 fn pct_cell(usage: Option<i64>, base: Option<i64>) -> Cell<'static> {
-    match (usage, base) {
-        (Some(u), Some(b)) if b > 0 => {
-            let pct = (u * 100) / b;
-            let color = if pct >= 100 {
-                Color::Red
-            } else if pct >= 90 {
-                Color::Rgb(255, 140, 0)
-            } else if pct >= 70 {
-                Color::Yellow
-            } else {
-                Color::Green
+    match crate::pods::usage_pct(usage, base) {
+        Some((pct, pressure)) => {
+            let color = match pressure {
+                crate::pods::Pressure::Over => Color::Red,
+                crate::pods::Pressure::VeryHigh => Color::Rgb(255, 140, 0),
+                crate::pods::Pressure::High => Color::Yellow,
+                crate::pods::Pressure::Ok => Color::Green,
             };
             Cell::from(format!("{pct}%")).style(Style::default().fg(color))
         }
-        _ => Cell::from("—").style(Style::default().fg(DIM)),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
     }
 }
 

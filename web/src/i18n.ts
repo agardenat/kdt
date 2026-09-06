@@ -98,10 +98,36 @@ export interface Strings {
   wlReplicas: string;
   wlMissing: string;
   wlMissingHelp: string;
+  wlRestarts: string;
+  wlSelectWorkload: string;
+  wlCpuReq: string;
+  wlCpuLim: string;
+  wlMemReq: string;
+  wlMemLim: string;
 
   // --- Vues Secrets / ConfigMaps.
   dataEmpty: string;
   secKeys: string;
+  secDetail: string;
+  secOrigin: string;
+  secAge: string;
+  secCertificate: string;
+  secConstraint: string;
+  secKey: string;
+  secIssuedOn: string;
+  secExpiresOn: string;
+  secConsumers: string;
+  secNoIngress: string;
+  secContent: string;
+  cmText: string;
+  cmBinary: string;
+  cmSize: string;
+  secFilter: string;
+  secFilterAll: string;
+  secFilterExpiring: string;
+  secFilterHelp: string;
+  secCopy: string;
+  secCopied: string;
   secShowText: string;
   secVisible: string;
   secBinary: string;
@@ -207,9 +233,36 @@ const FR: Strings = {
   wlMissing: "kinds illisibles",
   wlMissingHelp:
     "Ces kinds n'ont pas pu être listés : la vue en est incomplète, ce n'est pas qu'il n'y en a aucun.",
+  wlRestarts: "redémarrages",
+  wlSelectWorkload: "Choisissez un workload : un pod et un container ne se scalent pas.",
+  wlCpuReq: "CPU consommé, en % de la requête. Au-dessus de 100 %, le pod prend plus qu'il n'a réservé — c'est permis.",
+  wlCpuLim: "CPU consommé, en % de la limite. Au-dessus de 100 %, le container est throttlé.",
+  wlMemReq: "Mémoire consommée, en % de la requête.",
+  wlMemLim: "Mémoire consommée, en % de la limite. Au-dessus de 100 %, le container se fait tuer (OOMKilled).",
 
   dataEmpty: "Rien à montrer dans cette portée.",
   secKeys: "clés",
+  secDetail: "Détail",
+  secOrigin: "origine",
+  secAge: "âge",
+  secCertificate: "Certificat",
+  secConstraint: "contrainte",
+  secKey: "clé",
+  secIssuedOn: "émis le",
+  secExpiresOn: "expire le",
+  secConsumers: "Consommateurs",
+  secNoIngress: "aucun Ingress ne le référence",
+  secContent: "Contenu",
+  cmText: "texte",
+  cmBinary: "binaires",
+  cmSize: "taille",
+  secFilter: "Filtre",
+  secFilterAll: "tous",
+  secFilterExpiring: "à renouveler",
+  secFilterHelp:
+    "« à renouveler » ne garde que les secrets porteurs d'un certificat dont l'échéance n'est pas saine — un certificat illisible n'y figure pas, puisqu'on ignore quand il expire.",
+  secCopy: "Copier",
+  secCopied: "copié",
   secShowText: "afficher",
   secVisible: "⚠ valeurs à l'écran",
   secBinary: "binaire, {n} octets",
@@ -315,9 +368,36 @@ const EN: Strings = {
   wlMissing: "unreadable kinds",
   wlMissingHelp:
     "These kinds could not be listed: the view is incomplete, it does not mean there are none.",
+  wlRestarts: "restarts",
+  wlSelectWorkload: "Pick a workload: a pod or a container cannot be scaled.",
+  wlCpuReq: "CPU used, as % of the request. Above 100% the pod takes more than it reserved — which is allowed.",
+  wlCpuLim: "CPU used, as % of the limit. Above 100% the container is throttled.",
+  wlMemReq: "Memory used, as % of the request.",
+  wlMemLim: "Memory used, as % of the limit. Above 100% the container gets OOMKilled.",
 
   dataEmpty: "Nothing to show in this scope.",
   secKeys: "keys",
+  secDetail: "Detail",
+  secOrigin: "origin",
+  secAge: "age",
+  secCertificate: "Certificate",
+  secConstraint: "constraint",
+  secKey: "key",
+  secIssuedOn: "issued on",
+  secExpiresOn: "expires on",
+  secConsumers: "Consumers",
+  secNoIngress: "no Ingress references it",
+  secContent: "Content",
+  cmText: "text",
+  cmBinary: "binary",
+  cmSize: "size",
+  secFilter: "Filter",
+  secFilterAll: "all",
+  secFilterExpiring: "to renew",
+  secFilterHelp:
+    "\"to renew\" keeps only secrets carrying a certificate whose expiry is not healthy — an undecodable certificate is not listed, since we cannot know when it expires.",
+  secCopy: "Copy",
+  secCopied: "copied",
   secShowText: "reveal",
   secVisible: "⚠ values on screen",
   secBinary: "binary, {n} bytes",

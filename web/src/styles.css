@@ -636,11 +636,15 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 }
 .tbody .tr.sec-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
 
-/* Le panneau des clés, déplié sous la ligne. */
-.keys {
-  padding: .5rem .85rem .7rem 2.4rem;
-  border-bottom: 1px solid var(--line-soft); background: var(--sunk);
-}
+/* Le contenu du panneau du haut : deux colonnes de faits, puis les clés. */
+.detail { font-size: 12px; }
+.detail .facts { grid-template-columns: 8.5rem 1fr; margin-bottom: .2rem; }
+.detail .facts dd.wrap { word-break: break-all; }
+.detail .facts dd.ok { color: var(--ok); }
+.detail .facts dd.warn { color: var(--warn); font-weight: 600; }
+.detail .facts dd.err { color: var(--err); font-weight: 600; }
+.sans { margin: 0 0 .4rem; padding-left: 1.1rem; font-family: var(--mono); font-size: 11.5px; }
+
 .keys-bar {
   display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem;
   font-size: 11.5px;
@@ -660,3 +664,72 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 
 .facts.tls { margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--line); }
 .facts.tls dd { font-size: 11.5px; word-break: break-word; }
+
+/* Les quatre bandes de pression, telles que kdt les juge. L'orange de `very-high` est une bande à
+   lui : s'approcher d'une limite n'est pas la dépasser. */
+.cell.num.pr-ok { color: var(--ok); }
+.cell.num.pr-high { color: var(--warn); }
+.cell.num.pr-very-high { color: #e8590c; }
+.cell.num.pr-over { color: var(--err); font-weight: 600; }
+:root:not([data-theme="light"]) .cell.num.pr-very-high { color: #ff922b; }
+:root[data-theme="dark"] .cell.num.pr-very-high { color: #ff922b; }
+
+/* Trois états côte à côte plutôt qu'une touche qui cycle : on voit lequel est actif sans avoir à
+   appuyer pour le découvrir. */
+.segmented { display: flex; margin-left: .7rem; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.segmented button {
+  padding: .18rem .5rem; background: none; border: 0; border-right: 1px solid var(--line);
+  color: var(--muted); cursor: pointer; font-size: 11px;
+}
+.segmented button:last-child { border-right: 0; }
+.segmented button:hover { color: var(--fg); background: var(--row-hover); }
+.segmented button[aria-pressed="true"] { background: var(--row-sel); color: var(--accent); font-weight: 600; }
+
+.inv-pill.copy { margin-left: .45rem; padding: 0 .3rem; }
+/* Le nom de la clé et sa commande de copie tiennent dans la même colonne, l'une sous l'autre :
+   la valeur d'à côté se replie sur dix lignes, et un bouton aligné sur elle partirait au loin. */
+.keys-row .k-col { display: flex; flex-direction: column; align-items: flex-start; gap: .25rem; }
+.keys-row .k-col .inv-pill.copy { padding: 0 .3rem; }
+
+/* ---------------------------------------------------------------- couleur des commandes
+
+   Le principe des lignes de table — peindre l'écart, pas la norme — ne vaut pas pour les boutons :
+   eux ne décrivent pas le cluster, ils disent ce qu'on peut faire. Une commande éteinte se
+   cherche, et on l'a vérifié à ses dépens. Trois familles seulement, chacune avec un sens :
+
+   · accent  — ce qui agit sur le cluster, et ce qui est actif ;
+   · ambre   — ce qui met des valeurs de Secret à l'écran ;
+   · vert    — un accusé de réception qui s'efface. */
+
+/* Ce qui ouvre un menu d'action porte l'accent : c'est la seule commande d'une barre qui écrit
+   sur le cluster, et elle ne doit pas se confondre avec le repli du panneau juste à côté. */
+.panel-toggle.action {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  font-weight: 600;
+}
+.panel-toggle.action:hover:not(:disabled) {
+  background: var(--row-sel); border-color: var(--accent);
+}
+.panel-toggle.action[aria-expanded="true"] {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.panel-toggle:disabled { opacity: .45; cursor: default; color: var(--muted); }
+.panel-toggle.action:disabled { border-color: var(--line); font-weight: 400; }
+
+/* Révéler un secret est le seul geste de l'interface qui met à l'écran quelque chose qu'on ne
+   voulait pas y voir par défaut. Le bouton actif porte donc l'ambre de l'avertissement qui
+   l'accompagne, pas l'accent des commandes ordinaires. */
+.keys-bar .inv-pill[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  border-color: var(--warn); color: var(--warn); font-weight: 600;
+}
+.keys-bar .inv-pill:hover { border-color: var(--warn); color: var(--warn); }
+
+/* La pastille d'inventaire est une commande de navigation : accent quand elle est ouverte, et
+   rien de plus — elle ne change pas le cluster. */
+.inv-pill[aria-expanded="true"] { background: var(--row-sel); }
+.inv-pill.copy:hover { border-color: var(--ok); color: var(--ok); }
+
+/* Le seul vert hors verdict : un accusé qui s'efface au bout de deux secondes. */
+.inv-pill.copy { transition: color .12s, border-color .12s; }
+.inv-pill.copy.done { color: var(--ok); border-color: var(--ok); }

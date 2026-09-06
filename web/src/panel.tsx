@@ -5,7 +5,7 @@
 // pour que sa vue Flux réutilise le même panneau. Les trois onglets — Logs, Status, Related — sont
 // donc les mêmes objets sur la même donnée, quelle que soit la vue qui a ouvert la ligne.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import * as api from "./api";
 import type { Lang } from "./i18n";
 import {
@@ -23,7 +23,20 @@ import {
  * `DetailTab { Logs, Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail »
  * en plus n'existerait que sur le web, et les deux interfaces ne se ressembleraient plus.
  */
-export type PanelTab = "logs" | "status" | "related";
+export type PanelTab = "detail" | "logs" | "status" | "related";
+
+/**
+ * Un onglet propre à une vue, posé devant les trois onglets partagés.
+ *
+ * Certaines vues de kdt montrent l'objet lui-même dans le panneau du haut, et pas seulement son
+ * état : un Secret y affiche son type, ses clés, son certificat, ses consommateurs, et c'est là
+ * que ses valeurs se révèlent. Ce contenu-là est propre à la vue, donc c'est elle qui le rend ;
+ * le panneau se contente de lui faire une place devant `Logs`.
+ */
+export interface DetailPane {
+  label: string;
+  node: ReactNode;
+}
 
 /** Hauteur du panneau au premier affichage, et celle que le double-clic sur la poignée rétablit. */
 export const DEFAULT_PANEL_HEIGHT = 300;
@@ -54,6 +67,7 @@ export function InspectPanel({
   onClose,
   height,
   lang,
+  detail,
 }: {
   record: EventRecord;
   tab: PanelTab;
@@ -61,6 +75,7 @@ export function InspectPanel({
   onClose: () => void;
   height: number;
   lang: Lang;
+  detail?: DetailPane;
 }) {
   // Un Pod rend ses propres logs, une ressource Flux ceux de son controller filtrés sur elle.
   // Ailleurs, l'onglet resterait vide : remonter d'un Deployment à ses pods demande de choisir
@@ -71,6 +86,11 @@ export function InspectPanel({
     <section className="panel" style={{ height }}>
       <div className="phd">
         <div className="ptabs" role="tablist">
+          {detail && (
+            <button role="tab" aria-selected={tab === "detail"} onClick={() => onTab("detail")}>
+              {detail.label}
+            </button>
+          )}
           <button
             role="tab"
             aria-selected={tab === "logs"}
@@ -112,6 +132,8 @@ export function InspectPanel({
       </div>
 
       <div className="pbody">
+        {/* L'onglet propre à la vue passe devant : quand il existe, c'est lui qu'on vient lire. */}
+        {tab === "detail" && (detail?.node ?? null)}
         {tab === "logs" &&
           (logs ? (
             <LogsPane record={record} lang={lang} />
