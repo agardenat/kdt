@@ -109,7 +109,7 @@ pub enum KyKind {
 }
 
 impl KyKind {
-    pub fn from_str(s: &str) -> Option<KyKind> {
+    pub fn parse(s: &str) -> Option<KyKind> {
         Some(match s {
             "ClusterPolicy" => KyKind::ClusterPolicy,
             "Policy" => KyKind::Policy,
@@ -710,7 +710,7 @@ async fn list_policy_kinds(client: &Client) -> ListedPolicies {
 }
 
 fn parse_policy(obj: &DynamicObject, kind: &str, api_version: &str) -> Option<KyPolicy> {
-    let ky_kind = KyKind::from_str(kind)?;
+    let ky_kind = KyKind::parse(kind)?;
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
     let name = obj.metadata.name.clone().unwrap_or_default();
     let spec = obj.data.get("spec");

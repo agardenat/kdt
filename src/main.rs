@@ -1,78 +1,18 @@
-//! Entry point: builds the kube client, sets up logging, and launches the TUI.
+//! Point d'entrée du TUI : construit le client, installe les journaux, lance l'interface.
+//!
+//! Tout le métier vit dans la bibliothèque du même crate — voir `lib.rs`. Ce fichier n'a que ce
+//! qu'un binaire a de particulier : l'allocateur, les journaux, et l'ordre de démarrage.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-mod ai;
-mod argocd;
-mod capacity;
-mod certmanager;
-mod cli;
-mod clip;
-mod config;
-mod configmaps;
-mod connect;
-mod delete;
-mod diagnostic;
-mod edit;
-mod enrich;
-mod events;
-mod exec;
-mod extract;
-mod flux;
-mod glyphs;
-mod identity;
-mod k8ssandra;
-mod kyverno;
-mod lang;
-mod mgmtapi;
-mod namespaces;
-mod netpol;
-mod nodeops;
-mod nodetool;
-mod pdf;
-mod pods;
-mod portfwd;
-mod rancher;
-mod rbac;
-mod reflector;
-mod repair;
-mod secrets;
-mod splash;
-mod storage;
-mod svc;
-mod touch;
-mod ui;
-mod velero;
-mod vulnerabilities;
-mod yaml;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use kube::Client;
 use tracing_subscriber::EnvFilter;
 
-// Build a kube client from the kubeconfig: an explicit context if given, otherwise inferred
-// (in-cluster service account or current kubeconfig context). Reads files only — nothing here
-// contacts the cluster, which is why the startup screen exists to do it visibly.
-// Also returns the API server URL, shown on that screen: it is what makes a wrong context obvious.
-async fn build_client(context: Option<&str>) -> Result<(Client, String)> {
-    use kube::config::{Config, KubeConfigOptions};
-    let config = match context {
-        Some(ctx) => {
-            let opts = KubeConfigOptions {
-                context: Some(ctx.to_string()),
-                ..KubeConfigOptions::default()
-            };
-            Config::from_kubeconfig(&opts).await?
-        }
-        None => Config::infer().await?,
-    };
-    let url = config.cluster_url.to_string();
-    Ok((connect::build(config)?, url))
-}
+use kdt::{ai, cli, config, events, glyphs, lang, ui};
 
 // Resolve the log file path: explicit env var, then XDG state dir, HOME, finally /tmp.
 fn log_file_path() -> PathBuf {
@@ -134,11 +74,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (client, api_url) = build_client(args.context.as_deref()).await?;
+    let (client, api_url) = kdt::build_client(args.context.as_deref()).await?;
 
     let ns = if args.all_namespaces { None } else { args.namespace.clone() };
     let ns_label = match &ns { Some(n) => n.clone(), None => "all".to_string() };
-    let (ctx_label, cluster_label) = resolve_context_labels(args.context.as_deref());
+    let (ctx_label, cluster_label) = kdt::resolve_context_labels(args.context.as_deref());
     let buffer = events::new_buffer();
     let log_state = events::new_log_state();
     let status_state = events::new_status_state();
@@ -147,23 +87,4 @@ async fn main() -> Result<()> {
     let ai_state = ai::new_ai_state();
     let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, api_url, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
     ui::run(app).await
-}
-
-// Resolve the (context, cluster) labels shown in the UI banner from the kubeconfig,
-// falling back to the context name when the cluster cannot be determined.
-fn resolve_context_labels(explicit: Option<&str>) -> (String, String) {
-    use kube::config::Kubeconfig;
-    let kc = Kubeconfig::read().ok();
-    let ctx_name = explicit
-        .map(String::from)
-        .or_else(|| kc.as_ref().and_then(|k| k.current_context.clone()))
-        .unwrap_or_else(|| "default".to_string());
-    let cluster = kc
-        .as_ref()
-        .and_then(|k| k.contexts.iter().find(|c| c.name == ctx_name))
-        .and_then(|c| c.context.as_ref())
-        .map(|c| c.cluster.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ctx_name.clone());
-    (ctx_name, cluster)
 }

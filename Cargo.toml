@@ -4,13 +4,26 @@ version = "1.26.0"
 edition = "2021"
 license = "Apache-2.0"
 
+# Le binaire est le TUI : sans la feature, il n'y a rien à en faire, et `required-features`
+# l'exclut de la compilation plutôt que de la faire échouer.
+[[bin]]
+name = "kdt"
+path = "src/main.rs"
+required-features = ["tui"]
+
+[features]
+default = ["tui"]
+# Les trois modules qui dessinent dans un terminal — `ui`, `splash`, `glyphs` — et la seule
+# dépendance qu'ils tirent. Un consommateur sans terminal, comme kdt-web, compile sans.
+tui = ["dep:ratatui"]
+
 [dependencies]
 kube = { version = "3.1", default-features = false, features = ["client", "jsonpatch", "runtime", "rustls-tls", "socks5", "ws"] }
 # Naming the JSON Patch type is the only way to build one: a merge patch on `spec.members` would
 # replace the whole array. Already in the tree through kube-core.
 json-patch = "4"
 k8s-openapi = { version = "0.27", features = ["latest"] }
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"], optional = true }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }

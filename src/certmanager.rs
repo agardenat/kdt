@@ -72,7 +72,7 @@ pub enum CmKind {
 }
 
 impl CmKind {
-    pub fn from_str(s: &str) -> Option<CmKind> {
+    pub fn parse(s: &str) -> Option<CmKind> {
         Some(match s {
             "ClusterIssuer" => CmKind::ClusterIssuer,
             "Issuer" => CmKind::Issuer,
@@ -343,7 +343,7 @@ fn parse_cm(
     api_version: &str,
     st: &'static Strings,
 ) -> Option<CmResource> {
-    let cm_kind = CmKind::from_str(kind)?;
+    let cm_kind = CmKind::parse(kind)?;
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
     let name = obj.metadata.name.clone().unwrap_or_default();
     let spec = obj.data.get("spec");
@@ -502,7 +502,7 @@ fn lineage_owner(refs: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerRe
 {
     let usable = |kind: &str| {
         matches!(
-            CmKind::from_str(kind),
+            CmKind::parse(kind),
             Some(CmKind::Certificate | CmKind::CertificateRequest | CmKind::Order)
         )
     };
