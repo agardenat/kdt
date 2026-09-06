@@ -19,8 +19,24 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::routing::{get, post};
 use axum::Router;
+use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Arguments de kdt-web.
+#[derive(Parser)]
+#[command(name = "kdt-web", version, about = "Interface web de kdt")]
+struct Args {
+    /// Contexte du kubeconfig à viser.
+    ///
+    /// À donner systématiquement hors du cluster : le contexte courant n'est presque jamais
+    /// celui qu'on vise, et rien ne signale l'erreur — kdt-web servirait un autre cluster que
+    /// celui qu'on croit, sous une identité que ce cluster ne connaît pas.
+    ///
+    /// Sans effet dans un pod, où l'identité vient du compte de service.
+    #[arg(long, env = "KDT_WEB_CONTEXT")]
+    context: Option<String>,
+}
 
 use config::WebConfig;
 use portal::Portal;
@@ -49,20 +65,43 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    let args = Args::parse();
     let config = WebConfig::from_env().context("configuration")?;
 
-    // L'identité du compte de service est retirée : elle ne doit jamais servir à répondre à une
-    // requête. Ce qu'on garde est l'adresse de l'apiserver et la CA qui le valide.
-    let mut kube = kube::Config::infer()
-        .await
-        .context("adresse de l'apiserver et CA du cluster")?;
+    // L'identité qu'apporte le kubeconfig — ou le compte de service — est retirée : elle ne doit
+    // jamais servir à répondre à une requête. Ce qu'on garde est l'adresse de l'apiserver et la
+    // CA qui le valide ; l'identité vient de la personne connectée, à chaque requête.
+    let mut kube = match &args.context {
+        Some(context) => {
+            let options = kube::config::KubeConfigOptions {
+                context: Some(context.clone()),
+                ..Default::default()
+            };
+            kube::Config::from_kubeconfig(&options)
+                .await
+                .with_context(|| format!("contexte {context:?} du kubeconfig"))?
+        }
+        None => kube::Config::infer()
+            .await
+            .context("adresse de l'apiserver et CA du cluster")?,
+    };
     kube.auth_info = Default::default();
 
     info!(
         apiserver = %kube.cluster_url,
+        contexte = args.context.as_deref().unwrap_or("(inféré)"),
         portail = %config.portal_url,
         "kdt-web démarre"
     );
+    if args.context.is_none() {
+        // Dans un pod, c'est le cas nominal. Hors cluster, c'est presque toujours une erreur :
+        // le contexte courant n'est pas celui qu'on vise, et l'adresse ci-dessus est la seule
+        // chose qui le dise.
+        warn!(
+            apiserver = %kube.cluster_url,
+            "aucun --context : vérifiez que cet apiserver est bien celui visé"
+        );
+    }
     if config.assets.is_none() {
         info!("aucun bundle à servir : seule l'API répond (mode développement)");
     }
