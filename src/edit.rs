@@ -23,6 +23,7 @@ use kube::{Api, Client};
 use serde_json::Value;
 
 use crate::delete::{controller_owner_of, gitops_owner_of, GitOpsTool, Level};
+use crate::lang::Strings;
 use crate::yaml::{dynamic_api, dynamic_resource, to_yaml};
 
 // One reason an edit is likely to be pointless or refused, as data: the UI turns it into a
@@ -60,6 +61,30 @@ impl Reason {
             | Reason::RunningPod
             | Reason::PartialSpec { .. } => Level::Warn,
         }
+    }
+}
+
+// The localised sentence for one guard-rail. It lives here rather than in the renderer: the
+// sentence *is* the reason, and kdt-web says the same thing as the TUI because it says it from
+// here.
+pub fn reason_text(st: &Strings, reason: &Reason) -> String {
+    match reason {
+        Reason::GitOps { tool, detail } => {
+            let template = match tool {
+                GitOpsTool::FluxKustomize => st.ed_flux_ks,
+                GitOpsTool::FluxHelm => st.ed_flux_hr,
+                GitOpsTool::Argo => st.ed_argo,
+                GitOpsTool::Helm => st.ed_helm,
+            };
+            template.replace("{d}", detail)
+        }
+        Reason::OwnedBy { kind, name } => st.ed_owned.replace("{d}", &format!("{}/{}", kind, name)),
+        Reason::Terminating => st.ed_terminating.to_string(),
+        Reason::Completed { phase } => st.ed_completed.replace("{d}", phase),
+        Reason::Forbidden => st.ed_forbidden.to_string(),
+        Reason::Immutable => st.ed_immutable_obj.to_string(),
+        Reason::RunningPod => st.ed_running_pod.to_string(),
+        Reason::PartialSpec { kind } => st.ed_partial_spec.replace("{d}", kind),
     }
 }
 
@@ -113,7 +138,7 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
 // What the user actually changed, sorted into the buckets that decide whether applying is worth
 // doing: `paths` is every difference, the other three are the subsets that will be ignored,
 // rejected, or that make the document a different object altogether.
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Diff {
     pub paths: Vec<String>,
     pub server_owned: Vec<String>,
@@ -393,6 +418,33 @@ pub fn api_error_text(e: kube::Error) -> String {
     }
 }
 
+/// The document to edit and the guard-rails that apply to it, returned rather than deposited in a
+/// shared state. Same two questions as the TUI asks before opening the editor — will this change
+/// survive, and will the API server take it — answered by the same code.
+pub async fn preflight_once(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<(Value, Vec<Reason>), String> {
+    load(client, api_version, kind, namespace, name).await
+}
+
+/// Write the edited document back, as `kubectl edit` does: the `resourceVersion` it carries makes
+/// the API server refuse the write if the object moved underneath, rather than clobbering someone
+/// else's change in silence.
+pub async fn apply_once(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    doc: Value,
+) -> Result<(), String> {
+    replace(client, api_version, kind, namespace, name, doc).await
+}
+
 async fn load(
     client: &Client,
     api_version: &str,
@@ -504,9 +556,15 @@ pub fn remove_temp(path: &Path) {
 // Parse what came back from the editor. Anything that is not a single YAML mapping is refused here
 // rather than by the API server, so the user gets the error while the buffer is still at hand.
 pub fn parse(text: &str) -> Result<Value, String> {
+    parse_doc(text, crate::lang::active())
+}
+
+// Same parse, with the string table given: a server answering one request cannot read the language
+// from a process-wide setting.
+pub fn parse_doc(text: &str, st: &Strings) -> Result<Value, String> {
     let value: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     if !value.is_object() {
-        return Err(crate::lang::active().edit_not_an_object.to_string());
+        return Err(st.edit_not_an_object.to_string());
     }
     Ok(value)
 }

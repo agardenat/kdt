@@ -62,8 +62,9 @@ pub enum TreeRow {
 }
 use crate::certmanager::{
     build_cert_tree, cert_tree_uid, chain_hints, chain_path, chain_subtree, fetch_certs,
-    in_flight_request, is_rate_limited, new_certs_state, owning_certificate, renew, retry_acme,
-    CertState, CmKind, CmReady, CmResource, HintLevel, PasswordRef, SecretFacts, SharedCerts,
+    filter_chains, in_flight_request, is_rate_limited, new_certs_state, owning_certificate, renew,
+    retry_acme, CertFilter, CertState, CmKind, CmReady, CmResource, HintLevel, PasswordRef,
+    SecretFacts, SharedCerts,
 };
 
 // A rendered row of the cert-manager chain: either a cert-manager object, or the TLS Secret a
@@ -72,32 +73,6 @@ use crate::certmanager::{
 pub enum CertRow {
     Res(FlatTreeNode),
     Secret { depth: usize, namespace: String, name: String },
-}
-
-// How the certs tree is filtered (`f`): everything, only the chains with a problem, or only the
-// chains with issuance actually in flight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CertFilter { All, Problems, InFlight }
-
-impl CertFilter {
-    fn label(self) -> &'static str {
-        match self {
-            CertFilter::All => "ALL",
-            CertFilter::Problems => "PROBLEMS",
-            CertFilter::InFlight => "IN-FLIGHT",
-        }
-    }
-    fn matches(self, r: &CmResource) -> bool {
-        match self {
-            CertFilter::All => true,
-            // Anything that is not settled-and-comfortable. Issuance in flight counts: a chain that
-            // has been "Issuing" for an hour is exactly what one opens this filter to find.
-            CertFilter::Problems => {
-                r.ready != CmReady::Ready || matches!(r.days_remaining, Some(d) if d < 30)
-            }
-            CertFilter::InFlight => r.ready == CmReady::InProgress,
-        }
-    }
 }
 
 // A rendered row of the Kyverno view. The same enum serves both orientations: policy-centric nests
@@ -6962,18 +6937,7 @@ impl App {
                 .cloned()
                 .collect(),
         };
-        if self.certs_filter == CertFilter::All {
-            return scoped;
-        }
-        let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (i, r) in scoped.iter().enumerate() {
-            if self.certs_filter.matches(r) {
-                keep.extend(chain_path(i, &scoped));
-            }
-        }
-        let mut idx: Vec<usize> = keep.into_iter().collect();
-        idx.sort_unstable();
-        idx.into_iter().map(|i| scoped[i].clone()).collect()
+        filter_chains(&scoped, self.certs_filter)
     }
 
     // Auto-folding: a healthy Certificate's chain is noise, a broken one's is the answer. Recomputed
@@ -15164,26 +15128,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
 
 // The localised sentence for one edit guard-rail.
 fn edit_reason_text(st: &lang::Strings, reason: &EdReason) -> String {
-    match reason {
-        EdReason::GitOps { tool, detail } => {
-            let template = match tool {
-                GitOpsTool::FluxKustomize => st.ed_flux_ks,
-                GitOpsTool::FluxHelm => st.ed_flux_hr,
-                GitOpsTool::Argo => st.ed_argo,
-                GitOpsTool::Helm => st.ed_helm,
-            };
-            template.replace("{d}", detail)
-        }
-        EdReason::OwnedBy { kind, name } => {
-            st.ed_owned.replace("{d}", &format!("{}/{}", kind, name))
-        }
-        EdReason::Terminating => st.ed_terminating.to_string(),
-        EdReason::Completed { phase } => st.ed_completed.replace("{d}", phase),
-        EdReason::Forbidden => st.ed_forbidden.to_string(),
-        EdReason::Immutable => st.ed_immutable_obj.to_string(),
-        EdReason::RunningPod => st.ed_running_pod.to_string(),
-        EdReason::PartialSpec { kind } => st.ed_partial_spec.replace("{d}", kind),
-    }
+    crate::edit::reason_text(st, reason)
 }
 
 // Beyond this many changed paths the panel stops listing them one by one and just counts the rest:
@@ -17990,31 +17935,7 @@ fn synthetic_inventory_record(ks_uid: &str, it: &InventoryItem) -> EventRecord {
 // delete, AI and Status/Related machinery against the real object behind it. `enrich.rs` already
 // recognises these kinds, so the Related tab and the AI prompt get the chain context for free.
 fn synthetic_cert_record(r: &CmResource) -> EventRecord {
-    let (severity, reason) = match r.ready {
-        CmReady::Ready => (Severity::Normal, "Ready".to_string()),
-        CmReady::InProgress => (Severity::Normal, "Issuing".to_string()),
-        CmReady::Failed => (Severity::Warning, "Failed".to_string()),
-        CmReady::Unknown => (Severity::Warning, "Unknown".to_string()),
-    };
-    let message = if r.message.is_empty() {
-        format!("{} {}/{}", r.kind.as_str(), r.namespace, r.name)
-    } else {
-        r.message.clone()
-    };
-    EventRecord {
-        uid: format!("cm|{}", r.uid()),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason,
-        api_version: r.api_version.clone(),
-        kind: r.kind.as_str().to_string(),
-        namespace: r.namespace.clone(),
-        name: r.name.clone(),
-        message,
-        component: "cert-manager".to_string(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::certmanager::synthetic_record(r)
 }
 
 // Snapshot records for the Kyverno view. What each record points at decides what the shared `y`,
@@ -18122,20 +18043,7 @@ fn synthetic_namespace_record(ns: &str, counts: &KyCounts) -> EventRecord {
 
 // Snapshot record for the TLS Secret leaf, so `y` and `Ctrl-D` on that row address the Secret itself.
 fn synthetic_cert_secret_record(namespace: &str, name: &str) -> EventRecord {
-    EventRecord {
-        uid: format!("cmsec|{}/{}", namespace, name),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "Secret".to_string(),
-        api_version: "v1".to_string(),
-        kind: "Secret".to_string(),
-        namespace: namespace.to_string(),
-        name: name.to_string(),
-        message: format!("Secret {}/{}", namespace, name),
-        component: "cert-manager".to_string(),
-        host: String::new(),
-        count: 1,
-    }
+    crate::certmanager::secret_record(namespace, name)
 }
 
 // Colour for a pod STATUS string: green when settled, red for crash/error states, yellow otherwise.
@@ -26301,21 +26209,17 @@ fn secret_detail_lines(s: &SecretInfo, reveal: SecretReveal) -> (Line<'static>, 
 
 // Same palette as the Flux view, so a readiness colour means the same thing everywhere in kdt.
 fn cert_ready_cell(r: CmReady) -> (&'static str, Color) {
-    match r {
-        CmReady::Ready => ("Ready", Color::Green),
-        CmReady::InProgress => ("Issuing", Color::Cyan),
-        CmReady::Failed => ("Failed", Color::Red),
-        CmReady::Unknown => ("Unknown", Color::Yellow),
-    }
+    let color = match r {
+        CmReady::Ready => Color::Green,
+        CmReady::InProgress => Color::Cyan,
+        CmReady::Failed => Color::Red,
+        CmReady::Unknown => Color::Yellow,
+    };
+    (r.label(), color)
 }
 
 fn cert_glyph(r: CmReady) -> &'static str {
-    match r {
-        CmReady::Ready => "✓",
-        CmReady::InProgress => "↻",
-        CmReady::Failed => "✗",
-        CmReady::Unknown => "·",
-    }
+    r.glyph()
 }
 
 fn cert_row_style(r: CmReady) -> Style {
@@ -26338,19 +26242,7 @@ fn cert_expiry_cell(days: Option<i64>) -> Cell<'static> {
 
 // What a Certificate targets: its DNS names if it has them, otherwise the Secret it writes.
 fn cert_target(r: &CmResource) -> String {
-    if !r.dns_names.is_empty() {
-        let head = r.dns_names[0].clone();
-        if r.dns_names.len() > 1 {
-            return format!("{} +{}", head, r.dns_names.len() - 1);
-        }
-        return head;
-    }
-    match (&r.challenge, &r.secret_name, &r.issuer_type) {
-        (Some(c), _, _) if !c.dns_name.is_empty() => format!("{} {}", c.type_, c.dns_name),
-        (_, Some(sn), _) => format!("→ {sn}"),
-        (_, _, Some(t)) => t.clone(),
-        _ => String::new(),
-    }
+    r.target()
 }
 
 // Keystore formats a Certificate asks cert-manager to add to its Secret, as a row suffix. Empty for
@@ -26360,10 +26252,7 @@ fn cert_keystore_badge(r: &CmResource) -> String {
     if r.keystores.is_empty() {
         return String::new();
     }
-    format!(
-        " [{}]",
-        r.keystores.iter().map(|k| k.format.as_str()).collect::<Vec<_>>().join("+")
-    )
+    format!(" [{}]", r.keystore_formats().join("+"))
 }
 
 // Splits the badge back off the pre-measured label so it can be dimmed without changing the column

@@ -1,4 +1,4 @@
-// Le pliage de l'arbre Flux, et rien d'autre.
+// Le pliage d'un arbre envoyé à plat, et rien d'autre.
 //
 // Le serveur envoie l'arbre entièrement déplié, en parcours préfixe, chaque ligne portant sa
 // profondeur. Toutes les arêtes sont donc déjà résolues — `dependsOn`, `status.helmChart`,
@@ -14,8 +14,22 @@
 
 import type { FluxRow } from "./types";
 
+/**
+ * Ce qu'une ligne d'arbre doit porter pour être pliable.
+ *
+ * Les trois fonctions génériques ci-dessous ne demandent que ça, et servent donc aussi bien l'arbre
+ * Flux que la chaîne cert-manager : les deux arrivent du serveur en parcours préfixe, arêtes déjà
+ * résolues. Ce qui reste propre à Flux — ce qu'un pli cache, ce qui doit rester ouvert — garde son
+ * type.
+ */
+export interface TreeRow {
+  uid: string;
+  depth: number;
+  has_children: boolean;
+}
+
 /** Les descendants de `i` : l'intervalle `]i, fin[` des lignes plus profondes. */
-function subtreeEnd(rows: FluxRow[], i: number): number {
+function subtreeEnd(rows: TreeRow[], i: number): number {
   const depth = rows[i].depth;
   let end = i + 1;
   while (end < rows.length && rows[end].depth > depth) end += 1;
@@ -55,7 +69,7 @@ export function hiddenUnder(rows: FluxRow[], i: number): Hidden {
  *
  * La ligne n'est pas son propre ancêtre : repliée à la main, elle le reste.
  */
-export function ancestorsOf(rows: FluxRow[], i: number): string[] {
+export function ancestorsOf(rows: TreeRow[], i: number): string[] {
   const out: string[] = [];
   let want = rows[i].depth - 1;
   for (let k = i - 1; k >= 0 && want >= 0; k -= 1) {
@@ -92,12 +106,12 @@ export function revealed(rows: FluxRow[], selectedUid: string | null): Set<strin
  * ancêtre d'un problème, ou de la ligne lue — ne s'applique pas : il est enjambé sans être
  * oublié, pour que le pli reprenne dès que la branche redevient calme.
  */
-export function visibleRows(
-  rows: FluxRow[],
+export function visibleRows<T extends TreeRow>(
+  rows: T[],
   collapsed: Set<string>,
   reveal: Set<string>,
-): FluxRow[] {
-  const out: FluxRow[] = [];
+): T[] {
+  const out: T[] = [];
   // Tant que ce seuil est posé, toute ligne plus profonde est sous un pli et n'est pas émise.
   let hideDeeperThan: number | null = null;
   for (const row of rows) {

@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
+import CertsView from "./CertsView";
 import EventsView from "./EventsView";
 import FluxView from "./FluxView";
 import WorkloadsView from "./WorkloadsView";
@@ -15,7 +16,7 @@ import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
 import type { Capabilities, Identity } from "./types";
 
-type ViewId = "events" | "flux" | "workloads" | "data";
+type ViewId = "events" | "flux" | "workloads" | "data" | "certs";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -41,7 +42,7 @@ const VIEWS: Array<{
   { id: "capacity", label: "Capacity", key: "c" },
   { id: "storage", label: "Storage", key: "s" },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
-  { id: "certs", label: "Certs", key: "t", needs: "certs" },
+  { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r" },
   { id: "kyverno", label: "Kyverno", key: "k", needs: "kyverno" },
   { id: "identity", label: "Identity", key: "i", needs: "identity" },
@@ -83,6 +84,11 @@ export default function App() {
     }
   });
   const [scopeOpen, setScopeOpen] = useState(false);
+  // La cible d'un saut vers la vue Secrets — le `s` de la vue certs. Elle est consommée par
+  // `DataView`, qui la sélectionne si elle est dans sa liste, puis la rend.
+  const [focusSecret, setFocusSecret] = useState<{ namespace: string; name: string } | null>(null);
+  // Et la cible du saut inverse — le `o` du TUI, d'un Secret vers la chaîne qui l'émet.
+  const [focusCert, setFocusCert] = useState<{ namespace: string; name: string } | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const st = strings(lang);
 
@@ -190,7 +196,8 @@ export default function App() {
   // Les vues qui listent des objets indépendants sont dans la portée ; celles qui dessinent un
   // graphe n'y sont pas — filtrer l'arbre Flux par namespace lui ferait perdre ses arêtes, la
   // GitRepository de flux-system étant le parent de presque tout. C'est le partage de kdt.
-  const scoped = view === "events" || view === "workloads" || view === "data";
+  const scoped =
+    view === "events" || view === "workloads" || view === "data" || view === "certs";
 
   return (
     <div className="app">
@@ -319,6 +326,38 @@ export default function App() {
               panelOpen={panelOpen}
               onPanelOpen={setPanelOpen}
               onNeedsAuth={onNeedsAuth}
+              focusSecret={focusSecret}
+              onFocusConsumed={() => setFocusSecret(null)}
+              // Le saut vers la chaîne n'est offert que si le rail porte la vue certs : sans
+              // cert-manager sur ce cluster, elle n'existe pas et le bouton mènerait nulle part.
+              onOpenCert={
+                views.some((v) => v.id === "certs")
+                  ? (namespace, name) => {
+                      setFocusCert({ namespace, name });
+                      setView("certs");
+                    }
+                  : undefined
+              }
+            />
+          ) : view === "certs" ? (
+            <CertsView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+              // Le `s` du TUI : la vue Secrets sait déjà décoder un certificat et révéler des
+              // valeurs, et la vue certs lui passe la main plutôt que d'en refaire une moitié.
+              onOpenSecret={(namespace, name) => {
+                setFocusSecret({ namespace, name });
+                setView("data");
+              }}
+              focusCert={focusCert}
+              onFocusConsumed={() => setFocusCert(null)}
             />
           ) : view === "workloads" ? (
             <WorkloadsView

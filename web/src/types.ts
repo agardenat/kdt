@@ -431,3 +431,197 @@ export function age(iso: string, now: number = Date.now()): string {
   if (hours < 48) return `${hours}h`;
   return `${Math.floor(hours / 24)}d`;
 }
+
+// --- Vue certs (cert-manager) --------------------------------------------------------------------
+
+/**
+ * Où en est un objet cert-manager, tel que `kdt::certmanager::parse_ready` le juge.
+ *
+ * Le piège que ce verdict absorbe : Issuers, Certificates et CertificateRequests publient leur état
+ * dans `status.conditions`, mais **Orders et Challenges portent un simple `status.state`**. Lire les
+ * conditions seules afficherait tout l'ACME en `unknown` — précisément ce qu'on vient regarder.
+ */
+export type CmReady = "ready" | "in-progress" | "failed" | "unknown";
+
+/** Un constat de la chaîne, rédigé par kdt. C'est ce que cette vue apporte de plus qu'un `get`. */
+export interface CertHint {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/**
+ * Un fichier qu'un keystore doit produire dans le Secret.
+ *
+ * `present` à `null` veut dire que les clés du Secret ne sont pas connues — lecture refusée, ou
+ * portée qui ne le couvre pas. Ni présent, ni absent : on ne sait pas, et on ne l'affirme pas.
+ */
+export interface KeystoreFile {
+  key: string;
+  present: boolean | null;
+}
+
+export interface KeystorePasswordRef {
+  name: string;
+  key: string;
+  secret_found: boolean | null;
+  key_found: boolean | null;
+}
+
+export interface CertKeystore {
+  format: string;
+  alias: string | null;
+  files: KeystoreFile[];
+  /** `null` quand le mot de passe est donné littéralement dans le spec : rien à résoudre. */
+  password_ref: KeystorePasswordRef | null;
+}
+
+/** Le Secret qu'un Certificate produit, et ce que la vue Secrets en sait. */
+export interface ProducedSecret {
+  secret_name: string;
+  namespace: string;
+  /** Les faits sont-ils établis ? Faux = inconnu, ce qui n'est pas « absent ». */
+  known: boolean;
+  found: boolean | null;
+  days_remaining: number | null;
+  ingress_refs: number | null;
+  keystores: CertKeystore[];
+  renewal_time: string | null;
+  not_after: string | null;
+}
+
+/** Une cible d'action, telle que le serveur l'a nommée. */
+export interface CertActionTarget {
+  apiVersion: string;
+  namespace: string;
+  name: string;
+}
+
+/**
+ * Les deux leviers de la chaîne.
+ *
+ * `acme_retry` ne nomme une cible que s'il y a une demande vivante à relancer — et jamais sous quota
+ * ACME, où réessayer ne fait que brûler ce qui reste. C'est kdt qui tranche, pas le bouton.
+ */
+export interface CertActions {
+  renew: boolean;
+  acme_retry: CertActionTarget | null;
+  rate_limited: boolean;
+}
+
+export interface ChallengeInfo {
+  type_: string;
+  dns_name: string;
+  /** Le solveur a-t-il réellement publié l'enregistrement ou la route ? */
+  presented: boolean;
+}
+
+/** Une ligne de la chaîne : un objet cert-manager, avec sa place dans l'arbre et son verdict. */
+export interface CertResourceRow {
+  row: "resource";
+  uid: string;
+  kind: string;
+  /** Le kind raccourci pour la colonne de l'arbre : `CertRequest` plutôt que `CertificateRequest`. */
+  kind_short: string;
+  api_version: string;
+  namespace: string;
+  name: string;
+  ready: CmReady;
+  ready_label: string;
+  ready_glyph: string;
+  ready_tone: LineTone;
+  message: string;
+  age: string;
+  days_remaining: number | null;
+  expiry_tone: LineTone | null;
+  /** Ce que la ligne vise : ses DNS, le Secret qu'elle écrit, ou le challenge qu'elle valide. */
+  target: string;
+  keystore_formats: string[];
+  depth: number;
+  has_children: boolean;
+  /** Le rang dans l'ordre de kdt : problèmes d'abord, puis l'échéance la plus proche. */
+  rank: number;
+  issuer_type: string | null;
+  challenge: ChallengeInfo | null;
+  dns_names: string[];
+  secret_name: string | null;
+  not_after: string | null;
+  renewal_time: string | null;
+  /** Le Certificate qui commande cette ligne, quel que soit l'étage de la chaîne où l'on est. */
+  cert_uid: string | null;
+  hints: CertHint[];
+  /** Sur une ligne Certificate seulement : le Secret produit et ses keystores. */
+  produced?: ProducedSecret | null;
+  actions?: CertActions;
+  record: EventRecord;
+}
+
+/** La feuille TLS qui ferme une chaîne : le Secret que l'Ingress sert réellement. */
+export interface CertSecretRow {
+  row: "secret";
+  uid: string;
+  namespace: string;
+  name: string;
+  depth: number;
+  has_children: false;
+  days_remaining: number | null;
+  expiry_tone: LineTone | null;
+  ingress_refs: number;
+  record: EventRecord;
+}
+
+export type CertRow = CertResourceRow | CertSecretRow;
+
+/** Le filtre de la vue, tel que kdt le cycle sur `f`. Il garde les ancêtres de ce qu'il retient. */
+export type CertFilter = "all" | "problems" | "in-flight";
+
+export interface CertsPayload {
+  rows: CertRow[];
+  counts: { total: number; ready: number; failed: number; in_flight: number; expiring: number };
+  /** Les CRD cert-manager sont-elles là ? Absentes, la vue n'a pas de sujet. */
+  installed: boolean;
+  /** Le groupe ACME est absent d'un cluster qui n'émet que depuis une CA : ce n'est pas une panne. */
+  acme_installed: boolean;
+  error: string | null;
+  /** Les Secrets n'ont pas pu être lus : les constats s'abstiennent au lieu d'affirmer une absence. */
+  secrets_error: string | null;
+}
+
+// --- Gestes sur un objet quelconque ---------------------------------------------------------------
+
+/** Les deux rendus du YAML, comme l'overlay `y` du TUI. */
+export interface ObjectYaml {
+  /** Tel que l'apiserver le donne — `kubectl get -o yaml`. */
+  raw: string;
+  /** Net de ce que le runtime a ajouté — à la manière de `kubectl neat`. */
+  neat: string;
+}
+
+/**
+ * Un garde-fou avant d'éditer, rédigé par kdt.
+ *
+ * Aucun ne bloque : ils disent ce qui va se passer — un objet appliqué par Flux est remis en place
+ * à la réconciliation suivante — et la personne reste libre.
+ */
+export interface EditReason {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+export interface EditPreflight {
+  text: string;
+  reasons: EditReason[];
+}
+
+/** Ce qu'une édition changerait, trié par kdt. */
+export interface EditDiff {
+  paths: string[];
+  /** Champs que l'apiserver possède : écrire dessus ne fait rien. */
+  server_owned: string[];
+  /** Champs figés une fois l'objet créé : l'apiserver refusera. */
+  immutable: string[];
+  /** Champs qui feraient pointer le document vers un **autre** objet. */
+  identity: string[];
+  empty: boolean;
+  noop: boolean;
+  rejected: boolean;
+}

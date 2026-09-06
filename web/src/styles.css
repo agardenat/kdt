@@ -733,3 +733,115 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* Le seul vert hors verdict : un accusé qui s'efface au bout de deux secondes. */
 .inv-pill.copy { transition: color .12s, border-color .12s; }
 .inv-pill.copy.done { color: var(--ok); border-color: var(--ok); }
+
+/* ---------------------------------------------------------------- vue certs (cert-manager)
+
+   Le ton d'une ligne vient de sa lisibilité, calculée par kdt. Un échec porte un fond et pas
+   seulement une couleur : c'est le seul état qu'on doit trouver en balayant la page. Une chaîne
+   saine n'est pas peinte — colorier la normale laisse l'anormale se fondre dedans. */
+.tbody .tr.cert-ready { color: inherit; }
+.tbody .tr.cert-in-progress { color: var(--info); }
+.tbody .tr.cert-unknown { color: var(--warn); }
+.tbody .tr.cert-failed {
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.tbody .tr.cert-failed:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+
+/* La feuille TLS ferme la chaîne : elle n'est pas un objet cert-manager, et sa couleur le dit —
+   comme le magenta du TUI, qui la distingue au premier coup d'œil de la lignée au-dessus. */
+.tbody .tr.cert-leaf { color: var(--muted); }
+.tbody .tr.cert-leaf .cell.id .kind { color: #b950c8; }
+.st.leaf { color: #b950c8; font-weight: 600; }
+:root:not([data-theme="light"]) .tbody .tr.cert-leaf .cell.id .kind,
+:root:not([data-theme="light"]) .st.leaf { color: #d48ade; }
+:root[data-theme="dark"] .tbody .tr.cert-leaf .cell.id .kind,
+:root[data-theme="dark"] .st.leaf { color: #d48ade; }
+
+/* La chaîne dans le panneau du haut : une lignée, donc une indentation, et la ligne qu'on lit
+   marquée — sans ça on ne sait plus où l'on est dans ce qu'on vient de déplier. */
+.detail .chain { margin: 0 0 .5rem; padding: 0; list-style: none; font-size: 11.5px; }
+.detail .chain li { padding: .12rem 0; line-height: 1.5; }
+.detail .chain li.here { background: var(--row-sel); border-radius: 4px; font-weight: 600; }
+.detail .chain li .wrap { padding-left: 1.1rem; white-space: pre-wrap; word-break: break-word; }
+
+/* Les constats, dans l'ordre où kdt les rend. Le glyphe porte le niveau, à largeur fixe. */
+.detail .hints { margin: 0 0 .4rem; padding: 0; list-style: none; font-size: 11.5px; }
+.detail .hints li { padding: .12rem 0; line-height: 1.45; }
+.detail .hints li.danger { color: var(--err); }
+.detail .hints li.warn { color: var(--warn); }
+.detail .hints li.info { color: var(--muted); }
+.detail .hints .gl { width: 1rem; }
+
+/* Un keystore : le format, les deux fichiers qu'il doit produire, puis ce qui les paramètre. Un
+   fichier dont on ignore le sort reste `—` : ni présent, ni absent. */
+.keystore {
+  display: flex; align-items: center; flex-wrap: wrap; gap: .55rem;
+  font-family: var(--mono); font-size: 11.5px; padding: .15rem 0;
+}
+.keystore .ok { color: var(--ok); }
+.keystore .err { color: var(--err); font-weight: 600; }
+.keystore .dim { color: var(--dim); }
+
+/* Une note d'un menu : ce qui explique une entrée absente. Elle n'est pas une entrée elle-même. */
+.menu-note {
+  margin: .35rem .45rem 0; font-size: 11px; line-height: 1.4;
+}
+.menu-note.err { color: var(--err); }
+
+/* ---------------------------------------------------------------- gestes sur un objet
+
+   Trois boutons dans la barre — YAML, Éditer, Toucher — et ce qu'ils ouvrent va dans le panneau du
+   haut. L'accusé de `Toucher` se lit à côté du bouton : c'est le seul qui écrive sans rien ouvrir,
+   donc le seul dont le résultat n'a pas d'endroit où s'afficher. */
+.obj-actions {
+  display: flex; align-items: center; gap: .35rem;
+  font-size: 11.5px;
+}
+.obj-actions .ok { color: var(--ok); }
+.obj-actions .err { color: var(--err); }
+.obj-actions .dim { color: var(--dim); }
+
+/* L'éditeur occupe le panneau : le document en dessous, ce qui le commande au-dessus, pour que la
+   zone de texte reste la plus grande chose à l'écran. */
+.editor { display: flex; flex-direction: column; height: 100%; gap: .4rem; }
+.editor .logbar { flex: none; }
+.editor .yaml-edit {
+  flex: 1; min-height: 8rem; width: 100%; resize: none;
+  padding: .5rem .6rem; background: var(--sunk); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre; overflow: auto;
+}
+.editor .yaml-edit:focus { outline: none; border-color: var(--accent); }
+
+/* Les garde-fous. Aucun ne bloque — ils disent ce qui va se passer — donc ils se lisent avant le
+   document, et pas sous forme de refus. */
+.editor .guards { flex: none; }
+.editor .guard { margin: 0 0 .2rem; font-size: 11.5px; line-height: 1.45; }
+.editor .guard.danger { color: var(--err); }
+.editor .guard.warn { color: var(--warn); }
+.editor .guard.info { color: var(--muted); }
+
+/* Ce qu'une écriture changerait, trié par kdt : ce qui sera ignoré, ce qui sera refusé, le reste. */
+.editor .diff { flex: none; border: 1px solid var(--line); border-radius: 6px; padding: .5rem .6rem; }
+.editor .diff .paths {
+  margin: 0 0 .5rem; padding: 0; list-style: none;
+  max-height: 9rem; overflow: auto; font-size: 11.5px;
+}
+.editor .diff .paths li { padding: .1rem 0; }
+.editor .diff .paths li.err { color: var(--err); }
+.editor .diff .paths li.dim { color: var(--dim); }
+.editor .diff .warn { color: var(--warn); font-size: 11.5px; margin: 0 0 .5rem; }
+
+/* Les tons à l'intérieur du panneau du haut.
+   Chaque contexte redéfinissait les siens, si bien qu'un `dim` ou un `ok` posé dans un contenu
+   neuf gardait la couleur du texte ordinaire — visible, mais sans le ton qu'il annonce. */
+.detail .dim, .editor .dim { color: var(--dim); }
+.detail .ok, .editor .ok { color: var(--ok); }
+.detail .warn, .editor .warn { color: var(--warn); }
+.detail .err, .editor .err { color: var(--err); }
+
+/* Le groupe à trois états est dessiné pour la barre des vues, où il suit un onglet. Dans la barre
+   d'un contenu du panneau, sa marge s'ajoute à l'espacement et le décale pour rien. */
+.logbar .segmented { margin-left: 0; }

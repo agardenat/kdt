@@ -10,9 +10,12 @@
 
 mod api;
 mod auth;
+mod certs;
 mod config;
 mod config_secrets;
 mod flux;
+mod lang;
+mod objects;
 mod portal;
 mod session;
 mod workloads;
@@ -146,6 +149,18 @@ async fn main() -> Result<()> {
         // demande nommée, secret par secret, et cette requête-là laisse une trace.
         .route("/api/v1/secrets/reveal", get(config_secrets::reveal))
         .route("/api/v1/configmaps", get(config_secrets::configmaps))
+        .route("/api/v1/certs", get(certs::list))
+        // Les deux leviers de la chaîne : forcer la ré-émission, et relancer un cycle ACME bloqué
+        // en supprimant la demande en cours.
+        .route("/api/v1/certs/renew", post(certs::renew))
+        .route("/api/v1/certs/acme-retry", post(certs::acme_retry))
+        // Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le TUI.
+        // Ils ne connaissent aucune vue : chaque vue leur passe les coordonnées de sa ligne.
+        .route("/api/v1/object/yaml", get(objects::yaml))
+        .route("/api/v1/object/edit", get(objects::edit))
+        .route("/api/v1/object/diff", post(objects::diff))
+        .route("/api/v1/object/apply", post(objects::apply))
+        .route("/api/v1/object/touch", post(objects::touch))
         .route("/healthz", get(|| async { "ok" }));
 
     // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de

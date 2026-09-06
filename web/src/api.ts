@@ -6,6 +6,9 @@
 
 import type {
   Capabilities,
+  CertActionTarget,
+  CertFilter,
+  CertsPayload,
   EventRecord,
   EventsPayload,
   FluxPayload,
@@ -18,10 +21,14 @@ import type {
   ConfigMapRow,
   SecretsPayload,
   SecretValue,
+  EditDiff,
+  EditPreflight,
+  ObjectYaml,
   StatusPayload,
   WorkloadRow,
   WorkloadsPayload,
 } from "./types";
+import type { Lang } from "./i18n";
 
 /** Le serveur demande de repasser par le portail : la session n'est plus valide. */
 export class NeedsAuth extends Error {}
@@ -252,4 +259,86 @@ export function status(record: EventRecord): Promise<StatusPayload> {
     name: record.name,
   });
   return get<StatusPayload>(`/api/v1/status?${params.toString()}`);
+}
+
+/**
+ * La chaîne cert-manager de la portée.
+ *
+ * Le filtre part au serveur et non au navigateur : il garde les **ancêtres** de ce qu'il retient —
+ * un Certificate en échec sans son Issuer perdrait le contexte qu'on vient chercher — et cette
+ * règle-là a besoin des arêtes, que seul kdt a.
+ *
+ * La langue voyage aussi : les constats de la chaîne sont rédigés côté serveur.
+ */
+export function certs(namespace: string, filter: CertFilter, lang: Lang): Promise<CertsPayload> {
+  const params = new URLSearchParams({ filter, lang });
+  if (namespace) params.set("ns", namespace);
+  return get<CertsPayload>(`/api/v1/certs?${params.toString()}`);
+}
+
+/** Force la ré-émission d'un Certificate, comme `cmctl renew`. */
+export function certRenew(
+  target: CertActionTarget,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/certs/renew", { ...target, lang });
+}
+
+/**
+ * Relance un cycle ACME bloqué en supprimant la CertificateRequest en cours.
+ *
+ * La cible est celle que le serveur a nommée : supprimer le Challenge ne servirait à rien, son
+ * Order le recrée à l'identique.
+ */
+export function certAcmeRetry(
+  target: CertActionTarget,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/certs/acme-retry", { ...target, lang });
+}
+
+/** Les coordonnées d'un objet, telles que les gestes génériques les attendent. */
+function object(record: EventRecord) {
+  return {
+    apiVersion: record.api_version,
+    kind: record.kind,
+    namespace: record.namespace,
+    name: record.name,
+  };
+}
+
+/** Le YAML de l'objet, dans ses deux rendus. C'est le `y` du TUI. */
+export function objectYaml(record: EventRecord): Promise<ObjectYaml> {
+  const params = new URLSearchParams(object(record));
+  return get<ObjectYaml>(`/api/v1/object/yaml?${params.toString()}`);
+}
+
+/** Le document à éditer et les garde-fous qui s'y appliquent. C'est le `e` du TUI, avant l'éditeur. */
+export function objectEdit(record: EventRecord, lang: Lang): Promise<EditPreflight> {
+  const params = new URLSearchParams({ ...object(record), lang });
+  return get<EditPreflight>(`/api/v1/object/edit?${params.toString()}`);
+}
+
+/** Ce que ce document changerait, trié par kdt — demandé avant d'écrire, jamais après. */
+export function objectDiff(record: EventRecord, doc: string, lang: Lang): Promise<EditDiff> {
+  return send<EditDiff>("/api/v1/object/diff", { ...object(record), doc, lang });
+}
+
+/** Écrit le document retouché. Un PUT : l'apiserver refuse si l'objet a bougé entre-temps. */
+export function objectApply(
+  record: EventRecord,
+  doc: string,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/object/apply", { ...object(record), doc, lang });
+}
+
+/**
+ * Horodate l'objet pour provoquer une écriture, sans rien lui changer d'autre. C'est le `h` du TUI.
+ *
+ * Il part sans confirmation, comme dans kdt : deux annotations sous `kdt.io/` s'ajoutent et rien
+ * n'est retiré. L'auteur inscrit est la personne connectée, décidé côté serveur.
+ */
+export function objectTouch(record: EventRecord, lang: Lang): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/object/touch", { ...object(record), lang });
 }

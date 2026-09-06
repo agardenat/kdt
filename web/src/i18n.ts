@@ -142,6 +142,71 @@ export interface Strings {
   secSelfSigned: string;
   secValidity: string;
   secUsedBy: string;
+  secOpenChain: string;
+  secOpenChainHelp: string;
+  secNoOrigin: string;
+
+  // --- Vue certs (cert-manager). Le jargon reste en anglais des deux côtés : `Issuer`,
+  // `Challenge`, `keystore`, `renew` ne se disent pas autrement. Les constats de la chaîne, eux,
+  // sont rédigés par le serveur et arrivent déjà traduits.
+  certTree: string;
+  certList: string;
+  certFilterAll: string;
+  certFilterProblems: string;
+  certFilterFlight: string;
+  certFilterHelp: string;
+  certEmpty: string;
+  certNotInstalled: string;
+  certNoAcme: string;
+  certSecretsUnreadable: string;
+  certActions: string;
+  certRenew: string;
+  certDescRenew: string;
+  certAcmeRetry: string;
+  certDescAcmeRetry: string;
+  certRateLimited: string;
+  certSelectRow: string;
+  certOpenSecret: string;
+  certOpenSecretHelp: string;
+  certChain: string;
+  certProduced: string;
+  certKeystores: string;
+  certSecretAbsent: string;
+  certSecretUnknown: string;
+  certConsumersNone: string;
+  certConsumersOne: string;
+  certConsumersMany: string;
+  certExpiresIn: string;
+  certExpiredSince: string;
+  certRenewalOn: string;
+  certExpiresOn: string;
+  certSignedBy: string;
+  certKeystoreAlias: string;
+  certKeystorePwRef: string;
+  certKeystorePwInline: string;
+  certDetail: string;
+  certFold: string;
+  certDays: string;
+
+  // --- Gestes sur un objet quelconque : `y`, `e`, `h` dans le TUI.
+  objActions: string;
+  objSelectRow: string;
+  objYamlRaw: string;
+  objYamlNeat: string;
+  objTouchHelp: string;
+  objEditGuards: string;
+  objEditApply: string;
+  objEditReload: string;
+  objEditChanges: string;
+  objEditNoChange: string;
+  objEditNoop: string;
+  objEditServerOwned: string;
+  objEditImmutable: string;
+  objEditIdentity: string;
+  objEditConfirm: string;
+  objEditCancel: string;
+  objEditReadOnlyHint: string;
+  objWorking: string;
 }
 
 const FR: Strings = {
@@ -277,6 +342,76 @@ const FR: Strings = {
   secSelfSigned: "auto-signé",
   secValidity: "Validité",
   secUsedBy: "Utilisé par",
+  secOpenChain: "voir la chaîne",
+  secOpenChainHelp:
+    "Ouvre la vue certs sur le Certificate qui produit ce Secret, avec la chaîne qui l'émet — issuer, demande, order, challenge.",
+  secNoOrigin: "Ce Secret n'est pas produit par cert-manager",
+
+  certTree: "Chaîne",
+  certList: "Liste",
+  certFilterAll: "tout",
+  certFilterProblems: "problèmes",
+  certFilterFlight: "en cours",
+  certFilterHelp:
+    "« problèmes » retient ce qui n'est pas Ready et ce qui expire sous 30 jours ; « en cours » ne garde que l'émission en vol. Les ancêtres d'une ligne retenue restent affichés : sans son Issuer, un Certificate en échec perd ce qui l'explique.",
+  certEmpty: "Aucun objet cert-manager dans cette portée.",
+  certNotInstalled: "cert-manager n'est pas installé sur ce cluster.",
+  certNoAcme: "sans ACME",
+  certSecretsUnreadable:
+    "Secrets illisibles : le Secret produit et les keystores ne sont pas vérifiés ici.",
+  certActions: "Actions cert-manager",
+  certRenew: "renouveler",
+  certDescRenew:
+    "Force la ré-émission : la condition Issuing passe à True, comme le fait cmctl renew.",
+  certAcmeRetry: "relancer ACME",
+  certDescAcmeRetry:
+    "Supprime la CertificateRequest en cours ; son Order et ses Challenges partent avec elle, et cert-manager en émet une nouvelle.",
+  certRateLimited:
+    "Quota ACME atteint : réessayer ne ferait que brûler ce qui reste. La relance est retirée.",
+  certSelectRow: "Sélectionnez une ligne de la chaîne",
+  certOpenSecret: "voir le Secret",
+  certOpenSecretHelp:
+    "Ouvre la vue Secrets sur le Secret produit, où le certificat est décodé et les valeurs se révèlent.",
+  certChain: "Chaîne",
+  certProduced: "Secret produit",
+  certKeystores: "Keystores",
+  certSecretAbsent: "Secret {ns}/{name} absent — le certificat est prêt mais rien ne le sert.",
+  certSecretUnknown: "état du Secret inconnu dans cette portée",
+  certConsumersNone: "aucun Ingress ne le référence",
+  certConsumersOne: "référencé par 1 Ingress",
+  certConsumersMany: "référencé par {n} Ingress",
+  certExpiresIn: "expire dans {n} j",
+  certExpiredSince: "expiré depuis {n} j",
+  certRenewalOn: "renouvellement",
+  certExpiresOn: "expiration",
+  certSignedBy: "{n} certificat(s) signé(s) par cet issuer",
+  certKeystoreAlias: "alias {alias}",
+  certKeystorePwRef: "mot de passe : {name}/{key}",
+  certKeystorePwInline: "mot de passe littéral",
+  certDetail: "Chaîne",
+  certFold: "Plier / déplier la chaîne",
+  certDays: "{n} j",
+
+  objActions: "Objet",
+  objSelectRow: "Sélectionnez une ligne",
+  objYamlRaw: "brut",
+  objYamlNeat: "net",
+  objTouchHelp:
+    "Horodate l'objet sous kdt.io/ pour provoquer une écriture : c'est elle qui refait passer les webhooks d'admission. Rien d'autre n'est touché.",
+  objEditGuards: "Avant d'écrire",
+  objEditApply: "Appliquer",
+  objEditReload: "Recharger",
+  objEditChanges: "Ce que cela change",
+  objEditNoChange: "Le document est identique à l'objet : rien à écrire.",
+  objEditNoop:
+    "Tout le changement porte sur des champs que l'apiserver possède : écrire laisserait l'objet tel quel.",
+  objEditServerOwned: "possédés par l'apiserver, ignorés",
+  objEditImmutable: "figés une fois l'objet créé, l'apiserver refusera",
+  objEditIdentity: "identité de l'objet : ce document en viserait un autre",
+  objEditConfirm: "Écrire",
+  objEditCancel: "Annuler",
+  objEditReadOnlyHint: "Retouchez le document, puis « Appliquer » montre ce que cela change.",
+  objWorking: "en cours…",
 };
 
 const EN: Strings = {
@@ -412,6 +547,75 @@ const EN: Strings = {
   secSelfSigned: "self-signed",
   secValidity: "Validity",
   secUsedBy: "Used by",
+  secOpenChain: "open the chain",
+  secOpenChainHelp:
+    "Opens the certs view on the Certificate that produces this Secret, with the chain issuing it — issuer, request, order, challenge.",
+  secNoOrigin: "This Secret is not produced by cert-manager",
+
+  certTree: "Chain",
+  certList: "List",
+  certFilterAll: "all",
+  certFilterProblems: "problems",
+  certFilterFlight: "in flight",
+  certFilterHelp:
+    "\"problems\" keeps whatever is not Ready and whatever expires within 30 days; \"in flight\" keeps only issuance under way. Ancestors of a kept row stay on screen: without its Issuer, a failing Certificate loses what explains it.",
+  certEmpty: "No cert-manager object in this scope.",
+  certNotInstalled: "cert-manager is not installed on this cluster.",
+  certNoAcme: "no ACME",
+  certSecretsUnreadable:
+    "Secrets unreadable: the produced Secret and the keystores are not checked here.",
+  certActions: "cert-manager actions",
+  certRenew: "renew",
+  certDescRenew: "Forces re-issuance: the Issuing condition goes True, the way cmctl renew does.",
+  certAcmeRetry: "retry ACME",
+  certDescAcmeRetry:
+    "Deletes the in-flight CertificateRequest; its Order and Challenges go with it, and cert-manager issues a fresh one.",
+  certRateLimited:
+    "ACME rate limit hit: retrying would only burn what is left. The retry is withdrawn.",
+  certSelectRow: "Select a row of the chain",
+  certOpenSecret: "open the Secret",
+  certOpenSecretHelp:
+    "Opens the Secrets view on the produced Secret, where the certificate is decoded and values are revealed.",
+  certChain: "Chain",
+  certProduced: "Produced Secret",
+  certKeystores: "Keystores",
+  certSecretAbsent: "Secret {ns}/{name} missing — the certificate is ready but nothing serves it.",
+  certSecretUnknown: "Secret state unknown in this scope",
+  certConsumersNone: "no Ingress references it",
+  certConsumersOne: "referenced by 1 Ingress",
+  certConsumersMany: "referenced by {n} Ingresses",
+  certExpiresIn: "expires in {n} d",
+  certExpiredSince: "expired {n} d ago",
+  certRenewalOn: "renewal",
+  certExpiresOn: "expiry",
+  certSignedBy: "{n} certificate(s) signed by this issuer",
+  certKeystoreAlias: "alias {alias}",
+  certKeystorePwRef: "password: {name}/{key}",
+  certKeystorePwInline: "inline password",
+  certDetail: "Chain",
+  certFold: "Fold / unfold the chain",
+  certDays: "{n} d",
+
+  objActions: "Object",
+  objSelectRow: "Select a row",
+  objYamlRaw: "raw",
+  objYamlNeat: "neat",
+  objTouchHelp:
+    "Stamps the object under kdt.io/ to cause a write: that write is what runs the admission webhooks again. Nothing else is touched.",
+  objEditGuards: "Before writing",
+  objEditApply: "Apply",
+  objEditReload: "Reload",
+  objEditChanges: "What this changes",
+  objEditNoChange: "The document matches the object: nothing to write.",
+  objEditNoop:
+    "Every change lands on fields the API server owns: writing would leave the object as it is.",
+  objEditServerOwned: "owned by the API server, ignored",
+  objEditImmutable: "frozen once the object exists, the API server will refuse",
+  objEditIdentity: "object identity: this document would point at another object",
+  objEditConfirm: "Write",
+  objEditCancel: "Cancel",
+  objEditReadOnlyHint: "Edit the document, then \"Apply\" shows what it changes.",
+  objWorking: "working…",
 };
 
 export function strings(lang: Lang): Strings {

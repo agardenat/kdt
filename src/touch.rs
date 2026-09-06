@@ -74,7 +74,8 @@ pub async fn run_touch(
     let target = label(&kind, &namespace, &name);
     // The timestamp is not echoed: the toast shares its row with the shortcut bar, and `y` shows the
     // annotation that was actually written.
-    let msg = match patch(&client, &api_version, &kind, &namespace, &name, &at).await {
+    let msg = match touch_once(&client, &api_version, &kind, &namespace, &name, &at, &author()).await
+    {
         Ok(()) => st.touch_ok.replace("{d}", &target),
         Err(e) => st.touch_failed.replace("{d}", &target).replace("{e}", &clip(&e)),
     };
@@ -83,16 +84,22 @@ pub async fn run_touch(
     }
 }
 
-async fn patch(
+/// The write itself, with the author given rather than read from the environment.
+///
+/// The TUI passes [`author`], the local account. A server touching on someone else's behalf passes
+/// **that** person: the whole point of the annotation is to say who asked, and the account the
+/// process runs under would name the wrong one.
+pub async fn touch_once(
     client: &Client,
     api_version: &str,
     kind: &str,
     namespace: &str,
     name: &str,
     at: &str,
+    by: &str,
 ) -> Result<(), String> {
     let api = dynamic_api(client, api_version, kind, namespace).await?;
-    let body = patch_body(at, &author());
+    let body = patch_body(at, by);
     api.patch(name, &PatchParams::default(), &Patch::Merge(&body))
         .await
         .map(|_| ())

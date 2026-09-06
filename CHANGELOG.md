@@ -91,6 +91,54 @@ répondent, le reste n'existe pas.
   moins de 30), avec l'émetteur, les SAN, le `Certificate` cert-manager qui les produit et les
   Ingress qui les consomment. La clé privée n'est jamais lue.
 
+- **feat(web)** — la vue certs : la chaîne cert-manager, du point d'ancrage jusqu'au Secret servi.
+  Issuer → Certificate → CertificateRequest → Order → Challenge, puis le Secret produit et les
+  Ingress qui le référencent. Un certificat qui expire ne dit pas pourquoi ; la chaîne, si.
+
+  Les constats sont ceux de kdt et arrivent rédigés : un `dns-01` qui traîne au-delà du délai de
+  propagation, un `http-01` que le solveur n'a pas publié, un Order invalide qui porte l'échec
+  d'autorisation, un issuer cassé qui condamne tout ce qui pend dessous, un renouvellement échu
+  sans rien en vol, un Secret absent derrière un Certificate `Ready`, un keystore demandé qui n'a
+  jamais atterri. La chaîne d'un Certificate sain se replie d'elle-même, celle d'un Certificate en
+  panne s'ouvre — et jamais contre un pli posé à la main.
+
+  Les deux leviers suivent : `renouveler` force la ré-émission, `relancer ACME` supprime la
+  demande en cours pour en faire repartir une neuve. La relance n'est offerte que s'il y a une
+  demande vivante, et **jamais sous quota ACME** — y réessayer ne fait que brûler ce qui reste.
+
+  Les Secrets sont relus dans la même portée pour la feuille de chaîne et pour ces constats. Une
+  lecture refusée les laisse **muets** plutôt que d'affirmer une absence : un Secret illisible
+  n'est pas un Secret manquant.
+
+  Les deux vues se passent la main dans les deux sens, comme dans le TUI : d'une chaîne vers le
+  Secret qu'elle produit, où le certificat est décodé et les valeurs se révèlent, et d'un Secret
+  vers le Certificate qui l'émet — la chaîne visée s'ouvrant même si elle est saine, sans quoi le
+  saut se poserait sur une ligne repliée.
+
+- **feat(web)** — les trois gestes que kdt porte sur n'importe quel objet arrivent sur le web, dans
+  toutes les vues : lire son YAML, l'éditer, l'horodater. Ils vivent dans la barre qui sépare les
+  deux panneaux, et ce qu'ils ouvrent s'affiche dans le panneau du haut — c'est la disposition du
+  web, là où le TUI n'a que `y`, `e` et `h`.
+
+  L'édition garde les deux questions de kdt, posées avant d'écrire : *ce changement va-t-il
+  survivre ?* — un objet appliqué par Flux, Argo ou Helm est remis en place à la réconciliation
+  suivante — et *l'apiserver l'acceptera-t-il ?* Puis le tri des changements : ce que l'apiserver
+  possède et ignorera, ce qu'il fige et refusera, ce qui ferait pointer le document vers un autre
+  objet. Aucune de ces réponses ne bloque quoi que ce soit, et l'annulation reste la sortie par
+  défaut. L'écriture est un PUT, comme `kubectl edit` : l'apiserver refuse si l'objet a bougé.
+
+  L'horodatage inscrit **la personne connectée** comme auteur, pas le compte du pod : l'intérêt de
+  l'annotation est de dire qui a demandé.
+
+- **refactor** — la vue certs du TUI et celle du web lisent les mêmes règles : le libellé `READY`
+  et son ton, le glyphe, ce qu'une ligne vise, les keystores qu'elle demande, le filtre à trois
+  états — qui garde les ancêtres de ce qu'il retient — et les deux conversions en enregistrement
+  d'évènement descendent de `ui.rs` dans `certmanager.rs`. La sonde qui déposait son inventaire
+  dans un état partagé gagne une jumelle qui le rend, et les deux actions une forme qui répond au
+  lieu de publier un toast. Les phrases des garde-fous d'édition quittent `ui.rs` pour `edit.rs`
+  pour la même raison : un garde-fou qui se dirait autrement d'un côté et de l'autre serait un
+  garde-fou de moins.
+
 - **feat(web)** — le rail ne montre que les vues que ce cluster peut servir : sans Argo CD,
   pas d'onglet Argo CD. La sonde est un seul appel — la liste des groupes d'API — couvert par
   `system:discovery`, donc elle aboutit sans droit particulier.

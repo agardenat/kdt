@@ -41,16 +41,16 @@ pub async fn fetch_yaml(
     key: String,
     state: SharedYaml,
 ) {
-    let result = load_object(&client, &api_version, &kind, &namespace, &name).await;
+    let result = object_yaml(&client, &api_version, &kind, &namespace, &name).await;
     let mut s = state.lock().expect("yaml state poisoned");
     if s.key != key {
         return;
     }
     s.loading = false;
     match result {
-        Ok(value) => {
-            s.raw = to_yaml(&value);
-            s.neat = to_yaml(&neat(value));
+        Ok((raw, tidy)) => {
+            s.raw = raw;
+            s.neat = tidy;
             s.error = None;
         }
         Err(e) => {
@@ -59,6 +59,20 @@ pub async fn fetch_yaml(
             s.error = Some(e);
         }
     }
+}
+
+/// Both renderings of one object: `raw` as the API server returns it, `neat` stripped of what the
+/// runtime added. Returned rather than deposited in a shared state, for a caller that answers an
+/// HTTP request; the two forms are the very same ones the TUI overlay shows.
+pub async fn object_yaml(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<(String, String), String> {
+    let value = load_object(client, api_version, kind, namespace, name).await?;
+    Ok((to_yaml(&value), to_yaml(&neat(value.clone()))))
 }
 
 // Resolve any GVK through discovery and hand back the API, scoped the way the kind requires. Shared

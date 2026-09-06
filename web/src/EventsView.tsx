@@ -9,6 +9,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, Splitter, type PanelTab } from "./panel";
+import { ObjectActions } from "./objects";
 import { age, toneLabel, type EventRecord } from "./types";
 
 /**
@@ -113,6 +114,8 @@ export default function EventsView({
             onClose={() => onPanelOpen(false)}
             height={panelHeight}
             lang={lang}
+            st={st}
+            onNeedsAuth={onNeedsAuth}
           />
           <Splitter height={panelHeight} onHeight={onPanelHeight} lang={lang} />
         </>
@@ -132,6 +135,19 @@ export default function EventsView({
           <span className="count">{warnings}</span>
         </button>
         <div className="right">
+          {/* Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le
+              TUI. Ils vivent dans la barre, comme toutes les actions, et ouvrent le panneau du
+              haut sur ce qu'ils montrent. */}
+          <ObjectActions
+            record={selected}
+            lang={lang}
+            st={st}
+            onOpen={(t) => {
+              setTab(t);
+              onPanelOpen(true);
+            }}
+            onNeedsAuth={onNeedsAuth}
+          />
           {selected && (
             <button
               className="panel-toggle"

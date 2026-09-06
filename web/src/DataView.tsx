@@ -16,7 +16,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
+import { CopyButton } from "./copy";
 import { InspectPanel, Splitter, type PanelTab } from "./panel";
+import { ObjectActions } from "./objects";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
 
 const SECRET_COLUMNS =
@@ -35,6 +37,9 @@ export default function DataView({
   panelOpen,
   onPanelOpen,
   onNeedsAuth,
+  focusSecret,
+  onFocusConsumed,
+  onOpenCert,
 }: {
   lang: Lang;
   st: Strings;
@@ -45,6 +50,16 @@ export default function DataView({
   panelOpen: boolean;
   onPanelOpen: (open: boolean) => void;
   onNeedsAuth: (message: string) => void;
+  /** Un Secret sur lequel atterrir, quand une autre vue passe la main — le `s` de la vue certs. */
+  focusSecret?: { namespace: string; name: string } | null;
+  onFocusConsumed?: () => void;
+  /**
+   * Passe la main à la vue certs sur le Certificate qui produit ce Secret — le `o` du TUI.
+   *
+   * Absente quand ce cluster n'a pas cert-manager : la vue de destination n'existe alors pas, et
+   * proposer le saut mènerait à un onglet que le rail ne montre pas.
+   */
+  onOpenCert?: (namespace: string, certificate: string) => void;
 }) {
   const [world, setWorld] = useState<World>("secrets");
   const [secrets, setSecrets] = useState<SecretRow[]>([]);
@@ -91,6 +106,23 @@ export default function DataView({
   }, [load]);
 
   useEffect(() => setSelected(null), [world]);
+
+  // Le saut d'une autre vue atterrit dès que sa cible apparaît dans la liste : la lecture peut ne
+  // pas être finie quand le geste est fait. Il ne change pas la portée — comme dans kdt, où `s`
+  // déplace le curseur sans toucher au namespace courant : si le Secret n'y est pas, la vue
+  // demandée s'ouvre quand même et le curseur reste où il est.
+  useEffect(() => {
+    if (!focusSecret) return;
+    setWorld("secrets");
+    const hit = secrets.find(
+      (s) => s.namespace === focusSecret.namespace && s.name === focusSecret.name,
+    );
+    if (!hit) return;
+    setSelected(hit.uid);
+    setTab("detail");
+    onPanelOpen(true);
+    onFocusConsumed?.();
+  }, [focusSecret, secrets, onPanelOpen, onFocusConsumed]);
 
   const needle = query.trim().toLowerCase();
 
@@ -147,6 +179,8 @@ export default function DataView({
             onClose={() => onPanelOpen(false)}
             height={panelHeight}
             lang={lang}
+            st={st}
+            onNeedsAuth={onNeedsAuth}
             detail={{
               label: st.secDetail,
               node: selectedSecret ? (
@@ -212,6 +246,35 @@ export default function DataView({
         )}
 
         <div className="right">
+          {/* Le retour de « voir le Secret » : d'un Secret vers la chaîne qui l'émet. Le lien est
+              celui que kdt a déjà posé sur la ligne (`cert_manager`), pas une jointure refaite
+              ici — un Secret TLS qui ne vient pas de cert-manager n'a pas d'origine à ouvrir. */}
+          {onOpenCert && world === "secrets" && (
+            <button
+              className="panel-toggle"
+              disabled={!selectedSecret?.cert_manager}
+              title={selectedSecret?.cert_manager ? st.secOpenChainHelp : st.secNoOrigin}
+              onClick={() =>
+                selectedSecret?.cert_manager &&
+                onOpenCert(selectedSecret.namespace, selectedSecret.cert_manager)
+              }
+            >
+              {st.secOpenChain}
+            </button>
+          )}
+          {/* Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le
+              TUI. Ils vivent dans la barre, comme toutes les actions, et ouvrent le panneau du
+              haut sur ce qu'ils montrent. */}
+          <ObjectActions
+            record={selectedRecord}
+            lang={lang}
+            st={st}
+            onOpen={(t) => {
+              setTab(t);
+              onPanelOpen(true);
+            }}
+            onNeedsAuth={onNeedsAuth}
+          />
           {selectedRecord && (
             <button className="panel-toggle" onClick={() => onPanelOpen(!panelOpen)}>
               {panelOpen
@@ -614,38 +677,6 @@ function ConfigMapDetail({ c, st }: { c: ConfigMapRow; st: Strings }) {
         </>
       )}
     </div>
-  );
-}
-
-/**
- * Copie une valeur dans le presse-papier, avec un accusé qui s'efface.
- *
- * `navigator.clipboard` exige un contexte sécurisé : `https`, ou `localhost`, qui en est un. Servi
- * en clair depuis une autre machine, l'API est absente — le bouton le dit alors plutôt que
- * d'échouer en silence.
- */
-function CopyButton({ text, label, done }: { text: string; label: string; done: string }) {
-  const [state, setState] = useState<"idle" | "ok" | "unavailable">("idle");
-
-  useEffect(() => {
-    if (state === "idle") return;
-    const timer = window.setTimeout(() => setState("idle"), 2000);
-    return () => window.clearTimeout(timer);
-  }, [state]);
-
-  return (
-    <button
-      className={`inv-pill copy${state === "ok" ? " done" : ""}`}
-      title={label}
-      onClick={(e) => {
-        e.stopPropagation();
-        const write = navigator.clipboard?.writeText(text);
-        if (write) write.then(() => setState("ok")).catch(() => setState("unavailable"));
-        else setState("unavailable");
-      }}
-    >
-      {state === "ok" ? `✓ ${done}` : state === "unavailable" ? "✗" : "⧉"}
-    </button>
   );
 }
 

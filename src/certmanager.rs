@@ -51,7 +51,10 @@ const CM_VERSIONS: &[&str] = &["v1"];
 // (or a missing/incorrect TXT record) rather than normal latency.
 const DNS_PROPAGATION_GRACE_SECS: i64 = 600;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Serialize` on everything a row carries: kdt-web renders these values as they are, so the two
+// interfaces answer the same thing about the same chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CmReady {
     Ready,
     // Issuance in flight: not yet valid, but not a failure either.
@@ -61,7 +64,7 @@ pub enum CmReady {
 }
 
 // The six kinds that make up a cert-manager lineage, ordered from trust anchor to leaf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CmKind {
     ClusterIssuer,
     Issuer,
@@ -69,6 +72,39 @@ pub enum CmKind {
     CertificateRequest,
     Order,
     Challenge,
+}
+
+impl CmReady {
+    // The READY label, in the words the TUI paints. It travels to kdt-web as it is: a readiness is
+    // a judgement about the chain, and two spellings of it would be two answers.
+    pub fn label(self) -> &'static str {
+        match self {
+            CmReady::Ready => "Ready",
+            CmReady::InProgress => "Issuing",
+            CmReady::Failed => "Failed",
+            CmReady::Unknown => "Unknown",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            CmReady::Ready => "\u{2713}",
+            CmReady::InProgress => "\u{21bb}",
+            CmReady::Failed => "\u{2717}",
+            CmReady::Unknown => "\u{b7}",
+        }
+    }
+
+    // The tone of the label. `Unknown` is a warning and not a neutral state: a chain nobody can
+    // judge is a chain nobody is watching.
+    pub fn tone(self) -> crate::events::LineColor {
+        match self {
+            CmReady::Ready => crate::events::LineColor::Ok,
+            CmReady::InProgress => crate::events::LineColor::Info,
+            CmReady::Failed => crate::events::LineColor::Err,
+            CmReady::Unknown => crate::events::LineColor::Warn,
+        }
+    }
 }
 
 impl CmKind {
@@ -115,7 +151,7 @@ impl CmKind {
 // ACME-specific detail of a Challenge, surfaced so the detail panel can name the exact DNS record
 // the validation is waiting on. The state and reason are not repeated here: `parse_ready` already
 // folds them into `CmResource::ready` and `::message`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ChallengeInfo {
     // "dns-01" or "http-01".
     pub type_: String,
@@ -127,7 +163,7 @@ pub struct ChallengeInfo {
 // Keystore formats cert-manager can add to the produced Secret, alongside `tls.crt`/`tls.key`.
 // The file names are fixed by the controller (see the CRD documentation of `spec.keystores`), which
 // is what makes "requested but absent" a checkable fact rather than a guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum KeystoreFormat {
     Jks,
     Pkcs12,
@@ -160,7 +196,7 @@ impl KeystoreFormat {
 }
 
 // One requested keystore, from `spec.keystores.{jks,pkcs12}` with `create: true`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct KeystoreSpec {
     pub format: KeystoreFormat,
     // `passwordSecretRef` as (secret name, key). Namespace-local, like every cert-manager secret ref.
@@ -171,7 +207,7 @@ pub struct KeystoreSpec {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CmResource {
     pub kind: CmKind,
     pub api_version: String,
@@ -229,10 +265,87 @@ impl CmResource {
     pub fn in_flight(&self) -> bool {
         self.ready == CmReady::InProgress
     }
+
+    // What this row targets: its DNS names if it has any, otherwise the Secret it writes, the
+    // challenge it validates, or the kind of issuer it is. One column, whichever kind the row is.
+    pub fn target(&self) -> String {
+        if !self.dns_names.is_empty() {
+            let head = self.dns_names[0].clone();
+            if self.dns_names.len() > 1 {
+                return format!("{} +{}", head, self.dns_names.len() - 1);
+            }
+            return head;
+        }
+        match (&self.challenge, &self.secret_name, &self.issuer_type) {
+            (Some(c), _, _) if !c.dns_name.is_empty() => format!("{} {}", c.type_, c.dns_name),
+            (_, Some(sn), _) => format!("\u{2192} {sn}"),
+            (_, _, Some(t)) => t.clone(),
+            _ => String::new(),
+        }
+    }
+
+    // The keystore formats this Certificate asks cert-manager to add to its Secret. Empty for the
+    // vast majority of rows: the badge exists only to make the handful of Java-facing certificates
+    // findable without opening each one.
+    pub fn keystore_formats(&self) -> Vec<&'static str> {
+        self.keystores.iter().map(|k| k.format.as_str()).collect()
+    }
 }
 
 pub fn cert_tree_uid(kind: &str, ns: &str, name: &str) -> String {
     format!("{}|{}/{}", kind, ns, name)
+}
+
+// How the view is filtered (`f` in the TUI, three buttons on the web): everything, only the chains
+// with a problem, or only those with issuance actually in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertFilter {
+    #[default]
+    All,
+    Problems,
+    InFlight,
+}
+
+impl CertFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            CertFilter::All => "ALL",
+            CertFilter::Problems => "PROBLEMS",
+            CertFilter::InFlight => "IN-FLIGHT",
+        }
+    }
+
+    pub fn matches(self, r: &CmResource) -> bool {
+        match self {
+            CertFilter::All => true,
+            // Anything that is not settled-and-comfortable. Issuance in flight counts: a chain that
+            // has been "Issuing" for an hour is exactly what one opens this filter to find.
+            CertFilter::Problems => {
+                r.ready != CmReady::Ready || matches!(r.days_remaining, Some(d) if d < 30)
+            }
+            CertFilter::InFlight => r.ready == CmReady::InProgress,
+        }
+    }
+}
+
+/// The resources a filter keeps, **with their ancestors**.
+///
+/// A filter never hides an object's lineage: dropping the Issuer above a failing Certificate would
+/// strand it and lose the very context one is looking for.
+pub fn filter_chains(resources: &[CmResource], filter: CertFilter) -> Vec<CmResource> {
+    if filter == CertFilter::All {
+        return resources.to_vec();
+    }
+    let mut keep: HashSet<usize> = HashSet::new();
+    for (i, r) in resources.iter().enumerate() {
+        if filter.matches(r) {
+            keep.extend(chain_path(i, resources));
+        }
+    }
+    let mut idx: Vec<usize> = keep.into_iter().collect();
+    idx.sort_unstable();
+    idx.into_iter().map(|i| resources[i].clone()).collect()
 }
 
 #[derive(Default, Debug, Clone)]
@@ -280,13 +393,20 @@ pub fn new_certs_state() -> SharedCerts {
 // not deployed" from "deployed but nothing issued yet", and `acme_installed` keeps a CA-only cluster
 // from being reported as broken.
 pub async fn fetch_certs(client: Client, state: SharedCerts) {
-    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("certs poisoned");
         s.loading = true;
         s.error = None;
     }
+    let fetched = certs_inventory(&client, crate::lang::active()).await;
+    let mut s = state.lock().expect("certs poisoned");
+    *s = fetched;
+}
 
+// The same listing, returned rather than deposited in a shared state, and with its string table
+// given rather than read from the global one. That is what kdt-web needs: it answers one request at
+// a time, for one person, whose language is not a process-wide setting.
+pub async fn certs_inventory(client: &Client, st: &'static Strings) -> CertState {
     let mut resources: Vec<CmResource> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut installed = false;
@@ -296,7 +416,7 @@ pub async fn fetch_certs(client: Client, state: SharedCerts) {
         let mut resolved = None;
         for v in *versions {
             let gvk = GroupVersionKind::gvk(group, v, kind);
-            if let Ok((ar, _caps)) = discovery::pinned_kind(&client, &gvk).await {
+            if let Ok((ar, _caps)) = discovery::pinned_kind(client, &gvk).await {
                 resolved = Some((ar, *v));
                 break;
             }
@@ -323,18 +443,14 @@ pub async fn fetch_certs(client: Client, state: SharedCerts) {
 
     resources.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
-    let mut s = state.lock().expect("certs poisoned");
-    s.loading = false;
-    s.installed = installed;
-    s.acme_installed = acme_installed;
-    s.resources = resources;
-    s.error = if !installed {
+    let error = if !installed {
         Some(st.cert_crds_missing.to_string())
-    } else if s.resources.is_empty() && !errors.is_empty() {
+    } else if resources.is_empty() && !errors.is_empty() {
         Some(errors.join(" · "))
     } else {
         None
     };
+    CertState { resources, error, loading: false, installed, acme_installed }
 }
 
 fn parse_cm(
@@ -841,16 +957,70 @@ fn has_in_flight_acme(idx: usize, resources: &[CmResource]) -> bool {
         .any(|i| matches!(resources[i].kind, CmKind::Order | CmKind::Challenge) && resources[i].in_flight())
 }
 
+// --- Snapshot records --------------------------------------------------------------------------
+
+// Adapt a cert-manager object into an [`EventRecord`], so every row of the chain drives the shared
+// YAML, edit, touch, delete, Status and Related machinery against the real object behind it. It is
+// a judgement about the cluster — a failed issuance is a Warning — so it lives here and not in the
+// renderer, and kdt-web reaches for the same one to open the same panes.
+pub fn synthetic_record(r: &CmResource) -> crate::events::EventRecord {
+    let (severity, reason) = match r.ready {
+        CmReady::Ready => (crate::events::Severity::Normal, "Ready"),
+        CmReady::InProgress => (crate::events::Severity::Normal, "Issuing"),
+        CmReady::Failed => (crate::events::Severity::Warning, "Failed"),
+        CmReady::Unknown => (crate::events::Severity::Warning, "Unknown"),
+    };
+    let message = if r.message.is_empty() {
+        format!("{} {}/{}", r.kind.as_str(), r.namespace, r.name)
+    } else {
+        r.message.clone()
+    };
+    crate::events::EventRecord {
+        uid: format!("cm|{}", r.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity,
+        reason: reason.to_string(),
+        api_version: r.api_version.clone(),
+        kind: r.kind.as_str().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "cert-manager".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// The TLS Secret leaf that closes a chain. It addresses the Secret itself, so the actions on that
+// row act on the Secret and not on the Certificate that produced it.
+pub fn secret_record(namespace: &str, name: &str) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("cmsec|{}/{}", namespace, name),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: "Secret".to_string(),
+        api_version: "v1".to_string(),
+        kind: "Secret".to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message: format!("Secret {}/{}", namespace, name),
+        component: "cert-manager".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 // --- Diagnostics --------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HintLevel {
     Info,
     Warn,
     Danger,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hint {
     pub level: HintLevel,
     pub text: String,
@@ -858,7 +1028,7 @@ pub struct Hint {
 
 // What the Secrets view knows about the Secret a Certificate targets. Passed in rather than fetched
 // so this module never duplicates `secrets.rs`, and so the rules stay pure and testable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SecretFacts {
     pub found: bool,
     pub days_remaining: Option<i64>,
@@ -873,7 +1043,7 @@ pub struct SecretFacts {
 
 // Whether a keystore password reference actually resolves. Both flags false is the common failure:
 // the Secret named by `passwordSecretRef` does not exist in the Certificate's namespace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PasswordRef {
     pub secret_found: bool,
     pub key_found: bool,
@@ -1096,6 +1266,30 @@ pub async fn renew(
     if let Ok(mut s) = status.lock() {
         *s = Some((std::time::Instant::now(), msg));
     }
+}
+
+// The one-shot form, for a caller that answers a request rather than a keypress: it hands back
+// what happened instead of posting it to a footer toast. `renew` above is the toast wrapper.
+pub async fn renew_once(
+    client: &Client,
+    api_version: &str,
+    namespace: &str,
+    name: &str,
+    st: &'static Strings,
+) -> Result<String, String> {
+    run_renew(client, api_version, namespace, name, st).await
+}
+
+// Same for the ACME retry. The caller is expected to have checked [`is_rate_limited`] first: this
+// deletes the in-flight CertificateRequest whatever the reason it is stuck.
+pub async fn retry_acme_once(
+    client: &Client,
+    api_version: &str,
+    namespace: &str,
+    name: &str,
+    st: &'static Strings,
+) -> Result<String, String> {
+    run_retry_acme(client, api_version, namespace, name, st).await
 }
 
 async fn run_renew(

@@ -7,7 +7,8 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import * as api from "./api";
-import type { Lang } from "./i18n";
+import type { Lang, Strings } from "./i18n";
+import { EditPane, YamlPane } from "./objects";
 import {
   hasLogs,
   toneLabel,
@@ -22,8 +23,12 @@ import {
  *
  * `DetailTab { Logs, Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail »
  * en plus n'existerait que sur le web, et les deux interfaces ne se ressembleraient plus.
+ *
+ * `yaml` et `edit` viennent après : dans kdt ce sont deux overlays qu'ouvrent `y` et `e`, et ils
+ * marchent dans toutes les vues. Ici ce sont deux onglets du même panneau — les boutons qui les
+ * ouvrent vivent dans la barre, le contenu vit là où va tout contenu.
  */
-export type PanelTab = "detail" | "logs" | "status" | "related";
+export type PanelTab = "detail" | "logs" | "status" | "related" | "yaml" | "edit";
 
 /**
  * Un onglet propre à une vue, posé devant les trois onglets partagés.
@@ -67,7 +72,9 @@ export function InspectPanel({
   onClose,
   height,
   lang,
+  st,
   detail,
+  onNeedsAuth,
 }: {
   record: EventRecord;
   tab: PanelTab;
@@ -75,12 +82,16 @@ export function InspectPanel({
   onClose: () => void;
   height: number;
   lang: Lang;
+  st: Strings;
   detail?: DetailPane;
+  onNeedsAuth: (message: string) => void;
 }) {
   // Un Pod rend ses propres logs, une ressource Flux ceux de son controller filtrés sur elle.
   // Ailleurs, l'onglet resterait vide : remonter d'un Deployment à ses pods demande de choisir
   // lesquels, et ce choix a des règles qu'on ne réinvente pas ici.
   const logs = hasLogs(record);
+  // `y` et `e` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en a pas.
+  const addressable = Boolean(record.kind && record.name);
 
   return (
     <section className="panel" style={{ height }}>
@@ -111,6 +122,26 @@ export function InspectPanel({
           </button>
           <button role="tab" aria-selected={tab === "related"} onClick={() => onTab("related")}>
             Related
+          </button>
+          {/* Les deux gestes de kdt qui portent sur n'importe quel objet. Un enregistrement qui ne
+              désigne rien — une ligne de regroupement — n'en a pas : l'onglet le dit. */}
+          <button
+            role="tab"
+            aria-selected={tab === "yaml"}
+            disabled={!addressable}
+            title={addressable ? undefined : st.objSelectRow}
+            onClick={() => onTab("yaml")}
+          >
+            {st.actionYaml}
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === "edit"}
+            disabled={!addressable}
+            title={addressable ? undefined : st.objSelectRow}
+            onClick={() => onTab("edit")}
+          >
+            {st.actionEdit}
           </button>
         </div>
 
@@ -146,6 +177,12 @@ export function InspectPanel({
           ))}
         {tab === "status" && <StatusPane record={record} lang={lang} />}
         {tab === "related" && <RelatedPane record={record} lang={lang} />}
+        {tab === "yaml" && addressable && (
+          <YamlPane key={record.uid} record={record} lang={lang} st={st} />
+        )}
+        {tab === "edit" && addressable && (
+          <EditPane key={record.uid} record={record} lang={lang} st={st} onNeedsAuth={onNeedsAuth} />
+        )}
       </div>
     </section>
   );

@@ -14,7 +14,10 @@ use serde_json::{Map, Value};
 
 use crate::yaml::dynamic_api;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+// `Serialize` because kdt-web renders these levels as they are: the guard-rail is kdt's, and the
+// browser paints it rather than judging it again.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Info,
     Warn,
