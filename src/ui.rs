@@ -1117,7 +1117,7 @@ impl SecretFilter {
         }
     }
 }
-use crate::events::{
+use crate::events::{is_critical_reason, 
     fetch_cluster_info, fetch_flux_logs, fetch_logs, fetch_namespaces, fetch_node_usage,
     fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
     new_cluster_info_state,
@@ -1143,16 +1143,6 @@ impl Filter {
 }
 
 // Event reasons treated as "errors" by the Errors filter (crash/oom/scheduling/mount failures…).
-fn is_critical_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "BackOff" | "CrashLoopBackOff" | "ImagePullBackOff" | "ErrImagePull"
-        | "OOMKilled" | "Evicted" | "FailedScheduling" | "FailedMount"
-        | "FailedCreate" | "FailedCreatePodSandBox" | "FailedSync"
-        | "FailedKillPod" | "FailedAttachVolume" | "Unhealthy"
-        | "NodeNotReady" | "NetworkNotReady" | "Killing"
-    ) || reason.starts_with("Failed") || reason.starts_with("Err")
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull }
@@ -14395,13 +14385,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             };
 
             let header_row = Row::new(vec![
-                Cell::from("TIME"), Cell::from("SEV"), Cell::from("NS"), Cell::from("KIND"),
+                Cell::from("AGE"), Cell::from("SEV"), Cell::from("NS"), Cell::from("KIND"),
                 Cell::from("NAME"), Cell::from("REASON"), Cell::from("CNT"), Cell::from("MESSAGE"),
             ])
             .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
             let widths = [
-                Constraint::Length(8), Constraint::Length(4), Constraint::Length(20),
+                Constraint::Length(5), Constraint::Length(4), Constraint::Length(20),
                 Constraint::Length(14), Constraint::Length(40), Constraint::Length(22),
                 Constraint::Length(4), Constraint::Min(20),
             ];
@@ -30202,7 +30192,7 @@ fn related_lines(app: &App) -> Vec<Line<'static>> {
                 };
                 let component = if r.component.is_empty() { String::new() } else { format!(" [{}]", r.component) };
                 Line::from(vec![
-                    Span::styled(format_time(r), Style::default().fg(DIM)),
+                    Span::styled(crate::events::format_age(&r.time), Style::default().fg(DIM)),
                     Span::raw("  "),
                     Span::styled(r.reason.clone(), Style::default().fg(Color::Cyan)),
                     Span::styled(component, Style::default().fg(DIM)),
@@ -30598,7 +30588,7 @@ fn line_color(c: LineColor) -> Color {
 }
 
 fn row_for(r: &EventRecord, h_scroll: usize) -> Row<'static> {
-    let time_str = format_time(r);
+    let time_str = crate::events::format_age(&r.time);
     let (sev_label, sev_style) = match r.severity {
         Severity::Warning if is_critical_reason(&r.reason) => (
             "ERR",
@@ -30728,15 +30718,6 @@ fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, Strin
     }
     body.push_str(st.prompt_sys_note);
     ("Node usage (per-container avec issues)".to_string(), body)
-}
-
-fn format_time(r: &EventRecord) -> String {
-    let s = r.time.to_string();
-    if let Some(t) = s.split('T').nth(1) {
-        t.split('.').next().unwrap_or(t).trim_end_matches('Z').to_string()
-    } else {
-        s
-    }
 }
 
 // Snapshot the last 200 log lines for inclusion in the AI prompt (or a placeholder if unavailable).

@@ -21,7 +21,7 @@ use kube::runtime::{watcher, WatchStreamExt};
 use kube::{Api, Client};
 use tokio::task::JoinHandle;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Normal,
@@ -29,8 +29,10 @@ pub enum Severity {
 }
 
 // `Serialize` parce que kdt-web sert ces enregistrements tels quels : le TUI et l'interface web
-// doivent parler du même objet, pas de deux projections qui divergeront.
-#[derive(Debug, Clone, serde::Serialize)]
+// doivent parler du même objet, pas de deux projections qui divergeront. `Deserialize` parce que
+// le navigateur renvoie l'enregistrement pour demander le contexte qui l'entoure — ce qui revient
+// alors est ce que le serveur avait émis, sans champ à reconstruire de mémoire.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventRecord {
     pub uid: String,
     pub time: Timestamp,
@@ -44,6 +46,45 @@ pub struct EventRecord {
     pub component: String,
     pub host: String,
     pub count: i32,
+}
+
+/// Reasons that mean something is already broken, not merely worth watching.
+///
+/// Lives here rather than in the UI because it is a judgement about the cluster, not about how to
+/// draw it: the TUI paints these rows red, and kdt-web has to reach the same verdict. Two lists
+/// would drift, and the two interfaces would then disagree about the same event.
+pub fn is_critical_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "BackOff" | "CrashLoopBackOff" | "ImagePullBackOff" | "ErrImagePull"
+        | "OOMKilled" | "Evicted" | "FailedScheduling" | "FailedMount"
+        | "FailedCreate" | "FailedCreatePodSandBox" | "FailedSync"
+        | "FailedKillPod" | "FailedAttachVolume" | "Unhealthy"
+        | "NodeNotReady" | "NetworkNotReady" | "Killing"
+    ) || reason.starts_with("Failed") || reason.starts_with("Err")
+}
+
+/// How severely a record reads, once the reason is taken into account.
+///
+/// Kubernetes only has Normal and Warning; the third level is ours, and it is the one that
+/// matters on screen — a `CrashLoopBackOff` is not the same news as a `Unhealthy` probe blip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tone {
+    Ok,
+    Warn,
+    Err,
+}
+
+impl EventRecord {
+    /// The verdict the UI paints. Computed here so every interface paints the same one.
+    pub fn tone(&self) -> Tone {
+        match self.severity {
+            Severity::Warning if is_critical_reason(&self.reason) => Tone::Err,
+            Severity::Warning => Tone::Warn,
+            Severity::Normal => Tone::Ok,
+        }
+    }
 }
 
 impl EventRecord {
@@ -306,6 +347,22 @@ async fn pod_log_lines(api: &Api<Pod>, pod: &str, tail: i64, opts: &LogOpts) -> 
     PodLogs { lines: out, containers: names }
 }
 
+/// Recent logs for one pod, returned rather than deposited in a shared state.
+///
+/// `fetch_logs` below writes into the TUI's shared state, which suits a screen that redraws on a
+/// tick but not a caller that has one question and wants one answer — kdt-web serving an HTTP
+/// request, for instance. Same probe, same output, no second implementation to drift.
+pub async fn pod_logs(
+    client: Client,
+    namespace: &str,
+    pod: &str,
+    tail: i64,
+    opts: &LogOpts,
+) -> PodLogs {
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    pod_log_lines(&api, pod, tail, opts).await
+}
+
 // Fetch recent logs for every container (init + regular) of a pod. The `tail` budget is split
 // across containers when there is more than one. `key` guards against a stale write (see AiState).
 pub async fn fetch_logs(
@@ -475,7 +532,9 @@ fn format_flux_log_line(v: &serde_json::Value, ctrl: &str, global: bool) -> Stri
     out
 }
 
-#[derive(Debug, Clone, Copy)]
+// `Serialize` : kdt-web peint ces lignes avec le ton que le TUI leur donne, sans le recalculer.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LineColor { Plain, Ok, Warn, Err, Info, Dim }
 
 #[derive(Default, Debug, Clone)]
@@ -492,24 +551,37 @@ pub fn new_status_state() -> SharedStatus {
     Arc::new(Mutex::new(StatusState::default()))
 }
 
-pub async fn fetch_status(
+/// The status summary for one object, returned rather than deposited in a shared state.
+///
+/// Same split as `pod_logs`: the TUI writes into state it redraws from, while a caller answering
+/// one HTTP request wants the lines back. The formatting — and therefore the verdict each line
+/// carries — is the same for both.
+pub async fn object_status(
     client: Client,
-    api_version: String,
-    kind: String,
-    namespace: String,
-    name: String,
-    key: String,
-    state: SharedStatus,
-) {
-    let result: Result<Vec<(LineColor, String)>, String> = if kind == "Pod" {
-        let api: Api<Pod> = Api::namespaced(client, &namespace);
-        match api.get(&name).await {
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<(LineColor, String)>, String> {
+    status_lines(client, api_version, kind, namespace, name).await
+}
+
+async fn status_lines(
+    client: Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<(LineColor, String)>, String> {
+    if kind == "Pod" {
+        let api: Api<Pod> = Api::namespaced(client, namespace);
+        match api.get(name).await {
             Ok(p) => Ok(format_pod_status(&p)),
             Err(e) => Err(e.to_string()),
         }
     } else if kind == "Node" {
         let node_api: Api<Node> = Api::all(client.clone());
-        match node_api.get(&name).await {
+        match node_api.get(name).await {
             Ok(n) => {
                 let mut lines = format_node_status(&n);
                 let pod_api: Api<Pod> = Api::all(client.clone());
@@ -530,9 +602,20 @@ pub async fn fetch_status(
             Err(e) => Err(e.to_string()),
         }
     } else {
-        fetch_dynamic(client, &api_version, &kind, &namespace, &name).await
-    };
+        fetch_dynamic(client, api_version, kind, namespace, name).await
+    }
+}
 
+pub async fn fetch_status(
+    client: Client,
+    api_version: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    key: String,
+    state: SharedStatus,
+) {
+    let result = status_lines(client, &api_version, &kind, &namespace, &name).await;
     let mut s = state.lock().expect("status state poisoned");
     if s.current_key.as_deref() != Some(&key) {
         return;
