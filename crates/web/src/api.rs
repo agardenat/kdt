@@ -82,8 +82,10 @@ pub async fn events(
             .into_response();
     }
 
-    // Le plus récent d'abord : c'est l'ordre dans lequel on lit un flux d'évènements.
-    records.sort_by_key(|r| std::cmp::Reverse(r.time));
+    // Chronologique, le plus récent **en bas** : c'est l'ordre du TUI, et c'est celui d'un flux
+    // qu'on regarde défiler. L'inverse paraissait plus naturel sur le web, mais faisait dire
+    // deux choses différentes aux deux interfaces devant la même liste.
+    records.sort_by_key(|r| r.time);
 
     axum::Json(serde_json::json!({
         "scope": scope,

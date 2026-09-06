@@ -102,6 +102,7 @@ export default function App() {
   });
   const [scopeOpen, setScopeOpen] = useState(false);
   const filterRef = useRef<HTMLInputElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const st = strings(lang);
 
   useEffect(() => applyTheme(theme), [theme]);
@@ -188,6 +189,15 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [scopeOpen, selected, panelOpen]);
 
+  // Le flux se lit par le bas : tant qu'aucune ligne n'est retenue, la vue suit la plus récente,
+  // comme le curseur du TUI qui reste sur `last`. Dès qu'une ligne est sélectionnée, la vue
+  // s'ancre — sinon on perdrait de vue ce qu'on est en train d'examiner à chaque rafraîchissement.
+  useEffect(() => {
+    if (selected) return;
+    const body = bodyRef.current;
+    if (body) body.scrollTop = body.scrollHeight;
+  }, [rows, selected]);
+
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return rows.filter((r) => {
@@ -206,7 +216,7 @@ export default function App() {
     return (
       <div className="center">
         <div className="box">
-          <h2>kdt-web</h2>
+          <h2>kdt</h2>
           <p>
             Cette interface utilise <strong>votre</strong> identité sur le cluster : elle ne voit
             que ce que vos droits vous permettent de voir.
@@ -225,7 +235,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="name">kdt-web</span>
+          <span className="name">kdt</span>
         </div>
 
         <div className="scope">
@@ -367,7 +377,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="body">
+          <div className="body" ref={bodyRef}>
             {needsAuth ? (
               <div className="center">
                 <div className="box">
@@ -464,7 +474,7 @@ function EventTable({
             <div className="cell mono">{r.kind}</div>
             <div className="cell id">{r.name}</div>
             <div className={`cell reason-${r.tone}`}>{r.reason}</div>
-            <div className="cell num">{r.count > 1 ? `x${r.count}` : ""}</div>
+            <div className="cell num">x{r.count}</div>
             <div className="cell">{r.message}</div>
           </div>
         ))}

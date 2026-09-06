@@ -14393,7 +14393,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             let widths = [
                 Constraint::Length(5), Constraint::Length(4), Constraint::Length(20),
                 Constraint::Length(14), Constraint::Length(40), Constraint::Length(22),
-                Constraint::Length(4), Constraint::Min(20),
+                // Six, parce que le compte s'écrit `x1232` : à quatre, un évènement qui se répète
+                // — donc précisément celui qu'on veut voir — perdait ses chiffres de droite.
+                Constraint::Length(6), Constraint::Min(20),
             ];
 
             let table = Table::new(rows, widths)

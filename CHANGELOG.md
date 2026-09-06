@@ -53,6 +53,10 @@ vue répond, le reste n'existe pas.
   deux côtés : deux interfaces qui jugent séparément finissent par ne plus dire la même chose du
   même évènement.
 
+- **fix(tui)** — la colonne `CNT` des évènements tronquait : quatre caractères pour un compte qui
+  s'écrit `x1232`, donc précisément l'évènement qui se répète — celui qu'on veut voir — perdait
+  ses chiffres de droite. Six désormais.
+
 - **change(tui)** — la colonne `TIME` des évènements devient `AGE` : `12:34:56` demandait de
   calculer soi-même la fraîcheur d'une ligne, `3m` la donne. Le panneau de détail suit, et la
   colonne se resserre de huit caractères à cinq.
