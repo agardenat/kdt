@@ -117,6 +117,51 @@ async fn list_into(out: &mut Vec<EventRecord>, api: Api<K8sEvent>) -> Result<(),
     Ok(())
 }
 
+/// Ce que ce cluster sait faire, du point de vue de la personne connectée.
+///
+/// Le rail des vues s'en sert pour n'afficher que celles qui ont un sujet : une vue Argo CD sur un
+/// cluster sans Argo CD ne servirait qu'à faire perdre du temps. La détection est un fait sur le
+/// cluster, calculé par `kdt` ; la route ne fait que le rendre.
+pub async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let client = match session_client(&state, &headers).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    match kdt::capabilities::detect(&client).await {
+        Ok(caps) => axum::Json(caps).into_response(),
+        // Un apiserver muet n'est pas un cluster sans add-on. Le dire plutôt que de rendre des
+        // `false` : le navigateur préfère alors n'écarter aucune vue, et chaque vue rapportera
+        // elle-même ce qu'elle n'a pas pu lire — au lieu qu'une panne réseau se manifeste par un
+        // menu amputé que personne ne saurait interpréter.
+        Err(e) => {
+            warn!(erreur = %e, "sonde des add-ons en échec");
+            (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Le client de la personne connectée, ou la réponse à lui rendre s'il n'y en a pas.
+///
+/// Les deux refus ne disent pas la même chose et ne se confondent pas : aucune session du tout,
+/// ou une session dont le droit n'est plus valide côté portail. Les manipuler ensemble ici évite
+/// que chaque route en oublie un.
+pub(crate) async fn session_client(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<kube::Client, Response> {
+    let Some(session) = auth::current(state, headers).await else {
+        return Err(unauthenticated());
+    };
+    session
+        .client(&state.portal, &state.kube)
+        .await
+        .map_err(|e| expired(&session.subject, e))
+}
+
 fn unauthenticated() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -128,30 +173,61 @@ fn unauthenticated() -> Response {
         .into_response()
 }
 
-/// Les logs d'un pod, quand l'objet de l'évènement en est un.
+/// Les logs de l'objet visé, quels qu'ils soient pour lui.
 ///
-/// Réservé au kind `Pod` : remonter d'un Deployment à ses pods demande de choisir lesquels, et ce
-/// choix a des règles — le TUI les a — qu'on ne réinvente pas ici en attendant de les réutiliser.
+/// « Les logs de cette ligne » ne veut pas dire la même chose selon la ligne, et c'est le serveur
+/// qui tranche — comme `maybe_fetch_logs` tranche dans le TUI. Un Pod rend les siens ; une
+/// ressource Flux n'en a aucun, ce sont ceux de son controller filtrés sur elle. Laisser le
+/// navigateur choisir la route reviendrait à recopier cette règle ailleurs.
+///
+/// Les autres kinds ne rendent rien : remonter d'un Deployment à ses pods demande de choisir
+/// lesquels, et ce choix a des règles — le TUI les a — qu'on ne réinvente pas ici en attendant de
+/// les réutiliser.
 pub async fn logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<LogsQuery>,
 ) -> Response {
-    let Some(session) = auth::current(&state, &headers).await else {
-        return unauthenticated();
+    let client = match session_client(&state, &headers).await {
+        Ok(client) => client,
+        Err(response) => return response,
     };
-    if query.namespace.is_empty() || query.pod.is_empty() {
+    if query.namespace.is_empty() || query.name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "error": "namespace et pod sont requis" })),
+            axum::Json(serde_json::json!({ "error": "namespace et name sont requis" })),
         )
             .into_response();
     }
 
-    let client = match session.client(&state.portal, &state.kube).await {
-        Ok(client) => client,
-        Err(e) => return expired(&session.subject, e),
-    };
+    if query.component == "flux" {
+        // Le controller qui réconcilie ce kind, et ses lignes filtrées sur cet objet — la même
+        // paire que le TUI compose, plafond compris : les controllers parlent de tout le cluster,
+        // et 200 lignes ne suffisent pas à en isoler une ressource.
+        let controllers = vec![kdt::flux::controller_for_kind(&query.kind).to_string()];
+        let filter = (query.namespace.clone(), query.name.clone());
+        return match kdt::events::flux_logs(client, &controllers, Some(&filter), 500).await {
+            Ok(lines) => axum::Json(serde_json::json!({
+                "lines": lines,
+                // Un controller n'a pas de containers à choisir : le sélecteur n'a rien à offrir.
+                "containers": Vec::<String>::new(),
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "lines": [], "containers": [], "error": e })),
+            )
+                .into_response(),
+        };
+    }
+
+    if query.kind != "Pod" {
+        return axum::Json(serde_json::json!({
+            "lines": Vec::<String>::new(),
+            "containers": Vec::<String>::new(),
+        }))
+        .into_response();
+    }
 
     let opts = kdt::events::LogOpts {
         previous: query.previous,
@@ -159,7 +235,7 @@ pub async fn logs(
     };
     // Le même plafond que le TUI applique par défaut : assez pour comprendre, assez peu pour ne
     // pas rapatrier un fichier de log entier à chaque ouverture d'onglet.
-    let logs = kdt::events::pod_logs(client, &query.namespace, &query.pod, 200, &opts).await;
+    let logs = kdt::events::pod_logs(client, &query.namespace, &query.name, 200, &opts).await;
 
     axum::Json(serde_json::json!({
         "lines": logs.lines,
@@ -173,7 +249,13 @@ pub struct LogsQuery {
     #[serde(default)]
     namespace: String,
     #[serde(default)]
-    pod: String,
+    name: String,
+    #[serde(default)]
+    kind: String,
+    /// `flux` pour une ressource Flux, vide pour un objet ordinaire. C'est le champ que
+    /// `EventRecord` porte déjà, et il dit d'où viennent les lignes à lire.
+    #[serde(default)]
+    component: String,
     #[serde(default)]
     container: Option<String>,
     #[serde(default)]
@@ -191,13 +273,9 @@ pub async fn related(
     headers: HeaderMap,
     axum::Json(record): axum::Json<EventRecord>,
 ) -> Response {
-    let Some(session) = auth::current(&state, &headers).await else {
-        return unauthenticated();
-    };
-
-    let client = match session.client(&state.portal, &state.kube).await {
+    let client = match session_client(&state, &headers).await {
         Ok(client) => client,
-        Err(e) => return expired(&session.subject, e),
+        Err(response) => return response,
     };
 
     let sections = kdt::enrich::gather_extra_context(&client, &record).await;
@@ -232,13 +310,9 @@ pub async fn status(
     headers: HeaderMap,
     Query(query): Query<StatusQuery>,
 ) -> Response {
-    let Some(session) = auth::current(&state, &headers).await else {
-        return unauthenticated();
-    };
-
-    let client = match session.client(&state.portal, &state.kube).await {
+    let client = match session_client(&state, &headers).await {
         Ok(client) => client,
-        Err(e) => return expired(&session.subject, e),
+        Err(response) => return response,
     };
 
     match kdt::events::object_status(

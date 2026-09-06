@@ -2,12 +2,13 @@
   "name": "kdt-web",
   "private": true,
   "type": "module",
-  "description": "Interface web de kdt — coquille : layout, routage et données factices",
+  "description": "Interface web de kdt — le front : layout, vues, et l'API du serveur",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.2.8",
@@ -19,6 +20,7 @@
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
     "typescript": "^7.0.2",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vitest": "^3.2.7"
   }
 }

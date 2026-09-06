@@ -11,8 +11,11 @@
 mod api;
 mod auth;
 mod config;
+mod config_secrets;
+mod flux;
 mod portal;
 mod session;
+mod workloads;
 
 use std::sync::Arc;
 
@@ -121,10 +124,28 @@ async fn main() -> Result<()> {
         )
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/me", get(auth::me))
+        .route("/api/v1/capabilities", get(api::capabilities))
         .route("/api/v1/events", get(api::events))
         .route("/api/v1/logs", get(api::logs))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/related", post(api::related))
+        .route("/api/v1/flux", get(flux::tree))
+        .route("/api/v1/flux/inventory", get(flux::inventory))
+        .route("/api/v1/flux/logs", get(flux::logs))
+        // Les deux seules routes qui écrivent sur le cluster. Elles écrivent sous l'identité de la
+        // personne connectée, comme les lectures : le compte de service du pod n'a toujours aucun
+        // droit, et c'est le RBAC du cluster qui dit qui peut réconcilier quoi.
+        .route("/api/v1/flux/reconcile", post(flux::reconcile))
+        .route("/api/v1/flux/suspend", post(flux::suspend))
+        .route("/api/v1/workloads", get(workloads::list))
+        .route("/api/v1/workloads/scale", post(workloads::scale))
+        .route("/api/v1/workloads/restart", post(workloads::restart))
+        .route("/api/v1/workloads/recycle", post(workloads::recycle))
+        .route("/api/v1/secrets", get(config_secrets::secrets))
+        // Séparée de la liste, et c'est tout l'intérêt : les valeurs ne partent que sur une
+        // demande nommée, secret par secret, et cette requête-là laisse une trace.
+        .route("/api/v1/secrets/reveal", get(config_secrets::reveal))
+        .route("/api/v1/configmaps", get(config_secrets::configmaps))
         .route("/healthz", get(|| async { "ok" }));
 
     // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de

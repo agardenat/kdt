@@ -45,6 +45,77 @@ export interface Strings {
   ownerLabel: string;
   eventsLabel: string;
   secretsLabel: string;
+
+  // --- Vue Flux. Le jargon reste en anglais des deux côtés : `Kustomization`, `HelmRelease`,
+  // `suspend`, `reconcile` ne se disent pas autrement, et les étiquettes READY viennent déjà du
+  // serveur. Ce qui suit est ce que le navigateur rédige lui-même.
+  fluxTree: string;
+  fluxList: string;
+  fluxReveal: string;
+  fluxRevealHelp: string;
+  fluxActions: string;
+  fluxReconcile: string;
+  fluxReconcileSrc: string;
+  fluxForceUpgrade: string;
+  fluxResetFailures: string;
+  fluxSyncRoot: string;
+  fluxSuspend: string;
+  fluxResume: string;
+  fluxDescReconcile: string;
+  fluxDescReconcileSrc: string;
+  fluxDescForceUpgrade: string;
+  fluxDescResetFailures: string;
+  fluxDescSyncRoot: string;
+  fluxDescSuspend: string;
+  fluxDescResume: string;
+  fluxConfirm: string;
+  fluxCancel: string;
+  fluxScopeless: string;
+  fluxEmpty: string;
+  fluxInventory: string;
+  fluxInventoryHelp: string;
+  fluxNoPrune: string;
+  fluxNoPruneTitle: string;
+  fluxControllerLogs: string;
+  fluxSelectRow: string;
+  fluxFold: string;
+
+  // --- Vue Workloads.
+  wlGrouped: string;
+  wlPods: string;
+  wlRunning: string;
+  wlBroken: string;
+  wlWorking: string;
+  wlEmpty: string;
+  wlContainers: string;
+  wlActions: string;
+  wlScale: string;
+  wlRestart: string;
+  wlRecycle: string;
+  wlDescScale: string;
+  wlDescRestart: string;
+  wlDescRecycle: string;
+  wlReplicas: string;
+  wlMissing: string;
+  wlMissingHelp: string;
+
+  // --- Vues Secrets / ConfigMaps.
+  dataEmpty: string;
+  secKeys: string;
+  secShowText: string;
+  secVisible: string;
+  secBinary: string;
+  secBinaryKey: string;
+  secTls: string;
+  secExpired: string;
+  secExpiring: string;
+  secDays: string;
+  secExpiredSince: string;
+  secUndecodable: string;
+  secIssuer: string;
+  secSelfSigned: string;
+  secValidity: string;
+  secUsedBy: string;
 }
 
 const FR: Strings = {
@@ -72,17 +143,87 @@ const FR: Strings = {
   emptyTitle: "Aucune ligne ne passe le filtre",
   emptyScope: "La portée est",
   emptyFilter: "le filtre est",
-  notMockedTitle: "pas dans cette coquille",
+  notMockedTitle: "pas encore branchée",
   notMockedBody:
-    "Quatre vues sont peuplées : Velero, Flux, Capacity et Identity. Le rail montre les treize pour qu'on juge s'il tient à cette longueur.",
+    "Cette vue existe dans kdt et reste à porter ici. Le rail les montre toutes pour qu'on juge s'il tient à cette longueur.",
   rows: "lignes",
   nodes: "nœuds",
-  refreshed: "rafraîchi il y a 4s",
+  refreshed: "rafraîchi il y a {age}",
   hintFilter: "filtrer",
   hintClose: "fermer",
   ownerLabel: "Owner",
   eventsLabel: "Events",
   secretsLabel: "Secrets",
+
+  fluxTree: "Arbre",
+  fluxList: "Liste",
+  fluxReveal: "suivre les problèmes",
+  fluxRevealHelp:
+    "Ouvre d'office les branches qui mènent à une ressource en échec ou en cours de réconciliation, et les referme une fois l'incident réglé. Vos plis manuels ne sont pas touchés.",
+  fluxActions: "Réconciliation Flux",
+  fluxReconcile: "reconcile",
+  fluxReconcileSrc: "+source",
+  fluxForceUpgrade: "forcer l'upgrade",
+  fluxResetFailures: "réarmer",
+  fluxSyncRoot: "sync racine",
+  fluxSuspend: "suspend",
+  fluxResume: "resume",
+  fluxDescReconcile: "Réconcilie la ressource sélectionnée (annotation reconcile.fluxcd.io).",
+  fluxDescReconcileSrc: "Réconcilie d'abord la source (Git/Helm/OCI) puis la ressource.",
+  fluxDescForceUpgrade: "Rejoue l'upgrade Helm même si le chart et les valeurs n'ont pas bougé.",
+  fluxDescResetFailures: "Efface les compteurs d'échec d'une release en « retries exhausted ».",
+  fluxDescSyncRoot: "Réconcilie la GitRepository racine flux-system (resync complet).",
+  fluxDescSuspend: "Met la réconciliation en pause. Ne supprime rien.",
+  fluxDescResume: "Relance la réconciliation mise en pause.",
+  fluxConfirm: "Confirmer",
+  fluxCancel: "Annuler",
+  fluxScopeless: "L'arbre Flux couvre tout le cluster : le filtrer par namespace lui ferait perdre ses arêtes.",
+  fluxEmpty: "Aucune ressource Flux lisible sur ce cluster.",
+  fluxInventory: "objets",
+  fluxInventoryHelp:
+    "Les objets que cette Kustomization a appliqués, avec l'état de chacun (les touches +/- de kdt).",
+  fluxNoPrune: "no-prune",
+  fluxNoPruneTitle: "spec.prune: false — ce que cette Kustomization a appliqué survit à sa disparition de git.",
+  fluxControllerLogs: "Logs des controllers",
+  fluxSelectRow: "Choisissez une ligne pour agir dessus.",
+  fluxFold: "Plier / déplier",
+
+  wlGrouped: "Workloads",
+  wlPods: "Pods",
+  wlRunning: "pods en Running",
+  wlBroken: "pods en panne",
+  wlWorking: "en cours…",
+  wlEmpty: "Aucun workload ni pod dans cette portée.",
+  wlContainers: "Containers du pod",
+  wlActions: "Actions sur le workload",
+  wlScale: "scale",
+  wlRestart: "restart",
+  wlRecycle: "recycle",
+  wlDescScale: "Porte le nombre de répliques à la valeur choisie.",
+  wlDescRestart: "kubectl rollout restart : redémarrage progressif, sans coupure.",
+  wlDescRecycle:
+    "Descend à 0 puis remonte : recrée tous les pods d'un coup, avec une coupure brève. Prend quelques secondes, et si la remontée échoue le workload reste à 0.",
+  wlReplicas: "répliques",
+  wlMissing: "kinds illisibles",
+  wlMissingHelp:
+    "Ces kinds n'ont pas pu être listés : la vue en est incomplète, ce n'est pas qu'il n'y en a aucun.",
+
+  dataEmpty: "Rien à montrer dans cette portée.",
+  secKeys: "clés",
+  secShowText: "afficher",
+  secVisible: "⚠ valeurs à l'écran",
+  secBinary: "binaire, {n} octets",
+  secBinaryKey: "binaire (binaryData)",
+  secTls: "secrets TLS",
+  secExpired: "certificats expirés",
+  secExpiring: "certificats qui expirent sous 30 jours",
+  secDays: "{n} j",
+  secExpiredSince: "expiré depuis {n} j",
+  secUndecodable: "certificat illisible",
+  secIssuer: "Émetteur",
+  secSelfSigned: "auto-signé",
+  secValidity: "Validité",
+  secUsedBy: "Utilisé par",
 };
 
 const EN: Strings = {
@@ -110,17 +251,87 @@ const EN: Strings = {
   emptyTitle: "No row passes the filter",
   emptyScope: "Scope is",
   emptyFilter: "filter is",
-  notMockedTitle: "not in this shell",
+  notMockedTitle: "not wired up yet",
   notMockedBody:
-    "Four views are populated: Velero, Flux, Capacity and Identity. The rail lists all thirteen so we can judge whether it holds at that length.",
+    "This view exists in kdt and is still to be ported here. The rail lists them all so we can judge whether it holds at that length.",
   rows: "rows",
   nodes: "nodes",
-  refreshed: "refreshed 4s ago",
+  refreshed: "refreshed {age} ago",
   hintFilter: "filter",
   hintClose: "close",
   ownerLabel: "Owner",
   eventsLabel: "Events",
   secretsLabel: "Secrets",
+
+  fluxTree: "Tree",
+  fluxList: "List",
+  fluxReveal: "follow problems",
+  fluxRevealHelp:
+    "Unfolds the branches leading to a failing or reconciling resource, and folds them back once it settles. Your manual folds are left alone.",
+  fluxActions: "Flux reconcile",
+  fluxReconcile: "reconcile",
+  fluxReconcileSrc: "+source",
+  fluxForceUpgrade: "force upgrade",
+  fluxResetFailures: "reset failures",
+  fluxSyncRoot: "root sync",
+  fluxSuspend: "suspend",
+  fluxResume: "resume",
+  fluxDescReconcile: "Reconcile the selected resource (reconcile.fluxcd.io annotation).",
+  fluxDescReconcileSrc: "Reconcile the source first (Git/Helm/OCI) then the resource.",
+  fluxDescForceUpgrade: "Replay the Helm upgrade even when the chart and values are unchanged.",
+  fluxDescResetFailures: "Clear the failure counters of a release stuck in \"retries exhausted\".",
+  fluxDescSyncRoot: "Reconcile the root flux-system GitRepository (full resync).",
+  fluxDescSuspend: "Pause reconciliation. Deletes nothing.",
+  fluxDescResume: "Resume a paused reconciliation.",
+  fluxConfirm: "Confirm",
+  fluxCancel: "Cancel",
+  fluxScopeless: "The Flux tree spans the whole cluster: filtering it by namespace would lose its edges.",
+  fluxEmpty: "No readable Flux resource on this cluster.",
+  fluxInventory: "objects",
+  fluxInventoryHelp:
+    "The objects this Kustomization applied, each with its own state (the +/- keys in kdt).",
+  fluxNoPrune: "no-prune",
+  fluxNoPruneTitle: "spec.prune: false — what this Kustomization applied outlives its removal from git.",
+  fluxControllerLogs: "Controller logs",
+  fluxSelectRow: "Pick a row to act on it.",
+  fluxFold: "Fold / unfold",
+
+  wlGrouped: "Workloads",
+  wlPods: "Pods",
+  wlRunning: "running pods",
+  wlBroken: "broken pods",
+  wlWorking: "working…",
+  wlEmpty: "No workload or pod in this scope.",
+  wlContainers: "Pod containers",
+  wlActions: "Workload actions",
+  wlScale: "scale",
+  wlRestart: "restart",
+  wlRecycle: "recycle",
+  wlDescScale: "Set the replica count to the chosen value.",
+  wlDescRestart: "kubectl rollout restart: gradual restart, no downtime.",
+  wlDescRecycle:
+    "Scale to 0 then back up: recreate all pods at once, with brief downtime. Takes a few seconds, and if the way back up fails the workload stays at 0.",
+  wlReplicas: "replicas",
+  wlMissing: "unreadable kinds",
+  wlMissingHelp:
+    "These kinds could not be listed: the view is incomplete, it does not mean there are none.",
+
+  dataEmpty: "Nothing to show in this scope.",
+  secKeys: "keys",
+  secShowText: "reveal",
+  secVisible: "⚠ values on screen",
+  secBinary: "binary, {n} bytes",
+  secBinaryKey: "binary (binaryData)",
+  secTls: "TLS secrets",
+  secExpired: "expired certificates",
+  secExpiring: "certificates expiring within 30 days",
+  secDays: "{n}d",
+  secExpiredSince: "expired {n}d ago",
+  secUndecodable: "undecodable certificate",
+  secIssuer: "Issuer",
+  secSelfSigned: "self-signed",
+  secValidity: "Validity",
+  secUsedBy: "Used by",
 };
 
 export function strings(lang: Lang): Strings {

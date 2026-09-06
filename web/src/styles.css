@@ -459,3 +459,204 @@ button, input { font: inherit; color: inherit; }
    sélectionne au passage — sans quoi on surligne la moitié de la page en tirant. */
 .splitter.dragging { touch-action: none; }
 body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
+
+/* ---------------------------------------------------------------- vue Flux
+
+   Les tons arrivent calculés du serveur : `row_tone` pour la ligne, `ready_tone` pour
+   l'étiquette. Ce ne sont pas les mêmes — une ressource suspendue est éteinte sur sa ligne et
+   jaune sur son étiquette, parce qu'un réglage délibéré n'est pas une alerte mais doit quand
+   même expliquer pourquoi rien ne bouge. Le CSS ne fait que les peindre. */
+
+.tbody .tr.flux-warn { color: var(--warn); }
+.tbody .tr.flux-info { color: var(--info); }
+.tbody .tr.flux-dim { color: var(--dim); }
+/* Un échec porte un fond et pas seulement une couleur : c'est le seul état qu'on doit trouver en
+   balayant la page, pas en la lisant. Même choix que la ligne rouge du TUI. */
+.tbody .tr.flux-err {
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.tbody .tr.flux-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+/* Une ligne saine n'est pas peinte : colorier la normale laisse l'anormale se fondre dedans. */
+.tbody .tr.flux-plain { color: inherit; }
+
+.tbody .tr.flux-inv { color: var(--muted); }
+.tbody .tr.flux-inv .cell.id.ok { color: var(--ok); }
+.tbody .tr.flux-inv .cell.id.err { color: var(--err); }
+.tbody .tr.flux-inv .cell.id.info { color: var(--info); }
+.tbody .tr.flux-inv .cell.id.dim { color: var(--dim); }
+
+.cell .kind { color: var(--accent); font-weight: 500; }
+.cell.dim { color: var(--dim); }
+
+/* La poignée de pliage garde la même largeur qu'elle porte un marqueur ou non : sans ça, les
+   feuilles et les branches ne s'alignent pas et l'indentation cesse de vouloir dire la
+   profondeur. */
+.fold, .fold-gap {
+  display: inline-block; width: 1.1rem; flex: none; text-align: center;
+  font-family: var(--mono); font-size: 11px;
+}
+.fold {
+  background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0;
+  border-radius: 3px;
+}
+.fold:hover { color: var(--accent); background: var(--sunk); }
+
+/* Ce qu'un pli cache, et l'écart à la norme : deux badges, jamais la normale. Un pli plein de
+   ressources saines n'a rien à annoncer, et une Kustomization qui élague fait ce qu'on attend. */
+.badge {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  margin-left: .4rem; white-space: nowrap;
+}
+.badge.err { color: var(--err); }
+.badge.info { color: var(--info); }
+.badge.prune { color: var(--info); margin-left: 0; margin-right: .45rem; }
+
+/* Une option de la barre : case à cocher + libellé, l'état visible sans avoir à le déduire. */
+.opt {
+  display: flex; align-items: center; gap: .3rem; cursor: pointer;
+  color: var(--muted); font-size: 11.5px; white-space: nowrap;
+}
+.opt:hover { color: var(--fg); }
+.opt input { cursor: pointer; margin: 0; }
+
+/* L'équivalent des touches +/- du TUI. Le TUI n'a que des touches et doit donc les répartir ;
+   ici chaque cible est visible, alors elle porte son mot. Le compte remplace le libellé une fois
+   l'inventaire ouvert — il dit quelque chose que le mot ne dit plus. */
+.inv-pill {
+  margin-left: .45rem; padding: 0 .35rem; flex: none;
+  background: none; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--muted); cursor: pointer;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
+}
+.inv-pill:hover { color: var(--accent); border-color: var(--accent); }
+.inv-pill[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+
+/* Le décompte du bandeau, dans la forme du titre du TUI : ✓a ✗b ↻c ?d ■e. */
+.tally {
+  display: flex; align-items: center; gap: .55rem; margin-left: .7rem;
+  font-family: var(--mono); font-size: 11.5px;
+}
+.tally .ok { color: var(--ok); }
+.tally .err { color: var(--err); font-weight: 600; }
+.tally .info { color: var(--info); }
+.tally .warn { color: var(--warn); }
+.tally .dim { color: var(--dim); }
+
+.statusbar .ok { color: var(--ok); }
+
+/* ---------------------------------------------------------------- menu d'action
+
+   Rien n'y est destructif — réconcilier redemande le travail, suspendre met en pause sans rien
+   supprimer — mais tout y écrit sur le cluster. D'où la même confirmation que dans kdt, et une
+   annulation qui est la sortie par défaut. */
+.menu-anchor { position: relative; }
+.pop.menu { top: 30px; left: auto; right: 0; width: 340px; }
+.menu-target {
+  padding: .1rem .4rem .45rem; font-size: 11.5px; color: var(--muted);
+  border-bottom: 1px solid var(--line-soft); margin-bottom: .35rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.menu-list { display: flex; flex-direction: column; gap: 1px; }
+.menu-item {
+  display: flex; flex-direction: column; gap: .12rem; width: 100%; padding: .4rem .45rem;
+  background: none; border: 0; border-radius: 5px; cursor: pointer; text-align: left;
+}
+.menu-item:hover { background: var(--row-hover); }
+.menu-item .lbl { font-family: var(--mono); font-size: 12px; color: var(--fg); }
+.menu-item .desc { font-size: 11px; color: var(--muted); line-height: 1.4; }
+
+.menu-confirm { padding: .2rem .45rem .3rem; }
+.menu-confirm p { margin: 0 0 .6rem; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+.menu-buttons { display: flex; gap: .4rem; justify-content: flex-end; }
+.menu-buttons button {
+  padding: .3rem .7rem; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); cursor: pointer; font-size: 11.5px;
+}
+.menu-buttons button:hover { border-color: var(--accent); }
+.menu-buttons .cta {
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- vue Workloads
+
+   Trois niveaux dans la même table. Le ton de chaque ligne vient du serveur : `row_tone` pour le
+   pod, `tone` pour le container, `status_tone` pour l'étiquette. Le CSS ne fait que peindre. */
+
+.tbody .tr.wl-workload { font-weight: 600; }
+.tbody .tr.wl-workload .cell.id { color: var(--fg); }
+.tbody .tr.wl-dim { color: var(--dim); }
+/* Un pod en panne porte un fond : c'est le seul état qu'on doit trouver en balayant la page. */
+.tbody .tr.wl-err {
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.tbody .tr.wl-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.wl-warn { color: var(--warn); }
+.tbody .tr.wl-plain { color: inherit; }
+.tbody .tr.wl-container { color: var(--muted); font-size: 12px; }
+
+/* Le glyphe de disponibilité d'un container, à largeur fixe pour que les noms restent alignés. */
+.gl { display: inline-block; width: 1.1rem; flex: none; font-family: var(--mono); }
+.gl.ok { color: var(--ok); }
+.gl.err { color: var(--err); }
+.gl.warn { color: var(--warn); }
+.gl.dim { color: var(--dim); }
+
+/* Les colonnes de compteurs portent le ton que kdt leur donne : un redémarrage n'est pas une
+   panne, mais c'est le seul chiffre de la ligne qui raconte quelque chose. */
+.cell.num.warn { color: var(--warn); }
+.cell.num.err { color: var(--err); }
+.cell.num.dim { color: var(--dim); }
+.cell.num.ok { color: var(--ok); }
+
+.statusbar .warn { color: var(--warn); }
+
+/* Le champ de saisie d'un menu : on ne demande jamais un nombre sans montrer le champ et la
+   valeur de départ. */
+.menu-confirm .opt { margin-bottom: .6rem; gap: .5rem; }
+.menu-confirm .opt input[type="number"] {
+  width: 5rem; height: 26px; padding: 0 .4rem;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- Secrets / ConfigMaps
+
+   Le ton d'une ligne de secret vient de l'échéance de son certificat, quand il en a un. Un secret
+   ordinaire n'a rien à juger et reste neutre : lui donner une couleur ferait porter un verdict à
+   une ligne qui n'en mérite pas. */
+.tbody .tr.sec-plain { color: inherit; }
+.tbody .tr.sec-ok { color: inherit; }
+.tbody .tr.sec-warn { border-left-color: var(--warn); }
+.tbody .tr.sec-err {
+  border-left-color: var(--err);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.tbody .tr.sec-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+
+/* Le panneau des clés, déplié sous la ligne. */
+.keys {
+  padding: .5rem .85rem .7rem 2.4rem;
+  border-bottom: 1px solid var(--line-soft); background: var(--sunk);
+}
+.keys-bar {
+  display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem;
+  font-size: 11.5px;
+}
+.keys-bar .warn { color: var(--warn); font-weight: 600; }
+.keys-bar .inv-pill[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+
+.keys-list { display: grid; grid-template-columns: auto 1fr; gap: .25rem .9rem; }
+.keys-row { display: contents; }
+.keys-row .k { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.keys-row .v {
+  font-size: 11.5px; word-break: break-all; white-space: pre-wrap;
+  max-height: 9rem; overflow: auto;
+}
+/* Masqué est l'état par défaut, et il doit se lire comme un choix, pas comme une donnée vide. */
+.keys-row .v.masked { color: var(--dim); letter-spacing: .12em; user-select: none; }
+
+.facts.tls { margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--line); }
+.facts.tls dd { font-size: 11.5px; word-break: break-word; }

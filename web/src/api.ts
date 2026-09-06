@@ -5,12 +5,22 @@
 // panne du cluster.
 
 import type {
+  Capabilities,
   EventRecord,
   EventsPayload,
+  FluxPayload,
+  FluxRow,
   Identity,
+  InventoryPayload,
   PodLogs,
+  ReconcileScope,
   RelatedSection,
+  ConfigMapRow,
+  SecretsPayload,
+  SecretValue,
   StatusPayload,
+  WorkloadRow,
+  WorkloadsPayload,
 } from "./types";
 
 /** Le serveur demande de repasser par le portail : la session n'est plus valide. */
@@ -70,9 +80,76 @@ export function identity(): Promise<Identity> {
   return get<Identity>("/api/v1/me");
 }
 
+/** Les add-ons installés sur ce cluster, qui décident des vues à proposer. */
+export function capabilities(): Promise<Capabilities> {
+  return get<Capabilities>("/api/v1/capabilities");
+}
+
 export function events(namespaces: string[]): Promise<EventsPayload> {
   const query = namespaces.length ? `?ns=${encodeURIComponent(namespaces.join(","))}` : "";
   return get<EventsPayload>(`/api/v1/events${query}`);
+}
+
+/** Les workloads et les pods de la portée. Un seul namespace, ou vide pour tout le cluster. */
+export function workloads(namespace: string): Promise<WorkloadsPayload> {
+  const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
+  return get<WorkloadsPayload>(`/api/v1/workloads${query}`);
+}
+
+/** La cible d'une action sur un workload, telle que le serveur l'attend. */
+function target(w: WorkloadRow, replicas?: number) {
+  return {
+    apiVersion: w.api_version,
+    kind: w.kind,
+    namespace: w.namespace,
+    name: w.name,
+    ...(replicas === undefined ? {} : { replicas }),
+  };
+}
+
+/** Porte le nombre de répliques à une valeur absolue. */
+export function scale(w: WorkloadRow, replicas: number): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/workloads/scale", target(w, replicas));
+}
+
+/** Redémarrage progressif, sans coupure (`kubectl rollout restart`). */
+export function restart(w: WorkloadRow): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/workloads/restart", target(w));
+}
+
+/**
+ * Descend à zéro puis remonte. **La requête met plusieurs secondes** : le serveur attend d'avoir
+ * tenté la remontée avant de répondre, parce qu'une descente réussie suivie d'une remontée en
+ * échec laisse le workload à zéro et que ça ne se découvre pas au rafraîchissement suivant.
+ */
+export function recycle(w: WorkloadRow, replicas: number): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/workloads/recycle", target(w, replicas));
+}
+
+/** Les Secrets de la portée, sans leurs valeurs. */
+export function secrets(namespace: string): Promise<SecretsPayload> {
+  const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
+  return get<SecretsPayload>(`/api/v1/secrets${query}`);
+}
+
+/**
+ * Les valeurs d'un Secret, sur demande explicite.
+ *
+ * Un appel par secret : c'est ce qui garde les valeurs hors de la liste, et cette requête-là
+ * laisse une trace nommée côté serveur. Ne jamais l'appeler en boucle sur une liste.
+ */
+export function revealSecret(
+  namespace: string,
+  name: string,
+): Promise<{ values: SecretValue[] }> {
+  const params = new URLSearchParams({ namespace, name });
+  return get<{ values: SecretValue[] }>(`/api/v1/secrets/reveal?${params.toString()}`);
+}
+
+/** Les ConfigMaps de la portée, valeurs comprises — c'est du texte en clair. */
+export function configmaps(namespace: string): Promise<{ configmaps: ConfigMapRow[] }> {
+  const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
+  return get<{ configmaps: ConfigMapRow[] }>(`/api/v1/configmaps${query}`);
 }
 
 /** Envoie le navigateur ouvrir une session. Le portail fait le reste. */
@@ -90,15 +167,81 @@ export function related(record: EventRecord): Promise<{ sections: RelatedSection
   return send<{ sections: RelatedSection[] }>("/api/v1/related", record);
 }
 
+/**
+ * Les logs de cet objet, quels qu'ils soient pour lui.
+ *
+ * L'enregistrement entier part dans la requête — kind et component compris — parce que c'est le
+ * serveur qui sait ce que « les logs de cette ligne » veut dire : les siens pour un Pod, ceux de
+ * son controller filtrés sur elle pour une ressource Flux. Poster un chemin déjà choisi ici
+ * reviendrait à recopier cette règle dans le navigateur.
+ */
 export function logs(
-  namespace: string,
-  pod: string,
+  record: EventRecord,
   options: { container?: string; previous?: boolean } = {},
 ): Promise<PodLogs> {
-  const params = new URLSearchParams({ namespace, pod });
+  const params = new URLSearchParams({
+    namespace: record.namespace,
+    name: record.name,
+    kind: record.kind,
+    component: record.component,
+  });
   if (options.container) params.set("container", options.container);
   if (options.previous) params.set("previous", "true");
   return get<PodLogs>(`/api/v1/logs?${params.toString()}`);
+}
+
+/** L'arbre Flux du cluster entier. Il n'a pas de portée : voir `crates/web/src/flux.rs`. */
+export function fluxTree(): Promise<FluxPayload> {
+  return get<FluxPayload>("/api/v1/flux");
+}
+
+/** Ce qu'une Kustomization a appliqué, avec l'état vivant de chaque objet. */
+export function fluxInventory(row: FluxRow): Promise<InventoryPayload> {
+  const params = new URLSearchParams({
+    apiVersion: row.api_version,
+    kind: row.kind,
+    namespace: row.namespace,
+    name: row.name,
+  });
+  return get<InventoryPayload>(`/api/v1/flux/inventory?${params.toString()}`);
+}
+
+/** Les logs agrégés de tous les controllers Flux. */
+export function fluxLogs(): Promise<{ lines: string[]; error?: string }> {
+  return get<{ lines: string[]; error?: string }>("/api/v1/flux/logs");
+}
+
+/**
+ * Demande une réconciliation. Rend la phrase que kdt rédige, telle quelle.
+ *
+ * Un refus arrive en `ApiError` : la demande est bien passée, c'est l'état de l'objet qui la
+ * repousse — suspendu, source suspendue, kind qui n'honore pas ce levier. Rien à réessayer tel
+ * quel, donc la phrase est ce qui compte.
+ */
+export function fluxReconcile(row: FluxRow, scope: ReconcileScope): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/flux/reconcile", {
+    apiVersion: row.api_version,
+    kind: row.kind,
+    namespace: row.namespace,
+    name: row.name,
+    scope,
+  });
+}
+
+/**
+ * Bascule `spec.suspend`, et rend la valeur écrite.
+ *
+ * La direction n'est pas envoyée : elle se décide sur l'objet vivant, côté serveur. Le tableau
+ * affiché a jusqu'à un rafraîchissement de retard, et agir sur cette lecture-là inverse
+ * l'intention — le geste qui devait reprendre suspendrait à nouveau.
+ */
+export function fluxSuspend(row: FluxRow): Promise<{ suspended: boolean }> {
+  return send<{ suspended: boolean }>("/api/v1/flux/suspend", {
+    apiVersion: row.api_version,
+    kind: row.kind,
+    namespace: row.namespace,
+    name: row.name,
+  });
 }
 
 export function status(record: EventRecord): Promise<StatusPayload> {

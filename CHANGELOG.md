@@ -14,8 +14,8 @@ Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-we
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne et une première
-vue répond, le reste n'existe pas.
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, deux vues
+répondent, le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
   C'est ce qui permet à `kdt-web` de réutiliser les modules métier au lieu d'en copier les règles :
@@ -44,6 +44,73 @@ vue répond, le reste n'existe pas.
   table — `Logs`, `Status`, `Related`, les trois onglets de `DetailTab`. Repliable comme le `²`
   de kdt, et redimensionnable à la poignée, au double-clic ou au clavier : le web a une souris,
   le terminal n'en a pas.
+
+- **feat(web)** — la vue Flux : l'arbre de dépendances GitOps, tel que le TUI le résout. Les
+  arêtes — `dependsOn`, `status.helmChart`, `spec.sourceRef` — sont calculées par `kdt` et le
+  navigateur n'en reçoit que le résultat : il n'a pas de quoi s'en rebâtir un qui différerait.
+  Repliable, avec le décompte de ce qu'un pli cache (`✗3 ↻1`), et les branches qui mènent à un
+  problème s'ouvrent d'elles-mêmes puis se referment une fois l'incident réglé.
+
+  Le badge `no-prune` marque la Kustomization qui laisse survivre ce qui a disparu de git — c'est
+  l'écart à la norme qui se signale, jamais la norme. `⊞` déplie ce qu'une Kustomization a
+  appliqué, avec l'état vivant de chaque objet.
+
+  Les leviers de kdt sont là : `reconcile`, `+source`, `sync racine`, et sur une HelmRelease
+  `forcer l'upgrade` et `réarmer`. La bascule `suspend`/`resume` décide sa direction sur l'objet
+  vivant et non sur le tableau affiché, qui a jusqu'à un rafraîchissement de retard. La phrase que
+  kdt rédige est rendue telle quelle — un refus dit pourquoi, il ne devient pas une panne.
+
+  L'arbre n'a pas de portée, comme dans kdt : le filtrer par namespace lui ferait perdre ses
+  arêtes, la `GitRepository` de `flux-system` étant le parent de presque tout. La barre de portée
+  le dit au lieu de filtrer en silence.
+
+- **feat(web)** — la vue Workloads : les workloads du namespace, leurs pods, et les containers de
+  chaque pod. Le rattachement d'un pod à son workload est celui de kdt — remontée des
+  `ownerReferences` avec résolution ReplicaSet → Deployment — et le navigateur n'en reçoit que le
+  résultat. Les pods orphelins ferment la marche plutôt que de disparaître.
+
+  Chaque kind se compte comme il doit : répliques pour un Deployment, pods programmés pour un
+  DaemonSet, complétions pour un Job — dont le verdict se lit sur les conditions, les compteurs ne
+  distinguant pas un Job qui tourne d'un Job qui a renoncé. `spec.replicas` reste le seul témoin
+  qu'un kind se scale, donc `scale` n'est pas proposé sur un DaemonSet ni sur un Job.
+
+  `scale`, `restart` et `recycle` vivent sur la ligne qu'ils visent. `recycle` prévient de ce
+  qu'il risque : une remontée en échec laisse le workload à zéro, et la réponse le dit.
+
+- **feat(web)** — les vues Secrets et ConfigMaps, voisines et opposées sur un point. Une ConfigMap
+  est du texte en clair : ses valeurs arrivent avec la ligne. Un Secret n'envoie **rien** — ni ses
+  valeurs, ni son manifeste, qui les contient. Les révéler est une requête nommée, secret par
+  secret, tracée côté serveur.
+
+  C'est la règle du TUI — masqué par défaut, remis à masqué quand la sélection change — portée sur
+  un média où « ne pas afficher » ne suffit plus : sur une page, il faut ne pas envoyer. Une liste
+  qui porterait les valeurs les ferait traverser le réseau toutes les dix secondes, pour tous les
+  secrets de la portée, et les laisserait dans l'onglet réseau des devtools.
+
+  Les secrets TLS sont triés par urgence, l'échéance colorée par bande (expiré, moins de 15 jours,
+  moins de 30), avec l'émetteur, les SAN, le `Certificate` cert-manager qui les produit et les
+  Ingress qui les consomment. La clé privée n'est jamais lue.
+
+- **feat(web)** — le rail ne montre que les vues que ce cluster peut servir : sans Argo CD,
+  pas d'onglet Argo CD. La sonde est un seul appel — la liste des groupes d'API — couvert par
+  `system:discovery`, donc elle aboutit sans droit particulier.
+
+  Un apiserver injoignable et un cluster sans add-on ne donnent **pas** la même réponse : sonde en
+  échec, le rail n'écarte rien. Une vue qui disparaît est un message, et il serait faux.
+
+- **refactor** — sept règles de la vue Workloads qui jugeaient le cluster depuis `ui.rs` — le ton
+  d'un statut de pod, celui de la ligne, celui d'un container, l'étiquette et le ton du statut d'un
+  workload, la lecture des redémarrages, le rattachement d'un pod à son workload — descendent dans
+  `pods.rs`, avec les trois conversions en `EventRecord`. Deux verdicts jusque-là implicites y sont
+  nommés : `is_scalable` et `is_restartable`.
+
+- **refactor** — la vue Flux du TUI et celle du web lisent les mêmes règles : l'étiquette `READY`
+  et son ton, le ton de la ligne — qui n'est pas le même, une ressource suspendue étant éteinte
+  sur sa ligne et jaune sur son étiquette — la lecture de `no-prune`, et la conversion d'une
+  ressource Flux en enregistrement d'évènement descendent de `ui.rs` dans `flux.rs`. Les trois
+  sondes qui déposaient leur résultat dans un état partagé — inventaire Flux, inventaire d'une
+  Kustomization, logs des controllers — gagnent une jumelle qui le rend, comme `pod_logs` avant
+  elles : une requête HTTP veut une réponse, pas un état à redessiner.
 
 - **refactor** — trois règles qui jugeaient le cluster vivaient dans `ui.rs`, donc derrière la
   feature `tui` et hors de portée de kdt-web : `is_critical_reason` — celle qui sépare un
