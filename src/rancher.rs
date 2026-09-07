@@ -48,7 +48,7 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
 
-use crate::events::format_age;
+use crate::events::{format_age, hint_record, EventRecord, LineColor};
 use crate::lang::{fill, Strings};
 
 pub use crate::storage::{Hint, HintLevel};
@@ -119,7 +119,8 @@ const F_TOKEN_HASHING: &str = "token-hashing";
 // --- Identity ------------------------------------------------------------------------------------
 
 /// Which side of an identity a principal names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PrincipalKind {
     User,
     Group,
@@ -223,7 +224,8 @@ fn split_dn(dn: &str) -> Vec<(String, String)> {
 // --- Records -------------------------------------------------------------------------------------
 
 /// Which cluster the view is looking at. Decides what the data means, and what its absence means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ClusterRole {
     /// The cluster running the Rancher server: every identity object is here.
     Local,
@@ -236,7 +238,7 @@ pub enum ClusterRole {
 
 /// An authentication provider, as configured — not as merely present. Rancher creates an `AuthConfig`
 /// for every provider it supports, so existence says nothing; `enabled: true` does.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AuthProvider {
     pub name: String,
     /// `required`, `restricted`, `unrestricted` — empty when Rancher never set it.
@@ -244,7 +246,7 @@ pub struct AuthProvider {
 }
 
 /// The Rancher installation itself, as the view's headline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherServer {
     pub role: ClusterRole,
     /// `settings/server-version`, empty when unreadable.
@@ -260,7 +262,7 @@ pub struct RancherServer {
 }
 
 /// One human (or service account) known to Rancher, with both of its identities.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherUser {
     /// The Rancher identity: `u-4oivhvq2jk`. What every RoleBinding and audit line carries.
     pub id: String,
@@ -295,7 +297,8 @@ pub struct RancherUser {
 }
 
 /// The scope a binding grants access to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BindScope {
     Global,
     Cluster,
@@ -314,7 +317,7 @@ impl BindScope {
 
 /// One grant: a subject, a scope, a role. The three binding kinds collapse into this because the
 /// question they answer is the same one.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherBinding {
     pub scope: Option<BindScopeInner>,
     /// `local`, `local:p-22ldd`, empty for a global binding.
@@ -354,7 +357,7 @@ pub struct RancherBinding {
 pub type BindScopeInner = BindScope;
 
 /// A Rancher project and the namespaces it owns.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherProject {
     pub id: String,
     pub display_name: String,
@@ -375,7 +378,8 @@ pub struct RancherProject {
 
 /// How a setting's value is written down, which decides how it is rendered and what a new value is
 /// checked against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SettingUnit {
     /// A count of minutes. `0` means "no expiry" for every TTL Rancher has.
     Minutes,
@@ -386,7 +390,7 @@ pub enum SettingUnit {
 }
 
 /// One token-lifetime setting, with the value actually in force and where it comes from.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TokenSetting {
     pub name: String,
     /// The value in force: `value` when an operator set one, `default` otherwise.
@@ -415,7 +419,7 @@ impl TokenSetting {
 
 /// A Rancher API token. Read for what it says about access, never for its secret — the `token` field
 /// is not carried into the row.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherToken {
     pub name: String,
     pub user_id: String,
@@ -443,7 +447,7 @@ pub struct RancherToken {
 
 // --- State ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RancherState {
     pub server: RancherServer,
     pub users: Vec<RancherUser>,
@@ -497,6 +501,17 @@ pub async fn fetch_rancher(client: Client, state: SharedRancher) {
         s.loading = true;
         s.error = None;
     }
+    let next = rancher_inventory(&client, st).await;
+    *state.lock().expect("rancher poisoned") = next;
+}
+
+/// The whole directory, returned rather than deposited in a shared state.
+///
+/// Same split as `events::pod_logs`: the TUI redraws from a state it owns, a caller answering one
+/// HTTP request wants the value. The language table is an argument rather than the process global —
+/// a server answers several people at once.
+pub async fn rancher_inventory(client: &Client, st: &'static Strings) -> RancherState {
+    let client = client.clone();
 
     // Discovery first, as one wave: twelve sequential probes on a remote cluster is ten seconds of
     // blank screen.
@@ -513,13 +528,11 @@ pub async fn fetch_rancher(client: Client, state: SharedRancher) {
     let resolved: Vec<_> = futures::future::join_all(probes).await.into_iter().flatten().collect();
 
     if resolved.is_empty() {
-        let mut s = state.lock().expect("rancher poisoned");
-        *s = RancherState {
+        return RancherState {
             loading: false,
             error: Some(st.ranch_absent.to_string()),
             ..RancherState::default()
         };
-        return;
     }
 
     let lists = resolved.iter().map(|(kind, ar)| {
@@ -574,7 +587,7 @@ pub async fn fetch_rancher(client: Client, state: SharedRancher) {
             .push(warn(fill(st.ranch_users_unreadable, &[("e", &e)])));
     }
     next.loading = false;
-    *state.lock().expect("rancher poisoned") = next;
+    next
 }
 
 async fn list_namespaces(client: &Client) -> Vec<Namespace> {
@@ -1877,6 +1890,278 @@ fn note_subject(
         provider: provider.to_string(),
         ..RancherUser::default()
     });
+}
+
+// --- Verdicts -------------------------------------------------------------------------------------
+//
+// What the view *says* about the cluster, as opposed to how it is drawn. They live here so the TUI
+// and kdt-web reach the same conclusion from the same field rather than each judging on its own.
+
+/// The colour band of a provider name. A local account is the one credential no directory
+/// offboarding revokes, so it reads differently from a directory-backed one at a glance.
+pub fn provider_tone(provider: &str) -> LineColor {
+    match provider {
+        "local" | "" => LineColor::Warn,
+        "system" => LineColor::Dim,
+        _ => LineColor::Info,
+    }
+}
+
+impl RancherUser {
+    /// What the IDENTITY column shows. An account this cluster cannot resolve gets a dash rather
+    /// than its own Rancher id repeated: the reason belongs in the detail panel.
+    pub fn identity_cell(&self) -> String {
+        if self.identity.is_empty() {
+            "—".to_string()
+        } else {
+            self.identity.clone()
+        }
+    }
+
+    pub fn state_label(&self, st: &'static Strings) -> &'static str {
+        match self.enabled {
+            Some(false) => st.ranch_state_disabled,
+            // Absent means active — see the module header.
+            _ => st.ranch_state_active,
+        }
+    }
+
+    /// Only a disabled account is a verdict; being active is background information.
+    pub fn state_tone(&self) -> LineColor {
+        match self.enabled {
+            Some(false) => LineColor::Err,
+            _ => LineColor::Dim,
+        }
+    }
+}
+
+impl RancherBinding {
+    /// A role that owns its scope is surfaced, never judged — hence amber rather than red.
+    pub fn role_tone(&self) -> LineColor {
+        if self.owner_role {
+            LineColor::Warn
+        } else {
+            LineColor::Dim
+        }
+    }
+
+    /// The findings plus the one the row itself carries.
+    ///
+    /// A projected row says what it was rebuilt from, so nothing about it reads as a Rancher object
+    /// it is not. Said here rather than in each renderer: it is a statement about the data, and two
+    /// copies of it would drift.
+    pub fn display_hints(&self, st: &'static Strings) -> Vec<Hint> {
+        let mut out = self.hints.clone();
+        if !self.authoritative {
+            out.push(Hint {
+                level: HintLevel::Info,
+                text: st.ranch_binding_projected.to_string(),
+            });
+        }
+        out
+    }
+
+    /// What the SUBJECT TYPE column shows.
+    pub fn subject_kind_label(&self) -> &'static str {
+        match self.subject_kind {
+            Some(PrincipalKind::Group) => "group",
+            Some(PrincipalKind::User) => "user",
+            None => "—",
+        }
+    }
+}
+
+impl RancherToken {
+    /// A token that never expires is the state worth noticing: Rancher's own default for a
+    /// kubeconfig download is `0`, and each download then leaves an eternal credential behind.
+    pub fn ttl_tone(&self) -> LineColor {
+        if self.ttl_ms == 0 {
+            LineColor::Warn
+        } else {
+            LineColor::Dim
+        }
+    }
+
+    /// What the SCOPE column shows. An unscoped token is valid on every managed cluster *and* on the
+    /// Rancher API itself; a scoped one only where it says. The wider of the two is worth noticing.
+    pub fn scope_label(&self, st: &'static Strings) -> String {
+        if self.cluster.is_empty() {
+            st.ranch_token_scope_all.to_string()
+        } else {
+            self.cluster.clone()
+        }
+    }
+
+    pub fn scope_tone(&self) -> LineColor {
+        if self.cluster.is_empty() {
+            LineColor::Warn
+        } else {
+            LineColor::Info
+        }
+    }
+
+    pub fn state_label(&self, st: &'static Strings) -> &'static str {
+        if self.expired {
+            st.ranch_state_disabled
+        } else {
+            st.ranch_state_active
+        }
+    }
+
+    pub fn state_tone(&self) -> LineColor {
+        if self.expired {
+            LineColor::Warn
+        } else {
+            LineColor::Dim
+        }
+    }
+
+    /// The account a token belongs to, falling back to its raw id when nothing resolved it.
+    pub fn owner_label(&self) -> String {
+        if self.user_label.is_empty() {
+            self.user_id.clone()
+        } else {
+            self.user_label.clone()
+        }
+    }
+}
+
+impl TokenSetting {
+    /// A setting's value as a human reads it: a duration for the minute-based TTLs, the raw string
+    /// otherwise. `0` stays "never", which is what Rancher means by it.
+    pub fn value_text(&self, st: &'static Strings) -> String {
+        match (self.unit, self.minutes()) {
+            (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, st),
+            _ if self.effective.is_empty() => "—".to_string(),
+            _ => self.effective.clone(),
+        }
+    }
+
+    /// The shipped default, written the way the value in force is. It sits next to it because
+    /// "someone changed this, and this is what it was" is the whole question one asks of a setting.
+    pub fn default_text(&self, st: &'static Strings) -> String {
+        match (self.unit, self.default.trim().parse::<i64>().ok()) {
+            (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, st),
+            _ if self.default.is_empty() => "—".to_string(),
+            _ => self.default.clone(),
+        }
+    }
+
+    /// `0` minutes means no expiry at all, which is the one value worth colouring.
+    pub fn value_tone(&self) -> LineColor {
+        if self.minutes() == Some(0) {
+            LineColor::Warn
+        } else {
+            LineColor::Plain
+        }
+    }
+}
+
+// --- Synthetic records ----------------------------------------------------------------------------
+
+/// The record of the `User` a row designates.
+///
+/// The message is what the search and the AI panel read, so it carries both identities of the
+/// account rather than the one the column happens to show. The raw principal goes in it too, so a
+/// search finds the account from a GUID copied out of an audit line — which is the whole reason one
+/// comes to this view.
+pub fn user_record(u: &RancherUser, st: &'static Strings) -> EventRecord {
+    let mut parts: Vec<String> = Vec::new();
+    if !u.identity.is_empty() {
+        parts.push(u.identity.clone());
+    }
+    if !u.username.is_empty() && u.username != u.identity {
+        parts.push(u.username.clone());
+    }
+    parts.push(format!("{}={}", st.ranch_lbl_provider, u.provider));
+    if !u.global_roles.is_empty() {
+        parts.push(format!("{}={}", st.ranch_lbl_global_roles, u.global_roles.join(",")));
+    }
+    if !u.groups.is_empty() {
+        parts.push(format!("{}={}", st.ranch_lbl_groups, u.groups.join(",")));
+    }
+    if !u.principal.is_empty() {
+        parts.push(u.principal.clone());
+    }
+    hint_record(
+        &u.uid,
+        API_MGMT,
+        "User",
+        "",
+        &u.id,
+        if u.is_admin { "Admin" } else { "User" },
+        parts.join(" · "),
+        &u.hints,
+    )
+}
+
+pub fn binding_record(b: &RancherBinding, st: &'static Strings) -> EventRecord {
+    let message = format!(
+        "{} {} → {} ({})",
+        b.subject_label, st.ranch_lbl_role, b.role_label, b.scope_label,
+    );
+    hint_record(
+        &b.uid,
+        &b.api_version,
+        &b.kind,
+        &b.namespace,
+        &b.name,
+        b.scope.map(|s| s.label()).unwrap_or("access"),
+        message,
+        &b.hints,
+    )
+}
+
+/// On a downstream cluster the row is rebuilt from the `field.cattle.io/projectId` annotations: the
+/// project id is real but the `Project` object lives upstream, and the cluster namespace that would
+/// address it is not known here. Such a row names no kind, so the object gestures answer "no object"
+/// instead of aiming a request at something this cluster does not hold.
+pub fn project_record(p: &RancherProject, st: &'static Strings) -> EventRecord {
+    let message = format!(
+        "{} · {} {} · {} {}",
+        p.display_name,
+        p.namespaces.len(),
+        st.ranch_lbl_namespaces,
+        p.members,
+        st.ranch_lbl_members,
+    );
+    let kind = if p.namespace.is_empty() { "" } else { "Project" };
+    hint_record(&p.uid, API_MGMT, kind, &p.namespace, &p.name, "Project", message, &p.hints)
+}
+
+pub fn setting_record(s: &TokenSetting, st: &'static Strings) -> EventRecord {
+    let source = if s.is_default { st.ranch_setting_default } else { st.ranch_setting_set };
+    hint_record(
+        &s.uid,
+        API_MGMT,
+        "Setting",
+        "",
+        &s.name,
+        "Setting",
+        format!("{} = {} ({})", s.name, s.value_text(st), source),
+        &s.hints,
+    )
+}
+
+pub fn token_record(t: &RancherToken, st: &'static Strings) -> EventRecord {
+    let message = format!(
+        "{} · {} {} · {} {}",
+        t.owner_label(),
+        st.ranch_lbl_provider,
+        t.provider,
+        st.ranch_lbl_ttl,
+        format_ttl(t.ttl_ms, st),
+    );
+    hint_record(
+        &t.uid,
+        API_MGMT,
+        "Token",
+        "",
+        &t.name,
+        if t.kind.is_empty() { "Token" } else { &t.kind },
+        message,
+        &t.hints,
+    )
 }
 
 // --- Writes ---------------------------------------------------------------------------------------

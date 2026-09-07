@@ -39,14 +39,17 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 
 // --- Diagnosis ----------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// `Serialize` because kdt-web paints these levels as they are: the verdict is kdt's, the browser
+// renders it rather than judging it a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HintLevel {
     Info,
     Warn,
     Danger,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hint {
     pub level: HintLevel,
     pub text: String,

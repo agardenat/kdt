@@ -12,6 +12,7 @@ use kube::api::DeleteParams;
 use kube::Client;
 use serde_json::{Map, Value};
 
+use crate::lang::Strings;
 use crate::yaml::dynamic_api;
 
 // `Serialize` because kdt-web renders these levels as they are: the guard-rail is kdt's, and the
@@ -97,6 +98,84 @@ impl Reason {
             Reason::KdtUserMembership | Reason::Finalizers => Level::Info,
         }
     }
+}
+
+/// The localised sentence for one guard-rail finding.
+///
+/// Lives here rather than in the TUI's renderer: the sentence *is* the guard-rail, and one written
+/// twice would end up saying two different things about the same object. `ui.rs` and kdt-web both
+/// call this one.
+pub fn reason_text(st: &Strings, reason: &Reason) -> String {
+    match reason {
+        Reason::GitOps { tool, detail } => {
+            let template = match tool {
+                GitOpsTool::FluxKustomize => st.del_flux_ks,
+                GitOpsTool::FluxHelm => st.del_flux_hr,
+                GitOpsTool::Argo => st.del_argo,
+                GitOpsTool::Helm => st.del_helm,
+            };
+            template.replace("{d}", detail)
+        }
+        Reason::GitOpsRoot { kind } => st.del_gitops_root.replace("{d}", kind),
+        Reason::NamespaceCascade => st.del_namespace.to_string(),
+        Reason::CrdCascade => st.del_crd.to_string(),
+        Reason::OwnedBy { kind, name } => {
+            st.del_owned.replace("{d}", &format!("{}/{}", kind, name))
+        }
+        Reason::SystemNamespace { namespace } => st.del_system_ns.replace("{d}", namespace),
+        Reason::NodeDrain => st.del_node.to_string(),
+        Reason::PersistentData => st.del_persistent.to_string(),
+        Reason::VeleroBackup => st.del_velero_backup.to_string(),
+        Reason::VeleroBackupRunning => st.del_velero_backup_running.to_string(),
+        Reason::CassandraData => st.del_cassandra_data.to_string(),
+        Reason::MedusaBackup => st.del_medusa_backup.to_string(),
+        Reason::MedusaRunning => st.del_medusa_running.to_string(),
+        Reason::KdtUserMembership => st.del_kdtuser_membership.to_string(),
+        Reason::Finalizers => st.del_finalizers.to_string(),
+    }
+}
+
+/// Whether the strict, type-the-name confirmation is required.
+///
+/// Same rule as [`DeleteState::needs_strict_confirm`], expressed on the values a caller that never
+/// built a `DeleteState` actually has — kdt-web asks the question of a response body, not of a
+/// shared state. A preflight that could not conclude counts as a reason: nothing says the deletion
+/// is harmless when the checks did not run.
+pub fn strict_required(reasons: &[Reason], preflight_failed: bool) -> bool {
+    preflight_failed || reasons.iter().any(|r| r.level() == Level::Danger)
+}
+
+/// The guard-rails that apply to an object, returned rather than deposited in a shared state.
+///
+/// The TUI redraws a state at each tick; an HTTP caller wants the answer. Same read, same checks —
+/// [`assess`] is what both go through.
+pub async fn preflight_once(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<Reason>, String> {
+    let value = load(client, api_version, kind, namespace, name).await?;
+    Ok(assess(&value))
+}
+
+/// Delete the object, with the propagation policy `kubectl delete` uses (background cascade).
+pub async fn delete_once(
+    client: &Client,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<(), String> {
+    if kind.is_empty() || name.is_empty() {
+        return Err("objet sans kind/name".to_string());
+    }
+    let api = dynamic_api(client, api_version, kind, namespace).await?;
+    api.delete(name, &DeleteParams::background())
+        .await
+        .map(|_| ())
+        .map_err(crate::edit::api_error_text)
 }
 
 #[derive(Default, Debug, Clone)]

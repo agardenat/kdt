@@ -33,7 +33,7 @@ use crate::ai::{
 };
 use crate::config::{self, FileConfig};
 use crate::delete::{
-    new_delete_state, preflight, run_delete, GitOpsTool, Level as DelLevel, Reason as DelReason,
+    new_delete_state, preflight, run_delete, Level as DelLevel,
     SharedDelete,
 };
 use crate::repair::{
@@ -482,7 +482,7 @@ enum ArgoRow {
 use crate::rancher::{
     apply_rancher_write, fetch_rancher, format_minutes, format_refresh, format_ttl,
     new_rancher_state, BindScope, ClusterRole, IssuedToken, PrincipalKind, RancherBinding,
-    RancherProject, RancherToken, RancherUser, RancherWrite, SettingUnit, SharedRancher,
+    RancherProject, RancherToken, RancherUser, RancherWrite, SharedRancher,
     TokenSetting,
 };
 
@@ -9341,19 +9341,19 @@ impl App {
         match self.ranch_world {
             RancWorld::Users => {
                 for u in s.users.iter().filter(|u| !problems_only || worse(&u.hints)) {
-                    recs.push(ranch_user_record(u));
+                    recs.push(crate::rancher::user_record(u, lang::active()));
                     rows.push(RancRow::User(Box::new(u.clone())));
                 }
             }
             RancWorld::Access => {
                 for b in s.bindings.iter().filter(|b| !problems_only || worse(&b.hints)) {
-                    recs.push(ranch_binding_record(b));
+                    recs.push(crate::rancher::binding_record(b, lang::active()));
                     rows.push(RancRow::Binding(Box::new(b.clone())));
                 }
             }
             RancWorld::Projects => {
                 for p in s.projects.iter().filter(|p| !problems_only || worse(&p.hints)) {
-                    recs.push(ranch_project_record(p));
+                    recs.push(crate::rancher::project_record(p, lang::active()));
                     rows.push(RancRow::Project(Box::new(p.clone())));
                 }
             }
@@ -9361,11 +9361,11 @@ impl App {
                 // The settings first: they are the reason the TTL column reads the way it does, and
                 // on a cluster whose kubeconfig default is 0 that is the headline, not a footnote.
                 for st_row in s.settings.iter().filter(|x| !problems_only || worse(&x.hints)) {
-                    recs.push(ranch_setting_record(st_row));
+                    recs.push(crate::rancher::setting_record(st_row, lang::active()));
                     rows.push(RancRow::Setting(Box::new(st_row.clone())));
                 }
                 for t in s.tokens.iter().filter(|t| !problems_only || worse(&t.hints)) {
-                    recs.push(ranch_token_record(t));
+                    recs.push(crate::rancher::token_record(t, lang::active()));
                     rows.push(RancRow::Token(Box::new(t.clone())));
                 }
             }
@@ -9508,7 +9508,7 @@ impl App {
                     label: st.k_ranch_set_setting,
                     desc: lang::fill(
                         st.desc_ranch_set_setting,
-                        &[("name", &s.name), ("current", &ranch_setting_value(s))],
+                        &[("name", &s.name), ("current", &s.value_text(lang::active()))],
                     ),
                     action: MenuAction::RanchSetSetting,
                 }],
@@ -9719,13 +9719,13 @@ impl App {
         match self.ident_world {
             IdentWorld::Users => {
                 for u in s.users.iter().filter(|u| !problems_only || worse(&u.hints)) {
-                    recs.push(ident_user_record(u));
+                    recs.push(crate::identity::user_record(u, lang::active()));
                     rows.push(IdentRow::User(Box::new(u.clone())));
                 }
             }
             IdentWorld::Groups => {
                 for g in s.groups.iter().filter(|g| !problems_only || worse(&g.hints)) {
-                    recs.push(ident_group_record(g));
+                    recs.push(crate::identity::group_record(g, lang::active()));
                     rows.push(IdentRow::Group(Box::new(g.clone())));
                 }
             }
@@ -15312,37 +15312,6 @@ fn edit_prompt(
     }
 }
 
-// The localised sentence for one guard-rail finding.
-fn delete_reason_text(st: &lang::Strings, reason: &DelReason) -> String {
-    match reason {
-        DelReason::GitOps { tool, detail } => {
-            let template = match tool {
-                GitOpsTool::FluxKustomize => st.del_flux_ks,
-                GitOpsTool::FluxHelm => st.del_flux_hr,
-                GitOpsTool::Argo => st.del_argo,
-                GitOpsTool::Helm => st.del_helm,
-            };
-            template.replace("{d}", detail)
-        }
-        DelReason::GitOpsRoot { kind } => st.del_gitops_root.replace("{d}", kind),
-        DelReason::NamespaceCascade => st.del_namespace.to_string(),
-        DelReason::CrdCascade => st.del_crd.to_string(),
-        DelReason::OwnedBy { kind, name } => {
-            st.del_owned.replace("{d}", &format!("{}/{}", kind, name))
-        }
-        DelReason::SystemNamespace { namespace } => st.del_system_ns.replace("{d}", namespace),
-        DelReason::NodeDrain => st.del_node.to_string(),
-        DelReason::PersistentData => st.del_persistent.to_string(),
-        DelReason::VeleroBackup => st.del_velero_backup.to_string(),
-        DelReason::VeleroBackupRunning => st.del_velero_backup_running.to_string(),
-        DelReason::CassandraData => st.del_cassandra_data.to_string(),
-        DelReason::MedusaBackup => st.del_medusa_backup.to_string(),
-        DelReason::MedusaRunning => st.del_medusa_running.to_string(),
-        DelReason::KdtUserMembership => st.del_kdtuser_membership.to_string(),
-        DelReason::Finalizers => st.del_finalizers.to_string(),
-    }
-}
-
 // A table whose scroll offset survives the frame. Building a fresh `TableState` at each draw means
 // an offset of 0 every time, and `Table` then scrolls just enough to show the selection — which
 // pins the cursor to the last visible row and slides the list under it, instead of letting the
@@ -15459,7 +15428,7 @@ fn draw_delete_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(color)),
-                Span::styled(delete_reason_text(st, r), Style::default().fg(color)),
+                Span::styled(crate::delete::reason_text(st, r), Style::default().fg(color)),
             ]));
         }
     }
@@ -20110,223 +20079,6 @@ fn ident_creation_landing(write: &IdentityWrite) -> Option<(IdentWorld, String)>
     }
 }
 
-fn ident_user_record(u: &IdentUser) -> EventRecord {
-    let st = lang::active();
-    let mut parts: Vec<String> = vec![u.subject()];
-    if !u.email.is_empty() {
-        parts.push(u.email.clone());
-    }
-    if !u.display_name.is_empty() {
-        parts.push(u.display_name.clone());
-    }
-    if !u.member_of.is_empty() {
-        parts.push(format!("{}={}", st.ident_lbl_groups, u.member_of.join(",")));
-    }
-    ranch_record(
-        &u.uid,
-        crate::identity::API_IDENTITY,
-        crate::identity::KIND_USER,
-        "",
-        &u.name,
-        u.phase.label(st),
-        parts.join(" · "),
-        &u.hints,
-    )
-}
-
-fn ident_group_record(g: &IdentGroup) -> EventRecord {
-    let st = lang::active();
-    let mut parts: Vec<String> = vec![g.effective_subject()];
-    if !g.description.is_empty() {
-        parts.push(g.description.clone());
-    }
-    if !g.members.is_empty() {
-        parts.push(format!("{}={}", st.ident_lbl_members, g.members.join(",")));
-    }
-    // The bindings go in the message so `/` finds the group from a ClusterRole name — which is how
-    // one asks "who has edit here" starting from the role.
-    for b in &g.bindings {
-        parts.push(b.label());
-    }
-    ranch_record(
-        &g.uid,
-        crate::identity::API_IDENTITY,
-        crate::identity::KIND_GROUP,
-        "",
-        &g.name,
-        // The reason column answers the question the view exists for: does this group grant
-        // anything at all.
-        if g.bindings.is_empty() { "Unbound" } else { "Bound" },
-        parts.join(" · "),
-        &g.hints,
-    )
-}
-
-fn ranch_severity(hints: &[crate::storage::Hint]) -> Severity {
-    match hints.iter().map(|h| h.level).max() {
-        Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
-        _ => Severity::Normal,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ranch_record(
-    uid: &str,
-    api_version: &str,
-    kind: &str,
-    namespace: &str,
-    name: &str,
-    reason: &str,
-    message: String,
-    hints: &[crate::storage::Hint],
-) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: ranch_severity(hints),
-        reason: reason.to_string(),
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
-        namespace: namespace.to_string(),
-        name: name.to_string(),
-        message,
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-// The message is what the AI panel and the search read, so it carries both identities of the
-// account rather than the one the column happens to show.
-fn ranch_user_record(u: &RancherUser) -> EventRecord {
-    let st = lang::active();
-    let mut parts: Vec<String> = Vec::new();
-    if !u.identity.is_empty() {
-        parts.push(u.identity.clone());
-    }
-    if !u.username.is_empty() && u.username != u.identity {
-        parts.push(u.username.clone());
-    }
-    parts.push(format!("{}={}", st.ranch_lbl_provider, u.provider));
-    if !u.global_roles.is_empty() {
-        parts.push(format!("{}={}", st.ranch_lbl_global_roles, u.global_roles.join(",")));
-    }
-    if !u.groups.is_empty() {
-        parts.push(format!("{}={}", st.ranch_lbl_groups, u.groups.join(",")));
-    }
-    // The raw principal goes in the message so `/` finds the account from a GUID copied out of a
-    // log or an audit line — which is the whole reason one comes to this view.
-    if !u.principal.is_empty() {
-        parts.push(u.principal.clone());
-    }
-    ranch_record(
-        &u.uid,
-        crate::rancher::API_MGMT,
-        "User",
-        "",
-        &u.id,
-        if u.is_admin { "Admin" } else { "User" },
-        parts.join(" · "),
-        &u.hints,
-    )
-}
-
-fn ranch_binding_record(b: &RancherBinding) -> EventRecord {
-    let st = lang::active();
-    let message = format!(
-        "{} {} → {} ({})",
-        b.subject_label,
-        st.ranch_lbl_role,
-        b.role_label,
-        b.scope_label,
-    );
-    ranch_record(
-        &b.uid,
-        &b.api_version,
-        &b.kind,
-        &b.namespace,
-        &b.name,
-        b.scope.map(|s| s.label()).unwrap_or("access"),
-        message,
-        &b.hints,
-    )
-}
-
-fn ranch_project_record(p: &RancherProject) -> EventRecord {
-    let st = lang::active();
-    let message = format!(
-        "{} · {} {} · {} {}",
-        p.display_name,
-        p.namespaces.len(),
-        st.ranch_lbl_namespaces,
-        p.members,
-        st.ranch_lbl_members,
-    );
-    // On a downstream cluster the row is rebuilt from the `field.cattle.io/projectId` annotations:
-    // the project id is real but the `Project` object lives upstream, and the cluster namespace that
-    // would address it is not known here. Such a row names no kind, so `y`, `h` and `Ctrl-D` say
-    // "no object" instead of aiming a request at something this cluster does not hold.
-    let kind = if p.namespace.is_empty() { "" } else { "Project" };
-    ranch_record(
-        &p.uid,
-        crate::rancher::API_MGMT,
-        kind,
-        &p.namespace,
-        &p.name,
-        "Project",
-        message,
-        &p.hints,
-    )
-}
-
-fn ranch_setting_record(s: &TokenSetting) -> EventRecord {
-    let st = lang::active();
-    let source = if s.is_default { st.ranch_setting_default } else { st.ranch_setting_set };
-    ranch_record(
-        &s.uid,
-        crate::rancher::API_MGMT,
-        "Setting",
-        "",
-        &s.name,
-        "Setting",
-        format!("{} = {} ({})", s.name, ranch_setting_value(s), source),
-        &s.hints,
-    )
-}
-
-// A setting's value as a human reads it: a duration for the minute-based TTLs, the raw string
-// otherwise. `0` stays "never", which is what Rancher means by it.
-fn ranch_setting_value(s: &TokenSetting) -> String {
-    match (s.unit, s.minutes()) {
-        (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, lang::active()),
-        _ if s.effective.is_empty() => "—".to_string(),
-        _ => s.effective.clone(),
-    }
-}
-
-fn ranch_token_record(t: &RancherToken) -> EventRecord {
-    let st = lang::active();
-    let owner = if t.user_label.is_empty() { t.user_id.clone() } else { t.user_label.clone() };
-    let message = format!(
-        "{} · {} {} · {} {}",
-        owner,
-        st.ranch_lbl_provider,
-        t.provider,
-        st.ranch_lbl_ttl,
-        format_ttl(t.ttl_ms, st),
-    );
-    ranch_record(
-        &t.uid,
-        crate::rancher::API_MGMT,
-        "Token",
-        "",
-        &t.name,
-        if t.kind.is_empty() { "Token" } else { &t.kind },
-        message,
-        &t.hints,
-    )
-}
-
 // How the installation is named in every title: what this cluster is, so that an empty user list
 // reads as "the accounts are elsewhere" rather than as "there are none".
 fn ranch_role_label(app: &App, server: &crate::rancher::RancherServer) -> String {
@@ -20338,27 +20090,6 @@ fn ranch_role_label(app: &App, server: &crate::rancher::RancherServer) -> String
             lang::fill(st.ranch_role_downstream, &[("url", &target)])
         }
         ClusterRole::Absent => st.ranch_absent.to_string(),
-    }
-}
-
-fn ranch_provider_style(provider: &str) -> Style {
-    match provider {
-        // A local account is the one credential no directory offboarding revokes: it reads
-        // differently from a directory-backed one at a glance.
-        "local" | "" => Style::default().fg(Color::Yellow),
-        "system" => Style::default().fg(DIM),
-        _ => Style::default().fg(Color::Cyan),
-    }
-}
-
-fn ranch_state_cell(u: &RancherUser) -> Cell<'static> {
-    let st = lang::active();
-    match u.enabled {
-        Some(false) => Cell::from(st.ranch_state_disabled)
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        // Absent means active — see the module header. Shown dim so the column reads as background
-        // information rather than as a verdict.
-        _ => Cell::from(st.ranch_state_active).style(Style::default().fg(DIM)),
     }
 }
 
@@ -20458,13 +20189,7 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default().add_modifier(Modifier::BOLD)
                         };
-                        // An account this cluster cannot resolve gets a dash, not its own id
-                        // repeated: the detail panel is where the reason belongs.
-                        let identity = if u.identity.is_empty() {
-                            "—".to_string()
-                        } else {
-                            u.identity.clone()
-                        };
+                        let identity = u.identity_cell();
                         let role_style = if u.is_admin {
                             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
                         } else {
@@ -20474,14 +20199,14 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Cell::from(u.id.clone()).style(Style::default().fg(DIM)),
                             Cell::from(identity).style(identity_style),
                             Cell::from(u.username.clone()),
-                            Cell::from(u.provider.clone()).style(ranch_provider_style(&u.provider)),
+                            Cell::from(u.provider.clone()).style(line_color_to_style(crate::rancher::provider_tone(&u.provider))),
                             Cell::from(u.global_roles.join(",")).style(role_style),
                             Cell::from(count_cell(u.groups.len())),
                             Cell::from(count_cell(u.binding_count)),
                             Cell::from(count_cell(u.token_count)),
                             Cell::from(format_refresh(&u.last_refresh))
                                 .style(Style::default().fg(DIM)),
-                            ranch_state_cell(u),
+                            Cell::from(u.state_label(st)).style(line_color_to_style(u.state_tone())),
                             Cell::from(u.age.clone()).style(Style::default().fg(DIM)),
                         ])
                     }
@@ -20548,15 +20273,11 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             _ => Style::default(),
                         };
                         let role_style = if b.owner_role {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                            line_color_to_style(b.role_tone()).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(DIM)
+                            line_color_to_style(b.role_tone())
                         };
-                        let kind = match b.subject_kind {
-                            Some(PrincipalKind::Group) => "group",
-                            Some(PrincipalKind::User) => "user",
-                            None => "—",
-                        };
+                        let kind = b.subject_kind_label();
                         // The binding every account gets by default reads as background: it is in
                         // the list because it exists, not because anyone decided it.
                         let (scope_style, subject_style) = if b.automatic {
@@ -20570,7 +20291,7 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             Cell::from(b.scope_label.clone()),
                             Cell::from(b.subject_label.clone()).style(subject_style),
                             Cell::from(kind).style(Style::default().fg(DIM)),
-                            Cell::from(b.provider.clone()).style(ranch_provider_style(&b.provider)),
+                            Cell::from(b.provider.clone()).style(line_color_to_style(crate::rancher::provider_tone(&b.provider))),
                             Cell::from(b.role_label.clone()).style(role_style),
                             Cell::from(b.age.clone()).style(Style::default().fg(DIM)),
                         ])
@@ -20654,34 +20375,16 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .iter()
                 .map(|row| match row {
                     RancRow::Token(t) => {
-                        let owner = if t.user_label.is_empty() {
-                            t.user_id.clone()
-                        } else {
-                            t.user_label.clone()
-                        };
-                        let state = if t.expired {
-                            Cell::from(st.ranch_state_disabled)
-                                .style(Style::default().fg(Color::Yellow))
-                        } else {
-                            Cell::from(st.ranch_state_active).style(Style::default().fg(DIM))
-                        };
-                        let ttl_style = if t.ttl_ms == 0 {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(DIM)
-                        };
-                        // An unscoped token is valid on every managed cluster *and* on the Rancher
-                        // API itself; a scoped one only where it says. The wider of the two is the
-                        // one worth noticing.
-                        let (scope, scope_style) = if t.cluster.is_empty() {
-                            (st.ranch_token_scope_all.to_string(), Style::default().fg(Color::Yellow))
-                        } else {
-                            (t.cluster.clone(), Style::default().fg(Color::Cyan))
-                        };
+                        let owner = t.owner_label();
+                        let state =
+                            Cell::from(t.state_label(st)).style(line_color_to_style(t.state_tone()));
+                        let ttl_style = line_color_to_style(t.ttl_tone());
+                        let scope = t.scope_label(st);
+                        let scope_style = line_color_to_style(t.scope_tone());
                         Row::new(vec![
                             Cell::from(t.name.clone()),
                             Cell::from(owner).style(Style::default().add_modifier(Modifier::BOLD)),
-                            Cell::from(t.provider.clone()).style(ranch_provider_style(&t.provider)),
+                            Cell::from(t.provider.clone()).style(line_color_to_style(crate::rancher::provider_tone(&t.provider))),
                             Cell::from(t.kind_label.clone()).style(Style::default().fg(DIM)),
                             Cell::from(scope).style(scope_style),
                             Cell::from(format_ttl(t.ttl_ms, st)).style(ttl_style),
@@ -20697,11 +20400,11 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default().add_modifier(Modifier::BOLD)
                         };
-                        let value = ranch_setting_value(s);
+                        let value = s.value_text(st);
                         let value_style = if s.minutes() == Some(0) {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                            line_color_to_style(s.value_tone()).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default()
+                            line_color_to_style(s.value_tone())
                         };
                         let source = if s.is_default {
                             Cell::from(st.ranch_setting_default).style(Style::default().fg(DIM))
@@ -20751,29 +20454,21 @@ fn draw_rancher_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-// The phase colour. `Locked` is amber rather than red: it clears by itself, unlike a disabled
-// account, which stays blocked until someone lifts it.
+// The phase, painted by the tone `identity` gives it. `Locked` is emphasised on top: it is kdt's
+// own verdict, not something the CRD says, and the bold is what makes it stand out from a phase
+// the controller wrote.
 fn ident_phase_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
-    let style = match u.phase {
-        Phase::Active => Style::default().fg(Color::Green),
-        Phase::Pending => Style::default().fg(Color::Cyan),
-        Phase::Locked => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        Phase::Disabled => Style::default().fg(Color::Red),
-        Phase::Unknown => Style::default().fg(DIM),
-    };
+    let mut style = line_color_to_style(u.phase.tone());
+    if u.phase == Phase::Locked {
+        style = style.add_modifier(Modifier::BOLD);
+    }
     Cell::from(u.phase.label(st)).style(style)
 }
 
 // The INVITATION column. An expired invitation is the one state worth colouring: it looks like a
 // working invitation from the outside, and the person on the other end sees a link that refuses.
 fn ident_invite_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
-    let text = invitation_label(&u.invitation, st);
-    let style = match u.invitation {
-        Invitation::Expired { .. } => Style::default().fg(Color::Yellow),
-        Invitation::Pending { .. } => Style::default().fg(Color::Cyan),
-        _ => Style::default().fg(DIM),
-    };
-    Cell::from(text).style(style)
+    Cell::from(invitation_label(&u.invitation, st)).style(line_color_to_style(u.invitation_tone()))
 }
 
 // The SESS column: how many accesses this account is renewing right now. It is the only column
@@ -20783,16 +20478,7 @@ fn ident_invite_cell(u: &IdentUser, st: &'static Strings) -> Cell<'static> {
 // `?` is not `0`. An unreadable sessions Secret means kdt does not know, and rendering that as
 // "nobody is connected" is exactly the mistake that would make a revocation look unnecessary.
 fn ident_sessions_cell(u: &IdentUser) -> Cell<'static> {
-    match &u.sessions {
-        None => Cell::from("?").style(Style::default().fg(DIM)),
-        Some(s) if s.open == 0 => Cell::from("—").style(Style::default().fg(DIM)),
-        // Sessions on a disabled account are the one state worth colouring: the controller is
-        // supposed to have closed them, and it has not.
-        Some(s) if u.disabled => {
-            Cell::from(s.open.to_string()).style(Style::default().fg(Color::Yellow))
-        }
-        Some(s) => Cell::from(s.open.to_string()).style(Style::default().fg(Color::Green)),
-    }
+    Cell::from(u.sessions_cell()).style(line_color_to_style(u.sessions_tone()))
 }
 
 fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -20964,12 +20650,12 @@ fn ident_table_parts(
                     IdentRow::Group(g) => {
                         // A group with no binding is the trap this view exists to show: everything
                         // reconciles, and its members get 403 everywhere.
-                        let rights = if g.bindings.is_empty() {
-                            Cell::from("—").style(Style::default().fg(Color::Yellow))
+                        let rights = Cell::from(if g.bindings.is_empty() {
+                            "—".to_string()
                         } else {
-                            Cell::from(g.bindings.len().to_string())
-                                .style(Style::default().fg(Color::Green))
-                        };
+                            g.bindings.len().to_string()
+                        })
+                        .style(line_color_to_style(g.rights_tone()));
                         let unknown = if g.unknown.is_empty() {
                             Cell::from("").style(Style::default().fg(DIM))
                         } else {
@@ -21510,13 +21196,7 @@ fn ranch_detail_lines(
             lines.push(label(st.lbl_age, b.age.clone()));
             // A projected row says what it was rebuilt from, so nothing here reads as a Rancher
             // object it is not.
-            let mut hints = b.hints.clone();
-            if !b.authoritative {
-                hints.push(crate::storage::Hint {
-                    level: StoHintLevel::Info,
-                    text: st.ranch_binding_projected.to_string(),
-                });
-            }
+            let hints = b.display_hints(st);
             if !hints.is_empty() {
                 lines.push(Line::from(""));
                 lines.extend(hint_lines(&hints, width));
@@ -21587,17 +21267,10 @@ fn ranch_detail_lines(
             banner(format!(" {} ", t.name))
         }
         RancRow::Setting(s) => {
-            lines.push(label(st.ranch_lbl_value, ranch_setting_value(s)));
+            lines.push(label(st.ranch_lbl_value, s.value_text(st)));
             // The shipped default sits next to the value in force: "someone changed this, and this
             // is what it was" is the whole question one asks of a setting.
-            lines.push(label(
-                st.ranch_lbl_default,
-                match (s.unit, s.default.trim().parse::<i64>().ok()) {
-                    (Some(SettingUnit::Minutes), Some(m)) => format_minutes(m, st),
-                    _ if s.default.is_empty() => "—".to_string(),
-                    _ => s.default.clone(),
-                },
-            ));
+            lines.push(label(st.ranch_lbl_default, s.default_text(st)));
             lines.push(label(
                 st.ranch_lbl_origin_setting,
                 if s.is_default { st.ranch_setting_default.to_string() } else { st.ranch_setting_set.to_string() },
@@ -32582,15 +32255,15 @@ mod rancher_view_tests {
     // namespace annotations of a downstream cluster names none: the `Project` is upstream.
     #[test]
     fn only_a_project_this_cluster_holds_names_an_object_to_touch() {
-        let local = ranch_project_record(&project());
+        let local = crate::rancher::project_record(&project(), lang::active());
         assert_eq!(local.kind, "Project");
         assert_eq!(local.namespace, "c-m-abc");
         assert_eq!(local.name, "p-dfg12");
 
-        let upstream = ranch_project_record(&RancherProject {
+        let upstream = crate::rancher::project_record(&RancherProject {
             namespace: String::new(),
             ..project()
-        });
+        }, lang::active());
         assert!(upstream.kind.is_empty(), "kind: {}", upstream.kind);
         // The row still reads as a project — only the write target is gone.
         assert!(upstream.message.contains("datasmart"));

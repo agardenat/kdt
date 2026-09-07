@@ -44,7 +44,7 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
 
-use crate::events::format_age;
+use crate::events::{format_age, hint_record, EventRecord, LineColor};
 use crate::lang::{fill, Strings};
 
 pub use crate::storage::{Hint, HintLevel};
@@ -105,7 +105,8 @@ pub const DEFAULT_VALIDITY: &str = "72h";
 // --- Rows ----------------------------------------------------------------------------------------
 
 /// What the PHASE column shows. `Locked` is kdt's own: the controller never writes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Phase {
     #[default]
     Unknown,
@@ -116,6 +117,18 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// The colour band the phase carries. `Locked` is amber rather than red: it clears by itself,
+    /// unlike a disabled account, which stays blocked until someone lifts it.
+    pub fn tone(&self) -> LineColor {
+        match self {
+            Phase::Active => LineColor::Ok,
+            Phase::Pending => LineColor::Info,
+            Phase::Locked => LineColor::Warn,
+            Phase::Disabled => LineColor::Err,
+            Phase::Unknown => LineColor::Dim,
+        }
+    }
+
     pub fn label(&self, st: &'static Strings) -> &'static str {
         match self {
             Phase::Unknown => st.ident_phase_unknown,
@@ -131,7 +144,8 @@ impl Phase {
 ///
 /// `Unreadable` is not `None`: a Secret that cannot be read says nothing about whether an
 /// invitation is outstanding, and the two must not render alike in the operator's head.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
 pub enum Invitation {
     /// No credential Secret: the account was created and never invited.
     #[default]
@@ -146,7 +160,7 @@ pub enum Invitation {
 }
 
 /// The three non-secret facts read out of the credential Secret.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CredentialFacts {
     pub invite_expires: Option<i64>,
     pub locked_until: Option<i64>,
@@ -154,7 +168,8 @@ pub struct CredentialFacts {
 }
 
 /// How this deployment hands out credentials. A property of the cluster, chosen once at install.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CredentialMode {
     /// X.509 signed by the cluster CA. Needs nothing of the apiserver, and offers a downloadable
     /// kubeconfig that no revocation reaches.
@@ -179,7 +194,7 @@ impl CredentialMode {
 /// the variable is unset, but an unset variable also describes a 0.1 deployment that had no modes,
 /// no sessions and no `revoke` — so kdt reports the absence rather than restating a default that
 /// would make a pre-1.0 cluster look like a configured one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Delivery {
     pub mode: Option<CredentialMode>,
     pub cert_ttl: Option<String>,
@@ -211,7 +226,7 @@ impl Delivery {
 ///
 /// Only the two timestamps of each entry are parsed. The identifier and the hash of the refresh
 /// secret have no field to land in, which is a stronger guarantee than a rule not to display them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SessionFacts {
     pub open: usize,
     /// Entries past their expiry. Upstream prunes them on the next write, so they are stale rows,
@@ -222,7 +237,7 @@ pub struct SessionFacts {
 }
 
 /// A binding whose subject is one of this system's groups.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BindingRef {
     /// `RoleBinding` or `ClusterRoleBinding`.
     pub kind: String,
@@ -246,7 +261,7 @@ impl BindingRef {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IdentUser {
     pub name: String,
     pub email: String,
@@ -268,6 +283,42 @@ pub struct IdentUser {
 }
 
 impl IdentUser {
+    /// The colour band of the INVITATION column. An expired invitation is the one state worth
+    /// colouring: from the outside it looks like a working one, and the person on the other end
+    /// sees a link that refuses.
+    pub fn invitation_tone(&self) -> LineColor {
+        match self.invitation {
+            Invitation::Expired { .. } => LineColor::Warn,
+            Invitation::Pending { .. } => LineColor::Info,
+            _ => LineColor::Dim,
+        }
+    }
+
+    /// The colour band of the SESS column — how many accesses this account is renewing right now.
+    /// It is the only column that says whether there is anything to revoke.
+    ///
+    /// Sessions on a disabled account are the one state worth colouring: the controller is meant to
+    /// have closed them, and it has not.
+    pub fn sessions_tone(&self) -> LineColor {
+        match &self.sessions {
+            None => LineColor::Dim,
+            Some(s) if s.open == 0 => LineColor::Dim,
+            Some(_) if self.disabled => LineColor::Warn,
+            Some(_) => LineColor::Ok,
+        }
+    }
+
+    /// What the SESS column shows. `?` is **not** `0`: an unreadable sessions Secret means kdt does
+    /// not know, and rendering that as "nobody is connected" is exactly the mistake that would make
+    /// a revocation look unnecessary.
+    pub fn sessions_cell(&self) -> String {
+        match &self.sessions {
+            None => "?".to_string(),
+            Some(s) if s.open == 0 => "—".to_string(),
+            Some(s) => s.open.to_string(),
+        }
+    }
+
     /// The identity the apiserver will see. Built the same way upstream builds it, and shown so
     /// nobody has to guess that the prefix is there.
     pub fn subject(&self) -> String {
@@ -275,7 +326,7 @@ impl IdentUser {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IdentGroup {
     pub name: String,
     /// `status.subject`, published by the controller. Empty until it has reconciled once.
@@ -292,6 +343,16 @@ pub struct IdentGroup {
 }
 
 impl IdentGroup {
+    /// The colour band of the RIGHTS column. A group with no binding is the trap this view exists
+    /// to show: everything reconciles, and its members get 403 everywhere.
+    pub fn rights_tone(&self) -> LineColor {
+        if self.bindings.is_empty() {
+            LineColor::Warn
+        } else {
+            LineColor::Ok
+        }
+    }
+
     /// The subject to reference in a binding. Falls back to the derived form when the controller
     /// has not published one yet — the rule is fixed upstream, so this is a restatement, not a
     /// guess.
@@ -305,7 +366,7 @@ impl IdentGroup {
 }
 
 /// Where the `invite` command can be run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ControllerRef {
     pub namespace: String,
     pub pod: String,
@@ -314,7 +375,7 @@ pub struct ControllerRef {
 
 // --- State ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IdentityState {
     pub users: Vec<IdentUser>,
     pub groups: Vec<IdentGroup>,
@@ -368,6 +429,20 @@ pub async fn fetch_identity(client: Client, state: SharedIdentity) {
         s.loading = true;
         s.error = None;
     }
+    let next = identity_inventory(&client, st).await;
+    *state.lock().expect("identity poisoned") = next;
+}
+
+/// The whole directory, returned rather than deposited in a shared state.
+///
+/// Same split as `events::pod_logs`: the TUI redraws from a state it owns, while a caller answering
+/// one HTTP request wants the value. The reads and the verdicts are the same for both — this is the
+/// function, and `fetch_identity` is the thin wrapper that parks its result.
+///
+/// The language table is an argument rather than the process global: a server answers several
+/// people at once, and `lang::active()` would make them share whichever language was set last.
+pub async fn identity_inventory(client: &Client, st: &'static Strings) -> IdentityState {
+    let client = client.clone();
 
     // Discovery as one wave, like every other add-on view: sequential probes on a remote cluster
     // are seconds of blank screen.
@@ -388,8 +463,7 @@ pub async fn fetch_identity(client: Client, state: SharedIdentity) {
         // cluster have local accounts". Whether Rancher answers is checked so the message can send
         // the reader to the directory that does exist.
         let rancher_present = rancher_answers(&client).await;
-        let mut s = state.lock().expect("identity poisoned");
-        *s = IdentityState {
+        return IdentityState {
             loading: false,
             error: Some(if rancher_present {
                 st.ident_absent_rancher.to_string()
@@ -398,7 +472,6 @@ pub async fn fetch_identity(client: Client, state: SharedIdentity) {
             }),
             ..IdentityState::default()
         };
-        return;
     }
 
     let lists = resolved.iter().map(|(kind, ar)| {
@@ -476,7 +549,7 @@ pub async fn fetch_identity(client: Client, state: SharedIdentity) {
     if next.controller.is_none() && next.error.is_none() {
         next.error = Some(fill(st.ident_no_controller, &[("sel", CONTROLLER_SELECTOR)]));
     }
-    *state.lock().expect("identity poisoned") = next;
+    next
 }
 
 /// Whether `management.cattle.io` is served here. One probe, only ever asked when kdt-identity is
@@ -542,6 +615,15 @@ pub fn is_group_subject(kind: &str, name: &str) -> bool {
 /// The controller pod, by the chart's labels. Everything about it is read: the namespace, the pod
 /// name, the container, and the delivery settings the chart wrote into its environment. Nothing is
 /// defaulted into a plausible value.
+/// The controller pod the admin commands run in, resolved from the cluster.
+///
+/// Exposed for kdt-web: an `invite` or a `revoke` execs into this pod, and the pod it execs into
+/// must never be a name the browser supplied. The server resolves it the same way the TUI does,
+/// from the chart's own labels, and the caller only names the account.
+pub async fn controller_ref(client: &Client) -> Option<ControllerRef> {
+    find_controller(client).await.map(|(c, _)| c)
+}
+
 async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery)> {
     let pods: Api<Pod> = Api::all(client.clone());
     let list = pods
@@ -1037,6 +1119,63 @@ fn spec_members(o: &DynamicObject) -> Vec<String> {
         .get("spec")
         .map(|s| arr_at(s, "members"))
         .unwrap_or_default()
+}
+
+// --- Synthetic records ---------------------------------------------------------------------------
+
+/// The record of the `KdtUser` a row designates.
+///
+/// The message is what the search and the AI panel read, so it carries the subject, the mail and the
+/// groups rather than the one field the column happens to show.
+pub fn user_record(u: &IdentUser, st: &'static Strings) -> EventRecord {
+    let mut parts: Vec<String> = vec![u.subject()];
+    if !u.email.is_empty() {
+        parts.push(u.email.clone());
+    }
+    if !u.display_name.is_empty() {
+        parts.push(u.display_name.clone());
+    }
+    if !u.member_of.is_empty() {
+        parts.push(format!("{}={}", st.ident_lbl_groups, u.member_of.join(",")));
+    }
+    hint_record(
+        &u.uid,
+        API_IDENTITY,
+        KIND_USER,
+        "",
+        &u.name,
+        u.phase.label(st),
+        parts.join(" · "),
+        &u.hints,
+    )
+}
+
+/// The record of the `KdtGroup` a row designates.
+pub fn group_record(g: &IdentGroup, st: &'static Strings) -> EventRecord {
+    let mut parts: Vec<String> = vec![g.effective_subject()];
+    if !g.description.is_empty() {
+        parts.push(g.description.clone());
+    }
+    if !g.members.is_empty() {
+        parts.push(format!("{}={}", st.ident_lbl_members, g.members.join(",")));
+    }
+    // The bindings go in the message so a search finds the group from a ClusterRole name — which is
+    // how one asks "who has edit here" starting from the role.
+    for b in &g.bindings {
+        parts.push(b.label());
+    }
+    hint_record(
+        &g.uid,
+        API_IDENTITY,
+        KIND_GROUP,
+        "",
+        &g.name,
+        // The reason column answers the question the view exists for: does this group grant
+        // anything at all.
+        if g.bindings.is_empty() { "Unbound" } else { "Bound" },
+        parts.join(" · "),
+        &g.hints,
+    )
 }
 
 // --- Writes --------------------------------------------------------------------------------------

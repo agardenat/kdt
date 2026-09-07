@@ -48,6 +48,44 @@ pub struct EventRecord {
     pub count: i32,
 }
 
+/// A synthetic record for a row that is not a Kubernetes event.
+///
+/// The inventory views — identity, rancher — make the shared panels work (`Logs`, `Status`,
+/// `Related`, and the `y`/`e`/`h`/`Ctrl-D` gestures) by handing each row the record of the object it
+/// designates. Written once here rather than in each view: the severity is the one verdict the
+/// record carries, and it is read off the row's own findings.
+#[allow(clippy::too_many_arguments)]
+pub fn hint_record(
+    uid: &str,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[crate::storage::Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: match hints.iter().map(|h| h.level).max() {
+            Some(crate::storage::HintLevel::Danger) | Some(crate::storage::HintLevel::Warn) => {
+                Severity::Warning
+            }
+            _ => Severity::Normal,
+        },
+        reason: reason.to_string(),
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 /// Reasons that mean something is already broken, not merely worth watching.
 ///
 /// Lives here rather than in the UI because it is a judgement about the cluster, not about how to
