@@ -152,6 +152,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/capabilities", get(api::capabilities))
         .route("/api/v1/cluster", get(cluster::banner))
         .route("/api/v1/events", get(api::events))
+        .route("/api/v1/namespaces", get(api::namespaces))
         .route("/api/v1/logs", get(api::logs))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/related", post(api::related))

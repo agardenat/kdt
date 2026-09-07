@@ -144,6 +144,32 @@ pub async fn capabilities(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 }
 
+/// Les namespaces que la personne connectée peut voir.
+///
+/// Le sélecteur de portée s'en sert pour proposer plutôt que faire deviner : un nom de namespace
+/// se retient mal, et une faute de frappe rend une vue vide qu'on lit comme un cluster vide.
+///
+/// **Un refus n'est pas une liste vide**, et c'est tout l'intérêt de rendre l'erreur avec la
+/// liste : lister les namespaces demande un droit cluster-scoped que beaucoup de gens n'ont pas,
+/// alors qu'ils travaillent dans un namespace qu'ils nomment très bien. La page garde donc la
+/// saisie libre, et dit pourquoi elle ne propose rien.
+pub async fn namespaces(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let client = match session_client(&state, &headers).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+
+    let shared = kdt::events::new_ns_list_state();
+    kdt::events::fetch_namespaces(client, shared.clone()).await;
+    let list = shared.lock().expect("ns list poisoned").clone();
+
+    axum::Json(serde_json::json!({
+        "namespaces": list.namespaces,
+        "error": list.error,
+    }))
+    .into_response()
+}
+
 /// Le client de la personne connectée, ou la réponse à lui rendre s'il n'y en a pas.
 ///
 /// Les deux refus ne disent pas la même chose et ne se confondent pas : aucune session du tout,

@@ -95,6 +95,12 @@ export default function App() {
     }
   });
   const [scopeOpen, setScopeOpen] = useState(false);
+  // Les namespaces proposés par le sélecteur de portée. `null` tant qu'on n'a pas lu, et
+  // `nsError` non nul quand la lecture a été refusée — un refus n'est pas un cluster sans
+  // namespace, et la saisie libre reste alors le seul chemin.
+  const [nsList, setNsList] = useState<string[] | null>(null);
+  const [nsError, setNsError] = useState<string | null>(null);
+  const [nsLoading, setNsLoading] = useState(false);
   // La cible d'un saut vers la vue Secrets — le `s` de la vue certs. Elle est consommée par
   // `DataView`, qui la sélectionne si elle est dans sa liste, puis la rend.
   const [focusSecret, setFocusSecret] = useState<{ namespace: string; name: string } | null>(null);
@@ -204,6 +210,33 @@ export default function App() {
     if (!views.some((v) => v.id === view)) setView("events");
   }, [views, view]);
 
+  // La liste des namespaces se relit à chaque ouverture du sélecteur : ils se créent et se
+  // suppriment, et une liste lue au chargement de la page vieillirait sans que rien ne le dise.
+  // Ce qui a déjà été lu reste affiché pendant la lecture, pour que la liste ne clignote pas.
+  useEffect(() => {
+    if (!scopeOpen) return;
+    let alive = true;
+    setNsLoading(true);
+    api
+      .namespaces()
+      .then((payload) => {
+        if (!alive) return;
+        setNsList(payload.namespaces);
+        setNsError(payload.error);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        if (e instanceof api.NeedsAuth) setNeedsAuth(e.message);
+        else setNsError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (alive) setNsLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [scopeOpen]);
+
   // `/` met le focus sur le filtre, `Échap` ferme ce qui est ouvert. Deux gestes du TUI qui
   // survivent au changement de média parce qu'ils ne coûtent rien à qui les ignore.
   useEffect(() => {
@@ -304,9 +337,12 @@ export default function App() {
           {scopeOpen && scoped && (
             <ScopePicker
               namespaces={namespaces}
+              available={nsList}
+              error={nsError}
+              loading={nsLoading}
+              st={st}
               onChange={setNamespaces}
               onClose={() => setScopeOpen(false)}
-              labels={{ title: st.scopeTitle, all: st.scopeAll }}
             />
           )}
         </div>
@@ -575,19 +611,56 @@ function Gauge({
   );
 }
 
-/** Choix de la portée : plusieurs namespaces, ou tout le cluster. */
+/**
+ * Choix de la portée : plusieurs namespaces, ou tout le cluster.
+ *
+ * La liste est proposée et se resserre à la frappe, plutôt que d'être devinée : un nom de
+ * namespace se retient mal, et une faute de frappe rend une vue vide qu'on lit comme un cluster
+ * vide. Ce que le TUI fait avec `n`, qui liste ce que le cluster sert.
+ *
+ * La saisie libre reste, et c'est la porte de sortie : lister les namespaces demande un droit
+ * cluster-scoped que beaucoup n'ont pas tout en travaillant dans un namespace qu'ils nomment très
+ * bien. Un refus laisse donc le champ utilisable, et dit pourquoi il ne propose rien.
+ */
 function ScopePicker({
   namespaces,
+  available,
+  error,
+  loading,
+  st,
   onChange,
   onClose,
-  labels,
 }: {
   namespaces: string[];
+  available: string[] | null;
+  error: string | null;
+  loading: boolean;
+  st: Strings;
   onChange: (next: string[]) => void;
   onClose: () => void;
-  labels: { title: string; all: string };
 }) {
   const [draft, setDraft] = useState("");
+  // La ligne que `Entrée` prendrait. Elle repart en tête à chaque frappe : après avoir tapé, ce
+  // qu'on vise est la meilleure correspondance, pas la ligne où le curseur traînait.
+  const [highlight, setHighlight] = useState(0);
+
+  const query = draft.trim().toLowerCase();
+  // Les namespaces choisis sont listés à part, en tête et hors filtre : c'est là qu'on les
+  // retire, et une portée qu'on ne voit plus est une portée qu'on oublie.
+  const matches = (available ?? [])
+    .filter((ns) => !namespaces.includes(ns))
+    .filter((ns) => !query || ns.toLowerCase().includes(query));
+  const exact = matches.length > 0 ? matches[Math.min(highlight, matches.length - 1)] : null;
+  // Ce que la saisie ajouterait telle quelle : un nom qui n'est pas proposé — parce que la liste
+  // est refusée, ou parce qu'il vient d'être créé.
+  const raw = draft.trim();
+  const rawAddable = raw.length > 0 && !namespaces.includes(raw) && !matches.includes(raw);
+
+  const toggle = (ns: string) => {
+    onChange(namespaces.includes(ns) ? namespaces.filter((n) => n !== ns) : [...namespaces, ns]);
+    setDraft("");
+    setHighlight(0);
+  };
 
   return (
     <div className="pop" onClick={(e) => e.stopPropagation()}>
@@ -599,44 +672,82 @@ function ScopePicker({
             onClose();
           }}
         >
-          {labels.title}
+          {st.scopeTitle}
         </button>
       </div>
 
-      {/* Saisi plutôt que choisi dans une liste : lister les namespaces demande un droit que
-          tout le monde n'a pas, et le refus se verrait ici au lieu de se voir sur la donnée. */}
       <input
         className="ns-add"
         value={draft}
-        placeholder="namespace + Entrée"
+        placeholder={st.nsSearch}
         autoFocus
         spellCheck={false}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setHighlight(0);
+        }}
         onKeyDown={(e) => {
-          if (e.key !== "Enter") return;
-          const name = draft.trim();
-          if (name && !namespaces.includes(name)) onChange([...namespaces, name]);
-          setDraft("");
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setHighlight((h) => Math.min(h + 1, Math.max(matches.length - 1, 0)));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setHighlight((h) => Math.max(h - 1, 0));
+          } else if (e.key === "Enter") {
+            // La ligne visée d'abord, la saisie brute ensuite : quand la liste répond, ce qu'on
+            // ajoute est ce qui existe ; quand elle ne répond pas, ce qu'on a tapé.
+            if (exact) toggle(exact);
+            else if (rawAddable) toggle(raw);
+          }
         }}
       />
 
+      {error && <div className="ns-note warn">{st.nsDenied}</div>}
+      {loading && available === null && <div className="ns-note">{st.nsLoading}</div>}
+
       <div className="ns-list">
-        {namespaces.length === 0 && (
-          <div className="ns-item">
-            <span style={{ opacity: 0.6 }}>{labels.all}</span>
+        {namespaces.length === 0 && !rawAddable && matches.length === 0 && !loading && (
+          <div className="ns-item flat">
+            <span style={{ opacity: 0.6 }}>{st.scopeAll}</span>
           </div>
         )}
+
         {namespaces.map((ns) => (
-          <div className="ns-item" key={ns}>
+          <button className="ns-item on" key={`on-${ns}`} onClick={() => toggle(ns)}>
+            <span className="tick">✓</span>
             <span>{ns}</span>
-            <button
-              aria-label={`retirer ${ns}`}
-              onClick={() => onChange(namespaces.filter((n) => n !== ns))}
-            >
+            <span className="rm" aria-hidden="true">
               ✕
-            </button>
-          </div>
+            </span>
+          </button>
         ))}
+
+        {matches.map((ns, i) => (
+          <button
+            className={`ns-item${ns === exact && i === Math.min(highlight, matches.length - 1) ? " hl" : ""}`}
+            key={ns}
+            onMouseEnter={() => setHighlight(i)}
+            onClick={() => toggle(ns)}
+          >
+            <span className="tick" />
+            <span>{ns}</span>
+          </button>
+        ))}
+
+        {/* La sortie de secours, sous les propositions : `Entrée` vise la ligne en tête, donc
+            l'ajout tel quel ne doit jamais s'y trouver quand le cluster propose mieux. Elle sert
+            à un namespace qui vient d'être créé — ou à une liste qu'on n'a pas le droit de lire. */}
+        {rawAddable && (
+          <button className="ns-item raw" onClick={() => toggle(raw)}>
+            <span className="tick">+</span>
+            <span>{raw}</span>
+            <span className="hint">{st.nsAdd}</span>
+          </button>
+        )}
+
+        {!error && available !== null && matches.length === 0 && query !== "" && (
+          <div className="ns-note">{st.nsNoMatch}</div>
+        )}
       </div>
     </div>
   );

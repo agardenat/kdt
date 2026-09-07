@@ -127,7 +127,10 @@ Arrêtée sur maquette le 2026-09-06. Front en React + Vite + TypeScript, dans `
 
 - **Barre supérieure persistante**, qui survit au changement de vue : sélecteur de namespace en
   **multi-sélection** (un, plusieurs, ou tout le cluster) et champ de filtre — l'équivalent du `/`
-  de kdt. Dans le TUI ce sont des modes (`n` / `0` changent la portée, `/` ouvre la recherche) ;
+  de kdt. Le sélecteur **propose la liste** des namespaces (`GET /api/v1/namespaces`) et la
+  resserre à la frappe ; la saisie libre reste la porte de sortie quand lister est refusé — ce
+  droit est cluster-scoped, et beaucoup travaillent dans un namespace qu'ils nomment très bien
+  sans l'avoir. Dans le TUI ce sont des modes (`n` / `0` changent la portée, `/` ouvre la recherche) ;
   ici ce sont deux contrôles toujours visibles, ce qui supprime au passage le piège du titre qui
   ment quand la portée change.
 - **Le bandeau du cluster**, dans cette même barre : le nom du cluster, la version de l'apiserver,

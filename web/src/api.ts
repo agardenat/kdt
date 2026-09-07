@@ -108,6 +108,17 @@ export function cluster(): Promise<ClusterBanner> {
   return get<ClusterBanner>("/api/v1/cluster");
 }
 
+/**
+ * Les namespaces visibles, pour le sélecteur de portée.
+ *
+ * `error` non nul avec une liste vide veut dire « refusé », pas « aucun » : lister les namespaces
+ * demande un droit cluster-scoped que beaucoup n'ont pas tout en travaillant dans un namespace
+ * qu'ils nomment très bien. La page garde alors la saisie libre.
+ */
+export function namespaces(): Promise<{ namespaces: string[]; error: string | null }> {
+  return get<{ namespaces: string[]; error: string | null }>("/api/v1/namespaces");
+}
+
 export function events(namespaces: string[]): Promise<EventsPayload> {
   const query = namespaces.length ? `?ns=${encodeURIComponent(namespaces.join(","))}` : "";
   return get<EventsPayload>(`/api/v1/events${query}`);

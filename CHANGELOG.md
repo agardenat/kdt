@@ -242,6 +242,16 @@ répondent, le reste n'existe pas.
   de nodes ni allocation, et le bandeau le dit par un tiret au lieu d'un `0/0 ready` vert qui
   affirmerait un cluster sain que personne n'a regardé. Le TUI corrige la même affirmation.
 
+- **fix(web)** — le sélecteur de portée ne proposait rien : il fallait connaître le nom du
+  namespace et le taper sans faute, une faute rendant une vue vide qu'on lit comme un cluster vide.
+  Il liste désormais les namespaces et resserre la liste à la frappe, les choisis en tête avec de
+  quoi les retirer.
+
+  La saisie libre reste, et c'est la porte de sortie : lister les namespaces demande un droit
+  cluster-scoped que beaucoup n'ont pas tout en travaillant dans un namespace qu'ils nomment très
+  bien. Un refus laisse donc le champ utilisable et dit pourquoi il ne propose rien — il ne se
+  rend pas comme une liste vide.
+
 - **fix(web)** — le panneau du haut restait accroché à la sélection : il apparaissait au premier
   clic et repartait au suivant, décalant la table de 300 px sous le curseur. Il reste désormais en
   place tant qu'il est déplié — sans sélection il montre son cadre et l'invite — et c'est le pli,

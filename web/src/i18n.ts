@@ -322,6 +322,13 @@ export interface Strings {
   clusterVersionUnknown: string;
   clusterNodesDenied: string;
   clusterNoMetrics: string;
+
+  // --- Sélecteur de portée : la liste des namespaces, et ce qu'il reste quand elle est refusée.
+  nsSearch: string;
+  nsLoading: string;
+  nsDenied: string;
+  nsNoMatch: string;
+  nsAdd: string;
 }
 
 const FR: Strings = {
@@ -648,6 +655,12 @@ const FR: Strings = {
     "La liste des nodes vous est refusée : ni compte de nodes, ni allocation CPU/mémoire.",
   clusterNoMetrics:
     "metrics-server ne répond pas : l'allocation est connue, l'usage ne l'est pas.",
+
+  nsSearch: "chercher un namespace…",
+  nsLoading: "lecture des namespaces…",
+  nsDenied: "Lister les namespaces vous est refusé : tapez le nom, il sera pris tel quel.",
+  nsNoMatch: "aucun namespace ne correspond",
+  nsAdd: "ajouter tel quel",
 };
 
 const EN: Strings = {
@@ -972,6 +985,12 @@ const EN: Strings = {
   clusterNodesDenied:
     "Listing nodes is denied to you: no node count, no CPU/memory allocation.",
   clusterNoMetrics: "metrics-server is not answering: allocation is known, usage is not.",
+
+  nsSearch: "search a namespace…",
+  nsLoading: "reading namespaces…",
+  nsDenied: "Listing namespaces is denied to you: type the name, it will be taken as is.",
+  nsNoMatch: "no namespace matches",
+  nsAdd: "add as typed",
 };
 
 export function strings(lang: Lang): Strings {
