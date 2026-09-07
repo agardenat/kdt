@@ -970,3 +970,53 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .detail > .keys-row { display: flex; gap: .9rem; align-items: flex-start; padding: .1rem 0; }
 .detail > .keys-row > .k-col { min-width: 12ch; flex: none; display: flex; flex-direction: column; gap: .2rem; }
 .detail > .keys-row > .v { flex: 1; min-width: 0; }
+
+/* --- Vue Kyverno -------------------------------------------------------------------------------
+   Cinq verdicts, cinq couleurs : `error` et `fail` ne se confondent pas, parce qu'une règle qui
+   n'arrive pas à s'évaluer est une policy cassée, alors qu'une règle qui échoue est une ressource
+   non conforme — les deux ne se corrigent pas au même endroit. C'est la distinction que kdt fait
+   dans le TUI, et ces classes ne font que la peindre. */
+.tbody .tr.ky-policy { color: inherit; font-weight: 600; }
+.tbody .tr.ky-rule { color: var(--muted); }
+.tbody .tr.ky-exception { color: #b950c8; }
+.tbody .tr.ky-pass { color: var(--ok); }
+.tbody .tr.ky-skip { color: var(--dim); }
+.tbody .tr.ky-warn { color: var(--warn); }
+.tbody .tr.ky-fail { color: var(--err); }
+.tbody .tr.ky-error { color: #b950c8; }
+
+/* Le lit rouge sombre du TUI : une policy qui ne peut pas s'évaluer, ou dont une règle est en
+   erreur, se distingue même quand elle a défilé loin du regard. */
+.tbody .tr.ky-alarm {
+  color: var(--err);
+  font-weight: 600;
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  border-left-color: var(--err);
+}
+.tbody .tr.ky-alarm:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+
+.cell.info { color: var(--info); }
+.cell.tone-ok { color: var(--ok); }
+.cell.tone-warn { color: var(--warn); }
+.cell.tone-err { color: var(--err); }
+.cell.tone-info { color: var(--info); }
+.cell.tone-dim, .cell.tone-plain { color: var(--dim); }
+
+/* La bande de santé, dans la barre d'actions : elle vaut quelle que soit la ligne lue, et c'est
+   même la seule chose de cette vue qui puisse dire que Kyverno n'intercepte rien du tout. */
+.ky-health {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .8rem;
+  padding: .3rem .85rem; border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+}
+.ky-health .ok { color: var(--ok); }
+.ky-health .err { color: var(--err); font-weight: 600; }
+.ky-health .warn { color: var(--warn); }
+.ky-health .dim { color: var(--dim); }
+.ky-badge {
+  padding: 0 .35rem; border-radius: 4px; font-weight: 700; color: var(--bg);
+  background: var(--ok); white-space: nowrap;
+}
+.ky-badge.degraded { background: var(--err); }
+.ky-badge.inactive { background: var(--warn); }
+.ky-badge.unknown { background: var(--dim); }

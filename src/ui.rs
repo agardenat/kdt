@@ -75,47 +75,12 @@ pub enum CertRow {
     Secret { depth: usize, namespace: String, name: String },
 }
 
-// A rendered row of the Kyverno view. The same enum serves both orientations: policy-centric nests
-// Rule and Violation under Policy, resource-centric nests Violation under Resource under Namespace.
-// Whichever is active, the vector stays index-aligned with `App::snapshot`.
-pub enum KyRow {
-    // Index into the filtered policy list.
-    Policy { idx: usize, collapsed: bool, has_children: bool },
-    Rule { policy: usize, rule: usize, collapsed: bool, has_children: bool },
-    // Index into the filtered violation list.
-    Violation { idx: usize, depth: usize },
-    Exception { policy: usize, exception: usize },
-    Namespace { name: String, collapsed: bool, counts: KyCounts },
-    Resource { kind: String, namespace: String, name: String, collapsed: bool, counts: KyCounts },
-}
-
-// How the Kyverno tree is filtered (`f`): everything, only what needs a human, or only the policies
-// that actually block writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KyvernoFilter { All, Problems, Enforce }
-
-impl KyvernoFilter {
-    fn label(self) -> &'static str {
-        match self {
-            KyvernoFilter::All => "ALL",
-            KyvernoFilter::Problems => "PROBLEMS",
-            KyvernoFilter::Enforce => "ENFORCE",
-        }
-    }
-    fn matches(self, p: &KyPolicy) -> bool {
-        match self {
-            KyvernoFilter::All => true,
-            // A policy that cannot evaluate is as much a problem as one that rejects things: it is
-            // silently protecting nothing.
-            KyvernoFilter::Problems => p.has_problem(),
-            KyvernoFilter::Enforce => p.action.blocks(),
-        }
-    }
-}
+// La vue kyverno n'a pas de modèle à elle : ses lignes, ses verdicts et ses enregistrements
+// synthétiques vivent dans `crate::kyverno`, et kdt-web lit exactement les mêmes.
 use crate::kyverno::{
-    fetch_kyverno, is_admission_denial, new_kyverno_state, parse_denial_message,
-    purge_stuck_update_requests, KyAction, KyCounts, KyPolicy, KyReady, KyResult, KyViolation,
-    SharedKyverno,
+    build_ky_rows, fetch_kyverno, is_admission_denial, ky_autofold, new_kyverno_state,
+    parse_denial_message, purge_stuck_update_requests, record_for_row, KyAction, KyCounts,
+    KyFilter as KyvernoFilter, KyPolicy, KyReady, KyResult, KyRow, KyViolation, SharedKyverno,
 };
 use crate::lang;
 use crate::lang::Strings;
@@ -7233,39 +7198,10 @@ impl App {
         }
     }
 
-    fn ky_policy_uid(p: &KyPolicy) -> String {
-        p.uid()
-    }
-
-    fn ky_rule_uid(p: &KyPolicy, rule: &str) -> String {
-        format!("{}|rule|{}", p.uid(), rule)
-    }
-
-    // Auto-folding: a healthy policy's rules are noise, a failing one's are the answer. Recomputed
-    // on every refresh so a policy that starts rejecting things opens itself — but never against a
-    // node the user has folded or unfolded by hand.
+    // Le repli automatique : une policy saine referme ses règles, une policy en peine les
+    // ouvre — sauf là où quelqu'un a plié à la main. La règle est celle de `crate::kyverno`.
     fn apply_kyverno_autofold(&mut self, policies: &[KyPolicy]) {
-        for p in policies {
-            let uid = p.uid();
-            if !self.ky_user_toggled.contains(&uid) {
-                if p.has_problem() {
-                    self.ky_collapsed.remove(&uid);
-                } else {
-                    self.ky_collapsed.insert(uid.clone());
-                }
-            }
-            for r in &p.rules {
-                let ruid = Self::ky_rule_uid(p, &r.name);
-                if self.ky_user_toggled.contains(&ruid) {
-                    continue;
-                }
-                if r.counts.problems() > 0 {
-                    self.ky_collapsed.remove(&ruid);
-                } else {
-                    self.ky_collapsed.insert(ruid);
-                }
-            }
-        }
+        ky_autofold(policies, &self.ky_user_toggled, &mut self.ky_collapsed);
     }
 
     // Rebuilds `ky_rows` and `App::snapshot` in lockstep, so a selected index means the same row in
@@ -7294,12 +7230,13 @@ impl App {
             (policies, violations)
         };
         self.apply_kyverno_autofold(&policies);
+        let st = lang::t(self.ai_language);
 
-        let (rows, recs) = if self.ky_by_resource {
-            self.build_ky_resource_rows(&policies, &violations)
-        } else {
-            self.build_ky_policy_rows(&policies, &violations)
-        };
+        let rows = build_ky_rows(&policies, &violations, self.ky_by_resource, &self.ky_collapsed);
+        let recs: Vec<EventRecord> = rows
+            .iter()
+            .map(|row| record_for_row(row, &policies, &violations, st))
+            .collect();
         self.ky_rows = rows;
         self.ky_view_policies = policies;
         self.ky_view_violations = violations;
@@ -7336,137 +7273,6 @@ impl App {
         }
     }
 
-    // Policy -> rule (+ the autogen ones) -> the resources that fail it, then the exceptions that
-    // excuse it. Answers "what does this policy do, and what is it breaking?".
-    fn build_ky_policy_rows(
-        &self,
-        policies: &[KyPolicy],
-        violations: &[KyViolation],
-    ) -> (Vec<KyRow>, Vec<EventRecord>) {
-        let mut rows: Vec<KyRow> = Vec::new();
-        let mut recs: Vec<EventRecord> = Vec::new();
-
-        for (pi, p) in policies.iter().enumerate() {
-            let uid = p.uid();
-            let collapsed = self.ky_collapsed.contains(&uid);
-            let has_children = !p.rules.is_empty() || !p.exceptions.is_empty();
-            rows.push(KyRow::Policy { idx: pi, collapsed, has_children });
-            recs.push(synthetic_policy_record(p));
-            if collapsed {
-                continue;
-            }
-
-            for (ri, r) in p.rules.iter().enumerate() {
-                let ruid = Self::ky_rule_uid(p, &r.name);
-                let rule_violations: Vec<usize> = violations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, v)| v.policy_uid == uid && v.rule == r.name)
-                    .map(|(i, _)| i)
-                    .collect();
-                let rcollapsed = self.ky_collapsed.contains(&ruid);
-                rows.push(KyRow::Rule {
-                    policy: pi,
-                    rule: ri,
-                    collapsed: rcollapsed,
-                    has_children: !rule_violations.is_empty(),
-                });
-                // A rule is not an API object of its own: point the record at the policy so `y` and
-                // `e` open the thing that can actually be edited.
-                recs.push(synthetic_rule_record(p, &r.name));
-                if rcollapsed {
-                    continue;
-                }
-                for vi in rule_violations {
-                    rows.push(KyRow::Violation { idx: vi, depth: 2 });
-                    recs.push(synthetic_violation_record(&violations[vi]));
-                }
-            }
-
-            for (ei, e) in p.exceptions.iter().enumerate() {
-                rows.push(KyRow::Exception { policy: pi, exception: ei });
-                recs.push(synthetic_exception_record(e));
-            }
-        }
-        (rows, recs)
-    }
-
-    // Namespace -> resource -> the policies it violates. The same join read the other way round:
-    // answers "what is wrong in this namespace?".
-    fn build_ky_resource_rows(
-        &self,
-        _policies: &[KyPolicy],
-        violations: &[KyViolation],
-    ) -> (Vec<KyRow>, Vec<EventRecord>) {
-        // Preserve the violation ordering (worst result first) while grouping, so the namespace and
-        // resource that need attention stay at the top.
-        let mut ns_order: Vec<String> = Vec::new();
-        let mut by_ns: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, v) in violations.iter().enumerate() {
-            let ns = v.namespace.clone();
-            if !by_ns.contains_key(&ns) {
-                ns_order.push(ns.clone());
-            }
-            by_ns.entry(ns).or_default().push(i);
-        }
-
-        let mut rows: Vec<KyRow> = Vec::new();
-        let mut recs: Vec<EventRecord> = Vec::new();
-
-        for ns in ns_order {
-            let idxs = &by_ns[&ns];
-            let mut counts = KyCounts::default();
-            for i in idxs {
-                counts.add_result(violations[*i].result);
-            }
-            let nuid = format!("ns|{}", ns);
-            let ncollapsed = self.ky_collapsed.contains(&nuid);
-            rows.push(KyRow::Namespace { name: ns.clone(), collapsed: ncollapsed, counts });
-            recs.push(synthetic_namespace_record(&ns, &counts));
-            if ncollapsed {
-                continue;
-            }
-
-            let mut res_order: Vec<(String, String)> = Vec::new();
-            let mut by_res: std::collections::HashMap<(String, String), Vec<usize>> =
-                std::collections::HashMap::new();
-            for i in idxs {
-                let key = (violations[*i].kind.clone(), violations[*i].name.clone());
-                if !by_res.contains_key(&key) {
-                    res_order.push(key.clone());
-                }
-                by_res.entry(key).or_default().push(*i);
-            }
-
-            for key in res_order {
-                let vis = &by_res[&key];
-                let mut rcounts = KyCounts::default();
-                for i in vis {
-                    rcounts.add_result(violations[*i].result);
-                }
-                let ruid = format!("res|{}/{}/{}", ns, key.0, key.1);
-                let rcollapsed = self.ky_collapsed.contains(&ruid);
-                rows.push(KyRow::Resource {
-                    kind: key.0.clone(),
-                    namespace: ns.clone(),
-                    name: key.1.clone(),
-                    collapsed: rcollapsed,
-                    counts: rcounts,
-                });
-                recs.push(synthetic_violation_record(&violations[vis[0]]));
-                if rcollapsed {
-                    continue;
-                }
-                for i in vis {
-                    rows.push(KyRow::Violation { idx: *i, depth: 2 });
-                    recs.push(synthetic_violation_record(&violations[*i]));
-                }
-            }
-        }
-        (rows, recs)
-    }
-
     fn move_ky_selection(&mut self, delta: i32) {
         if self.snapshot.is_empty() { return; }
         let cur = self.table_state.selected().unwrap_or(0) as i32;
@@ -7481,19 +7287,7 @@ impl App {
     // The fold key of the row under the cursor, or None for a leaf that cannot be folded.
     fn ky_fold_key(&self) -> Option<String> {
         let sel = self.table_state.selected()?;
-        match self.ky_rows.get(sel)? {
-            KyRow::Policy { idx, .. } => self.ky_view_policies.get(*idx).map(Self::ky_policy_uid),
-            KyRow::Rule { policy, rule, .. } => {
-                let p = self.ky_view_policies.get(*policy)?;
-                let r = p.rules.get(*rule)?;
-                Some(Self::ky_rule_uid(p, &r.name))
-            }
-            KyRow::Namespace { name, .. } => Some(format!("ns|{}", name)),
-            KyRow::Resource { kind, namespace, name, .. } => {
-                Some(format!("res|{}/{}/{}", namespace, kind, name))
-            }
-            KyRow::Violation { .. } | KyRow::Exception { .. } => None,
-        }
+        self.ky_rows.get(sel)?.fold_key(&self.ky_view_policies)
     }
 
     // Space: fold/unfold the selected node and remember that the choice was deliberate, so the
@@ -7520,11 +7314,7 @@ impl App {
     }
 
     fn cycle_ky_filter(&mut self) {
-        self.ky_filter = match self.ky_filter {
-            KyvernoFilter::All => KyvernoFilter::Problems,
-            KyvernoFilter::Problems => KyvernoFilter::Enforce,
-            KyvernoFilter::Enforce => KyvernoFilter::All,
-        };
+        self.ky_filter = self.ky_filter.next();
         self.ky_detail_scroll = 0;
         self.refresh_kyverno_snapshot();
     }
@@ -17926,108 +17716,11 @@ fn synthetic_cert_record(r: &CmResource) -> EventRecord {
     crate::certmanager::synthetic_record(r)
 }
 
-// Snapshot records for the Kyverno view. What each record points at decides what the shared `y`,
-// `e`, `h` and `Ctrl-D` act on, and that differs by row: a policy row addresses the policy, a
-// violation row addresses the *offending resource* — which is what makes `h` on a violation
-// re-trigger admission and have Kyverno re-evaluate it on the spot.
-fn synthetic_policy_record(p: &KyPolicy) -> EventRecord {
-    let (severity, reason) = match p.ready {
-        KyReady::Ready if p.counts.error > 0 => (Severity::Warning, "PolicyError".to_string()),
-        KyReady::Ready if p.counts.fail > 0 => (Severity::Warning, "PolicyViolation".to_string()),
-        KyReady::Ready => (Severity::Normal, "Ready".to_string()),
-        KyReady::NotReady => (Severity::Warning, "NotReady".to_string()),
-        KyReady::Unknown => (Severity::Normal, "Unknown".to_string()),
-    };
-    let message = if p.ready_message.is_empty() {
-        format!("{} {} · {}", p.kind.as_str(), p.name, p.action.label())
-    } else {
-        p.ready_message.clone()
-    };
-    EventRecord {
-        uid: format!("ky|{}", p.uid()),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason,
-        api_version: p.api_version.clone(),
-        kind: p.kind.as_str().to_string(),
-        namespace: p.namespace.clone(),
-        name: p.name.clone(),
-        message,
-        component: "kyverno".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
 
-// A rule is not an API object: the record addresses the policy that declares it, so `y` and `e` on
-// a rule row open the document the rule actually lives in.
-fn synthetic_rule_record(p: &KyPolicy, rule: &str) -> EventRecord {
-    EventRecord {
-        uid: format!("kyrule|{}|{}", p.uid(), rule),
-        reason: "Rule".to_string(),
-        severity: Severity::Normal,
-        message: lang::fill(
-            lang::active().rec_rule,
-            &[("policy", &p.name), ("rule", rule)],
-        ),
-        ..synthetic_policy_record(p)
-    }
-}
 
-fn synthetic_violation_record(v: &KyViolation) -> EventRecord {
-    let severity = if v.result == KyResult::Warn { Severity::Normal } else { Severity::Warning };
-    EventRecord {
-        uid: format!("kyvio|{}", v.uid()),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity,
-        reason: v.result.label().to_string(),
-        // Reports do not always name the apiVersion; `current_object_ref` defaults it to v1, which
-        // is right for the core kinds and harmless elsewhere since discovery resolves the kind.
-        api_version: v.api_version.clone(),
-        kind: v.kind.clone(),
-        namespace: v.namespace.clone(),
-        name: v.name.clone(),
-        message: v.message.clone(),
-        component: "kyverno".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
 
-fn synthetic_exception_record(e: &crate::kyverno::KyException) -> EventRecord {
-    EventRecord {
-        uid: format!("kyexc|{}/{}", e.namespace, e.name),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "Exception".to_string(),
-        api_version: e.api_version.clone(),
-        kind: "PolicyException".to_string(),
-        namespace: e.namespace.clone(),
-        name: e.name.clone(),
-        message: format!("exclut {}", e.match_summary),
-        component: "kyverno".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
 
 // A namespace grouping row addresses the Namespace object itself, so `y` on it is still useful.
-fn synthetic_namespace_record(ns: &str, counts: &KyCounts) -> EventRecord {
-    EventRecord {
-        uid: format!("kyns|{}", ns),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: if counts.fail + counts.error > 0 { Severity::Warning } else { Severity::Normal },
-        reason: "Namespace".to_string(),
-        api_version: "v1".to_string(),
-        kind: if ns.is_empty() { String::new() } else { "Namespace".to_string() },
-        namespace: String::new(),
-        name: ns.to_string(),
-        message: counts.summary(),
-        component: "kyverno".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
 
 // Snapshot record for the TLS Secret leaf, so `y` and `Ctrl-D` on that row address the Secret itself.
 fn synthetic_cert_secret_record(namespace: &str, name: &str) -> EventRecord {
@@ -27153,23 +26846,12 @@ fn cert_chain_lines(
 // --- Kyverno rendering ---------------------------------------------------------------------------
 
 fn ky_action_cell(a: KyAction) -> Cell<'static> {
-    let color = match a {
-        // Enforce is the only posture that can break a deployment at 3am: it reads as a warning.
-        KyAction::Enforce => Color::LightRed,
-        KyAction::Warn => Color::Yellow,
-        KyAction::Audit => Color::Cyan,
-        KyAction::None => DIM,
-    };
-    Cell::from(a.label()).style(Style::default().fg(color))
+    Cell::from(a.label()).style(Style::default().fg(line_color(a.tone())))
 }
 
 fn ky_ready_cell(r: KyReady) -> Cell<'static> {
-    let (txt, color) = match r {
-        KyReady::Ready => ("✓ Ready", Color::Green),
-        KyReady::NotReady => ("✗ NotReady", Color::Red),
-        KyReady::Unknown => ("· ?", Color::Yellow),
-    };
-    Cell::from(txt).style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+    Cell::from(format!("{} {}", r.glyph(), r.label()))
+        .style(Style::default().fg(line_color(r.tone())).add_modifier(Modifier::BOLD))
 }
 
 fn ky_result_color(r: KyResult) -> Color {
@@ -27185,26 +26867,13 @@ fn ky_result_color(r: KyResult) -> Color {
 }
 
 // A policy that cannot evaluate, or that is erroring, gets a dark red bed so it stands out from the
-// merely-failing ones even when scrolled past.
+// merely-failing ones even when scrolled past. `alarming()` is the verdict, and it lives in `kyverno`.
 fn ky_policy_row_style(p: &KyPolicy) -> Style {
-    if p.ready == KyReady::NotReady || p.counts.error > 0 {
+    if p.alarming() {
         Style::default().bg(Color::Rgb(40, 0, 0))
     } else {
         Style::default()
     }
-}
-
-// The scope a policy applies to, taken from its authored rules — the autogen ones only restate the
-// same match against the workload kinds Kyverno derived.
-fn ky_policy_scope(p: &KyPolicy) -> String {
-    if let Some(s) = p.schedule.as_ref() {
-        return format!("cron {}", s);
-    }
-    p.rules
-        .iter()
-        .find(|r| !r.autogen)
-        .map(|r| r.match_summary.clone())
-        .unwrap_or_default()
 }
 
 fn kyverno_panel_title(app: &App) -> String {
@@ -27288,7 +26957,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
             KyRow::Violation { idx, depth } => {
                 let Some(v) = app.ky_view_violations.get(*idx) else { return String::new() };
-                format!("{}{} {}", "  ".repeat(*depth), v.result.glyph(), ky_target_label(v))
+                format!("{}{} {}", "  ".repeat(*depth), v.result.glyph(), v.target())
             }
             KyRow::Exception { policy, exception } => {
                 let Some(e) = app
@@ -27356,7 +27025,7 @@ fn draw_kyverno_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
                         ky_action_cell(p.action),
                         ky_ready_cell(p.ready),
-                        Cell::from(ky_policy_scope(p)).style(Style::default().fg(DIM)),
+                        Cell::from(p.scope()).style(Style::default().fg(DIM)),
                         detail,
                     ])
                     .style(ky_policy_row_style(p))
@@ -27600,13 +27269,6 @@ fn ns_label(ns: &str) -> &str {
     if ns.is_empty() { "(cluster)" } else { ns }
 }
 
-fn ky_target_label(v: &KyViolation) -> String {
-    if v.namespace.is_empty() {
-        v.name.clone()
-    } else {
-        format!("{}/{}", v.namespace, v.name)
-    }
-}
 
 fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(4) as usize;
@@ -27949,7 +27611,7 @@ fn ky_policy_lines(
                     format!("  {} {:<12}", v.result.glyph(), v.kind),
                     Style::default().fg(ky_result_color(v.result)),
                 ),
-                Span::raw(ky_target_label(v)),
+                Span::raw(v.target()),
                 Span::styled(format!("  {}", v.rule), Style::default().fg(DIM)),
             ]));
         }
@@ -27995,7 +27657,7 @@ fn ky_violation_lines(
         Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD),
     )));
     out.push(Line::from(""));
-    out.push(field("ressource", ky_target_label(v)));
+    out.push(field("ressource", v.target()));
     if !v.api_version.is_empty() {
         out.push(field("apiVersion", v.api_version.clone()));
     }

@@ -27,6 +27,8 @@ import type {
   EditPreflight,
   IdentityPayload,
   IdentityWriteResult,
+  KyFilter,
+  KyvernoPayload,
   IssuedToken,
   ObjectYaml,
   RancherPayload,
@@ -444,4 +446,32 @@ export function rancherWrite(
     ...request,
     lang,
   });
+}
+
+/**
+ * L'inventaire Kyverno du cluster : l'arbre, la santé, la file des requests.
+ *
+ * L'axe et le filtre partent au serveur, pas au navigateur : l'axe change le sens de la jointure —
+ * par ressource, l'arbre part des namespaces — et le filtre garde l'arbre valide, une policy
+ * écartée emportant ses règles et ses constats avec elle.
+ *
+ * Sans portée : les policies sont cluster-scoped, et l'axe par ressource groupe déjà par namespace.
+ */
+export function kyverno(
+  axis: "policy" | "resource",
+  filter: KyFilter,
+  lang: Lang,
+): Promise<KyvernoPayload> {
+  const params = new URLSearchParams({ axis, filter, lang });
+  return get<KyvernoPayload>(`/api/v1/kyverno?${params.toString()}`);
+}
+
+/**
+ * Vide la file des UpdateRequest bloquées.
+ *
+ * C'est la coupure manuelle d'une boucle qu'un controller en peine ne rompt pas tout seul. Les
+ * `Completed` et `Skip` ne sont pas touchées : elles ne sont pas de la file d'attente.
+ */
+export function kyvernoPurge(lang: Lang): Promise<{ message: string; deleted: number }> {
+  return send<{ message: string; deleted: number }>("/api/v1/kyverno/purge", { lang });
 }

@@ -618,6 +618,238 @@ export interface CertsPayload {
   secrets_error: string | null;
 }
 
+// --- Vue Kyverno ----------------------------------------------------------------------------------
+//
+// La jointure que Kyverno ne fait pas lui-même : une policy, ses règles — y compris les `autogen-*`
+// qu'il a dérivées et que les rapports sont seuls à nommer — et les ressources qui échouent dessus.
+// Tout ce qui juge est calculé par `kdt::kyverno` ; ce qui suit n'est que la forme de ce qu'il rend.
+
+/** Ce qu'une règle fait quand elle échoue. `Deny` du moteur CEL et `Enforce` sont la même posture. */
+export type KyAction = "none" | "audit" | "warn" | "enforce";
+
+/** Le verdict d'une ligne de rapport. `error` est une policy cassée, pas une ressource fautive. */
+export type KyResult = "pass" | "skip" | "warn" | "fail" | "error";
+
+export interface KyCounts {
+  pass: number;
+  fail: number;
+  warn: number;
+  error: number;
+  skip: number;
+}
+
+/** Ce que chaque ligne de l'arbre porte, quel que soit ce qu'elle désigne. */
+interface KyRowBase {
+  uid: string;
+  depth: number;
+  has_children: boolean;
+  /** Le pli que kdt poserait : sain replié, en peine ouvert. Un pli manuel gagne toujours. */
+  fold_default: boolean;
+  record: EventRecord;
+}
+
+export interface KyPolicyRow extends KyRowBase {
+  row: "policy";
+  kind: string;
+  /** Le kind raccourci pour la colonne de l'arbre. */
+  kind_short: string;
+  api_version: string;
+  namespace: string;
+  name: string;
+  title: string;
+  action: KyAction;
+  action_label: string;
+  action_tone: LineTone;
+  /** Vrai quand la policy refuse des écritures à l'admission. */
+  blocks: boolean;
+  background: boolean;
+  admission: boolean;
+  ready: "ready" | "not-ready" | "unknown";
+  ready_label: string;
+  ready_glyph: string;
+  ready_tone: LineTone;
+  ready_message: string;
+  /** Elle ne peut pas s'évaluer, ou une règle est en erreur : elle ne protège rien. */
+  alarming: boolean;
+  /** À quoi elle s'applique, lu sur ses règles écrites — pas sur celles que Kyverno a dérivées. */
+  scope: string;
+  summary: string;
+  counts: KyCounts;
+  rules: KyRule[];
+  exceptions: KyExceptionInfo[];
+  overrides: KyOverride[];
+  schedule: string | null;
+  age: string;
+}
+
+export interface KyRule {
+  name: string;
+  /** validate | mutate | generate | verifyImages | cel — ce que la règle fait. */
+  verb: string;
+  /** Dérivée par Kyverno d'une règle sur Pod. Ce sont ces noms-là que les rapports emploient. */
+  autogen: boolean;
+  action: KyAction;
+  match_summary: string;
+  message: string;
+  counts: KyCounts;
+}
+
+export interface KyRuleRow extends KyRowBase, KyRule {
+  row: "rule";
+  policy_uid: string;
+  policy_name: string;
+  action_label: string;
+  action_tone: LineTone;
+  /** Sa posture n'est pas celle de la policy : la colonne ACTION du dessus ne vaut pas pour elle. */
+  differs: boolean;
+  summary: string;
+}
+
+export interface KyExceptionInfo {
+  api_version: string;
+  namespace: string;
+  name: string;
+  /** Les règles excusées ; vide veut dire toutes. */
+  rules: string[];
+  match_summary: string;
+}
+
+export interface KyExceptionRow extends KyRowBase, KyExceptionInfo {
+  row: "exception";
+  policy_uid: string;
+}
+
+/** Une posture propre à certains namespaces : sans elle la colonne ACTION ment. */
+export interface KyOverride {
+  action: KyAction;
+  namespaces: string[];
+}
+
+export interface KyViolation {
+  policy_uid: string;
+  policy: string;
+  rule: string;
+  result: KyResult;
+  severity: string;
+  category: string;
+  message: string;
+  api_version: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  /** « background scan » ou « admission review request » : comment le constat a été produit. */
+  process: string;
+  age: string;
+}
+
+export interface KyViolationRow extends KyRowBase, KyViolation {
+  row: "violation";
+  result_label: string;
+  result_glyph: string;
+  /** La ressource fautive, en une étiquette. */
+  target: string;
+  is_problem: boolean;
+}
+
+export interface KyNamespaceRow extends KyRowBase {
+  row: "namespace";
+  name: string;
+  counts: KyCounts;
+  summary: string;
+  alarming: boolean;
+}
+
+export interface KyResourceRow extends KyRowBase {
+  row: "resource";
+  kind: string;
+  namespace: string;
+  name: string;
+  counts: KyCounts;
+  summary: string;
+}
+
+export type KyRow =
+  | KyPolicyRow
+  | KyRuleRow
+  | KyViolationRow
+  | KyExceptionRow
+  | KyNamespaceRow
+  | KyResourceRow;
+
+/**
+ * L'état de l'installation, avant toute policy.
+ *
+ * `inactive` est le seul que rien d'autre ne rapporte : tous les controllers verts alors qu'aucun
+ * webhook n'est enregistré veut dire que Kyverno n'intercepte rien du tout.
+ */
+export type KyHealthState = "unknown" | "degraded" | "inactive" | "ok";
+
+export interface KyHealth {
+  state: KyHealthState;
+  version: string;
+  controllers: Array<{ name: string; ready: number; desired: number; up: boolean }>;
+  validating_webhooks: number;
+  mutating_webhooks: number;
+  /** Faux quand les webhooks n'ont pas pu être lus : zéro ne voudrait alors rien dire. */
+  webhooks_known: boolean;
+  reports: number;
+}
+
+/**
+ * La file des `generate` / `mutateExisting`.
+ *
+ * Muette partout ailleurs : une file bloquée ne laisse ni PolicyReport ni refus d'admission, et
+ * les règles qui en dépendent cessent silencieusement de produire quoi que ce soit.
+ */
+export interface KyBacklog {
+  known: boolean;
+  total: number;
+  pending: number;
+  failed: number;
+  completed: number;
+  skip: number;
+  stuck: number;
+  /** Au-delà du seuil de kdt : la file ne se draine plus, ce n'est plus un compte mais une panne. */
+  pileup: boolean;
+  by_policy: Array<[string, number]>;
+  oldest_stuck: string | null;
+  ephemeral_reports: number;
+}
+
+/** Un refus d'admission, tel que l'Event le raconte. Il n'existe nulle part ailleurs. */
+export interface KyDenial {
+  age: string;
+  target: string;
+  rule: string;
+  message: string;
+}
+
+/** Le filtre des policies, tel que kdt le cycle sur `f`. */
+export type KyFilter = "all" | "problems" | "enforce";
+
+export interface KyvernoPayload {
+  rows: KyRow[];
+  counts: {
+    policies: number;
+    enforce: number;
+    not_ready: number;
+    fail: number;
+    warn: number;
+    error: number;
+    violations: number;
+  };
+  health: KyHealth;
+  backlog: KyBacklog;
+  /** Les refus d'admission, par nom de policy. */
+  denials: Record<string, KyDenial[]>;
+  /** Les évènements n'ont pas pu être lus : la section se tait au lieu d'affirmer zéro refus. */
+  denials_error: string | null;
+  installed: boolean;
+  /** Le moteur CEL est absent avant Kyverno 1.14 : ce n'est pas une panne. */
+  cel_installed: boolean;
+  error: string | null;
+}
+
 // --- Gestes sur un objet quelconque ---------------------------------------------------------------
 
 /** Les deux rendus du YAML, comme l'overlay `y` du TUI. */

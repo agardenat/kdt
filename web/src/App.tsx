@@ -10,6 +10,7 @@ import CertsView from "./CertsView";
 import EventsView from "./EventsView";
 import FluxView from "./FluxView";
 import IdentityView from "./IdentityView";
+import KyvernoView from "./KyvernoView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
@@ -19,7 +20,15 @@ import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
 import type { Capabilities, ClusterBanner, ClusterResource, Identity } from "./types";
 
-type ViewId = "events" | "flux" | "workloads" | "data" | "certs" | "identity" | "rancher";
+type ViewId =
+  | "events"
+  | "flux"
+  | "workloads"
+  | "data"
+  | "certs"
+  | "identity"
+  | "rancher"
+  | "kyverno";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -47,7 +56,7 @@ const VIEWS: Array<{
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r" },
-  { id: "kyverno", label: "Kyverno", key: "k", needs: "kyverno" },
+  { id: "kyverno", label: "Kyverno", key: "k", ready: true, needs: "kyverno" },
   { id: "identity", label: "Identity", key: "i", ready: true, needs: "identity" },
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
@@ -291,7 +300,13 @@ export default function App() {
   const scoped =
     view === "events" || view === "workloads" || view === "data" || view === "certs";
   const scopelessReason =
-    view === "identity" ? st.identScopeless : view === "rancher" ? st.ranchScopeless : st.fluxScopeless;
+    view === "identity"
+      ? st.identScopeless
+      : view === "rancher"
+        ? st.ranchScopeless
+        : view === "kyverno"
+          ? st.kyScopeless
+          : st.fluxScopeless;
 
   return (
     <div className="app">
@@ -480,6 +495,17 @@ export default function App() {
             />
           ) : view === "identity" ? (
             <IdentityView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "kyverno" ? (
+            <KyvernoView
               lang={lang}
               st={st}
               query={query}

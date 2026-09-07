@@ -16,6 +16,7 @@ mod config;
 mod config_secrets;
 mod flux;
 mod identity;
+mod kyverno;
 mod lang;
 mod objects;
 mod portal;
@@ -180,6 +181,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/identity/write", post(identity::write))
         .route("/api/v1/rancher", get(rancher::list))
         .route("/api/v1/rancher/write", post(rancher::write))
+        .route("/api/v1/kyverno", get(kyverno::list))
+        // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
+        // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.
+        .route("/api/v1/kyverno/purge", post(kyverno::purge))
         .route("/api/v1/certs", get(certs::list))
         // Les deux leviers de la chaîne : forcer la ré-émission, et relancer un cycle ACME bloqué
         // en supprimant la demande en cours.

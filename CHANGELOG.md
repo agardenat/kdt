@@ -14,7 +14,7 @@ Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-we
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, sept vues
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, huit vues
 répondent, le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
@@ -215,6 +215,26 @@ répondent, le reste n'existe pas.
   Le compte visé par une émission est **relu côté serveur** : le token porte le `userPrincipal`
   reconstruit depuis le principal réel, et un principal fourni par l'appelant ferait émettre un
   credential au nom de quelqu'un d'autre. Le credential rendu n'existe que dans cette réponse.
+
+- **feat(web)** — la vue Kyverno : la jointure que Kyverno ne fait pas lui-même — une policy, ses
+  règles et les ressources qui échouent dessus. Un `PolicyReport` ne nomme la policy et la règle
+  que par des chaînes, et les rapports d'un Deployment ne citent que les règles `autogen-*` que
+  Kyverno a dérivées : celles-ci sont dans l'arbre, marquées comme telles. La jointure se lit dans
+  les deux sens — *que casse cette policy ?* et *qu'est-ce qui ne va pas dans ce namespace ?*
+
+  Une policy saine referme ses règles, une policy en peine les ouvre, et un pli posé à la main
+  gagne toujours : le verdict vient du serveur, le navigateur ne fait que le suivre.
+
+  La bande de santé dit ce qu'aucune ligne ne dirait : Kyverno peut avoir tous ses controllers
+  verts et **n'intercepter rien du tout** si aucun webhook n'est enregistré. La file des
+  `UpdateRequest` y figure aussi — muette partout ailleurs, une file bloquée ne laissant ni
+  PolicyReport ni refus d'admission — avec les policies qui la tiennent lorsqu'elle ne se draine
+  plus, et le levier qui la vide.
+
+  Les refus d'admission ont leur section, et ils n'existent nulle part ailleurs : la ressource
+  refusée n'a jamais existé, donc aucun rapport ne la décrit — seul un Event en garde la trace.
+  Les évènements illisibles laissent la section muette plutôt que d'affirmer qu'il n'y a eu aucun
+  refus.
 
 - **feat(web)** — le `Ctrl-D` de kdt arrive sur le web, dans toutes les vues : les garde-fous
   d'abord — déployé par un moteur GitOps, point d'entrée GitOps, cascade d'un Namespace ou d'une

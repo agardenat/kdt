@@ -312,6 +312,70 @@ export interface Strings {
   ranchOrphanNs: string;
   ranchNotAuthoritative: string;
 
+  // --- Vue Kyverno. Le jargon reste en anglais des deux côtés : `policy`, `rule`, `enforce`,
+  // `audit`, `webhook` ne se disent pas autrement, et les constats viennent déjà du serveur.
+  kyByPolicy: string;
+  kyByResource: string;
+  kyAxisHelp: string;
+  kyFilterEnforce: string;
+  kyFilterHelp: string;
+  kyEmpty: string;
+  kyNotInstalled: string;
+  kyScopeless: string;
+  kyDetail: string;
+  kyResourceLabel: string;
+  kySelectRow: string;
+  kyFold: string;
+  kyPolicies: string;
+  kyEnforcing: string;
+  kyNotReady: string;
+  kyNoViolation: string;
+  kyHealthOk: string;
+  kyHealthDegraded: string;
+  kyHealthInactive: string;
+  kyHealthUnknown: string;
+  kyNoControllers: string;
+  kyWebhooks: string;
+  kyNoWebhook: string;
+  kyNoCel: string;
+  kyReports: string;
+  kyRequests: string;
+  kyRequestsPending: string;
+  kyRequestsFailed: string;
+  kyRequestsOldest: string;
+  kyRequestsTop: string;
+  kyEphemeral: string;
+  kyPurge: string;
+  kyPurgeHelp: string;
+  kyPurgeNone: string;
+  kyPurgeConfirm: string;
+  kyPosture: string;
+  kyAdmission: string;
+  kyBackground: string;
+  kyBackgroundOnly: string;
+  kyNoBackground: string;
+  kySchedule: string;
+  kyOverride: string;
+  kyRules: string;
+  kyAutogen: string;
+  kyAppliesTo: string;
+  kyExceptions: string;
+  kyExcludes: string;
+  kyForRules: string;
+  kyAllRules: string;
+  kyFailing: string;
+  kyDenials: string;
+  kyNoDenial: string;
+  kyDenialsDenied: string;
+  kyViolated: string;
+  kyErrorNote: string;
+  kyRetrigger: string;
+  kyOrigin: string;
+  kyEvaluated: string;
+  kySeverity: string;
+  kyCategory: string;
+  kyNotReadyNote: string;
+
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
@@ -646,6 +710,76 @@ const FR: Strings = {
   ranchNotAuthoritative:
     "Ligne reconstruite depuis le RBAC projeté par l'agent : l'objet Rancher est en amont.",
 
+  kyByPolicy: "par policy",
+  kyByResource: "par ressource",
+  kyAxisHelp:
+    "La même jointure lue par un bout ou par l'autre : « que casse cette policy ? » ou « qu'est-ce qui ne va pas ici ? ».",
+  kyFilterEnforce: "bloquantes",
+  kyFilterHelp:
+    "« problèmes » garde aussi les policies qui ne peuvent pas s'évaluer : elles ne protègent rien. « bloquantes » ne garde que celles qui refusent des écritures.",
+  kyEmpty: "Aucune policy ne correspond.",
+  kyNotInstalled: "Kyverno n'est pas installé sur ce cluster.",
+  kyScopeless:
+    "Les policies sont cluster-scoped, et l'axe par ressource groupe déjà par namespace : cette vue lit tout le cluster.",
+  kyDetail: "Policy",
+  kyResourceLabel: "ressource",
+  kySelectRow: "Choisissez une ligne pour agir dessus.",
+  kyFold: "Plier / déplier",
+  kyPolicies: "policies",
+  kyEnforcing: "enforce",
+  kyNotReady: "not ready",
+  kyNoViolation: "aucun constat",
+  kyHealthOk: "kyverno",
+  kyHealthDegraded: "kyverno dégradé",
+  kyHealthInactive: "kyverno inactif",
+  kyHealthUnknown: "kyverno non lu",
+  kyNoControllers: "controllers introuvables dans le namespace kyverno",
+  kyWebhooks: "webhooks",
+  kyNoWebhook:
+    "Aucun webhook enregistré : les controllers tournent, mais rien n'est intercepté.",
+  kyNoCel: "moteur CEL absent (Kyverno < 1.14)",
+  kyReports: "rapports",
+  kyRequests: "requests",
+  kyRequestsPending: "en attente",
+  kyRequestsFailed: "en échec",
+  kyRequestsOldest: "la plus ancienne : {age}",
+  kyRequestsTop: "surtout :",
+  kyEphemeral: "{n} rapports intermédiaires",
+  kyPurge: "purger les requests bloquées",
+  kyPurgeHelp:
+    "Supprime les UpdateRequest Pending/Failed. Kyverno recrée ce qui est encore nécessaire via synchronize.",
+  kyPurgeNone: "Aucune request bloquée à purger.",
+  kyPurgeConfirm: "{n} requests bloquées seront supprimées.",
+  kyPosture: "posture",
+  kyAdmission: "admission",
+  kyBackground: "background",
+  kyBackgroundOnly: "background seulement",
+  kyNoBackground: "non — rien n'est scanné hors admission",
+  kySchedule: "schedule",
+  kyOverride: "override",
+  kyRules: "règles",
+  kyAutogen: "autogen",
+  kyAppliesTo: "s'applique à",
+  kyExceptions: "exceptions",
+  kyExcludes: "exclut",
+  kyForRules: "pour les règles",
+  kyAllRules: "toutes les règles",
+  kyFailing: "ce qui échoue",
+  kyDenials: "refus à l'admission",
+  kyNoDenial: "aucun refus dans les évènements lus",
+  kyDenialsDenied:
+    "Les évènements vous sont refusés : les refus d'admission ne peuvent pas être affichés.",
+  kyViolated: "policies enfreintes",
+  kyErrorNote:
+    "« error » veut dire que la règle n'a pas pu s'évaluer : c'est la policy qui est cassée, pas la ressource.",
+  kyRetrigger:
+    "Un constat de background scan est réévalué au prochain passage : toucher l'objet le refait immédiatement.",
+  kyOrigin: "origine",
+  kyEvaluated: "évalué",
+  kySeverity: "severity",
+  kyCategory: "category",
+  kyNotReadyNote: "Cette policy ne peut pas s'évaluer : elle ne protège rien.",
+
   filterAll: "tout",
   filterProblems: "problèmes",
 
@@ -976,6 +1110,74 @@ const EN: Strings = {
   ranchOrphanNs: "namespaces with no project",
   ranchNotAuthoritative:
     "Row rebuilt from the RBAC the cluster agent projected: the Rancher object lives upstream.",
+
+  kyByPolicy: "by policy",
+  kyByResource: "by resource",
+  kyAxisHelp:
+    "The same join read from either end: \u201cwhat does this policy break?\u201d or \u201cwhat is wrong here?\u201d.",
+  kyFilterEnforce: "blocking",
+  kyFilterHelp:
+    "\u201cproblems\u201d also keeps the policies that cannot evaluate: they protect nothing. \u201cblocking\u201d keeps only those that reject writes.",
+  kyEmpty: "No policy matches.",
+  kyNotInstalled: "Kyverno is not installed on this cluster.",
+  kyScopeless:
+    "Policies are cluster-scoped, and the resource axis already groups by namespace: this view reads the whole cluster.",
+  kyDetail: "Policy",
+  kyResourceLabel: "resource",
+  kySelectRow: "Pick a row to act on it.",
+  kyFold: "Fold / unfold",
+  kyPolicies: "policies",
+  kyEnforcing: "enforce",
+  kyNotReady: "not ready",
+  kyNoViolation: "no finding",
+  kyHealthOk: "kyverno",
+  kyHealthDegraded: "kyverno degraded",
+  kyHealthInactive: "kyverno inactive",
+  kyHealthUnknown: "kyverno not read",
+  kyNoControllers: "controllers not found in the kyverno namespace",
+  kyWebhooks: "webhooks",
+  kyNoWebhook: "No webhook registered: the controllers run, but nothing is intercepted.",
+  kyNoCel: "CEL engine absent (Kyverno < 1.14)",
+  kyReports: "reports",
+  kyRequests: "requests",
+  kyRequestsPending: "pending",
+  kyRequestsFailed: "failed",
+  kyRequestsOldest: "oldest: {age}",
+  kyRequestsTop: "mostly:",
+  kyEphemeral: "{n} intermediate reports",
+  kyPurge: "purge stuck requests",
+  kyPurgeHelp:
+    "Deletes Pending/Failed UpdateRequests. Kyverno recreates what is still needed via synchronize.",
+  kyPurgeNone: "No stuck request to purge.",
+  kyPurgeConfirm: "{n} stuck requests will be deleted.",
+  kyPosture: "posture",
+  kyAdmission: "admission",
+  kyBackground: "background",
+  kyBackgroundOnly: "background only",
+  kyNoBackground: "no \u2014 nothing is scanned outside admission",
+  kySchedule: "schedule",
+  kyOverride: "override",
+  kyRules: "rules",
+  kyAutogen: "autogen",
+  kyAppliesTo: "applies to",
+  kyExceptions: "exceptions",
+  kyExcludes: "excludes",
+  kyForRules: "for rules",
+  kyAllRules: "every rule",
+  kyFailing: "what fails",
+  kyDenials: "admission denials",
+  kyNoDenial: "no denial in the events read",
+  kyDenialsDenied: "Events are denied to you: admission denials cannot be shown.",
+  kyViolated: "policies violated",
+  kyErrorNote:
+    "\u201cerror\u201d means the rule could not be evaluated: the policy is broken, not the resource.",
+  kyRetrigger:
+    "A background-scan finding is re-evaluated on the next pass: touching the object redoes it now.",
+  kyOrigin: "origin",
+  kyEvaluated: "evaluated",
+  kySeverity: "severity",
+  kyCategory: "category",
+  kyNotReadyNote: "This policy cannot evaluate: it protects nothing.",
 
   filterAll: "all",
   filterProblems: "problems",

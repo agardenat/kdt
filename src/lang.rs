@@ -1435,6 +1435,7 @@ pub struct Strings {
 
     // Kyverno, ConfigMaps, Flux tree and the related-resources pane.
     pub ky_all_rules: &'static str,
+    pub ky_rec_excludes: &'static str,
     pub ky_empty_select: &'static str,
     pub ky_degraded: &'static str,
     pub ky_no_controllers: &'static str,
@@ -3342,6 +3343,7 @@ pub const FR: Strings = Strings {
 
     // Kyverno, ConfigMaps, Flux tree and the related-resources pane.
     ky_all_rules: "toutes les règles",
+    ky_rec_excludes: "exclut {summary}",
     ky_empty_select: " sélectionnez une policy ",
     ky_degraded: " kyverno dégradé ",
     ky_no_controllers: "  contrôleurs introuvables dans le namespace kyverno",
@@ -5241,6 +5243,7 @@ pub const EN: Strings = Strings {
 
     // Kyverno, ConfigMaps, Flux tree and the related-resources pane.
     ky_all_rules: "every rule",
+    ky_rec_excludes: "excludes {summary}",
     ky_empty_select: " pick a policy ",
     ky_degraded: " kyverno degraded ",
     ky_no_controllers: "  controllers not found in the kyverno namespace",
