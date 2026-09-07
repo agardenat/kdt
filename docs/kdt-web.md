@@ -290,9 +290,13 @@ public — donc pas de `secretRef`, pas de `imagePullSecrets`.
 - En Actions, ce PAT disparaît : `permissions: packages: write` et `GITHUB_TOKEN`. Le job `image`
   de `release.yml` construit et pousse ainsi, sur le même tag `v*` que les binaires, en
   `linux/amd64` seulement — kdt tire plus de six cents crates, typst compris, et une seconde
-  architecture émulée par QEMU dépasserait la limite de six heures d'un runner. Deux réserves :
-  le premier push crée le package en privé, et `GITHUB_TOKEN` est refusé sur un package existant
-  non lié au dépôt.
+  architecture émulée par QEMU dépasserait la limite de six heures d'un runner. Deux réserves,
+  toutes deux vérifiées le 2026-09-07 sur kdt-identity : le premier push crée le package en privé,
+  et `GITHUB_TOKEN` est refusé sur un package que le dépôt n'a pas le droit d'écrire —
+  `denied: permission_denied: write_package`, après le build complet, puisque le push est la
+  dernière étape. Un package né d'un `podman push` au PAT est dans ce cas : le label le rattache
+  au dépôt, il ne lui donne aucun droit. Cela se règle une fois, dans les réglages du package,
+  **Manage Actions access** → ajouter le dépôt en rôle **Write**.
 
 **Deux images distinctes, deux charts** — `ghcr.io/agardenat/kdt-web` à côté de
 `ghcr.io/agardenat/kdt-identity` :
