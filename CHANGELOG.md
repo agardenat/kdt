@@ -353,6 +353,11 @@ répondent, le reste n'existe pas.
   condition — une `v2.0.0-alpha.1` aurait été marquée « dernière version » et poussée dans la
   formule du tap, basculant tout le monde sur une alpha.
 
+- **fix(web)** — un lien profond répondait « page manquante » : `/events` servait bien
+  l'interface, mais avec un code 404. Le navigateur affichait la page, et la supervision, les
+  caches et les journaux de l'ingress voyaient une page absente à chaque ouverture. Le repli de
+  la SPA répond désormais 200.
+
 ## [1.26.0] — 2026-09-05
 
 - **feat(identity)** — vue `:identity` : comptes et groups locaux de kdt-identity, avec la colonne

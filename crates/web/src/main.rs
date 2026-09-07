@@ -224,7 +224,12 @@ async fn main() -> Result<()> {
             tower_http::services::ServeDir::new(dir)
                 // Une SPA a des routes que le disque ne connaît pas : `/events` n'est pas un
                 // fichier. Tout ce qui n'existe pas retombe sur la page, qui saura quoi faire.
-                .not_found_service(tower_http::services::ServeFile::new(index)),
+                //
+                // `fallback` et non `not_found_service` : le second force un 404 sur la réponse.
+                // Le navigateur afficherait tout de même l'interface, mais chaque lien profond
+                // serait annoncé comme une page manquante — à la supervision, à un cache, et à
+                // qui lit les journaux de l'ingress.
+                .fallback(tower_http::services::ServeFile::new(index)),
         );
     }
 
