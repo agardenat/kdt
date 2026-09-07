@@ -1,0 +1,38 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+  kdt-web reçoit des codes d'autorisation et détient des credentials de cluster : il n'a rien à
+  faire en clair. Le cookie de session porte l'attribut `Secure`, donc un navigateur ne le
+  renverrait même pas sur du HTTP — kdt-web serait inutilisable, silencieusement.
+*/}}
+{{- if not .Values.ingress.tls.enabled }}
+{{- fail "ingress.tls.enabled=false : kdt-web reçoit des codes d'autorisation et son cookie de session est marqué Secure. Le servir en clair le rend inutilisable autant que dangereux." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "kdt-web.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-web.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  tls:
+    - hosts:
+        - {{ required "ingress.host est obligatoire quand l'ingress est activé" .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | default (printf "%s-tls" (include "kdt-web.fullname" .)) }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "kdt-web.fullname" . }}
+                port:
+                  name: http
+{{- end }}

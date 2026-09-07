@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+  kdt-web n'a aucun pouvoir propre sur le cluster, mais il détient les credentials des personnes
+  connectées. Ce qu'il peut joindre est donc réduit à ce dont il a besoin : le DNS, l'apiserver,
+  le portail, et le stockage objet des backups quand on ouvre le contenu d'un backup Velero.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kdt-web.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-web.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "kdt-web.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if .Values.networkPolicy.ingressFrom }}
+    - from: {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- else }}
+    # Aucune source déclarée : seul le trafic depuis le même namespace atteint kdt-web.
+    # Renseigner networkPolicy.ingressFrom avec le sélecteur du contrôleur d'ingress.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- end }}
+  egress:
+    # DNS, sans quoi rien ne résout.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # L'apiserver, le portail, et le stockage objet des backups. Aucun de ces CIDR n'est connu
+    # du chart : à restreindre aux vôtres en production, l'ouverture large ci-dessous n'étant
+    # qu'un défaut praticable.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [169.254.169.254/32]
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+{{- end }}

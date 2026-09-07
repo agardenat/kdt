@@ -1,0 +1,97 @@
+# Racine publique de kdt-web, telle qu'un navigateur l'atteint.
+#
+# C'est d'elle que se déduit l'adresse de retour du flow d'autorisation —
+# <webUrl>/auth/callback — et le portail n'en accepte aucune autre. Elle doit donc être
+# identique à la valeur `webUrl` du chart de kdt-identity, au caractère près.
+#
+# https est exigé : le cookie de session porte `Secure`, et un navigateur ne le renverrait
+# jamais sur du HTTP. La boucle locale fait exception, c'est le seul chemin praticable derrière
+# un port-forward.
+webUrl: ""
+
+# Racine du portail kdt-identity, telle que kdt-web l'atteint — et telle que le navigateur
+# l'atteint, puisque c'est vers elle qu'il est redirigé pour se connecter. Les deux doivent
+# désigner la même adresse : une URL interne ici enverrait les navigateurs sur un hôte qu'ils
+# ne résolvent pas.
+portalUrl: ""
+
+# Nom sous lequel ce cluster est connu, affiché dans le bandeau.
+#
+# Il n'existe nulle part dans Kubernetes : un cluster ne connaît pas son propre nom. Vide, le
+# bandeau retombe sur l'hôte de l'apiserver — qui désigne sans ambiguïté, mais ne se retient
+# pas. Mettez celui qui figure dans le kubeconfig des équipes.
+clusterName: ""
+
+image:
+  repository: ghcr.io/agardenat/kdt-web
+  pullPolicy: IfNotPresent
+  # Par défaut, l'appVersion du chart.
+  tag: ""
+
+logLevel: kdt_web=info
+
+serviceAccount:
+  name: ""
+
+# Une seule instance. Les sessions vivent en mémoire du processus : une seconde réplique
+# renverrait « non connecté » à une requête sur deux, et le refresh token n'est stocké nulle
+# part qui puisse être partagé — c'est délibéré, il ne touche ni le disque ni un Secret.
+replicas: 1
+
+resources:
+  requests: {cpu: 20m, memory: 64Mi}
+  limits: {memory: 256Mi}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+# Clé de signature du cookie de session, 32 octets en base64.
+#
+# Laissée vide, le chart en engendre une et la relit d'une montée de version à l'autre : sans
+# cette précaution, chaque `helm upgrade` déconnecterait tout le monde.
+sessionKey: ""
+
+# Durée du cookie de session. Distincte du droit de session obtenu du portail, qui dure plus
+# longtemps et que lui seul peut révoquer : celle-ci ne fait que borner la validité du cookie.
+sessionTtl: 12h
+
+networkPolicy:
+  # Refuse tout par défaut, n'ouvre que ce qui est nécessaire. kdt-web détient les credentials
+  # des personnes connectées : il n'a rien à faire sur le réseau au-delà de l'apiserver, du
+  # DNS, du portail et du stockage objet des backups Velero.
+  enabled: true
+  # Sélecteur des pods autorisés à joindre kdt-web, typiquement le contrôleur d'ingress.
+  ingressFrom: []
+  # À activer sur un cluster sous Cilium. La règle egress vise l'apiserver par son CIDR, or
+  # Cilium traite le trafic vers un nœud comme les entités `host`/`remote-node`, hors d'atteinte
+  # d'un `ipBlock` tant que `policy-cidr-match-mode=nodes` n'est pas posé.
+  cilium: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+nameOverride: ""
+fullnameOverride: ""

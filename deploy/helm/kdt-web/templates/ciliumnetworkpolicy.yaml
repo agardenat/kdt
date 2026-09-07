@@ -1,0 +1,24 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.cilium }}
+{{/*
+  Sous Cilium, la règle egress de la NetworkPolicy ne suffit pas à joindre l'apiserver. Celui-ci
+  écoute sur l'adresse d'un nœud, et Cilium range le trafic vers un nœud sous les entités `host`
+  et `remote-node`, qu'aucun `ipBlock` ne couvre tant que `policy-cidr-match-mode` ne vaut pas
+  `nodes` — ce qui n'est pas le défaut. Sans cette policy, kdt-web démarre, affiche sa page, et
+  chaque vue reste vide.
+
+  Les autorisations se cumulent entre CiliumNetworkPolicy et NetworkPolicy : celle-ci n'ouvre
+  que l'apiserver, le reste continue d'être refusé par la NetworkPolicy.
+*/}}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "kdt-web.fullname" . }}-apiserver
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-web.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels: {{- include "kdt-web.selectorLabels" . | nindent 6 }}
+  egress:
+    - toEntities:
+        - kube-apiserver
+{{- end }}

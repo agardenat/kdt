@@ -1,0 +1,26 @@
+kdt-web est installé dans le namespace {{ .Release.Namespace }}.
+
+{{ if .Values.ingress.enabled }}Interface : {{ .Values.webUrl }}
+{{- else }}
+Aucun ingress n'est activé. Pour essayer :
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kdt-web.fullname" . }} 8080:{{ .Values.service.port }}
+
+webUrl doit alors valoir http://localhost:8080 — c'est l'adresse que le navigateur atteint, et
+l'adresse de retour en découle.
+{{- end }}
+
+Rien ne fonctionnera tant que le portail ne connaîtra pas cette adresse. Côté kdt-identity :
+
+  webUrl: {{ .Values.webUrl }}
+
+Elle doit être identique au caractère près : le portail compare l'adresse de retour
+({{ .Values.webUrl }}/auth/callback) à celle qu'il a déclarée, et refuse toute autre.
+
+Ce déploiement n'a **aucun droit sur les ressources du cluster** : son compte de service
+n'est visé par aucun Role ni ClusterRole. Chaque requête part avec le credential de la
+personne connectée, et le RBAC du cluster s'applique tel quel — quelqu'un qui ne voit rien
+dans kdt-web ne voit rien avec kubectl non plus.
+
+  kubectl -n {{ .Release.Namespace }} auth can-i --list \
+      --as=system:serviceaccount:{{ .Release.Namespace }}:{{ include "kdt-web.serviceAccountName" . }}

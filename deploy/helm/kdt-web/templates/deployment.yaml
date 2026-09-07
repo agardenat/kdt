@@ -1,0 +1,69 @@
+{{- include "kdt-web.validate" . -}}
+{{- $image := printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kdt-web.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-web.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  # Les sessions vivent en mémoire : deux pods pendant un roulement, c'est la moitié des
+  # requêtes servies par celui qui ne connaît pas le visiteur. On préfère la coupure franche —
+  # le pod s'arrête proprement, chacun se reconnecte, et personne ne voit d'erreur aléatoire.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "kdt-web.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kdt-web.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "kdt-web.serviceAccountName" . }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: web
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KDT_WEB_LISTEN
+              value: "0.0.0.0:8080"
+            - name: KDT_WEB_URL
+              value: {{ .Values.webUrl | quote }}
+            - name: KDT_WEB_PORTAL_URL
+              value: {{ .Values.portalUrl | quote }}
+            {{- with .Values.clusterName }}
+            - name: KDT_WEB_CLUSTER
+              value: {{ . | quote }}
+            {{- end }}
+            - name: KDT_WEB_SESSION_TTL
+              value: {{ .Values.sessionTtl | quote }}
+            - name: KDT_WEB_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kdt-web.fullname" . }}-session
+                  key: session-key
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          # `/healthz` ne touche ni au cluster ni à une session : une sonde qui authentifierait
+          # ferait redémarrer le pod dès que le portail hoquette, en emportant les sessions.
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

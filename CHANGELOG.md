@@ -353,6 +353,20 @@ répondent, le reste n'existe pas.
   condition — une `v2.0.0-alpha.1` aurait été marquée « dernière version » et poussée dans la
   formule du tap, basculant tout le monde sur une alpha.
 
+- **feat(web)** — kdt-web se déploie : une image `ghcr.io/agardenat/kdt-web` construite par le
+  workflow de release sur le même tag `v*` que les binaires, et un chart `deploy/helm/kdt-web`.
+  Jusqu'ici, ce qui tournait quelque part ne correspondait à rien de publié.
+
+  L'image est `FROM scratch` — le binaire musl, le bundle du front, les racines TLS, rien d'autre.
+  kdt-web détient les credentials des personnes connectées : un shell dans le conteneur suffirait
+  à les lire, et il n'y en a pas.
+
+  Le chart n'a **aucun `rbac.yaml`**, et c'est sa propriété principale : le compte de service
+  n'est visé par aucun Role ni ClusterRole, parce que chaque requête part avec le credential de
+  la personne connectée. Il refuse ce qui ne pourrait pas fonctionner — un `webUrl` en clair ou
+  terminé par un `/`, que le portail rejetterait au retour, et une seconde réplique, qui
+  servirait une requête sur deux depuis un processus qui ne connaît pas le visiteur.
+
 - **fix(web)** — un lien profond répondait « page manquante » : `/events` servait bien
   l'interface, mais avec un code 404. Le navigateur affichait la page, et la supervision, les
   caches et les journaux de l'ingress voyaient une page absente à chaque ouverture. Le repli de

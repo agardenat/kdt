@@ -287,10 +287,12 @@ public — donc pas de `secretRef`, pas de `imagePullSecrets`.
   only supports authentication using a personal access token (classic) ». Les scopes d'un classic
   valent pour le compte, pas pour un dépôt — un même token couvre donc les deux chaînes de
   publication, et le révoquer les casse ensemble.
-- En Actions, ce PAT disparaît : `permissions: packages: write` et `GITHUB_TOKEN`. Ce workflow
-  n'existe nulle part aujourd'hui — kdt-identity n'a aucun `.github/workflows/`, et `release.yml`
-  de kdt ne produit que des binaires. Deux réserves pour ce jour-là : le premier push crée le
-  package en privé, et `GITHUB_TOKEN` est refusé sur un package existant non lié au dépôt.
+- En Actions, ce PAT disparaît : `permissions: packages: write` et `GITHUB_TOKEN`. Le job `image`
+  de `release.yml` construit et pousse ainsi, sur le même tag `v*` que les binaires, en
+  `linux/amd64` seulement — kdt tire plus de six cents crates, typst compris, et une seconde
+  architecture émulée par QEMU dépasserait la limite de six heures d'un runner. Deux réserves :
+  le premier push crée le package en privé, et `GITHUB_TOKEN` est refusé sur un package existant
+  non lié au dépôt.
 
 **Deux images distinctes, deux charts** — `ghcr.io/agardenat/kdt-web` à côté de
 `ghcr.io/agardenat/kdt-identity` :
@@ -348,9 +350,12 @@ pré-version se renomme en finale le jour venu, section du CHANGELOG comprise.
    équivalent ailleurs — `diagnostic`, `flux`, `capacity` — branchées sur l'app blanche.
 5. Vues restantes, puis les écritures, puis logs et exec.
 
-La chaîne de livraison suit le jalon 3 : `Dockerfile` de kdt-web (musl, `FROM scratch`, avec le
-`LABEL org.opencontainers.image.source`), job d'image ajouté à `release.yml` sur le même tag `v*`,
-package GHCR passé public une fois, puis `deploy/helm/kdt-web`.
+La chaîne de livraison est en place : `Dockerfile` (musl, `FROM scratch`, avec le
+`LABEL org.opencontainers.image.source`), job `image` dans `release.yml` sur le même tag `v*`, et
+`deploy/helm/kdt-web`. Reste le geste qui ne se scripte pas : **passer le package GHCR en public**,
+une fois, depuis les réglages du package. Sans lui, l'absence d'`imagePullSecrets` dans le chart
+donne un `ImagePullBackOff` — et c'est bien le chart qui a raison, le binaire étant déjà distribué
+en deb, rpm et Homebrew.
 
 ## 10. Ce qu'on ne fait pas
 
