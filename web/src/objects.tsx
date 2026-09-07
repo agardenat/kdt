@@ -1,23 +1,37 @@
-// Les trois gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le toucher.
+// Les quatre gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le
+// toucher, le supprimer.
 //
-// Dans le TUI ce sont trois touches — `y`, `e`, `h` — disponibles dans toutes les vues parce
-// qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici c'est la même chose, dans
-// la grammaire du web (mémoire `gui-affordances-not-tui-keys`) : **les actions vivent dans la barre
-// qui sépare les deux panneaux, et ce qu'elles ouvrent s'affiche dans le panneau du haut.**
+// Dans le TUI ce sont quatre touches — `y`, `e`, `h`, `Ctrl-D` — disponibles dans toutes les vues
+// parce qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici c'est la même chose,
+// dans la grammaire du web (mémoire `gui-affordances-not-tui-keys`) : **les actions vivent dans la
+// barre qui sépare les deux panneaux, et ce qu'elles ouvrent s'affiche dans le panneau du haut.**
 //
 // `Toucher` est le seul qui écrive sans rien ouvrir, et c'est déjà le cas dans kdt : deux
 // annotations sous `kdt.io/` s'ajoutent, rien n'est retiré, et l'intérêt de la touche est d'être
 // assez rapide pour parcourir une liste avec. L'accusé se lit à côté du bouton.
+//
+// `Supprimer` fait l'inverse et ouvre tout : les garde-fous d'abord, la confirmation ensuite. La
+// sortie par défaut est celle qui ne supprime rien — dans le TUI `Entrée` annule et c'est `Ctrl-D`
+// qui affirme ; ici c'est le bouton d'annulation qui prend le focus, et celui qui supprime est une
+// cible distincte qu'il faut aller chercher.
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api";
 import { NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
-import type { EditDiff, EditPreflight, EditReason, EventRecord, ObjectYaml } from "./types";
+import type {
+  DeletePreflight,
+  DeleteReason,
+  EditDiff,
+  EditPreflight,
+  EditReason,
+  EventRecord,
+  ObjectYaml,
+} from "./types";
 
 /** L'onglet du panneau qu'un bouton de la barre ouvre. */
-export type ObjectTab = "yaml" | "edit";
+export type ObjectTab = "yaml" | "edit" | "delete";
 
 /**
  * Les trois boutons, posés dans la barre des onglets de la vue.
@@ -94,6 +108,17 @@ export function ObjectActions({
         onClick={() => void touch()}
       >
         {st.actionTouch}
+      </button>
+      {/* Il n'écrit rien tout seul : il ouvre les garde-fous dans le panneau du haut, et c'est là
+          que la confirmation se donne. Le bouton porte quand même le ton d'une action sur le
+          cluster — une commande éteinte se cherche. */}
+      <button
+        className="panel-toggle action"
+        disabled={!usable}
+        title={usable ? undefined : st.objSelectRow}
+        onClick={() => onOpen("delete")}
+      >
+        {st.actionDelete}
       </button>
       {busy && <span className="dim">{st.objWorking}</span>}
       {ack && <span className={ack.tone === "err" ? "err" : "ok"}>{ack.text}</span>}
@@ -334,4 +359,157 @@ function pathTone(path: string, diff: EditDiff): string {
   if (diff.identity.includes(path) || diff.immutable.includes(path)) return "err";
   if (diff.server_owned.includes(path)) return "dim";
   return "";
+}
+
+
+/**
+ * La suppression, avec les garde-fous de kdt et sa confirmation à deux vitesses.
+ *
+ * Rien n'est retiré avant que l'objet ait été lu et inspecté pour les raisons qui font d'une
+ * suppression une erreur — au premier rang desquelles être déployé par un moteur GitOps, où le
+ * controller remet en place ce qu'on a enlevé. Aucun constat ne bloque : ils décident **combien**
+ * la confirmation coûte, exactement comme dans le TUI.
+ *
+ * Deux règles reprises telles quelles de kdt, et une transposée :
+ *
+ * - **la sortie par défaut ne supprime rien** — c'est le bouton d'annulation qui a le focus, et le
+ *   bouton destructeur est une cible séparée qu'il faut viser ;
+ * - **un constat grave, ou une vérification qui n'a pas conclu, exige de retaper le nom** — et le
+ *   serveur le revérifie, parce qu'un garde-fou qui ne vit que dans la page se contourne ;
+ * - la transposition : le TUI distingue « armer » et « confirmer » avec deux touches faute de
+ *   mieux. Ici les deux issues sont deux boutons visibles côte à côte, ce qui rend le geste
+ *   volontaire par construction sans rien à apprendre.
+ */
+export function DeletePane({
+  record,
+  lang,
+  st,
+  onCancel,
+  onDeleted,
+  onNeedsAuth,
+}: {
+  record: EventRecord;
+  lang: Lang;
+  st: Strings;
+  onCancel: () => void;
+  onDeleted?: (message: string) => void;
+  onNeedsAuth: (message: string) => void;
+}) {
+  const [preflight, setPreflight] = useState<DeletePreflight | null>(null);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setPreflight(null);
+    setError(null);
+    setDone(null);
+    setTyped("");
+    try {
+      setPreflight(await api.objectDeletePreflight(record, lang));
+    } catch (e) {
+      if (e instanceof NeedsAuth) onNeedsAuth(e.message);
+      else setError(String((e as Error).message ?? e));
+    }
+  }, [record, lang, onNeedsAuth]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const remove = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { message } = await api.objectDelete(record, typed, lang);
+      setDone(message);
+      onDeleted?.(message);
+    } catch (e) {
+      if (e instanceof NeedsAuth) onNeedsAuth(e.message);
+      else setError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }, [record, typed, lang, onDeleted, onNeedsAuth]);
+
+  if (error && !preflight) return <p className="pane-err">{error}</p>;
+  if (!preflight) return <p className="pane-wait">{st.delChecking}</p>;
+
+  const strict = preflight.strict;
+  const matches = typed.trim() === record.name;
+
+  return (
+    <div className="editor">
+      <div className="guards">
+        <div className="sect">{st.delTarget}</div>
+        <p className="mono">
+          {record.kind} {record.namespace ? `${record.namespace}/${record.name}` : record.name}
+        </p>
+      </div>
+
+      <div className="guards">
+        <div className="sect">{st.delTitle}</div>
+        {/* Une vérification qui n'a pas pu conclure n'est pas un feu vert : elle se dit, et elle
+            fait passer la confirmation en mode strict. */}
+        {preflight.error && <p className="guard danger">{preflight.error}</p>}
+        {preflight.clear && <p className="guard info">{preflight.clear}</p>}
+        {preflight.reasons.map((r) => (
+          <Finding key={r.text} reason={r} />
+        ))}
+        {preflight.reasons.length > 0 && <p className="dim">{st.delHelp}</p>}
+      </div>
+
+      {error && <p className="pane-err">{error}</p>}
+      {done ? (
+        <p className="ok">{done}</p>
+      ) : (
+        <div className="delete-confirm">
+          {strict && (
+            <>
+              <p className="warn">{st.delStrictHelp}</p>
+              <input
+                className="ns-add"
+                value={typed}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder={st.delStrictPlaceholder}
+                onChange={(e) => setTyped(e.target.value)}
+              />
+              {typed.trim() !== "" && !matches && (
+                <p className="err">{st.delStrictMismatch.replace("{name}", record.name)}</p>
+              )}
+            </>
+          )}
+          <div className="menu-buttons">
+            {/* La sortie par défaut est celle qui ne supprime rien : c'est elle qui a le focus. */}
+            <button autoFocus onClick={onCancel}>
+              {st.delCancel}
+            </button>
+            <button className="panel-toggle" disabled={busy} onClick={() => void load()}>
+              {st.delReload}
+            </button>
+            <button
+              className="cta danger"
+              disabled={busy || (strict && !matches)}
+              onClick={() => void remove()}
+            >
+              {st.delConfirm}
+            </button>
+          </div>
+          {busy && <span className="dim">{lang === "fr" ? "suppression…" : "deleting…"}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Un constat, peint par son niveau. Aucun ne bloque : ils disent ce qui va se passer. */
+function Finding({ reason }: { reason: DeleteReason }) {
+  const glyph = reason.level === "danger" ? "✗" : reason.level === "warn" ? "▲" : "·";
+  return (
+    <p className={`guard ${reason.level}`}>
+      <span className="gl">{glyph}</span> {reason.text}
+    </p>
+  );
 }

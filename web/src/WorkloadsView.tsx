@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { InspectPanel, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
 
@@ -223,7 +223,10 @@ export default function WorkloadsView({
 
   return (
     <>
-      {selectedRecord && panelOpen && (
+            {/* Le panneau reste en place tant qu'il est déplié, sélection ou pas : le faire apparaître
+          avec la sélection décalait la table de 300 px à chaque clic, et on perdait la ligne qu'on
+          venait de viser. */}
+      {panelOpen && (
         <>
           <InspectPanel
             record={selectedRecord}
@@ -291,17 +294,7 @@ export default function WorkloadsView({
               <WorkloadMenu w={selectedWorkload} st={st} onRun={run} />
             )}
           </div>
-          {selectedRecord && (
-            <button className="panel-toggle" onClick={() => onPanelOpen(!panelOpen)}>
-              {panelOpen
-                ? lang === "fr"
-                  ? "▾ replier"
-                  : "▾ collapse"
-                : lang === "fr"
-                  ? "▸ panneau"
-                  : "▸ panel"}
-            </button>
-          )}
+          <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
@@ -358,7 +351,6 @@ export default function WorkloadsView({
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
-                      onPanelOpen(true);
                     }}
                   />
                 ) : entry.level === "pod" ? (
@@ -371,7 +363,6 @@ export default function WorkloadsView({
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
-                      onPanelOpen(true);
                     }}
                     onToggle={() => toggle(entry.row.uid)}
                   />
@@ -382,7 +373,6 @@ export default function WorkloadsView({
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
-                      onPanelOpen(true);
                     }}
                   />
                 ),

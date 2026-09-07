@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { InspectPanel, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
 import type { FluxCounts, FluxRow, InventoryItem, ReconcileScope } from "./types";
@@ -228,7 +228,10 @@ export default function FluxView({
 
   return (
     <>
-      {selectedRecord && panelOpen && (
+            {/* Le panneau reste en place tant qu'il est déplié, sélection ou pas : le faire apparaître
+          avec la sélection décalait la table de 300 px à chaque clic, et on perdait la ligne qu'on
+          venait de viser. */}
+      {panelOpen && (
         <>
           <InspectPanel
             record={selectedRecord}
@@ -298,17 +301,7 @@ export default function FluxView({
               <ActionMenu actions={actions} row={selectedRow} st={st} onRun={run} />
             )}
           </div>
-          {selectedRecord && (
-            <button className="panel-toggle" onClick={() => onPanelOpen(!panelOpen)}>
-              {panelOpen
-                ? lang === "fr"
-                  ? "▾ replier"
-                  : "▾ collapse"
-                : lang === "fr"
-                  ? "▸ panneau"
-                  : "▸ panel"}
-            </button>
-          )}
+          <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
@@ -354,7 +347,6 @@ export default function FluxView({
                     selected={selected === entry.item.uid}
                     onSelect={() => {
                       setSelected(entry.item.uid);
-                      onPanelOpen(true);
                     }}
                   />
                 ) : (
@@ -370,7 +362,6 @@ export default function FluxView({
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
-                      onPanelOpen(true);
                     }}
                     onFold={() => toggleFold(entry.row.uid)}
                     onInventory={() => void toggleInventory(entry.row)}

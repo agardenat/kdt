@@ -625,3 +625,359 @@ export interface EditDiff {
   noop: boolean;
   rejected: boolean;
 }
+
+/** Un garde-fou avant de supprimer, rédigé par kdt. Aucun ne bloque : ils décident du coût. */
+export interface DeleteReason {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/**
+ * Ce que les garde-fous ont trouvé, et le coût de la confirmation.
+ *
+ * `strict` veut dire qu'il faut retaper le nom : un constat de niveau `danger`, ou une
+ * vérification qui n'a pas pu conclure — auquel cas `error` le dit. Rien ne garantit qu'une
+ * suppression soit anodine quand on n'a pas pu regarder.
+ */
+export interface DeletePreflight {
+  reasons: DeleteReason[];
+  strict: boolean;
+  /** La phrase de kdt quand rien ne s'est déclenché : le panneau ne reste jamais vide. */
+  clear?: string | null;
+  error?: string;
+}
+
+// --- Vue identity ---------------------------------------------------------------------------------
+
+/** Un constat de kdt sur une ligne, tous modules confondus. */
+export interface Hint {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/** `locked` est le verdict propre à kdt : le controller ne l'écrit jamais. */
+export type IdentPhase = "unknown" | "pending" | "active" | "disabled" | "locked";
+
+/**
+ * L'invitation en cours, telle que le Secret de credential la raconte.
+ *
+ * `unreadable` n'est **pas** `none` : un Secret qu'on n'a pas pu lire ne dit rien sur l'existence
+ * d'une invitation, et les deux ne doivent pas se rendre pareil.
+ */
+export interface IdentInvitation {
+  state: "none" | "pending" | "expired" | "unreadable";
+  expires?: number;
+}
+
+/** Les sessions d'un compte : ce qu'une révocation fermerait réellement. */
+export interface IdentSessions {
+  open: number;
+  /** Entrées périmées. L'amont les purge à la prochaine écriture : ce n'est pas de l'accès. */
+  stale: number;
+  last_expiry: number | null;
+}
+
+/** Les trois faits non secrets lus dans le Secret de credential. */
+export interface IdentCredentials {
+  invite_expires: number | null;
+  locked_until: number | null;
+  failed_attempts: number;
+}
+
+/** Un binding dont le sujet est un groupe de ce système. */
+export interface IdentBinding {
+  kind: string;
+  namespace: string;
+  name: string;
+  role: string;
+}
+
+export interface IdentUserRow {
+  row: "user";
+  name: string;
+  email: string;
+  display_name: string;
+  disabled: boolean;
+  phase: IdentPhase;
+  phase_label: string;
+  phase_tone: LineTone;
+  /** Ce que `status.phase` disait vraiment, gardé pour montrer le `Locked` de kdt à côté. */
+  raw_phase: string;
+  member_of: string[];
+  invitation: IdentInvitation;
+  invitation_label: string;
+  invitation_tone: LineTone;
+  creds: IdentCredentials | null;
+  /** `null` = Secret de sessions illisible, ce qui n'est pas « aucune session ouverte ». */
+  sessions: IdentSessions | null;
+  sessions_cell: string;
+  sessions_tone: LineTone;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  /** L'identité que l'apiserver verra, préfixe compris. */
+  subject: string;
+  record: EventRecord;
+}
+
+export interface IdentGroupRow {
+  row: "group";
+  name: string;
+  /** Le sujet à citer verbatim dans un binding. */
+  subject: string;
+  description: string;
+  members: string[];
+  resolved: string[];
+  /** Membres listés qui ne correspondent à aucun compte. */
+  unknown: string[];
+  bindings: IdentBinding[];
+  bindings_labels: string[];
+  /** Un groupe que rien ne référence : tout réconcilie, et ses membres prennent 403 partout. */
+  rights_tone: LineTone;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  record: EventRecord;
+}
+
+/**
+ * Ce que le déploiement déclare de la délivrance.
+ *
+ * Chaque champ peut être `null`, et c'est voulu : l'amont défaute `mode` à `certificate`, mais une
+ * variable absente décrit aussi un déploiement 0.1 qui ne révoque rien. On n'affirme rien.
+ */
+export interface IdentDelivery {
+  mode: "certificate" | "oidc" | null;
+  cert_ttl: string | null;
+  token_ttl: string | null;
+  refresh_ttl: string | null;
+  kubeconfig_download: boolean | null;
+  /** Combien de temps un accès survit à sa révocation, selon le mode. */
+  revocation_window: string | null;
+  /** Le seul accès que ni `revoke` ni `spec.disabled` n'atteignent. */
+  download_open: boolean;
+}
+
+export interface IdentityPayload {
+  installed: boolean;
+  error: string | null;
+  /** Les Secrets de credential sont illisibles : la colonne INVITE se tait. */
+  creds_error: string | null;
+  /** Les Secrets de sessions sont illisibles : la colonne SESS se tait. Pas la même lecture. */
+  sessions_error: string | null;
+  controller: { namespace: string; pod: string; container: string } | null;
+  delivery: IdentDelivery;
+  counts: {
+    users: number;
+    active: number;
+    pending: number;
+    connected: number;
+    groups: number;
+    unbound: number;
+  };
+  users: IdentUserRow[];
+  groups: IdentGroupRow[];
+  install_command: string;
+}
+
+/** Une invitation, rendue **une seule fois**. Elle n'est écrite nulle part ailleurs. */
+export interface IdentInvite {
+  user: string;
+  expires: string;
+  link: string | null;
+  code: string | null;
+  /** Ce que la commande a réellement imprimé, si les deux champs n'ont pas pu en être tirés. */
+  raw: string;
+}
+
+/**
+ * Les trois issues d'une écriture, qui ne sont pas interchangeables : une écriture d'API ne dit
+ * rien, une invitation porte des valeurs qui n'existent qu'une fois, et une commande lancée dans le
+ * pod a ses propres mots — que kdt ne reformule pas.
+ */
+export type IdentityWriteResult =
+  | { outcome: "done" }
+  | { outcome: "invited"; invite: IdentInvite }
+  | { outcome: "said"; message: string };
+
+// --- Vue rancher ----------------------------------------------------------------------------------
+
+export type RanchScope = "global" | "cluster" | "project";
+
+export interface RanchUserRow {
+  row: "user";
+  /** L'identité Rancher `u-…`, celle que portent tous les bindings et les lignes d'audit. */
+  id: string;
+  username: string;
+  display_name: string;
+  provider: string;
+  principal: string;
+  identity: string;
+  /** Le principal est un GUID : la valeur brute est montrée telle quelle, pas déguisée en nom. */
+  identity_opaque: boolean;
+  local_only: boolean;
+  /** `null` = champ absent, ce qui veut dire **actif** chez Rancher. */
+  enabled: boolean | null;
+  must_change_password: boolean;
+  global_roles: string[];
+  is_admin: boolean;
+  groups: string[];
+  last_refresh: string;
+  token_count: number;
+  binding_count: number;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  identity_cell: string;
+  label: string;
+  provider_tone: LineTone;
+  state_label: string;
+  state_tone: LineTone;
+  refresh_label: string;
+  record: EventRecord;
+}
+
+export interface RanchBindingRow {
+  row: "binding";
+  scope: RanchScope | null;
+  scope_id: string;
+  scope_label: string;
+  scope_kind: string;
+  subject_kind: "user" | "group" | null;
+  subject_kind_label: string;
+  subject_id: string;
+  subject_label: string;
+  provider: string;
+  provider_tone: LineTone;
+  role: string;
+  role_label: string;
+  role_tone: LineTone;
+  owner_role: boolean;
+  /** Faux quand la ligne vient du RBAC projeté d'un downstream, pas d'un objet Rancher. */
+  authoritative: boolean;
+  /** Le rôle global que Rancher pose sur tout compte : il ne grante rien que quelqu'un ait choisi. */
+  automatic: boolean;
+  kind: string;
+  api_version: string;
+  namespace: string;
+  name: string;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  record: EventRecord;
+}
+
+export interface RanchProjectRow {
+  row: "project";
+  id: string;
+  display_name: string;
+  cluster: string;
+  namespaces: string[];
+  members: number;
+  owners: string[];
+  quota: string;
+  creator: string;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  namespace: string;
+  name: string;
+  /** Faux pour un project reconstruit depuis les annotations : l'objet est en amont. */
+  local_object: boolean;
+  record: EventRecord;
+}
+
+export interface RanchSettingRow {
+  row: "setting";
+  name: string;
+  effective: string;
+  is_default: boolean;
+  default: string;
+  unit: "minutes" | "bool" | "duration" | null;
+  /** `auth-token-max-ttl-minutes` : le plafond auquel tous les autres TTL sont ramenés. */
+  ceiling: boolean;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  value_text: string;
+  value_tone: LineTone;
+  /** Le défaut livré, écrit comme la valeur en vigueur : « quelqu'un a changé ça, et c'était ça ». */
+  default_text: string;
+  /** La valeur en minutes quand c'en est une. `0` veut dire « jamais d'expiration ». */
+  minutes: number | null;
+  source_label: string;
+  record: EventRecord;
+}
+
+export interface RanchTokenRow {
+  row: "token";
+  name: string;
+  user_id: string;
+  user_label: string;
+  owner_label: string;
+  provider: string;
+  provider_tone: LineTone;
+  kind: string;
+  kind_label: string;
+  /** `false` = la session de connexion elle-même : la révoquer déconnecte. */
+  derived: boolean;
+  description: string;
+  ttl_ms: number;
+  ttl_label: string;
+  ttl_tone: LineTone;
+  expires_at: string;
+  expired: boolean;
+  cluster: string;
+  scope_label: string;
+  scope_tone: LineTone;
+  state_label: string;
+  state_tone: LineTone;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  record: EventRecord;
+}
+
+export interface RancherPayload {
+  server: {
+    role: "local" | "downstream" | "absent";
+    role_label: string;
+    version: string;
+    url: string;
+    cluster_id: string;
+    cluster_name: string;
+    providers: { name: string; access_mode: string }[];
+    hints: Hint[];
+  };
+  error: string | null;
+  /** `token-hashing` actif : le secret d'un token émis n'est pas promis utilisable tel qu'affiché. */
+  token_hashing: boolean;
+  orphan_namespaces: number;
+  /** Les écritures n'existent que sur le cluster local ; ailleurs les objets sont des répliques. */
+  writable: boolean;
+  counts: {
+    users: number;
+    external: number;
+    admins: number;
+    bindings: number;
+    projects: number;
+    project_namespaces: number;
+    orphan_namespaces: number;
+    tokens: number;
+    expired_tokens: number;
+  };
+  users: RanchUserRow[];
+  bindings: RanchBindingRow[];
+  projects: RanchProjectRow[];
+  settings: RanchSettingRow[];
+  tokens: RanchTokenRow[];
+}
+
+/** Un token émis, rendu **une seule fois** : `bearer` n'existe que dans cette réponse. */
+export interface IssuedToken {
+  name: string;
+  bearer: string;
+  user_id: string;
+  user_label: string;
+  ttl_minutes: number;
+}

@@ -14,9 +14,11 @@ mod certs;
 mod config;
 mod config_secrets;
 mod flux;
+mod identity;
 mod lang;
 mod objects;
 mod portal;
+mod rancher;
 mod session;
 mod workloads;
 
@@ -149,18 +151,29 @@ async fn main() -> Result<()> {
         // demande nommée, secret par secret, et cette requête-là laisse une trace.
         .route("/api/v1/secrets/reveal", get(config_secrets::reveal))
         .route("/api/v1/configmaps", get(config_secrets::configmaps))
+        .route("/api/v1/identity", get(identity::list))
+        // Une seule route pour les sept écritures de l'annuaire : elles ne se distinguent que par
+        // l'action nommée dans le corps, et sept routes qui partagent la même résolution de cible
+        // se seraient répété la même chose sept fois.
+        .route("/api/v1/identity/write", post(identity::write))
+        .route("/api/v1/rancher", get(rancher::list))
+        .route("/api/v1/rancher/write", post(rancher::write))
         .route("/api/v1/certs", get(certs::list))
         // Les deux leviers de la chaîne : forcer la ré-émission, et relancer un cycle ACME bloqué
         // en supprimant la demande en cours.
         .route("/api/v1/certs/renew", post(certs::renew))
         .route("/api/v1/certs/acme-retry", post(certs::acme_retry))
-        // Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le TUI.
+        // Les gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`.
         // Ils ne connaissent aucune vue : chaque vue leur passe les coordonnées de sa ligne.
         .route("/api/v1/object/yaml", get(objects::yaml))
         .route("/api/v1/object/edit", get(objects::edit))
         .route("/api/v1/object/diff", post(objects::diff))
         .route("/api/v1/object/apply", post(objects::apply))
         .route("/api/v1/object/touch", post(objects::touch))
+        // Le `Ctrl-D` de kdt, en deux temps : ce que les garde-fous trouvent, puis la suppression —
+        // qui rejoue les garde-fous et refuse si le nom retapé n'est pas celui de l'objet.
+        .route("/api/v1/object/delete-preflight", get(objects::delete_preflight))
+        .route("/api/v1/object/delete", post(objects::delete))
         .route("/healthz", get(|| async { "ok" }));
 
     // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de

@@ -1,10 +1,20 @@
-//! Les trois gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le
-//! toucher.
+//! Les quatre gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le
+//! toucher, le supprimer.
 //!
-//! Dans le TUI ce sont trois touches — `y`, `e`, `h` — et elles marchent dans toutes les vues parce
-//! qu'elles ne visent pas une ligne de tableau mais l'objet Kubernetes derrière elle. Ici c'est le
-//! même partage : ces routes ne connaissent aucune vue, seulement des coordonnées d'objet, et
-//! chaque vue leur passe l'enregistrement de sa ligne sélectionnée.
+//! Dans le TUI ce sont quatre touches — `y`, `e`, `h`, `Ctrl-D` — et elles marchent dans toutes les
+//! vues parce qu'elles ne visent pas une ligne de tableau mais l'objet Kubernetes derrière elle. Ici
+//! c'est le même partage : ces routes ne connaissent aucune vue, seulement des coordonnées d'objet,
+//! et chaque vue leur passe l'enregistrement de sa ligne sélectionnée.
+//!
+//! # Ce que la suppression vérifie avant de supprimer
+//!
+//! Rien n'est retiré avant que l'objet ait été lu et inspecté pour les raisons qui font d'une
+//! suppression une erreur — au premier rang desquelles être déployé par un moteur GitOps, où le
+//! controller remet simplement en place ce qu'on a enlevé. Aucun constat ne bloque : ils décident
+//! seulement **combien** la confirmation coûte. Un constat de niveau `danger` — ou une vérification
+//! qui n'a pas pu conclure — exige de retaper le nom de l'objet ; le reste se confirme d'un bouton.
+//!
+//! La sortie par défaut est celle qui ne supprime rien, ici comme dans le TUI.
 //!
 //! # Ce que l'édition vérifie avant d'écrire
 //!
@@ -289,6 +299,141 @@ pub async fn touch(
             )
                 .into_response()
         }
+    }
+}
+
+/// Les garde-fous qui s'appliquent à cet objet, et le coût de la confirmation.
+///
+/// Une vérification qui n'aboutit pas — objet disparu, lecture refusée — n'est pas un feu vert :
+/// elle rend `strict` à vrai et se dit, plutôt que de laisser croire à une suppression anodine.
+/// C'est un 200 et non une erreur : la réponse est exploitable, elle porte juste une raison de
+/// plus de réfléchir.
+pub async fn delete_preflight(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ObjectQuery>,
+) -> Response {
+    let client = match session_client(&state, &headers).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    if let Some(bad) = missing(&query) {
+        return bad;
+    }
+    let st = lang_of(&query.lang);
+
+    match kdt::delete::preflight_once(
+        &client,
+        &query.api_version,
+        &query.kind,
+        &query.namespace,
+        &query.name,
+    )
+    .await
+    {
+        Ok(reasons) => axum::Json(serde_json::json!({
+            "reasons": reasons
+                .iter()
+                .map(|r| serde_json::json!({
+                    "level": r.level(),
+                    // La phrase est celle de kdt : un garde-fou qui se dirait autrement d'un côté et
+                    // de l'autre serait un garde-fou de moins.
+                    "text": kdt::delete::reason_text(st, r),
+                }))
+                .collect::<Vec<_>>(),
+            "strict": kdt::delete::strict_required(&reasons, false),
+            // La phrase qui répond « rien à signaler », pour que le panneau ne soit jamais vide.
+            "clear": reasons.is_empty().then_some(st.delete_no_finding),
+        }))
+        .into_response(),
+        Err(e) => axum::Json(serde_json::json!({
+            "reasons": Vec::<serde_json::Value>::new(),
+            "strict": true,
+            "error": st.delete_check_failed.replace("{e}", &e),
+        }))
+        .into_response(),
+    }
+}
+
+/// Le corps d'une suppression : les coordonnées, et le nom retapé quand il est exigé.
+#[derive(Deserialize)]
+pub struct DeleteBody {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+    #[serde(default)]
+    namespace: String,
+    name: String,
+    /// Le nom tel qu'il a été retapé. Vérifié **ici** et pas seulement dans le navigateur : la
+    /// confirmation stricte est un garde-fou, et un garde-fou qui ne vit que dans la page se
+    /// contourne en postant la requête à la main.
+    #[serde(default)]
+    confirm_name: String,
+    #[serde(default)]
+    lang: String,
+}
+
+/// Supprime l'objet, avec la politique de propagation de `kubectl delete` (cascade en arrière-plan).
+pub async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<DeleteBody>,
+) -> Response {
+    let Some(session) = auth::current(&state, &headers).await else {
+        return unauthenticated();
+    };
+    let client = match session_client(&state, &headers).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let st = lang_of(&body.lang);
+    if body.kind.is_empty() || body.name.is_empty() {
+        return refused("kind et name sont requis".to_string(), StatusCode::BAD_REQUEST);
+    }
+
+    // Les garde-fous sont rejoués avant d'écrire, et non repris de la réponse précédente : entre les
+    // deux requêtes l'objet a pu passer sous la main d'un moteur GitOps, ou disparaître.
+    let (reasons, failed) = match kdt::delete::preflight_once(
+        &client,
+        &body.api_version,
+        &body.kind,
+        &body.namespace,
+        &body.name,
+    )
+    .await
+    {
+        Ok(reasons) => (reasons, false),
+        Err(_) => (Vec::new(), true),
+    };
+    if kdt::delete::strict_required(&reasons, failed) && body.confirm_name.trim() != body.name {
+        return refused(
+            st.delete_strict_mismatch.replace("{name}", &body.name),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    // Tracé : une suppression part sous l'identité de la personne connectée, et c'est la seule trace
+    // que kdt-web en garde.
+    info!(
+        subject = %session.subject,
+        kind = %body.kind,
+        objet = %format!("{}/{}", body.namespace, body.name),
+        "suppression demandée"
+    );
+
+    match kdt::delete::delete_once(
+        &client,
+        &body.api_version,
+        &body.kind,
+        &body.namespace,
+        &body.name,
+    )
+    .await
+    {
+        Ok(()) => axum::Json(serde_json::json!({ "message": st.delete_ok })).into_response(),
+        // 409 : la demande est arrivée, c'est l'apiserver qui la repousse — finalizer, webhook
+        // d'admission, droit manquant. Sa phrase est ce qui compte.
+        Err(e) => refused(st.delete_failed.replace("{e}", &e), StatusCode::CONFLICT),
     }
 }
 

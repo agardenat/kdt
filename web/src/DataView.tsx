@@ -17,7 +17,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
-import { InspectPanel, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
 
@@ -170,7 +170,10 @@ export default function DataView({
 
   return (
     <>
-      {selectedRecord && panelOpen && (
+            {/* Le panneau reste en place tant qu'il est déplié, sélection ou pas : le faire apparaître
+          avec la sélection décalait la table de 300 px à chaque clic, et on perdait la ligne qu'on
+          venait de viser. */}
+      {panelOpen && (
         <>
           <InspectPanel
             record={selectedRecord}
@@ -275,17 +278,7 @@ export default function DataView({
             }}
             onNeedsAuth={onNeedsAuth}
           />
-          {selectedRecord && (
-            <button className="panel-toggle" onClick={() => onPanelOpen(!panelOpen)}>
-              {panelOpen
-                ? lang === "fr"
-                  ? "▾ replier"
-                  : "▾ collapse"
-                : lang === "fr"
-                  ? "▸ panneau"
-                  : "▸ panel"}
-            </button>
-          )}
+          <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
@@ -324,7 +317,6 @@ export default function DataView({
                   onSelect={() => {
                     setSelected(s.uid);
                     setTab("detail");
-                    onPanelOpen(true);
                   }}
                 />
               ))}
@@ -351,7 +343,6 @@ export default function DataView({
                   onSelect={() => {
                     setSelected(c.uid);
                     setTab("detail");
-                    onPanelOpen(true);
                   }}
                 />
               ))}

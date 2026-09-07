@@ -401,6 +401,18 @@ button, input { font: inherit; color: inherit; }
 }
 .ptabs button:disabled { opacity: .38; cursor: default; }
 
+/* Les trois gestes sur un objet sont des overlays, pas des onglets permanents : leur onglet
+   n'apparaît que tant qu'on y est, et porte sa propre croix. Il se distingue des quatre autres —
+   fond marqué, croix à droite — pour qu'on voie qu'il se ferme au lieu de se quitter. */
+.ptabs .ptab-overlay {
+  display: inline-flex; align-items: center; gap: .4rem; margin-left: .3rem;
+  background: var(--row-sel); border-radius: 6px 6px 0 0;
+}
+.ptabs .ptab-overlay .x { color: var(--muted); font-size: 11px; }
+.ptabs .ptab-overlay:hover .x { color: var(--err); }
+
+.pid .dim { color: var(--dim); }
+
 .pid {
   display: flex; align-items: center; gap: .55rem; min-width: 0;
   font-size: 12px; color: var(--muted);
@@ -845,3 +857,64 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* Le groupe à trois états est dessiné pour la barre des vues, où il suit un onglet. Dans la barre
    d'un contenu du panneau, sa marge s'ajoute à l'espacement et le décale pour rien. */
 .logbar .segmented { margin-left: 0; }
+
+/* ---------------------------------------------------------------- suppression
+
+   Le panneau du `Ctrl-D`. Deux règles de dessin, et elles portent la règle de fond : la sortie qui
+   ne supprime rien est un bouton ordinaire — c'est elle qui a le focus — et celle qui supprime est
+   la seule chose rouge de la page, à distance de la première. Un bouton destructeur qui ressemble
+   au bouton d'à côté est un bouton qu'on clique par réflexe. */
+.delete-confirm { flex: none; display: flex; flex-direction: column; gap: .5rem; }
+.delete-confirm p { margin: 0; font-size: 11.5px; line-height: 1.45; }
+.delete-confirm .ns-add { max-width: 34ch; font-family: var(--mono); }
+.menu-buttons .cta.danger {
+  background: var(--err); border-color: var(--err); color: #fff;
+  /* Poussé à droite du bouton qui annule : le geste demande de viser, pas de laisser filer. */
+  margin-left: .8rem;
+}
+.menu-buttons .cta.danger:disabled { opacity: .4; cursor: default; }
+
+/* ---------------------------------------------------------------- vues identity / rancher
+
+   Deux annuaires, et la même grammaire que les autres vues : la barre porte les actions, l'objet
+   ne porte que ses plis, le panneau du haut porte le contenu. Ce qui suit n'est que du dessin —
+   les tons viennent tous du serveur. */
+.badge-admin {
+  font-size: 10px; padding: 0 .3rem; border-radius: 3px; margin-left: .3rem;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);
+  font-weight: 600;
+}
+/* Le rôle que Rancher pose sur tout compte : il est là parce qu'il existe, pas parce que quelqu'un
+   l'a décidé. Il se lit comme de l'arrière-plan, sinon il ouvre la vue sur cent lignes identiques. */
+.tbody .tr.automatic .cell { color: var(--dim); }
+/* Une ligne reconstruite depuis le RBAC projeté d'un downstream : l'objet Rancher est en amont, et
+   la ligne le déclare plutôt que de se faire passer pour une source. */
+.badge-projected {
+  font-size: 10px; padding: 0 .3rem; border-radius: 3px; margin-left: .3rem;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.form-row { display: flex; align-items: center; gap: .5rem; margin: 0 0 .4rem; }
+.form-row label { font-size: 11.5px; color: var(--muted); min-width: 11ch; }
+.form-row input {
+  flex: 1; min-width: 0; padding: .25rem .45rem; border: 1px solid var(--line);
+  border-radius: 5px; background: var(--bg); font-size: 11.5px; font-family: var(--mono);
+}
+.form-row input:focus { outline: none; border-color: var(--accent); }
+/* Le lien et le code d'une invitation, le credential d'un token : des valeurs qui n'existent qu'une
+   fois. Elles sont montrées comme telles — encadrées, avec l'avertissement au-dessus — et non
+   glissées dans une ligne de tableau qu'on ferait défiler sans la voir. */
+.once {
+  border: 1px solid var(--warn); border-radius: 6px; padding: .6rem .7rem;
+  display: flex; flex-direction: column; gap: .5rem;
+}
+.once .warn { margin: 0; font-size: 11.5px; line-height: 1.45; }
+.once .k-col { display: flex; flex-direction: column; gap: .2rem; min-width: 12ch; }
+.once .keys-row { display: flex; gap: .8rem; align-items: flex-start; }
+.once .v { font-size: 11.5px; word-break: break-all; flex: 1; }
+
+/* Les deux vues d'annuaire posent leurs couples libellé/valeur dans le panneau, mêlés à des
+   sections et à des constats. Une grille les couperait en deux, donc chaque couple est une ligne à
+   lui, et la colonne de gauche garde une largeur fixe pour que les valeurs s'alignent quand même. */
+.detail > .keys-row { display: flex; gap: .9rem; align-items: flex-start; padding: .1rem 0; }
+.detail > .keys-row > .k-col { min-width: 12ch; flex: none; display: flex; flex-direction: column; gap: .2rem; }
+.detail > .keys-row > .v { flex: 1; min-width: 0; }

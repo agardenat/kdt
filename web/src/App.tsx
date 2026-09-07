@@ -9,6 +9,8 @@ import * as api from "./api";
 import CertsView from "./CertsView";
 import EventsView from "./EventsView";
 import FluxView from "./FluxView";
+import IdentityView from "./IdentityView";
+import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
 import { storedLang, storeLang, strings, type Lang } from "./i18n";
@@ -16,7 +18,7 @@ import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
 import type { Capabilities, Identity } from "./types";
 
-type ViewId = "events" | "flux" | "workloads" | "data" | "certs";
+type ViewId = "events" | "flux" | "workloads" | "data" | "certs" | "identity" | "rancher";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -45,7 +47,10 @@ const VIEWS: Array<{
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r" },
   { id: "kyverno", label: "Kyverno", key: "k", needs: "kyverno" },
-  { id: "identity", label: "Identity", key: "i", needs: "identity" },
+  { id: "identity", label: "Identity", key: "i", ready: true, needs: "identity" },
+  // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
+  // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
+  { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
   { id: "netpol", label: "NetPol", key: "n" },
   { id: "diagnostic", label: "Diagnostic", key: "d" },
 ];
@@ -196,8 +201,13 @@ export default function App() {
   // Les vues qui listent des objets indépendants sont dans la portée ; celles qui dessinent un
   // graphe n'y sont pas — filtrer l'arbre Flux par namespace lui ferait perdre ses arêtes, la
   // GitRepository de flux-system étant le parent de presque tout. C'est le partage de kdt.
+  // Les vues qui listent des objets indépendants sont dans la portée ; celles qui dessinent un
+  // graphe n'y sont pas, et les deux annuaires non plus — leurs objets sont cluster-scoped, ou
+  // vivent dans le namespace de leur cluster Rancher, ce qui n'a rien à voir avec la question posée.
   const scoped =
     view === "events" || view === "workloads" || view === "data" || view === "certs";
+  const scopelessReason =
+    view === "identity" ? st.identScopeless : view === "rancher" ? st.ranchScopeless : st.fluxScopeless;
 
   return (
     <div className="app">
@@ -211,7 +221,7 @@ export default function App() {
             className="scope-btn"
             aria-expanded={scopeOpen}
             disabled={!scoped}
-            title={scoped ? undefined : st.fluxScopeless}
+            title={scoped ? undefined : scopelessReason}
             onClick={() => setScopeOpen((v) => !v)}
           >
             <span className="lbl">{st.scopeLabel}</span>
@@ -358,6 +368,28 @@ export default function App() {
               }}
               focusCert={focusCert}
               onFocusConsumed={() => setFocusCert(null)}
+            />
+          ) : view === "identity" ? (
+            <IdentityView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "rancher" ? (
+            <RancherView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
             />
           ) : view === "workloads" ? (
             <WorkloadsView

@@ -14,7 +14,7 @@ Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-we
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, deux vues
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, sept vues
 répondent, le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
@@ -175,6 +175,80 @@ répondent, le reste n'existe pas.
 - **change(tui)** — la colonne `TIME` des évènements devient `AGE` : `12:34:56` demandait de
   calculer soi-même la fraîcheur d'une ligne, `3m` la donne. Le panneau de détail suit, et la
   colonne se resserre de huit caractères à cinq.
+
+- **feat(web)** — la vue identity : les comptes et les groups locaux de kdt-identity, avec les sept
+  colonnes du TUI. La phase `Locked` est celle que kdt établit depuis le Secret de credentials — le
+  contrôleur ne l'écrit jamais — et la colonne SESS dit si un compte tient un accès en ce moment,
+  donc s'il y a quelque chose à révoquer.
+
+  Les deux silences ne se lisent pas comme des zéros : un Secret de sessions illisible donne `?`,
+  un compte sans session donne `—`, et les deux erreurs de lecture — credentials et sessions —
+  voyagent séparément parce qu'elles taisent une colonne chacune.
+
+  Le mode de délivrance est dit une fois, au niveau de la vue : c'est lui qui rend la colonne SESS
+  lisible, en disant combien de temps un accès survit à sa révocation. Variable absente, rien
+  n'est affirmé — l'amont défaute à `certificate`, mais l'absence décrit aussi un déploiement 0.1
+  qui ne révoque rien. Le téléchargement de kubeconfig, seul accès que ni `revoke` ni
+  `spec.disabled` n'atteignent, est signalé là et jamais comme un badge par ligne.
+
+  Les sept écritures suivent : créer un compte ou un group depuis l'un ou l'autre monde, activer et
+  désactiver, l'appartenance — toujours en JSON patch, jamais en merge, qui remplacerait
+  `spec.members` en entier — inviter et fermer les sessions. Ces deux dernières sont des commandes
+  lancées dans le pod contrôleur, que le serveur localise **lui-même** par les labels du chart : un
+  nom de pod venu du navigateur ferait d'un `exec` une cible choisie par l'appelant. La sortie de
+  `revoke` devient la réponse telle quelle, et le lien et le code d'une invitation n'existent que
+  dans cette réponse-là.
+
+- **feat(web)** — la vue Rancher : le couple *(identité Rancher `u-…`, identité réelle)* sans
+  ouvrir Rancher, en quatre mondes — comptes, accès, projects, tokens — avec toutes les colonnes du
+  TUI. Un compte `local` se signale parce qu'aucun départ de l'annuaire ne le révoque, un principal
+  opaque est montré tel quel plutôt que déguisé en nom, et le rôle global que Rancher pose sur tout
+  compte se lit comme de l'arrière-plan.
+
+  Le monde des tokens montre d'abord les réglages de TTL qui les gouvernent : sur un cluster dont
+  `kubeconfig-default-token-ttl-minutes` vaut `0`, c'est le titre et non une note de bas de page.
+  Un token sans portée vaut sur tous les clusters gérés *et* sur l'API Rancher, un token sans
+  expiration ne s'éteint jamais : les deux se signalent.
+
+  Les quatre écritures — émettre un token, changer sa durée de vie, le révoquer, régler un
+  setting — sont refusées sur un cluster downstream, où les objets d'identité sont des répliques.
+  Le compte visé par une émission est **relu côté serveur** : le token porte le `userPrincipal`
+  reconstruit depuis le principal réel, et un principal fourni par l'appelant ferait émettre un
+  credential au nom de quelqu'un d'autre. Le credential rendu n'existe que dans cette réponse.
+
+- **feat(web)** — le `Ctrl-D` de kdt arrive sur le web, dans toutes les vues : les garde-fous
+  d'abord — déployé par un moteur GitOps, point d'entrée GitOps, cascade d'un Namespace ou d'une
+  CRD, propriétaire qui recrée, namespace système, données persistantes, backup velero ou Medusa
+  que supprimer l'objet ne supprime pas — puis la confirmation.
+
+  Aucun constat ne bloque : ils décident **combien** la confirmation coûte. Un constat grave, ou
+  une vérification qui n'a pas pu conclure, exige de retaper le nom de l'objet — et le serveur le
+  revérifie, parce qu'un garde-fou qui ne vivrait que dans la page se contournerait en postant la
+  requête à la main. Les garde-fous sont rejoués avant d'écrire plutôt que repris de la réponse
+  précédente : entre les deux requêtes, l'objet a pu passer sous la main d'un moteur GitOps.
+
+  La sortie par défaut ne supprime rien, comme dans kdt où `Entrée` annule : c'est le bouton
+  d'annulation qui prend le focus, et celui qui supprime est une cible distincte, à distance.
+
+- **fix(web)** — le panneau du haut restait accroché à la sélection : il apparaissait au premier
+  clic et repartait au suivant, décalant la table de 300 px sous le curseur. Il reste désormais en
+  place tant qu'il est déplié — sans sélection il montre son cadre et l'invite — et c'est le pli,
+  que la personne commande et que kdt retient, qui décide de sa présence. Sélectionner une ligne ne
+  le déplie plus ; les commandes de la barre, celles qui révèlent un contenu, si.
+
+- **fix(web)** — YAML, Éditer et Supprimer avaient chacun deux boutons : un dans la barre
+  d'actions, un onglet permanent dans le panneau, sans que rien ne dise lequel faisait quoi. Ce
+  sont des **overlays** dans kdt — on les ouvre et on les ferme — donc leur onglet n'existe plus
+  que tant qu'on y est, porte sa croix, et `Échap` le referme avant de replier le panneau. Un
+  overlay dont la cible disparaît retombe sur ce qui reste lisible.
+
+- **refactor** — les vues identity et Rancher du TUI et celles du web lisent les mêmes règles : le
+  ton d'une phase, celui d'une invitation périmée, celui de la colonne des sessions, le constat
+  qu'un group ne donne aucun droit, le compte `local` qu'aucun annuaire ne révoque, le token
+  éternel, la portée vide, le réglage à zéro minute, et les sept conversions en enregistrement
+  d'évènement descendent de `ui.rs` dans `identity.rs` et `rancher.rs`. Les deux sondes qui
+  déposaient leur inventaire dans un état partagé gagnent une jumelle qui le rend, et les phrases
+  des garde-fous de suppression quittent `ui.rs` pour `delete.rs`.
 
 - **fix(ci)** — un tag de pré-version ne publiait pas ce qu'il annonçait : `action-gh-release` a
   `prerelease` à `false` par défaut, sans détection SemVer, et le job Homebrew n'avait aucune

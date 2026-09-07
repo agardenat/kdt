@@ -21,9 +21,14 @@ import type {
   ConfigMapRow,
   SecretsPayload,
   SecretValue,
+  DeletePreflight,
   EditDiff,
   EditPreflight,
+  IdentityPayload,
+  IdentityWriteResult,
+  IssuedToken,
   ObjectYaml,
+  RancherPayload,
   StatusPayload,
   WorkloadRow,
   WorkloadsPayload,
@@ -341,4 +346,80 @@ export function objectApply(
  */
 export function objectTouch(record: EventRecord, lang: Lang): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/object/touch", { ...object(record), lang });
+}
+
+/**
+ * Les garde-fous qui s'appliquent à cet objet, avant de supprimer. C'est le premier temps du
+ * `Ctrl-D` du TUI.
+ *
+ * Une vérification qui n'aboutit pas n'est pas un refus : elle revient en 200 avec `strict` à vrai
+ * et sa raison. Ne pas avoir pu regarder ne veut pas dire qu'il n'y a rien à voir.
+ */
+export function objectDeletePreflight(record: EventRecord, lang: Lang): Promise<DeletePreflight> {
+  const params = new URLSearchParams({ ...object(record), lang });
+  return get<DeletePreflight>(`/api/v1/object/delete-preflight?${params.toString()}`);
+}
+
+/**
+ * Supprime l'objet, cascade en arrière-plan comme `kubectl delete`.
+ *
+ * `confirmName` n'est pas une formalité du navigateur : le serveur rejoue les garde-fous et refuse
+ * si le nom retapé n'est pas celui de l'objet. Un garde-fou qui ne vivrait que dans la page se
+ * contournerait en postant la requête à la main.
+ */
+export function objectDelete(
+  record: EventRecord,
+  confirmName: string,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/object/delete", {
+    ...object(record),
+    confirm_name: confirmName,
+    lang,
+  });
+}
+
+/**
+ * L'annuaire kdt-identity : les comptes, les groupes, et ce que le déploiement dit de la
+ * délivrance.
+ *
+ * Sans portée : les deux CRD sont cluster-scoped, un compte n'appartient à aucun namespace.
+ */
+export function identityDirectory(lang: Lang): Promise<IdentityPayload> {
+  return get<IdentityPayload>(`/api/v1/identity?lang=${encodeURIComponent(lang)}`);
+}
+
+/**
+ * Une écriture sur l'annuaire. L'action est nommée dans le corps.
+ *
+ * `invite` et `revoke` ne sont pas des écritures d'API : ce sont des commandes lancées dans le pod
+ * controller, que le serveur résout lui-même. Leur sortie revient telle quelle — kdt ne la
+ * reformule pas, et le navigateur non plus.
+ */
+export function identityWrite(
+  request: Record<string, unknown>,
+  lang: Lang,
+): Promise<IdentityWriteResult> {
+  return send<IdentityWriteResult>("/api/v1/identity/write", { ...request, lang });
+}
+
+/** Les quatre mondes de la vue Rancher, en une lecture. */
+export function rancherDirectory(lang: Lang): Promise<RancherPayload> {
+  return get<RancherPayload>(`/api/v1/rancher?lang=${encodeURIComponent(lang)}`);
+}
+
+/**
+ * Une écriture Rancher : émettre un token, changer un TTL, révoquer, régler un setting.
+ *
+ * L'émission rend le credential **une seule fois** : il n'existe que dans cette réponse, et le
+ * navigateur le montre puis le jette.
+ */
+export function rancherWrite(
+  request: Record<string, unknown>,
+  lang: Lang,
+): Promise<{ message: string; token?: IssuedToken }> {
+  return send<{ message: string; token?: IssuedToken }>("/api/v1/rancher/write", {
+    ...request,
+    lang,
+  });
 }

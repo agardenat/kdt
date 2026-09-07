@@ -8,7 +8,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import * as api from "./api";
 import type { Lang, Strings } from "./i18n";
-import { EditPane, YamlPane } from "./objects";
+import { DeletePane, EditPane, YamlPane } from "./objects";
 import {
   hasLogs,
   toneLabel,
@@ -24,11 +24,24 @@ import {
  * `DetailTab { Logs, Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail »
  * en plus n'existerait que sur le web, et les deux interfaces ne se ressembleraient plus.
  *
- * `yaml` et `edit` viennent après : dans kdt ce sont deux overlays qu'ouvrent `y` et `e`, et ils
- * marchent dans toutes les vues. Ici ce sont deux onglets du même panneau — les boutons qui les
- * ouvrent vivent dans la barre, le contenu vit là où va tout contenu.
+ * `yaml`, `edit` et `delete` viennent après : dans kdt ce sont trois overlays qu'ouvrent `y`, `e` et
+ * `Ctrl-D`, et ils marchent dans toutes les vues. Ici ce sont trois onglets du même panneau — les
+ * boutons qui les ouvrent vivent dans la barre, le contenu vit là où va tout contenu.
+ *
+ * Ces trois-là sont des **overlays**, pas des onglets permanents : dans kdt on les ouvre et on les
+ * ferme. Leur onglet n'apparaît donc que tant qu'on y est, et disparaît dès qu'on va ailleurs —
+ * sinon la barre d'onglets doublerait les boutons de la barre d'actions et on ne saurait plus
+ * lequel des deux « YAML » sert à quoi.
  */
-export type PanelTab = "detail" | "logs" | "status" | "related" | "yaml" | "edit";
+export type PanelTab = "detail" | "logs" | "status" | "related" | "yaml" | "edit" | "delete";
+
+/** Les trois onglets qui ne vivent que le temps qu'on les regarde. */
+const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete"];
+
+/** L'onglet de repli quand un overlay se ferme, ou quand la ligne visée disparaît. */
+function fallbackTab(hasDetail: boolean): PanelTab {
+  return hasDetail ? "detail" : "status";
+}
 
 /**
  * Un onglet propre à une vue, posé devant les trois onglets partagés.
@@ -64,6 +77,11 @@ export function clampPanelHeight(height: number): number {
  * Des logs sur 390 px se lisent en accordéon, alors que la largeur entière de l'écran les rend
  * comme un terminal. C'est aussi la disposition que kdt a déjà, donc celle que quelqu'un qui
  * passe de l'un à l'autre n'a pas à réapprendre.
+ *
+ * **Il reste à l'écran tant qu'il est déplié, sélection ou pas.** Le faire apparaître avec la
+ * sélection décalait la table de 300 px à chaque clic, et on perdait la ligne qu'on venait de
+ * viser. Sans sélection il montre son cadre et l'invite ; c'est le pli — que la personne commande
+ * et que kdt retient — qui décide de sa présence, jamais l'état de la donnée.
  */
 export function InspectPanel({
   record,
@@ -74,9 +92,11 @@ export function InspectPanel({
   lang,
   st,
   detail,
+  onDeleted,
   onNeedsAuth,
 }: {
-  record: EventRecord;
+  /** `null` quand rien n'est sélectionné : le panneau reste en place et le dit. */
+  record: EventRecord | null;
   tab: PanelTab;
   onTab: (t: PanelTab) => void;
   onClose: () => void;
@@ -84,27 +104,50 @@ export function InspectPanel({
   lang: Lang;
   st: Strings;
   detail?: DetailPane;
+  /** L'objet vient d'être supprimé : la vue relit, et la ligne disparaîtra d'elle-même. */
+  onDeleted?: (message: string) => void;
   onNeedsAuth: (message: string) => void;
 }) {
   // Un Pod rend ses propres logs, une ressource Flux ceux de son controller filtrés sur elle.
   // Ailleurs, l'onglet resterait vide : remonter d'un Deployment à ses pods demande de choisir
   // lesquels, et ce choix a des règles qu'on ne réinvente pas ici.
-  const logs = hasLogs(record);
-  // `y` et `e` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en a pas.
-  const addressable = Boolean(record.kind && record.name);
+  const logs = record ? hasLogs(record) : false;
+  // `y`, `e` et `Ctrl-D` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en
+  // a pas.
+  const addressable = Boolean(record && record.kind && record.name);
+  // L'onglet réellement affiché. Un overlay dont la cible a disparu — ligne désélectionnée, objet
+  // supprimé — retombe sur ce qui reste lisible plutôt que de laisser un onglet sans contenu.
+  const shown: PanelTab =
+    (OVERLAY_TABS.includes(tab) && !addressable) || (tab === "detail" && !detail)
+      ? fallbackTab(Boolean(detail))
+      : tab;
+
+  // `Échap` referme l'overlay avant de replier le panneau — l'ordre du TUI, où la touche ferme ce
+  // qui est ouvert par-dessus. La capture est nécessaire pour passer devant le handler global de
+  // la coquille, qui replierait le panneau entier.
+  useEffect(() => {
+    if (!OVERLAY_TABS.includes(shown)) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onTab(fallbackTab(Boolean(detail)));
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [shown, detail, onTab]);
 
   return (
     <section className="panel" style={{ height }}>
       <div className="phd">
         <div className="ptabs" role="tablist">
           {detail && (
-            <button role="tab" aria-selected={tab === "detail"} onClick={() => onTab("detail")}>
+            <button role="tab" aria-selected={shown === "detail"} onClick={() => onTab("detail")}>
               {detail.label}
             </button>
           )}
           <button
             role="tab"
-            aria-selected={tab === "logs"}
+            aria-selected={shown === "logs"}
             disabled={!logs}
             title={
               logs
@@ -117,40 +160,37 @@ export function InspectPanel({
           >
             Logs
           </button>
-          <button role="tab" aria-selected={tab === "status"} onClick={() => onTab("status")}>
+          <button role="tab" aria-selected={shown === "status"} onClick={() => onTab("status")}>
             Status
           </button>
-          <button role="tab" aria-selected={tab === "related"} onClick={() => onTab("related")}>
+          <button role="tab" aria-selected={shown === "related"} onClick={() => onTab("related")}>
             Related
           </button>
-          {/* Les deux gestes de kdt qui portent sur n'importe quel objet. Un enregistrement qui ne
-              désigne rien — une ligne de regroupement — n'en a pas : l'onglet le dit. */}
-          <button
-            role="tab"
-            aria-selected={tab === "yaml"}
-            disabled={!addressable}
-            title={addressable ? undefined : st.objSelectRow}
-            onClick={() => onTab("yaml")}
-          >
-            {st.actionYaml}
-          </button>
-          <button
-            role="tab"
-            aria-selected={tab === "edit"}
-            disabled={!addressable}
-            title={addressable ? undefined : st.objSelectRow}
-            onClick={() => onTab("edit")}
-          >
-            {st.actionEdit}
-          </button>
+          {/* Les gestes de kdt sur un objet quelconque sont des overlays : leur onglet n'existe
+              que tant qu'on y est. Les ouvrir se fait depuis la barre d'actions — un second jeu de
+              boutons permanent ici ferait deux « YAML » sans dire lequel fait quoi — et la croix
+              referme l'overlay comme `Échap` referme celui du TUI. */}
+          {OVERLAY_TABS.includes(shown) && (
+            <button className="ptab-overlay" role="tab" aria-selected onClick={() => onTab(fallbackTab(Boolean(detail)))}>
+              {shown === "yaml" ? st.actionYaml : shown === "edit" ? st.actionEdit : st.actionDelete}
+              <span className="x">✕</span>
+            </button>
+          )}
         </div>
 
         <div className="pid">
-          <span className={`st ${record.tone}`}>{toneLabel(record.tone)}</span>
-          <span className="mono">
-            {record.kind} {record.namespace ? `${record.namespace}/${record.name}` : record.name}
-          </span>
-          <span className="reason">{record.reason}</span>
+          {record ? (
+            <>
+              <span className={`st ${record.tone}`}>{toneLabel(record.tone)}</span>
+              <span className="mono">
+                {record.kind}{" "}
+                {record.namespace ? `${record.namespace}/${record.name}` : record.name}
+              </span>
+              <span className="reason">{record.reason}</span>
+            </>
+          ) : (
+            <span className="dim">{st.objSelectRow}</span>
+          )}
         </div>
 
         <button
@@ -163,28 +203,87 @@ export function InspectPanel({
       </div>
 
       <div className="pbody">
-        {/* L'onglet propre à la vue passe devant : quand il existe, c'est lui qu'on vient lire. */}
-        {tab === "detail" && (detail?.node ?? null)}
-        {tab === "logs" &&
-          (logs ? (
-            <LogsPane record={record} lang={lang} />
-          ) : (
-            <p className="pane-wait">
-              {lang === "fr"
-                ? "Cet objet ne porte pas de logs à suivre."
-                : "This object carries no logs to follow."}
-            </p>
-          ))}
-        {tab === "status" && <StatusPane record={record} lang={lang} />}
-        {tab === "related" && <RelatedPane record={record} lang={lang} />}
-        {tab === "yaml" && addressable && (
-          <YamlPane key={record.uid} record={record} lang={lang} st={st} />
-        )}
-        {tab === "edit" && addressable && (
-          <EditPane key={record.uid} record={record} lang={lang} st={st} onNeedsAuth={onNeedsAuth} />
+        {/* Sans sélection le panneau garde sa place et le dit : le faire disparaître décalerait la
+            table sous le curseur à chaque clic. */}
+        {!record ? (
+          <p className="pane-wait">{st.objSelectRow}</p>
+        ) : (
+          <>
+            {/* L'onglet propre à la vue passe devant : quand il existe, c'est lui qu'on vient lire. */}
+            {shown === "detail" && (detail?.node ?? null)}
+            {shown === "logs" &&
+              (logs ? (
+                <LogsPane record={record} lang={lang} />
+              ) : (
+                <p className="pane-wait">
+                  {lang === "fr"
+                    ? "Cet objet ne porte pas de logs à suivre."
+                    : "This object carries no logs to follow."}
+                </p>
+              ))}
+            {shown === "status" && <StatusPane record={record} lang={lang} />}
+            {shown === "related" && <RelatedPane record={record} lang={lang} />}
+            {shown === "yaml" && <YamlPane key={record.uid} record={record} lang={lang} st={st} />}
+            {shown === "edit" && (
+              <EditPane
+                key={record.uid}
+                record={record}
+                lang={lang}
+                st={st}
+                onNeedsAuth={onNeedsAuth}
+              />
+            )}
+            {shown === "delete" && (
+              <DeletePane
+                key={record.uid}
+                record={record}
+                lang={lang}
+                st={st}
+                // Annuler referme l'overlay et rend l'objet à sa vue : replier le panneau ferait
+                // disparaître la ligne qu'on vient de décider de garder, et un demi-recul le
+                // laisserait armé.
+                onCancel={() => onTab(fallbackTab(Boolean(detail)))}
+                onDeleted={onDeleted}
+                onNeedsAuth={onNeedsAuth}
+              />
+            )}
+          </>
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * Le pli du panneau, posé dans la barre d'actions de chaque vue.
+ *
+ * Toujours offert : le panneau ne dépend plus de la sélection, et ce bouton — avec `Échap` — est
+ * ce qui décide de sa présence. Le libellé nomme **la direction que le clic prendrait**, jamais
+ * l'état courant : « ▾ replier » sur un panneau ouvert, comme le pied de page du TUI.
+ */
+export function PanelToggle({
+  open,
+  onOpen,
+  lang,
+}: {
+  open: boolean;
+  onOpen: (open: boolean) => void;
+  lang: Lang;
+}) {
+  return (
+    <button
+      className="panel-toggle"
+      title={lang === "fr" ? "Panneau d'inspection" : "Inspection panel"}
+      onClick={() => onOpen(!open)}
+    >
+      {open
+        ? lang === "fr"
+          ? "▾ replier"
+          : "▾ collapse"
+        : lang === "fr"
+          ? "▸ panneau"
+          : "▸ panel"}
+    </button>
   );
 }
 

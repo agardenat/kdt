@@ -207,6 +207,114 @@ export interface Strings {
   objEditCancel: string;
   objEditReadOnlyHint: string;
   objWorking: string;
+
+  // --- Suppression : le `Ctrl-D` du TUI, dans la grammaire du web. Aucune de ces chaînes ne nomme
+  // une touche : le TUI n'a que le clavier, ici chaque geste a une cible visible.
+  delTitle: string;
+  delTarget: string;
+  delChecking: string;
+  delHelp: string;
+  delCancel: string;
+  delConfirm: string;
+  delStrictHelp: string;
+  delStrictPlaceholder: string;
+  delStrictMismatch: string;
+  delReload: string;
+
+  // --- Vue identity. Le jargon reste en anglais des deux côtés (`KdtUser`, `KdtGroup`, `subject`),
+  // et les phases, invitations et constats arrivent déjà rédigés du serveur.
+  identUsers: string;
+  identGroups: string;
+  identDetail: string;
+  identSelectRow: string;
+  identActions: string;
+  identInvite: string;
+  identInviteHelp: string;
+  identInviteValidity: string;
+  identInviteOnce: string;
+  identInviteLink: string;
+  identInviteCode: string;
+  identInviteRaw: string;
+  identInviteClose: string;
+  identRevoke: string;
+  identRevokeHelp: string;
+  identEnable: string;
+  identDisable: string;
+  identEnableHelp: string;
+  identDisableHelp: string;
+  identAddMember: string;
+  identRemoveMember: string;
+  identMemberHelp: string;
+  identCreateUser: string;
+  identCreateGroup: string;
+  identName: string;
+  identEmail: string;
+  identDisplayName: string;
+  identDescription: string;
+  identCreate: string;
+  identEmpty: string;
+  identNotInstalled: string;
+  identInstallHelp: string;
+  identScopeless: string;
+  identOperator: string;
+  identMode: string;
+  identModeUnknown: string;
+  identRevocation: string;
+  identRefresh: string;
+  identDownload: string;
+  identDownloadOpen: string;
+  identDownloadClosed: string;
+  identSubject: string;
+  identGroupsLabel: string;
+  identMembers: string;
+  identUnknownMembers: string;
+  identRights: string;
+  identSessions: string;
+  identNone: string;
+  identNoController: string;
+
+  // --- Vue rancher. Quatre mondes, et le vocabulaire de Rancher tel quel : `project`, `token`,
+  // `setting`, `principal` ne se traduisent pas dans un annuaire Rancher.
+  ranchUsers: string;
+  ranchAccess: string;
+  ranchProjects: string;
+  ranchTokens: string;
+  ranchDetail: string;
+  ranchSelectRow: string;
+  ranchActions: string;
+  ranchIssue: string;
+  ranchIssueHelp: string;
+  ranchIssueTtl: string;
+  ranchIssueHashing: string;
+  ranchSetTtl: string;
+  ranchSetTtlHelp: string;
+  ranchRevoke: string;
+  ranchRevokeHelp: string;
+  ranchRevokeSession: string;
+  ranchSetSetting: string;
+  ranchSetSettingHelp: string;
+  ranchApply: string;
+  ranchCancel: string;
+  ranchEmpty: string;
+  ranchReadOnly: string;
+  ranchScopeless: string;
+  ranchTokenOnce: string;
+  ranchTokenClose: string;
+  ranchIdentity: string;
+  ranchLogin: string;
+  ranchProvider: string;
+  ranchPrincipal: string;
+  ranchGlobalRoles: string;
+  ranchGroups: string;
+  ranchNamespaces: string;
+  ranchOwners: string;
+  ranchAuth: string;
+  ranchOrphanNs: string;
+  ranchNotAuthoritative: string;
+
+  // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
+  filterAll: string;
+  filterProblems: string;
 }
 
 const FR: Strings = {
@@ -412,6 +520,120 @@ const FR: Strings = {
   objEditCancel: "Annuler",
   objEditReadOnlyHint: "Retouchez le document, puis « Appliquer » montre ce que cela change.",
   objWorking: "en cours…",
+
+  delTitle: "Suppression",
+  delTarget: "Objet",
+  delChecking: "vérifications en cours…",
+  delHelp:
+    "Aucun de ces constats ne bloque : ils disent ce qui va se passer. Un objet déployé par un moteur GitOps revient à la réconciliation suivante.",
+  delCancel: "Ne rien supprimer",
+  delConfirm: "Supprimer définitivement",
+  delStrictHelp:
+    "Un constat grave s'applique — ou les vérifications n'ont pas pu conclure. Retapez le nom de l'objet pour confirmer.",
+  delStrictPlaceholder: "nom de l'objet",
+  delStrictMismatch: "attendu : {name}",
+  delReload: "Revérifier",
+
+  identUsers: "Comptes",
+  identGroups: "Groupes",
+  identDetail: "Compte",
+  identSelectRow: "Sélectionnez une ligne",
+  identActions: "Annuaire",
+  identInvite: "Inviter",
+  identInviteHelp:
+    "Lance `kdt-identity-server invite` dans le pod controller et rend un lien et un code, une seule fois.",
+  identInviteValidity: "validité",
+  identInviteOnce:
+    "Ces valeurs ne seront plus affichées. Elles voyagent par deux canaux différents, d'où deux copies séparées.",
+  identInviteLink: "Lien",
+  identInviteCode: "Code",
+  identInviteRaw: "Sortie de la commande",
+  identInviteClose: "J'ai copié",
+  identRevoke: "Fermer les sessions",
+  identRevokeHelp:
+    "Déconnecte le compte de toutes ses machines. Ce n'est pas le désactiver : il pourra se reconnecter.",
+  identEnable: "Réactiver",
+  identDisable: "Désactiver",
+  identEnableHelp: "Réautorise la délivrance de nouveaux accès.",
+  identDisableHelp:
+    "Bloque toute nouvelle délivrance. Les credentials déjà remis vivent jusqu'à leur expiration.",
+  identAddMember: "Ajouter au groupe",
+  identRemoveMember: "Retirer",
+  identMemberHelp:
+    "L'appartenance est portée par le groupe, jamais par le compte : elle s'écrit sur `spec.members`.",
+  identCreateUser: "Nouveau compte",
+  identCreateGroup: "Nouveau groupe",
+  identName: "nom",
+  identEmail: "e-mail",
+  identDisplayName: "nom affiché",
+  identDescription: "description",
+  identCreate: "Créer",
+  identEmpty: "Aucun compte ni groupe local sur ce cluster.",
+  identNotInstalled: "kdt-identity n'est pas installé sur ce cluster.",
+  identInstallHelp: "Commande d'installation",
+  identScopeless: "L'annuaire est cluster-scoped : la portée de namespace ne s'y applique pas.",
+  identOperator: "opérateur",
+  identMode: "délivrance",
+  identModeUnknown: "non déclarée",
+  identRevocation: "révocation",
+  identRefresh: "renouvellement",
+  identDownload: "kubeconfig",
+  identDownloadOpen: "téléchargement ouvert — cet accès échappe à la révocation",
+  identDownloadClosed: "téléchargement fermé",
+  identSubject: "subject",
+  identGroupsLabel: "groupes",
+  identMembers: "membres",
+  identUnknownMembers: "membres inconnus",
+  identRights: "droits",
+  identSessions: "sessions",
+  identNone: "aucun",
+  identNoController:
+    "Le pod controller n'a pas été trouvé : inviter et fermer les sessions sont indisponibles.",
+
+  ranchUsers: "Comptes",
+  ranchAccess: "Accès",
+  ranchProjects: "Projects",
+  ranchTokens: "Tokens",
+  ranchDetail: "Rancher",
+  ranchSelectRow: "Sélectionnez une ligne",
+  ranchActions: "Rancher",
+  ranchIssue: "Émettre un token",
+  ranchIssueHelp:
+    "Crée un Token calqué sur ceux que Rancher émet pour un kubeconfig. Le credential est affiché une seule fois.",
+  ranchIssueTtl: "durée de vie (minutes, 0 = jamais)",
+  ranchIssueHashing:
+    "`token-hashing` est actif : Rancher n'en stocke qu'un condensé, et le secret affiché n'est pas promis utilisable.",
+  ranchSetTtl: "Changer la durée de vie",
+  ranchSetTtlHelp: "Raccourcir un credential distribué trop généreusement, sans couper la session.",
+  ranchRevoke: "Révoquer",
+  ranchRevokeHelp: "Supprimer l'objet Token est la seule vraie révocation.",
+  ranchRevokeSession: "Ce token est la session de connexion elle-même : la révoquer déconnecte.",
+  ranchSetSetting: "Régler",
+  ranchSetSettingHelp: "Vaut pour tout le cluster : gouverne chaque credential émis ensuite.",
+  ranchApply: "Appliquer",
+  ranchCancel: "Annuler",
+  ranchEmpty: "Rien à afficher dans ce monde.",
+  ranchReadOnly:
+    "Ce cluster est un downstream : les objets d'identité y sont des répliques, et les écritures sont refusées.",
+  ranchScopeless: "La vue lit un annuaire : la portée de namespace ne s'y applique pas.",
+  ranchTokenOnce:
+    "Ce credential ne sera plus affiché. Il n'est écrit ni dans un log, ni sur disque, ni dans l'état.",
+  ranchTokenClose: "J'ai copié",
+  ranchIdentity: "identité",
+  ranchLogin: "login",
+  ranchProvider: "provider",
+  ranchPrincipal: "principal",
+  ranchGlobalRoles: "rôles globaux",
+  ranchGroups: "groupes",
+  ranchNamespaces: "namespaces",
+  ranchOwners: "owners",
+  ranchAuth: "authentification",
+  ranchOrphanNs: "namespaces sans project",
+  ranchNotAuthoritative:
+    "Ligne reconstruite depuis le RBAC projeté par l'agent : l'objet Rancher est en amont.",
+
+  filterAll: "tout",
+  filterProblems: "problèmes",
 };
 
 const EN: Strings = {
@@ -616,6 +838,120 @@ const EN: Strings = {
   objEditCancel: "Cancel",
   objEditReadOnlyHint: "Edit the document, then \"Apply\" shows what it changes.",
   objWorking: "working…",
+
+  delTitle: "Delete",
+  delTarget: "Object",
+  delChecking: "running checks…",
+  delHelp:
+    "None of these findings blocks anything: they say what will happen. An object deployed by a GitOps engine comes back at the next reconciliation.",
+  delCancel: "Delete nothing",
+  delConfirm: "Delete for good",
+  delStrictHelp:
+    "A serious finding applies — or the checks could not conclude. Retype the object name to confirm.",
+  delStrictPlaceholder: "object name",
+  delStrictMismatch: "expected: {name}",
+  delReload: "Check again",
+
+  identUsers: "Accounts",
+  identGroups: "Groups",
+  identDetail: "Account",
+  identSelectRow: "Select a row",
+  identActions: "Directory",
+  identInvite: "Invite",
+  identInviteHelp:
+    "Runs `kdt-identity-server invite` in the controller pod and hands back a link and a code, once.",
+  identInviteValidity: "validity",
+  identInviteOnce:
+    "These values will not be shown again. They travel through two separate channels, hence two separate copies.",
+  identInviteLink: "Link",
+  identInviteCode: "Code",
+  identInviteRaw: "Command output",
+  identInviteClose: "Copied",
+  identRevoke: "Close sessions",
+  identRevokeHelp:
+    "Signs the account out of every machine. This is not disabling it: they can sign back in.",
+  identEnable: "Re-enable",
+  identDisable: "Disable",
+  identEnableHelp: "Allows new accesses to be issued again.",
+  identDisableHelp:
+    "Blocks every new issuance. Credentials already handed out live until they expire.",
+  identAddMember: "Add to group",
+  identRemoveMember: "Remove",
+  identMemberHelp:
+    "Membership is held by the group, never by the account: it is written on `spec.members`.",
+  identCreateUser: "New account",
+  identCreateGroup: "New group",
+  identName: "name",
+  identEmail: "email",
+  identDisplayName: "display name",
+  identDescription: "description",
+  identCreate: "Create",
+  identEmpty: "No local account or group on this cluster.",
+  identNotInstalled: "kdt-identity is not installed on this cluster.",
+  identInstallHelp: "Install command",
+  identScopeless: "The directory is cluster-scoped: the namespace scope does not apply.",
+  identOperator: "operator",
+  identMode: "delivery",
+  identModeUnknown: "not declared",
+  identRevocation: "revocation",
+  identRefresh: "refresh",
+  identDownload: "kubeconfig",
+  identDownloadOpen: "download open — this access escapes revocation",
+  identDownloadClosed: "download closed",
+  identSubject: "subject",
+  identGroupsLabel: "groups",
+  identMembers: "members",
+  identUnknownMembers: "unknown members",
+  identRights: "rights",
+  identSessions: "sessions",
+  identNone: "none",
+  identNoController:
+    "The controller pod was not found: inviting and closing sessions are unavailable.",
+
+  ranchUsers: "Accounts",
+  ranchAccess: "Access",
+  ranchProjects: "Projects",
+  ranchTokens: "Tokens",
+  ranchDetail: "Rancher",
+  ranchSelectRow: "Select a row",
+  ranchActions: "Rancher",
+  ranchIssue: "Issue a token",
+  ranchIssueHelp:
+    "Creates a Token shaped like the ones Rancher issues for a kubeconfig. The credential is shown once.",
+  ranchIssueTtl: "lifetime (minutes, 0 = never)",
+  ranchIssueHashing:
+    "`token-hashing` is on: Rancher stores only a digest, and the secret shown is not promised to work.",
+  ranchSetTtl: "Change the lifetime",
+  ranchSetTtlHelp: "Rein in a credential handed out too generously, without cutting the session.",
+  ranchRevoke: "Revoke",
+  ranchRevokeHelp: "Deleting the Token object is the only real revocation.",
+  ranchRevokeSession: "This token is the login session itself: revoking it signs the person out.",
+  ranchSetSetting: "Set",
+  ranchSetSettingHelp: "Cluster-wide: it governs every credential issued afterwards.",
+  ranchApply: "Apply",
+  ranchCancel: "Cancel",
+  ranchEmpty: "Nothing to show in this world.",
+  ranchReadOnly:
+    "This cluster is a downstream: its identity objects are replicas, and writes are refused.",
+  ranchScopeless: "The view reads a directory: the namespace scope does not apply.",
+  ranchTokenOnce:
+    "This credential will not be shown again. It is written to no log, no disk and no state.",
+  ranchTokenClose: "Copied",
+  ranchIdentity: "identity",
+  ranchLogin: "login",
+  ranchProvider: "provider",
+  ranchPrincipal: "principal",
+  ranchGlobalRoles: "global roles",
+  ranchGroups: "groups",
+  ranchNamespaces: "namespaces",
+  ranchOwners: "owners",
+  ranchAuth: "authentication",
+  ranchOrphanNs: "namespaces with no project",
+  ranchNotAuthoritative:
+    "Row rebuilt from the RBAC the cluster agent projected: the Rancher object lives upstream.",
+
+  filterAll: "all",
+  filterProblems: "problems",
 };
 
 export function strings(lang: Lang): Strings {
