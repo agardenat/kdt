@@ -14,7 +14,7 @@ Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-we
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, huit vues
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, neuf vues
 répondent, le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
@@ -235,6 +235,27 @@ répondent, le reste n'existe pas.
   refusée n'a jamais existé, donc aucun rapport ne la décrit — seul un Event en garde la trace.
   Les évènements illisibles laissent la section muette plutôt que d'affirmer qu'il n'y a eu aucun
   refus.
+
+- **feat(web)** — la vue RBAC : non pas la liste des liaisons, que `kubectl get rolebindings -A`
+  donne déjà, mais le **score** et le **graphe**. Un Role seul n'accorde rien tant qu'il n'est pas
+  lié, et le même ClusterRole est anodin en RoleBinding namespacée et critique en
+  ClusterRoleBinding : la sévérité se calcule par liaison, à partir des règles résolues, des sujets
+  et du namespace — celle de kdt, pas une seconde règle écrite dans le navigateur.
+
+  Les quatre lectures du TUI sont là : la liste d'audit, l'identité et tout ce qu'elle cumule, la
+  liaison dépliée, et le rôle — la seule qui montre un ClusterRole re-accordé namespace par
+  namespace comme **un** nœud, avec ce qu'il agrège et ce qu'il alimente. Un pli porte sur le nœud
+  et non sur la ligne : un ClusterRole atteint par deux liaisons se replie d'un seul geste.
+
+  L'attribution dit qui a posé l'objet, et ne range pas Kyverno, Rancher, les défauts du cluster ni
+  les gestionnaires d'add-ons avec les grants orphelins : ils posent des objets sans passer par
+  kubectl, ils sont attribués. Une liste de ServiceAccounts illisible n'autorise aucun « ce compte
+  n'existe pas » — la vue le dit et se tait, plutôt que de montrer un graphe troué sans prévenir.
+
+  La portée resserre ce qui est **montré**, jamais ce qui est **lu** : une arête d'agrégation ou un
+  « personne ne lie ce rôle » calculés sur une liste partielle seraient faux. C'est la seule vue en
+  graphe qui accepte une portée, et la règle de ce qu'un namespace contient — ses RoleBindings,
+  plus les liaisons accordées à ses ServiceAccounts — est celle de kdt.
 
 - **feat(web)** — le `Ctrl-D` de kdt arrive sur le web, dans toutes les vues : les garde-fous
   d'abord — déployé par un moteur GitOps, point d'entrée GitOps, cascade d'un Namespace ou d'une

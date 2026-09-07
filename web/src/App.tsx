@@ -11,6 +11,7 @@ import EventsView from "./EventsView";
 import FluxView from "./FluxView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
+import RbacView from "./RbacView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
@@ -28,7 +29,8 @@ type ViewId =
   | "certs"
   | "identity"
   | "rancher"
-  | "kyverno";
+  | "kyverno"
+  | "rbac";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -55,7 +57,7 @@ const VIEWS: Array<{
   { id: "storage", label: "Storage", key: "s" },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
-  { id: "rbac", label: "RBAC", key: "r" },
+  { id: "rbac", label: "RBAC", key: "r", ready: true },
   { id: "kyverno", label: "Kyverno", key: "k", ready: true, needs: "kyverno" },
   { id: "identity", label: "Identity", key: "i", ready: true, needs: "identity" },
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
@@ -297,8 +299,15 @@ export default function App() {
   // Les vues qui listent des objets indépendants sont dans la portée ; celles qui dessinent un
   // graphe n'y sont pas, et les deux annuaires non plus — leurs objets sont cluster-scoped, ou
   // vivent dans le namespace de leur cluster Rancher, ce qui n'a rien à voir avec la question posée.
+  // La vue RBAC est dans la portée, à la différence des autres vues en graphe : la question « la
+  // RBAC de ce namespace » a un sens, et kdt y répond en filtrant les lignes sans jamais réduire ce
+  // qui est lu — une arête d'agrégation calculée sur une liste partielle serait fausse.
   const scoped =
-    view === "events" || view === "workloads" || view === "data" || view === "certs";
+    view === "events" ||
+    view === "workloads" ||
+    view === "data" ||
+    view === "certs" ||
+    view === "rbac";
   const scopelessReason =
     view === "identity"
       ? st.identScopeless
@@ -498,6 +507,18 @@ export default function App() {
               lang={lang}
               st={st}
               query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "rbac" ? (
+            <RbacView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
               panelHeight={panelHeight}
               onPanelHeight={setPanelHeight}
               panelOpen={panelOpen}

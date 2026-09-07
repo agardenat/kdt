@@ -850,6 +850,209 @@ export interface KyvernoPayload {
   error: string | null;
 }
 
+// --- Vue RBAC -------------------------------------------------------------------------------------
+//
+// Ce que cette vue apporte n'est pas la liste des liaisons mais le **score** et le **graphe** : un
+// Role seul n'accorde rien tant qu'il n'est pas lié, et le même ClusterRole est anodin en
+// RoleBinding et critique en ClusterRoleBinding. La sévérité, les constats et les arêtes viennent
+// tous de `kdt::rbac`.
+
+export type RbacSeverity = "info" | "low" | "medium" | "high" | "critical";
+
+/** Par quel bout le graphe est lu. C'est le `t` du TUI. */
+export type RbacOrient = "flat" | "subject" | "binding" | "role";
+
+/**
+ * D'où vient un objet, lu sur ses propres labels et ownerRefs.
+ *
+ * Kyverno, Rancher, les défauts du cluster et les gestionnaires d'add-ons posent des objets sans
+ * passer par kubectl : ils sont **attribués**, donc jamais rangés avec les grants orphelins.
+ */
+export type RbacProvenance =
+  | { source: "flux-kustomization"; namespace: string; name: string }
+  | { source: "flux-helm-release"; namespace: string; name: string }
+  | { source: "helm"; namespace: string; name: string }
+  | { source: "argo"; app: string }
+  | { source: "kyverno"; policy: string }
+  | { source: "rancher"; binding: string }
+  | { source: "bootstrap" }
+  | { source: "addon"; by: string }
+  | { source: "owner"; kind: string; name: string }
+  | { source: "kubectl" }
+  | { source: "unmanaged" };
+
+/** Une règle résolue, telle qu'une colonne la montre. `—` quand le champ est vide. */
+export interface RbacRule {
+  verbs: string;
+  resources: string;
+  api_groups: string;
+  resource_names: string[];
+}
+
+/** Un constat scoré, avec sa raison. */
+export interface RbacFinding {
+  sev: RbacSeverity;
+  tag: string;
+  detail: string;
+}
+
+/** Ce que chaque ligne de l'arbre porte, quel que soit ce qu'elle désigne. */
+interface RbacRowBase {
+  uid: string;
+  depth: number;
+  has_children: boolean;
+  /** Le pli que kdt poserait : tout ce dont le pire nœud est sous HIGH se referme. */
+  fold_default: boolean;
+  /**
+   * L'identité du **nœud**, à distinguer de `uid` qui est sa place dans la liste : un ClusterRole
+   * atteint par deux liaisons se replie d'un seul geste, partout où il apparaît.
+   */
+  fold_key: string | null;
+  record: EventRecord;
+}
+
+export interface RbacBindingRow extends RbacRowBase {
+  row: "binding";
+  binding_kind: string;
+  binding_name: string;
+  severity: RbacSeverity;
+  sev_label: string;
+  sev_icon: string;
+  scope_label: string;
+  /** Namespace critique : un pied dans la porte y escalade tout le cluster. */
+  scope_alarming: boolean;
+  role_label: string;
+  /** Le premier sujet, et combien d'autres. Une ligne ne porte pas dix identités. */
+  subject_label: string;
+  subject_rows: Array<{ label: string; short_label: string; kind: string; missing: boolean }>;
+  provenance: RbacProvenance;
+  provenance_label: string;
+  source: string | null;
+  /** Le pire constat seul : la liste complète est dans le panneau. */
+  risk_top: string;
+  risk_tags: string;
+  findings: RbacFinding[];
+  rule_rows: RbacRule[];
+  via_clusterrole: boolean;
+  aggregated: boolean;
+  age: string;
+}
+
+export interface RbacRoleRow extends RbacRowBase {
+  row: "role" | "contributor";
+  kind_label: string;
+  kind_short: string;
+  namespace: string;
+  name: string;
+  severity: RbacSeverity;
+  sev_label: string;
+  sev_icon: string;
+  provenance: RbacProvenance;
+  provenance_label: string;
+  source: string | null;
+  /** Le nombre de règles que l'objet déclare lui-même, avant que l'agrégation le remplisse. */
+  own_rules: number;
+  aggregated: boolean;
+  /** L'union est une borne basse : un sélecteur en `matchExpressions` n'est pas évalué. */
+  aggregation_partial: boolean;
+  aggregates_names: Array<{ name: string; rules: number }>;
+  aggregates_into_names: string[];
+  bound_cluster: number;
+  bound_namespaces: string[];
+  /** Re-accordé dans plusieurs namespaces : édité une fois, il déplace des droits partout. */
+  is_template: boolean;
+  /** Personne ne le lie : il n'accorde rien aujourd'hui, mais l'offre reste posée. */
+  is_unbound: boolean;
+  findings: RbacFinding[];
+  rule_rows: RbacRule[];
+  age: string;
+}
+
+export interface RbacSubjectRow extends RbacRowBase {
+  row: "subject";
+  key: string;
+  label: string;
+  short_label: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  severity: RbacSeverity;
+  sev_label: string;
+  sev_icon: string;
+  /** Le nom est lié, mais aucun ServiceAccount ne porte ce nom. */
+  missing: boolean;
+  sa: {
+    exists: boolean;
+    automount: boolean | null;
+    secrets: number;
+    image_pull_secrets: number;
+    provenance: RbacProvenance;
+    provenance_label: string;
+    source: string | null;
+    age: string;
+  } | null;
+  grants: Array<{
+    severity: RbacSeverity;
+    sev_label: string;
+    sev_icon: string;
+    role_label: string;
+    scope_label: string;
+    risk_top: string;
+  }>;
+}
+
+export interface RbacNsGroupRow extends RbacRowBase {
+  row: "nsgroup";
+  namespace: string;
+  role_name: string;
+  bindings: number;
+}
+
+export interface RbacRuleRow extends RbacRowBase, RbacRule {
+  row: "rule";
+  role_name: string;
+}
+
+export interface RbacSubjectLeafRow extends RbacRowBase {
+  row: "subject-leaf";
+  kind: string;
+  name: string;
+  label: string;
+  short_label: string;
+  missing: boolean;
+}
+
+export type RbacRow =
+  | RbacBindingRow
+  | RbacRoleRow
+  | RbacSubjectRow
+  | RbacNsGroupRow
+  | RbacRuleRow
+  | RbacSubjectLeafRow;
+
+export interface RbacPayload {
+  rows: RbacRow[];
+  counts: {
+    bindings: number;
+    roles: number;
+    service_accounts: number;
+    info: number;
+    low: number;
+    medium: number;
+    high: number;
+    critical: number;
+  };
+  /**
+   * La liste des ServiceAccounts n'a pas pu être lue.
+   *
+   * Tant que c'est vrai, aucun « ce compte n'existe pas » n'est prononcé : une lecture refusée
+   * n'est pas une preuve d'absence.
+   */
+  sa_degraded: boolean;
+  scope: string;
+  error: string | null;
+}
+
 // --- Gestes sur un objet quelconque ---------------------------------------------------------------
 
 /** Les deux rendus du YAML, comme l'overlay `y` du TUI. */

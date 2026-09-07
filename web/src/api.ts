@@ -29,6 +29,9 @@ import type {
   IdentityWriteResult,
   KyFilter,
   KyvernoPayload,
+  RbacOrient,
+  RbacPayload,
+  RbacSeverity,
   IssuedToken,
   ObjectYaml,
   RancherPayload,
@@ -474,4 +477,24 @@ export function kyverno(
  */
 export function kyvernoPurge(lang: Lang): Promise<{ message: string; deleted: number }> {
   return send<{ message: string; deleted: number }>("/api/v1/kyverno/purge", { lang });
+}
+
+/**
+ * Le graphe RBAC du cluster, en lignes d'arbre.
+ *
+ * L'orientation et le plancher de sévérité partent au serveur : lui seul a les arêtes, et le
+ * plancher décide quelles branches existent — filtrer les lignes après coup rattacherait des
+ * enfants à n'importe quoi.
+ *
+ * La portée narrows ce qui est montré, jamais ce qui est lu : un compte de re-liaisons ou un
+ * « personne ne lie ce rôle » calculés sur une liste partielle seraient faux.
+ */
+export function rbac(
+  namespace: string,
+  orient: RbacOrient,
+  minSev: RbacSeverity,
+): Promise<RbacPayload> {
+  const params = new URLSearchParams({ orient, min_sev: minSev });
+  if (namespace) params.set("ns", namespace);
+  return get<RbacPayload>(`/api/v1/rbac?${params.toString()}`);
 }

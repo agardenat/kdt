@@ -15,7 +15,7 @@
 //! `classify()` is pure and unit-tested; `fetch_rbac()` wires it to the live cluster following the
 //! same Shared-state pattern as `pods.rs`/`flux.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::core::v1::ServiceAccount;
@@ -28,7 +28,8 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
-use crate::events::format_age;
+use crate::events::{format_age, EventRecord, Severity as EventSeverity};
+use k8s_openapi::jiff::Timestamp;
 
 // Namespaces where a local binding escalates cluster-wide (controller SA tokens, GitOps controllers,
 // admission webhooks…). User-overridable; the override is merged with this default list.
@@ -54,8 +55,11 @@ pub const CRITICAL_NS_DEFAULT: &[&str] = &[
     "tigera-operator",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
+    // Le plancher par défaut d'une vue : tout est montré, et c'est au lecteur de resserrer.
+    #[default]
     Info,
     Low,
     Medium,
@@ -75,7 +79,8 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "namespace", rename_all = "kebab-case")]
 pub enum Scope {
     ClusterWide,
     Namespace(String),
@@ -261,7 +266,7 @@ fn rancher_projected_binding(name: Option<&str>, labels: &Labels) -> Option<Stri
 }
 
 // A rule flattened to plain strings so scoring is independent of the kube types (and testable).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PolicyRule {
     pub api_groups: Vec<String>,
     pub resources: Vec<String>,
@@ -292,7 +297,7 @@ impl PolicyRule {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Subject {
     pub kind: String,
     pub name: String,
@@ -347,7 +352,7 @@ fn leftmost_rdn(dn: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RoleRef {
     pub kind: String,
     pub name: String,
@@ -361,14 +366,14 @@ impl RoleRef {
 }
 
 // One scored reason a binding was flagged; collected for the detail view.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     pub sev: Severity,
     pub tag: &'static str,
     pub detail: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RbacBinding {
     pub scope: Scope,
     pub binding_kind: String,
@@ -392,7 +397,7 @@ pub struct RbacBinding {
     pub sa_idx: Vec<Option<usize>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum RoleKind {
     Role,
     ClusterRole,
@@ -416,7 +421,7 @@ impl RoleKind {
 // A Role or ClusterRole as an object in its own right. The binding-centric rows flatten these into
 // `RbacBinding::rules`; keeping them separate is what lets the tree show aggregation composition,
 // the ClusterRoles reused as per-namespace templates, and the roles nobody ever bound.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RoleEntry {
     pub kind: RoleKind,
     pub namespace: String, // empty for a ClusterRole
@@ -471,7 +476,7 @@ impl RoleEntry {
 
 // A ServiceAccount as an object, not just a subject string. Lets the view tell "granted to a SA that
 // exists" from "granted to a name nobody created".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SaEntry {
     pub namespace: String,
     pub name: String,
@@ -1395,6 +1400,870 @@ pub fn critical_namespaces(extra: &[String]) -> Vec<String> {
         }
     }
     v
+}
+
+// --- What both interfaces share: the graph as rows, and what each row points at -------------------
+//
+// This moved out of `ui.rs` when kdt-web grew an RBAC view. The reason is the one that applies to
+// every other view: a graph walked twice is a graph that will be walked differently. The tree, the
+// severity floor, the namespace scope and the synthetic records are computed once, here.
+
+/// One identity, with every grant it holds.
+///
+/// A ServiceAccount bound five times is one node with five children here, and five unrelated rows
+/// in the flat list — which is the whole point of the subject orientation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RbacSubjectNode {
+    /// `Kind|namespace/name` — the identity of the node, stable across refreshes.
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// Index into the ServiceAccount list when the subject is one this cluster holds.
+    pub sa: Option<usize>,
+    /// Indices into the binding list.
+    pub bindings: Vec<usize>,
+    /// The worst of the grants it holds: an identity is as dangerous as its best grant.
+    pub severity: Severity,
+}
+
+/// Which end of the graph the view is read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RbacOrient {
+    /// One row per binding, worst first. The audit list `:rbac` is opened for.
+    #[default]
+    Flat,
+    /// Identity → its bindings → the role each grants → the rules.
+    Subject,
+    /// Binding → its subjects and the role it grants → the rules.
+    Binding,
+    /// Role → what it aggregates → where it is granted → to whom.
+    Role,
+}
+
+impl RbacOrient {
+    pub fn next(self) -> Self {
+        match self {
+            RbacOrient::Flat => RbacOrient::Subject,
+            RbacOrient::Subject => RbacOrient::Binding,
+            RbacOrient::Binding => RbacOrient::Role,
+            RbacOrient::Role => RbacOrient::Flat,
+        }
+    }
+
+    pub fn label(self, st: &'static Strings) -> &'static str {
+        match self {
+            RbacOrient::Flat => st.rbac_orient_flat,
+            RbacOrient::Subject => st.rbac_orient_subject,
+            RbacOrient::Binding => st.rbac_orient_binding,
+            RbacOrient::Role => st.rbac_orient_role,
+        }
+    }
+}
+
+/// One row of the RBAC tree. Indices point into the graph the row builder was given.
+#[derive(Debug, Clone)]
+pub enum RbacRow {
+    Subject { idx: usize, collapsed: bool, has_children: bool },
+    Binding { idx: usize, depth: usize, collapsed: bool, has_children: bool },
+    Role { idx: usize, depth: usize, collapsed: bool, has_children: bool },
+    /// A ClusterRole that feeds an aggregated one, shown under it.
+    Contributor { idx: usize, depth: usize },
+    /// "re-granted in namespace X", grouping the RoleBindings of a template ClusterRole.
+    NsGroup { role: usize, namespace: String, depth: usize, collapsed: bool },
+    /// One resolved rule of a role. Not an API object: its record points at the role.
+    Rule { role: usize, rule: usize, depth: usize },
+    /// A subject shown as a leaf under its binding.
+    SubjectLeaf { binding: usize, subject: usize, depth: usize },
+}
+
+impl RbacRow {
+    pub fn depth(&self) -> usize {
+        match self {
+            RbacRow::Subject { .. } => 0,
+            RbacRow::Binding { depth, .. }
+            | RbacRow::Role { depth, .. }
+            | RbacRow::Contributor { depth, .. }
+            | RbacRow::NsGroup { depth, .. }
+            | RbacRow::Rule { depth, .. }
+            | RbacRow::SubjectLeaf { depth, .. } => *depth,
+        }
+    }
+
+    pub fn has_children(&self) -> bool {
+        match self {
+            RbacRow::Subject { has_children, .. }
+            | RbacRow::Binding { has_children, .. }
+            | RbacRow::Role { has_children, .. } => *has_children,
+            RbacRow::NsGroup { .. } => true,
+            RbacRow::Contributor { .. } | RbacRow::Rule { .. } | RbacRow::SubjectLeaf { .. } => false,
+        }
+    }
+
+    pub fn collapsed(&self) -> bool {
+        match self {
+            RbacRow::Subject { collapsed, .. }
+            | RbacRow::Binding { collapsed, .. }
+            | RbacRow::Role { collapsed, .. }
+            | RbacRow::NsGroup { collapsed, .. } => *collapsed,
+            _ => false,
+        }
+    }
+}
+
+/// A row, plus the two identities it needs.
+///
+/// They are not the same thing, and conflating them breaks the tree: `uid` is the row's place in
+/// the list — a ClusterRole reached from two bindings is two rows — while `fold_key` is the node's
+/// own identity, so folding that ClusterRole folds it wherever it appears.
+#[derive(Debug, Clone)]
+pub struct RbacNode {
+    pub row: RbacRow,
+    pub uid: String,
+    pub fold_key: Option<String>,
+}
+
+/// The graph the rows are built from, borrowed rather than cloned.
+pub struct RbacGraph<'a> {
+    pub bindings: &'a [RbacBinding],
+    pub roles: &'a [RoleEntry],
+    pub service_accounts: &'a [SaEntry],
+    pub subjects: &'a [RbacSubjectNode],
+    /// Display order for the role orientation: worst potential first, as indices into `roles`.
+    pub role_order: &'a [usize],
+}
+
+/// The identity of a binding as a node, independent of the path that reached it.
+pub fn binding_uid(b: &RbacBinding) -> String {
+    format!("{}|{}/{}", b.binding_kind, binding_ns(b), b.binding_name)
+}
+
+/// The namespace a binding object lives in — empty for a ClusterRoleBinding.
+pub fn binding_ns(b: &RbacBinding) -> String {
+    match &b.scope {
+        Scope::Namespace(ns) => ns.clone(),
+        Scope::ClusterWide => String::new(),
+    }
+}
+
+/// What "the RBAC of a namespace" means.
+///
+/// `:rbac <ns>` narrows what is *shown*, never what is read: an aggregation edge, a template count
+/// or a "nobody binds this role" claim computed over a partial list would be wrong. Two things are
+/// in scope:
+///
+///   * every RoleBinding of that namespace, whatever it grants and to whom;
+///   * every binding, ClusterRoleBinding included, whose subject is a ServiceAccount of that
+///     namespace — a cluster-wide grant handed to one of its accounts is this namespace's business,
+///     and usually the first thing to look at.
+///
+/// A ClusterRoleBinding that only names kube-system accounts is left out: it grants in this
+/// namespace as it does in every other one, and listing it here would drown the rows that are
+/// actually about this namespace.
+pub fn binding_in_ns(b: &RbacBinding, ns: &str) -> bool {
+    if matches!(&b.scope, Scope::Namespace(n) if n == ns) {
+        return true;
+    }
+    b.subjects
+        .iter()
+        .any(|s| s.kind == "ServiceAccount" && s.namespace.as_deref() == Some(ns))
+}
+
+/// The roles an in-scope binding points at: a ClusterRole granted into the namespace belongs to it,
+/// even though the object itself is cluster-wide.
+pub fn roles_reached_in_ns(bindings: &[RbacBinding], ns: &str) -> HashSet<usize> {
+    bindings
+        .iter()
+        .filter(|b| binding_in_ns(b, ns))
+        .filter_map(|b| b.role_idx)
+        .collect()
+}
+
+/// A role is in scope when it lives in the namespace — an unbound Role there is still its RBAC —
+/// or when a binding in scope grants it.
+pub fn role_in_ns(r: &RoleEntry, ri: usize, reached: &HashSet<usize>, ns: &str) -> bool {
+    r.namespace == ns || reached.contains(&ri)
+}
+
+/// Collapse the subject strings scattered across every binding into one node per identity.
+pub fn build_subjects(bindings: &[RbacBinding], sas: &[SaEntry]) -> Vec<RbacSubjectNode> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: HashMap<String, RbacSubjectNode> = HashMap::new();
+
+    for (bi, b) in bindings.iter().enumerate() {
+        for (si, s) in b.subjects.iter().enumerate() {
+            // A RoleBinding may name a ServiceAccount without its namespace, meaning its own.
+            let ns = match (&s.namespace, &b.scope) {
+                (Some(ns), _) => ns.clone(),
+                (None, Scope::Namespace(ns)) if s.kind == "ServiceAccount" => ns.clone(),
+                _ => String::new(),
+            };
+            let key = format!("{}|{}/{}", s.kind, ns, s.name);
+            let node = by_key.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                RbacSubjectNode {
+                    key: key.clone(),
+                    label: s.label(),
+                    kind: s.kind.clone(),
+                    namespace: ns.clone(),
+                    name: s.name.clone(),
+                    sa: b.sa_idx.get(si).copied().flatten(),
+                    bindings: Vec::new(),
+                    severity: Severity::Info,
+                }
+            });
+            if node.sa.is_none() {
+                node.sa = b.sa_idx.get(si).copied().flatten();
+            }
+            if !node.bindings.contains(&bi) {
+                node.bindings.push(bi);
+            }
+            node.severity = node.severity.max(b.severity);
+        }
+    }
+
+    // A ServiceAccount nobody binds is still worth a node: it is the other half of the "who can do
+    // what" question, and an unused SA with a mounted token is its own small finding.
+    for (i, sa) in sas.iter().enumerate() {
+        if !sa.exists || !sa.bindings.is_empty() {
+            continue;
+        }
+        let key = format!("ServiceAccount|{}/{}", sa.namespace, sa.name);
+        by_key.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            RbacSubjectNode {
+                key,
+                label: sa.label(),
+                kind: "ServiceAccount".to_string(),
+                namespace: sa.namespace.clone(),
+                name: sa.name.clone(),
+                sa: Some(i),
+                bindings: Vec::new(),
+                severity: Severity::Info,
+            }
+        });
+    }
+
+    let mut out: Vec<RbacSubjectNode> = order.into_iter().filter_map(|k| by_key.remove(&k)).collect();
+    out.sort_by_key(|n| (std::cmp::Reverse(n.severity as u8), n.label.clone()));
+    out
+}
+
+/// Whether kdt folds this node by default.
+///
+/// On a real cluster the subject tree runs to thousands of lines, and almost all of it is the
+/// read-only plumbing nobody opened this view for. Everything whose worst node is below HIGH is
+/// folded; the rest opens.
+pub fn default_folded(severity: Severity) -> bool {
+    severity < Severity::High
+}
+
+/// Fold the quiet, open the dangerous — except where someone folded by hand.
+pub fn autofold(
+    g: &RbacGraph,
+    user_toggled: &HashSet<String>,
+    collapsed: &mut HashSet<String>,
+) {
+    let mut want: Vec<(String, bool)> = Vec::new();
+    for n in g.subjects {
+        want.push((format!("subj|{}", n.key), default_folded(n.severity)));
+    }
+    for b in g.bindings {
+        want.push((binding_uid(b), default_folded(b.severity)));
+    }
+    for r in g.roles {
+        want.push((r.uid(), default_folded(r.severity)));
+    }
+    for (uid, fold) in want {
+        if user_toggled.contains(&uid) {
+            continue;
+        }
+        if fold {
+            collapsed.insert(uid);
+        } else {
+            collapsed.remove(&uid);
+        }
+    }
+}
+
+/// The tree, in the requested orientation, with the severity floor and namespace scope applied.
+pub fn build_rbac_rows(
+    g: &RbacGraph,
+    orient: RbacOrient,
+    min_sev: Severity,
+    ns: Option<&str>,
+    collapsed: &HashSet<String>,
+) -> Vec<RbacNode> {
+    let mut out = Vec::new();
+    match orient {
+        RbacOrient::Flat => flat_rows(g, min_sev, ns, &mut out),
+        RbacOrient::Subject => subject_rows(g, min_sev, ns, collapsed, &mut out),
+        RbacOrient::Binding => binding_rows(g, min_sev, ns, collapsed, &mut out),
+        RbacOrient::Role => role_rows(g, min_sev, ns, collapsed, &mut out),
+    }
+    out
+}
+
+fn shown(b: &RbacBinding, ns: Option<&str>) -> bool {
+    ns.is_none_or(|ns| binding_in_ns(b, ns))
+}
+
+// The flat audit list: one row per binding, worst first. No nesting, no folding — the reading
+// `:rbac` exists for, kept as an orientation rather than replaced by the tree.
+fn flat_rows(g: &RbacGraph, min_sev: Severity, ns: Option<&str>, out: &mut Vec<RbacNode>) {
+    for (i, b) in g.bindings.iter().enumerate() {
+        if b.severity < min_sev || !shown(b, ns) {
+            continue;
+        }
+        let uid = binding_uid(b);
+        out.push(RbacNode {
+            row: RbacRow::Binding { idx: i, depth: 0, collapsed: false, has_children: false },
+            fold_key: Some(uid.clone()),
+            uid,
+        });
+    }
+}
+
+// Identity -> its bindings -> the role each one grants -> the rules. Answers "what can this
+// ServiceAccount do in total", which the flat list structurally cannot.
+fn subject_rows(
+    g: &RbacGraph,
+    min_sev: Severity,
+    ns: Option<&str>,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<RbacNode>,
+) {
+    for (si, n) in g.subjects.iter().enumerate() {
+        if n.severity < min_sev {
+            continue;
+        }
+        // A ServiceAccount of the namespace is in scope even when nobody binds it — an unused
+        // account with a mounted token is part of what the namespace exposes. A User or a Group has
+        // no namespace of its own: it is in scope through its bindings.
+        if let Some(ns) = ns {
+            let mine = n.namespace == ns
+                || n.bindings
+                    .iter()
+                    .any(|&bi| g.bindings.get(bi).is_some_and(|b| binding_in_ns(b, ns)));
+            if !mine {
+                continue;
+            }
+        }
+        let root = format!("subj|{}", n.key);
+        let folded = collapsed.contains(&root);
+        out.push(RbacNode {
+            row: RbacRow::Subject { idx: si, collapsed: folded, has_children: !n.bindings.is_empty() },
+            uid: root.clone(),
+            fold_key: Some(root.clone()),
+        });
+        if folded {
+            continue;
+        }
+        for &bi in &n.bindings {
+            let b = &g.bindings[bi];
+            if b.severity < min_sev || !shown(b, ns) {
+                continue;
+            }
+            let key = binding_uid(b);
+            let bfolded = collapsed.contains(&key);
+            out.push(RbacNode {
+                row: RbacRow::Binding {
+                    idx: bi,
+                    depth: 1,
+                    collapsed: bfolded,
+                    has_children: b.role_idx.is_some(),
+                },
+                uid: format!("{root}/{key}"),
+                fold_key: Some(key.clone()),
+            });
+            if bfolded {
+                continue;
+            }
+            if let Some(ri) = b.role_idx {
+                push_role_subtree(g, ri, 2, &format!("{root}/{key}"), collapsed, out);
+            }
+        }
+    }
+}
+
+// The audit list, unfolded: binding -> role (-> what it aggregates) -> rules, with the subjects as
+// leaves. The same rows as `Flat`, with everything the flat row summarises made walkable.
+fn binding_rows(
+    g: &RbacGraph,
+    min_sev: Severity,
+    ns: Option<&str>,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<RbacNode>,
+) {
+    for (i, b) in g.bindings.iter().enumerate() {
+        if b.severity < min_sev || !shown(b, ns) {
+            continue;
+        }
+        let uid = binding_uid(b);
+        let folded = collapsed.contains(&uid);
+        out.push(RbacNode {
+            row: RbacRow::Binding {
+                idx: i,
+                depth: 0,
+                collapsed: folded,
+                has_children: !b.subjects.is_empty() || b.role_idx.is_some(),
+            },
+            uid: uid.clone(),
+            fold_key: Some(uid.clone()),
+        });
+        if folded {
+            continue;
+        }
+        for (si, _) in b.subjects.iter().enumerate() {
+            out.push(RbacNode {
+                row: RbacRow::SubjectLeaf { binding: i, subject: si, depth: 1 },
+                uid: format!("{uid}/subj|{si}"),
+                fold_key: None,
+            });
+        }
+        if let Some(ri) = b.role_idx {
+            push_role_subtree(g, ri, 1, &uid, collapsed, out);
+        }
+    }
+}
+
+// Role -> what it aggregates -> where it is granted -> to whom, plus its rules. The orientation
+// that makes templates and unbound roles visible: a ClusterRole re-granted in ten namespaces is one
+// node here, and ten unrelated lines everywhere else.
+fn role_rows(
+    g: &RbacGraph,
+    min_sev: Severity,
+    ns: Option<&str>,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<RbacNode>,
+) {
+    // Which bindings reach each role.
+    let mut by_role: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (bi, b) in g.bindings.iter().enumerate() {
+        if !shown(b, ns) {
+            continue;
+        }
+        if let Some(ri) = b.role_idx {
+            by_role.entry(ri).or_default().push(bi);
+        }
+    }
+    let reached = ns.map(|ns| roles_reached_in_ns(g.bindings, ns));
+
+    for &ri in g.role_order {
+        let Some(r) = g.roles.get(ri) else { continue };
+        if r.severity < min_sev {
+            continue;
+        }
+        if let (Some(ns), Some(reached)) = (ns, reached.as_ref()) {
+            if !role_in_ns(r, ri, reached, ns) {
+                continue;
+            }
+        }
+        let bindings = by_role.get(&ri).cloned().unwrap_or_default();
+        let uid = r.uid();
+        let folded = collapsed.contains(&uid);
+        let has_children =
+            !r.rules.is_empty() || !r.aggregates.is_empty() || !bindings.is_empty();
+        out.push(RbacNode {
+            row: RbacRow::Role { idx: ri, depth: 0, collapsed: folded, has_children },
+            uid: uid.clone(),
+            fold_key: Some(uid.clone()),
+        });
+        if folded {
+            continue;
+        }
+        push_contributors(g, r, 1, &uid, out);
+
+        // A template ClusterRole gets a level per namespace: the point of the node is that the same
+        // definition lands in many places, and the namespaces are the answer.
+        if r.is_template() {
+            for bound in &r.bound_namespaces {
+                // Under a scope the group only exists if a binding still shown grants the role
+                // there: an empty "re-granted in namespace X" node would claim a level the rows
+                // below it no longer fill.
+                if ns.is_some()
+                    && !bindings.iter().any(|&bi| {
+                        matches!(&g.bindings[bi].scope, Scope::Namespace(n) if n == bound)
+                    })
+                {
+                    continue;
+                }
+                let guid = format!("{uid}/ns|{bound}");
+                let gfolded = collapsed.contains(&guid);
+                out.push(RbacNode {
+                    row: RbacRow::NsGroup {
+                        role: ri,
+                        namespace: bound.clone(),
+                        depth: 1,
+                        collapsed: gfolded,
+                    },
+                    uid: guid.clone(),
+                    fold_key: Some(guid.clone()),
+                });
+                if gfolded {
+                    continue;
+                }
+                for &bi in &bindings {
+                    let b = &g.bindings[bi];
+                    if !matches!(&b.scope, Scope::Namespace(n) if n == bound) {
+                        continue;
+                    }
+                    out.push(RbacNode {
+                        row: RbacRow::Binding {
+                            idx: bi,
+                            depth: 2,
+                            collapsed: false,
+                            has_children: false,
+                        },
+                        uid: format!("{guid}/{}", binding_uid(b)),
+                        fold_key: None,
+                    });
+                }
+            }
+            // ClusterRoleBindings of a template still belong directly under the role.
+            for &bi in &bindings {
+                let b = &g.bindings[bi];
+                if !matches!(b.scope, Scope::ClusterWide) {
+                    continue;
+                }
+                out.push(RbacNode {
+                    row: RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false },
+                    uid: format!("{uid}/{}", binding_uid(b)),
+                    fold_key: None,
+                });
+            }
+        } else {
+            for &bi in &bindings {
+                let b = &g.bindings[bi];
+                out.push(RbacNode {
+                    row: RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false },
+                    uid: format!("{uid}/{}", binding_uid(b)),
+                    fold_key: None,
+                });
+            }
+        }
+        push_rules(r, ri, 1, &uid, out);
+    }
+}
+
+// A role node with everything under it, used wherever a binding leads to one.
+fn push_role_subtree(
+    g: &RbacGraph,
+    ri: usize,
+    depth: usize,
+    parent: &str,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<RbacNode>,
+) {
+    let Some(r) = g.roles.get(ri) else { return };
+    let key = r.uid();
+    let uid = format!("{parent}/{key}");
+    let folded = collapsed.contains(&key);
+    out.push(RbacNode {
+        row: RbacRow::Role {
+            idx: ri,
+            depth,
+            collapsed: folded,
+            has_children: !r.rules.is_empty() || !r.aggregates.is_empty(),
+        },
+        uid: uid.clone(),
+        fold_key: Some(key),
+    });
+    if folded {
+        return;
+    }
+    push_contributors(g, r, depth + 1, &uid, out);
+    push_rules(r, ri, depth + 1, &uid, out);
+}
+
+// The ClusterRoles an aggregated role is composed of. Shown as leaves, not as role nodes: the
+// question here is what `admin` is made of, not what each ingredient is bound to.
+fn push_contributors(
+    g: &RbacGraph,
+    r: &RoleEntry,
+    depth: usize,
+    parent: &str,
+    out: &mut Vec<RbacNode>,
+) {
+    for &ci in &r.aggregates {
+        let Some(c) = g.roles.get(ci) else { continue };
+        out.push(RbacNode {
+            row: RbacRow::Contributor { idx: ci, depth },
+            uid: format!("{parent}/agg|{}", c.uid()),
+            fold_key: None,
+        });
+    }
+}
+
+fn push_rules(r: &RoleEntry, ri: usize, depth: usize, parent: &str, out: &mut Vec<RbacNode>) {
+    for (i, _) in r.rules.iter().enumerate() {
+        out.push(RbacNode {
+            row: RbacRow::Rule { role: ri, rule: i, depth },
+            uid: format!("{parent}/rule|{i}"),
+            fold_key: None,
+        });
+    }
+}
+
+// --- Synthetic records ---------------------------------------------------------------------------
+//
+// What each record points at decides what the shared `y`, `e`, `h` and `Ctrl-D` act on — which is
+// the whole reason the tree is worth building: opening a ClusterRole node opens that ClusterRole,
+// something the binding-only view could not do. Rows that are not API objects (a rule, a namespace
+// group) point at their nearest editable parent, and rows with no object at all (a User, a Group, a
+// ServiceAccount that does not exist) carry an **empty kind**, which every caller reads as "nothing
+// to open".
+
+fn event_severity(s: Severity) -> EventSeverity {
+    if s >= Severity::High {
+        EventSeverity::Warning
+    } else {
+        EventSeverity::Normal
+    }
+}
+
+pub fn synthetic_binding_record(b: &RbacBinding, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: event_severity(b.severity),
+        reason: b.severity.label().to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: b.binding_kind.clone(),
+        namespace: binding_ns(b),
+        name: b.binding_name.clone(),
+        message: format!("{} · {}", b.role_ref.label(), b.risk_tags()),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_role_record(r: &RoleEntry, uid: &str) -> EventRecord {
+    let mut message = format!("{} rules", r.rules.len());
+    if r.aggregated {
+        message.push_str(&format!(" · aggregates {}", r.aggregates.len()));
+    }
+    if r.is_template() {
+        message.push_str(&format!(" · template ×{}", r.bound_namespaces.len()));
+    } else if r.is_unbound() {
+        message.push_str(" · unbound");
+    }
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: event_severity(r.severity),
+        reason: r.severity.label().to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message,
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_subject_record(n: &RbacSubjectNode, sas: &[SaEntry], uid: &str) -> EventRecord {
+    let sa = n.sa.and_then(|i| sas.get(i));
+    // Only a ServiceAccount that actually exists is an object one can open.
+    let openable = n.kind == "ServiceAccount" && sa.map(|s| s.exists).unwrap_or(false);
+    let message = match sa {
+        Some(s) if !s.exists => "does not exist".to_string(),
+        Some(s) => {
+            let mut m = format!("{} bindings", n.bindings.len());
+            if s.automount == Some(false) {
+                m.push_str(" · automount off");
+            }
+            if s.image_pull_secrets > 0 {
+                m.push_str(&format!(" · {} imagePullSecrets", s.image_pull_secrets));
+            }
+            m
+        }
+        None => format!("{} bindings", n.bindings.len()),
+    };
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: event_severity(n.severity),
+        reason: n.severity.label().to_string(),
+        api_version: if openable { "v1".to_string() } else { String::new() },
+        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
+        namespace: n.namespace.clone(),
+        name: n.name.clone(),
+        message,
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_subject_leaf_record(
+    s: &Subject,
+    sa: Option<&SaEntry>,
+    uid: &str,
+) -> EventRecord {
+    let openable = s.kind == "ServiceAccount" && sa.map(|x| x.exists).unwrap_or(false);
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: EventSeverity::Normal,
+        reason: s.kind.clone(),
+        api_version: if openable { "v1".to_string() } else { String::new() },
+        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
+        namespace: sa.map(|x| x.namespace.clone()).unwrap_or_default(),
+        name: s.name.clone(),
+        message: if sa.map(|x| !x.exists).unwrap_or(false) {
+            "does not exist".to_string()
+        } else {
+            s.label()
+        },
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_rule_record(r: &RoleEntry, rule: &PolicyRule, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: EventSeverity::Normal,
+        reason: "rule".to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message: format!(
+            "verbs {} · res {} · grp {}",
+            join_or_star(&rule.verbs),
+            join_or_star(&rule.resources),
+            join_or_star(&rule.api_groups)
+        ),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_nsgroup_record(r: &RoleEntry, ns: &str, uid: &str) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: EventSeverity::Normal,
+        reason: "namespace".to_string(),
+        api_version: "rbac.authorization.k8s.io/v1".to_string(),
+        kind: r.kind.label().to_string(),
+        namespace: r.namespace.clone(),
+        name: r.name.clone(),
+        message: format!("granted in {ns}"),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// The record a row points at, so rows and records stay index-aligned by construction.
+pub fn record_for_row(g: &RbacGraph, node: &RbacNode) -> EventRecord {
+    let empty = || EventRecord {
+        uid: node.uid.clone(),
+        time: Timestamp::now(),
+        severity: EventSeverity::Normal,
+        reason: String::new(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: String::new(),
+        message: String::new(),
+        component: "rbac".to_string(),
+        host: String::new(),
+        count: 1,
+    };
+    match &node.row {
+        RbacRow::Subject { idx, .. } => g
+            .subjects
+            .get(*idx)
+            .map(|n| synthetic_subject_record(n, g.service_accounts, &node.uid))
+            .unwrap_or_else(empty),
+        RbacRow::Binding { idx, .. } => g
+            .bindings
+            .get(*idx)
+            .map(|b| synthetic_binding_record(b, &node.uid))
+            .unwrap_or_else(empty),
+        RbacRow::Role { idx, .. } | RbacRow::Contributor { idx, .. } => g
+            .roles
+            .get(*idx)
+            .map(|r| synthetic_role_record(r, &node.uid))
+            .unwrap_or_else(empty),
+        RbacRow::NsGroup { role, namespace, .. } => g
+            .roles
+            .get(*role)
+            .map(|r| synthetic_nsgroup_record(r, namespace, &node.uid))
+            .unwrap_or_else(empty),
+        RbacRow::Rule { role, rule, .. } => g
+            .roles
+            .get(*role)
+            .and_then(|r| r.rules.get(*rule).map(|rl| (r, rl)))
+            .map(|(r, rl)| synthetic_rule_record(r, rl, &node.uid))
+            .unwrap_or_else(empty),
+        RbacRow::SubjectLeaf { binding, subject, .. } => g
+            .bindings
+            .get(*binding)
+            .and_then(|b| b.subjects.get(*subject).map(|s| (b, s)))
+            .map(|(b, s)| {
+                let sa = b
+                    .sa_idx
+                    .get(*subject)
+                    .copied()
+                    .flatten()
+                    .and_then(|i| g.service_accounts.get(i));
+                synthetic_subject_leaf_record(s, sa, &node.uid)
+            })
+            .unwrap_or_else(empty),
+    }
+}
+
+/// A list of verbs, resources or groups as a column shows them. Empty is `—`, never blank: an
+/// empty field and a field nobody filled read the same otherwise.
+pub fn join_or_star(v: &[String]) -> String {
+    if v.is_empty() {
+        "—".to_string()
+    } else {
+        v.join(",")
+    }
+}
+
+impl Severity {
+    /// The mark the severity carries in a column. Restricted to the font-safe glyph list.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Severity::Critical | Severity::High | Severity::Medium => "●",
+            Severity::Low => "○",
+            Severity::Info => "·",
+        }
+    }
+}
+
+impl RbacBinding {
+    /// The subject column: the first holder, and how many others there are.
+    ///
+    /// One line cannot carry ten identities, and the first one is what tells two grants apart.
+    pub fn subject_label(&self) -> String {
+        match self.subjects.split_first() {
+            Some((first, [])) => first.short_label(),
+            Some((first, rest)) => format!("{} (+{})", first.short_label(), rest.len()),
+            None => "—".to_string(),
+        }
+    }
+
+    /// A namespaced binding in a critical namespace is worth the same attention as a cluster-wide
+    /// one: a foothold there escalates everywhere.
+    pub fn scope_alarming(&self) -> bool {
+        self.findings.iter().any(|fd| fd.tag == "critical-ns")
+    }
 }
 
 #[cfg(test)]

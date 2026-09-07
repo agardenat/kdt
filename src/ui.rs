@@ -89,76 +89,17 @@ use crate::pods::{
     fetch_workloads, new_pods_state, run_force_recycle, run_restart, run_scale,
     ContainerResource, PodResource, SharedPods, WorkloadResource,
 };
+// La vue RBAC n'a pas de modèle à elle non plus : l'arbre, la portée, le plancher de sévérité et
+// les enregistrements synthétiques vivent dans `crate::rbac`, et kdt-web lit les mêmes.
 use crate::rbac::{
-    critical_namespaces, fetch_rbac, new_rbac_state, Finding as RbacFinding, PolicyRule as RbacRule,
-    RbacBinding, RoleEntry, SaEntry, Severity as RbacSeverity, SharedRbac,
+    binding_in_ns as rbac_binding_in_ns, build_rbac_rows,
+    build_subjects as build_rbac_subjects, critical_namespaces, fetch_rbac, join_or_star,
+    new_rbac_state, record_for_row as rbac_record_for_row, role_in_ns as rbac_role_in_ns,
+    roles_reached_in_ns as rbac_roles_reached_in_ns, Finding as RbacFinding,
+    PolicyRule as RbacRule, RbacBinding, RbacGraph, RbacNode, RbacOrient, RbacRow, RbacSubjectNode,
+    RoleEntry, SaEntry, Severity as RbacSeverity, SharedRbac,
 };
 
-// A rendered row of the RBAC graph. One enum for all four orientations, like `KyRow`: whichever is
-// active, the vector stays index-aligned with `App::snapshot`, which is what gives the view `y`,
-// `e`, `Ctrl-D`, the AI panel and the shared search for free.
-//
-// `idx` fields index the *unfiltered* `rbac_view_*` vectors, never a filtered subset — the graph
-// stores its cross-links as positions, so filtering happens by skipping rows, never by compacting
-// the lists out from under those links.
-pub enum RbacRow {
-    // Root of the subject orientation: a ServiceAccount, User or Group, from `rbac_subjects`.
-    Subject { idx: usize, collapsed: bool, has_children: bool },
-    Binding { idx: usize, depth: usize, collapsed: bool, has_children: bool },
-    Role { idx: usize, depth: usize, collapsed: bool, has_children: bool },
-    // A ClusterRole that feeds an aggregated one, shown under it.
-    Contributor { idx: usize, depth: usize },
-    // "re-granted in namespace X", grouping the RoleBindings of a template ClusterRole.
-    NsGroup { role: usize, namespace: String, depth: usize, collapsed: bool },
-    // One resolved rule of a role. Not an API object: its record points at the role.
-    Rule { role: usize, rule: usize, depth: usize },
-    // A subject shown as a leaf under its binding.
-    SubjectLeaf { binding: usize, subject: usize, depth: usize },
-}
-
-// The four readings of the same RBAC graph, cycled with `t`. `Flat` is the default: the severity-
-// sorted audit list is what one opens `:rbac` for, and it should not cost a keystroke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RbacOrient {
-    Flat,
-    Subject,
-    Binding,
-    Role,
-}
-
-impl RbacOrient {
-    fn next(self) -> Self {
-        match self {
-            RbacOrient::Flat => RbacOrient::Subject,
-            RbacOrient::Subject => RbacOrient::Binding,
-            RbacOrient::Binding => RbacOrient::Role,
-            RbacOrient::Role => RbacOrient::Flat,
-        }
-    }
-    fn label(self, st: &'static Strings) -> &'static str {
-        match self {
-            RbacOrient::Flat => st.rbac_orient_flat,
-            RbacOrient::Subject => st.rbac_orient_subject,
-            RbacOrient::Binding => st.rbac_orient_binding,
-            RbacOrient::Role => st.rbac_orient_role,
-        }
-    }
-}
-
-// A subject root: the same ServiceAccount/User/Group named by several bindings, collapsed into one
-// node. This is the view that answers "what can this identity do in total", which the binding rows
-// cannot: a SA bound five times is five unrelated lines there.
-pub struct RbacSubjectNode {
-    key: String,
-    label: String,
-    kind: String,
-    namespace: String,
-    name: String,
-    // Index into `rbac_view_sas` when the subject is a ServiceAccount we know of.
-    sa: Option<usize>,
-    bindings: Vec<usize>,
-    severity: RbacSeverity,
-}
 use crate::vulnerabilities::{
     fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
 };
@@ -1778,7 +1719,7 @@ pub struct App {
     pub rbac_detail_scroll: usize,
     pub rbac_refresh_handle: Option<JoinHandle<()>>,
     rbac_orient: RbacOrient,
-    rbac_rows: Vec<RbacRow>,
+    rbac_rows: Vec<RbacNode>,
     // Full, unfiltered copies of the fetched graph: the rows index into these, and the cross-links
     // inside them are positional, so they are never filtered down. Refreshed only when the fetch
     // bumps its generation, since re-cloning a few thousand roles on every tick is pure waste.
@@ -1786,6 +1727,8 @@ pub struct App {
     rbac_view_roles: Vec<RoleEntry>,
     rbac_view_sas: Vec<SaEntry>,
     rbac_subjects: Vec<RbacSubjectNode>,
+    // L'ordre d'affichage des roles — pires d'abord — calculé une fois par génération.
+    rbac_role_order: Vec<usize>,
     rbac_view_gen: u64,
     rbac_sa_degraded: bool,
     rbac_collapsed: std::collections::HashSet<String>,
@@ -2127,6 +2070,7 @@ impl App {
             rbac_view_roles: Vec::new(),
             rbac_view_sas: Vec::new(),
             rbac_subjects: Vec::new(),
+            rbac_role_order: Vec::new(),
             rbac_view_gen: 0,
             rbac_sa_degraded: false,
             rbac_collapsed: std::collections::HashSet::new(),
@@ -6048,7 +5992,7 @@ impl App {
     // rows index into these vectors, so they are kept whole (never filtered), and re-cloning a few
     // thousand roles on every frame would cost more than everything else the view does.
     fn sync_rbac_view(&mut self) {
-        let (bindings, roles, sas, degraded, generation) = {
+        let (bindings, roles, sas, degraded, generation, order) = {
             let s = self.rbac_state.lock().expect("rbac poisoned");
             if s.generation == self.rbac_view_gen {
                 return;
@@ -6059,6 +6003,7 @@ impl App {
                 s.service_accounts.clone(),
                 s.sa_degraded,
                 s.generation,
+                s.role_order(),
             )
         };
         self.rbac_subjects = build_rbac_subjects(&bindings, &sas);
@@ -6066,6 +6011,7 @@ impl App {
         self.rbac_view_roles = roles;
         self.rbac_view_sas = sas;
         self.rbac_sa_degraded = degraded;
+        self.rbac_role_order = order;
         self.rbac_view_gen = generation;
     }
 
@@ -6075,13 +6021,6 @@ impl App {
         self.current_ns_opt()
     }
 
-    fn rbac_binding_shown(&self, b: &RbacBinding) -> bool {
-        match self.rbac_ns_scope() {
-            None => true,
-            Some(ns) => rbac_binding_in_ns(b, &ns),
-        }
-    }
-
     // Rebuilds `rbac_rows` and `App::snapshot` in lockstep, so a selected index means the same row
     // in both. That alignment is what gives this view `y`, `e`, `Ctrl-D`, the AI panel and the
     // shared search without any code of its own.
@@ -6089,12 +6028,16 @@ impl App {
         self.sync_rbac_view();
         self.apply_rbac_autofold();
 
-        let (rows, recs) = match self.rbac_orient {
-            RbacOrient::Flat => self.build_rbac_flat_rows(),
-            RbacOrient::Subject => self.build_rbac_subject_rows(),
-            RbacOrient::Binding => self.build_rbac_binding_rows(),
-            RbacOrient::Role => self.build_rbac_role_rows(),
-        };
+        let rows = build_rbac_rows(
+            &self.rbac_graph(),
+            self.rbac_orient,
+            self.rbac_min_sev,
+            self.rbac_ns_scope().as_deref(),
+            &self.rbac_collapsed,
+        );
+        let graph = self.rbac_graph();
+        let recs: Vec<EventRecord> =
+            rows.iter().map(|node| rbac_record_for_row(&graph, node)).collect();
         self.rbac_rows = rows;
 
         let prev_uid = self
@@ -6127,319 +6070,38 @@ impl App {
         }
     }
 
-    // Auto-folding: on a real cluster the subject tree runs to thousands of lines, and almost all of
-    // it is the read-only plumbing nobody opened this view for. Fold everything whose worst node is
-    // below HIGH, open the rest — but never against a node the user folded or unfolded by hand.
+    // Le repli automatique : sur un vrai cluster l'arbre des sujets fait des milliers de lignes,
+    // presque toutes de la plomberie en lecture seule. La règle est celle de `crate::rbac`, et elle
+    // ne touche jamais un pli posé à la main.
     fn apply_rbac_autofold(&mut self) {
         if self.rbac_orient == RbacOrient::Flat {
             return;
         }
-        let mut want: Vec<(String, bool)> = Vec::new();
-        for (i, n) in self.rbac_subjects.iter().enumerate() {
-            let _ = i;
-            want.push((format!("subj|{}", n.key), n.severity < RbacSeverity::High));
-        }
-        for b in self.rbac_view_bindings.iter() {
-            want.push((rbac_binding_uid(b), b.severity < RbacSeverity::High));
-        }
-        for r in self.rbac_view_roles.iter() {
-            want.push((r.uid(), r.severity < RbacSeverity::High));
-        }
-        for (uid, fold) in want {
-            if self.rbac_user_toggled.contains(&uid) {
-                continue;
-            }
-            if fold {
-                self.rbac_collapsed.insert(uid);
-            } else {
-                self.rbac_collapsed.remove(&uid);
-            }
-        }
-    }
-
-    fn rbac_collapsed(&self, uid: &str) -> bool {
-        self.rbac_collapsed.contains(uid)
-    }
-
-    // The flat audit list: one row per binding, worst first. No nesting, no folding — the reading
-    // `:rbac` exists for, kept as an orientation rather than replaced by the tree.
-    fn build_rbac_flat_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
-        let mut rows = Vec::new();
-        let mut recs = Vec::new();
-        for (i, b) in self.rbac_view_bindings.iter().enumerate() {
-            if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
-                continue;
-            }
-            rows.push(RbacRow::Binding { idx: i, depth: 0, collapsed: false, has_children: false });
-            recs.push(synthetic_rbac_binding_record(b, &rbac_binding_uid(b)));
-        }
-        (rows, recs)
-    }
-
-    // Identity -> its bindings -> the role each one grants -> the rules. Answers "what can this
-    // ServiceAccount do in total", which the flat list structurally cannot.
-    fn build_rbac_subject_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
-        let mut rows = Vec::new();
-        let mut recs = Vec::new();
-        for (si, n) in self.rbac_subjects.iter().enumerate() {
-            if n.severity < self.rbac_min_sev {
-                continue;
-            }
-            // A ServiceAccount of the namespace is in scope even when nobody binds it — an unused
-            // account with a mounted token is part of what the namespace exposes. A User or a Group
-            // has no namespace of its own: it is in scope through its bindings.
-            if let Some(ns) = self.rbac_ns_scope() {
-                let mine = n.namespace == ns
-                    || n.bindings.iter().any(|&bi| {
-                        self.rbac_view_bindings.get(bi).is_some_and(|b| rbac_binding_in_ns(b, &ns))
-                    });
-                if !mine {
-                    continue;
-                }
-            }
-            let root = format!("subj|{}", n.key);
-            let collapsed = self.rbac_collapsed(&root);
-            rows.push(RbacRow::Subject { idx: si, collapsed, has_children: !n.bindings.is_empty() });
-            recs.push(synthetic_rbac_subject_record(n, &self.rbac_view_sas, &root));
-            if collapsed {
-                continue;
-            }
-            for &bi in &n.bindings {
-                let b = &self.rbac_view_bindings[bi];
-                if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
-                    continue;
-                }
-                let buid = format!("{root}/{}", rbac_binding_uid(b));
-                let bcollapsed = self.rbac_collapsed(&rbac_binding_uid(b));
-                rows.push(RbacRow::Binding {
-                    idx: bi,
-                    depth: 1,
-                    collapsed: bcollapsed,
-                    has_children: b.role_idx.is_some(),
-                });
-                recs.push(synthetic_rbac_binding_record(b, &buid));
-                if bcollapsed {
-                    continue;
-                }
-                if let Some(ri) = b.role_idx {
-                    self.push_role_subtree(ri, 2, &buid, &mut rows, &mut recs);
-                }
-            }
-        }
-        (rows, recs)
-    }
-
-    // The audit list, unfolded: binding -> role (-> what it aggregates) -> rules, with the subjects
-    // as leaves. The same rows as `Flat`, with everything the flat row summarises made walkable.
-    fn build_rbac_binding_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
-        let mut rows = Vec::new();
-        let mut recs = Vec::new();
-        for (i, b) in self.rbac_view_bindings.iter().enumerate() {
-            if b.severity < self.rbac_min_sev || !self.rbac_binding_shown(b) {
-                continue;
-            }
-            let uid = rbac_binding_uid(b);
-            let collapsed = self.rbac_collapsed(&uid);
-            rows.push(RbacRow::Binding {
-                idx: i,
-                depth: 0,
-                collapsed,
-                has_children: !b.subjects.is_empty() || b.role_idx.is_some(),
-            });
-            recs.push(synthetic_rbac_binding_record(b, &uid));
-            if collapsed {
-                continue;
-            }
-            for (si, s) in b.subjects.iter().enumerate() {
-                rows.push(RbacRow::SubjectLeaf { binding: i, subject: si, depth: 1 });
-                let sa = b.sa_idx.get(si).copied().flatten().map(|x| &self.rbac_view_sas[x]);
-                recs.push(synthetic_rbac_subject_leaf_record(s, sa, &format!("{uid}/subj|{si}")));
-            }
-            if let Some(ri) = b.role_idx {
-                self.push_role_subtree(ri, 1, &uid, &mut rows, &mut recs);
-            }
-        }
-        (rows, recs)
-    }
-
-    // Role -> what it aggregates -> where it is granted -> to whom, plus its rules. The orientation
-    // that makes templates and unbound roles visible: a ClusterRole re-granted in ten namespaces is
-    // one node here, and ten unrelated lines everywhere else.
-    fn build_rbac_role_rows(&self) -> (Vec<RbacRow>, Vec<EventRecord>) {
-        let mut rows = Vec::new();
-        let mut recs = Vec::new();
-        // Which bindings reach each role, grouped by the namespace they grant it in.
-        let mut by_role: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-        for (bi, b) in self.rbac_view_bindings.iter().enumerate() {
-            if !self.rbac_binding_shown(b) {
-                continue;
-            }
-            if let Some(ri) = b.role_idx {
-                by_role.entry(ri).or_default().push(bi);
-            }
-        }
-        let ns_scope = self.rbac_ns_scope();
-        let reached = ns_scope
-            .as_ref()
-            .map(|ns| rbac_roles_reached_in_ns(&self.rbac_view_bindings, ns));
-
-        let order = {
-            let s = self.rbac_state.lock().expect("rbac poisoned");
-            s.role_order()
+        let graph = RbacGraph {
+            bindings: &self.rbac_view_bindings,
+            roles: &self.rbac_view_roles,
+            service_accounts: &self.rbac_view_sas,
+            subjects: &self.rbac_subjects,
+            role_order: &self.rbac_role_order,
         };
-        for ri in order {
-            let Some(r) = self.rbac_view_roles.get(ri) else { continue };
-            if r.severity < self.rbac_min_sev {
-                continue;
-            }
-            if let (Some(ns), Some(reached)) = (ns_scope.as_ref(), reached.as_ref()) {
-                if !rbac_role_in_ns(r, ri, reached, ns) {
-                    continue;
-                }
-            }
-            let uid = r.uid();
-            let collapsed = self.rbac_collapsed(&uid);
-            let bindings = by_role.get(&ri).cloned().unwrap_or_default();
-            let has_children =
-                !r.rules.is_empty() || !r.aggregates.is_empty() || !bindings.is_empty();
-            rows.push(RbacRow::Role { idx: ri, depth: 0, collapsed, has_children });
-            recs.push(synthetic_rbac_role_record(r, &uid));
-            if collapsed {
-                continue;
-            }
-            self.push_contributors(r, 1, &uid, &mut rows, &mut recs);
-
-            // A template ClusterRole gets a level per namespace: the point of the node is that the
-            // same definition lands in many places, and the namespaces are the answer.
-            if r.is_template() {
-                for ns in &r.bound_namespaces {
-                    // Under a scope the group only exists if a binding still shown grants the role
-                    // there: an empty "re-granted in namespace X" node would claim a level the rows
-                    // below it no longer fill.
-                    if ns_scope.is_some()
-                        && !bindings.iter().any(|&bi| {
-                            matches!(&self.rbac_view_bindings[bi].scope,
-                                crate::rbac::Scope::Namespace(n) if n == ns)
-                        })
-                    {
-                        continue;
-                    }
-                    let guid = format!("{uid}/ns|{ns}");
-                    let gcollapsed = self.rbac_collapsed(&guid);
-                    rows.push(RbacRow::NsGroup {
-                        role: ri,
-                        namespace: ns.clone(),
-                        depth: 1,
-                        collapsed: gcollapsed,
-                    });
-                    recs.push(synthetic_rbac_nsgroup_record(r, ns, &guid));
-                    if gcollapsed {
-                        continue;
-                    }
-                    for &bi in &bindings {
-                        let b = &self.rbac_view_bindings[bi];
-                        if !matches!(&b.scope, crate::rbac::Scope::Namespace(n) if n == ns) {
-                            continue;
-                        }
-                        rows.push(RbacRow::Binding {
-                            idx: bi,
-                            depth: 2,
-                            collapsed: false,
-                            has_children: false,
-                        });
-                        recs.push(synthetic_rbac_binding_record(
-                            b,
-                            &format!("{guid}/{}", rbac_binding_uid(b)),
-                        ));
-                    }
-                }
-                // ClusterRoleBindings of a template still belong directly under the role.
-                for &bi in &bindings {
-                    let b = &self.rbac_view_bindings[bi];
-                    if !matches!(b.scope, crate::rbac::Scope::ClusterWide) {
-                        continue;
-                    }
-                    rows.push(RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false });
-                    recs.push(synthetic_rbac_binding_record(
-                        b,
-                        &format!("{uid}/{}", rbac_binding_uid(b)),
-                    ));
-                }
-            } else {
-                for &bi in &bindings {
-                    let b = &self.rbac_view_bindings[bi];
-                    rows.push(RbacRow::Binding { idx: bi, depth: 1, collapsed: false, has_children: false });
-                    recs.push(synthetic_rbac_binding_record(
-                        b,
-                        &format!("{uid}/{}", rbac_binding_uid(b)),
-                    ));
-                }
-            }
-            self.push_rules(r, ri, 1, &uid, &mut rows, &mut recs);
-        }
-        (rows, recs)
+        crate::rbac::autofold(&graph, &self.rbac_user_toggled, &mut self.rbac_collapsed);
     }
 
-    // A role node with everything under it, used wherever a binding leads to one.
-    fn push_role_subtree(
-        &self,
-        ri: usize,
-        depth: usize,
-        parent: &str,
-        rows: &mut Vec<RbacRow>,
-        recs: &mut Vec<EventRecord>,
-    ) {
-        let Some(r) = self.rbac_view_roles.get(ri) else { return };
-        let uid = format!("{parent}/{}", r.uid());
-        let collapsed = self.rbac_collapsed(&r.uid());
-        rows.push(RbacRow::Role {
-            idx: ri,
-            depth,
-            collapsed,
-            has_children: !r.rules.is_empty() || !r.aggregates.is_empty(),
-        });
-        recs.push(synthetic_rbac_role_record(r, &uid));
-        if collapsed {
-            return;
-        }
-        self.push_contributors(r, depth + 1, &uid, rows, recs);
-        self.push_rules(r, ri, depth + 1, &uid, rows, recs);
-    }
-
-    // The ClusterRoles an aggregated role is composed of. Shown as leaves, not as role nodes: the
-    // question here is what `admin` is made of, not what each ingredient is bound to.
-    fn push_contributors(
-        &self,
-        r: &RoleEntry,
-        depth: usize,
-        parent: &str,
-        rows: &mut Vec<RbacRow>,
-        recs: &mut Vec<EventRecord>,
-    ) {
-        for &ci in &r.aggregates {
-            let Some(c) = self.rbac_view_roles.get(ci) else { continue };
-            rows.push(RbacRow::Contributor { idx: ci, depth });
-            recs.push(synthetic_rbac_role_record(c, &format!("{parent}/agg|{}", c.uid())));
+    // La vue empruntée telle que `crate::rbac` l'attend : rien n'est copié, les index restent ceux
+    // du graphe complet.
+    fn rbac_graph(&self) -> RbacGraph<'_> {
+        RbacGraph {
+            bindings: &self.rbac_view_bindings,
+            roles: &self.rbac_view_roles,
+            service_accounts: &self.rbac_view_sas,
+            subjects: &self.rbac_subjects,
+            role_order: &self.rbac_role_order,
         }
     }
 
-    fn push_rules(
-        &self,
-        r: &RoleEntry,
-        ri: usize,
-        depth: usize,
-        parent: &str,
-        rows: &mut Vec<RbacRow>,
-        recs: &mut Vec<EventRecord>,
-    ) {
-        for (i, rule) in r.rules.iter().enumerate() {
-            rows.push(RbacRow::Rule { role: ri, rule: i, depth });
-            recs.push(synthetic_rbac_rule_record(r, rule, &format!("{parent}/rule|{i}")));
-        }
-    }
 
     fn rbac_selected(&self) -> Option<&RbacRow> {
-        self.rbac_rows.get(self.table_state.selected()?)
+        Some(&self.rbac_rows.get(self.table_state.selected()?)?.row)
     }
 
     // The binding the selection is about: the row itself when it is one, otherwise the binding its
@@ -6489,19 +6151,7 @@ impl App {
     // The fold key of the selected row, which is the node's own identity rather than its path: a
     // ClusterRole reached from two different bindings folds as one thing, as it should.
     fn rbac_fold_uid(&self) -> Option<String> {
-        match self.rbac_selected()? {
-            RbacRow::Subject { idx, .. } => {
-                Some(format!("subj|{}", self.rbac_subjects.get(*idx)?.key))
-            }
-            RbacRow::Binding { idx, .. } => {
-                Some(rbac_binding_uid(self.rbac_view_bindings.get(*idx)?))
-            }
-            RbacRow::Role { idx, .. } => Some(self.rbac_view_roles.get(*idx)?.uid()),
-            RbacRow::NsGroup { role, namespace, .. } => {
-                Some(format!("{}/ns|{namespace}", self.rbac_view_roles.get(*role)?.uid()))
-            }
-            _ => None,
-        }
+        self.rbac_rows.get(self.table_state.selected()?)?.fold_key.clone()
     }
 
     // `o` on an RBAC node: jump to the Flux object that manages it (Kustomization/HelmRelease),
@@ -23918,287 +23568,6 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-// Colour for a severity tier, shared by the RBAC table rows and the detail findings.
-// Identity of a binding, used both as a fold key and as a snapshot uid. Kind plus scope plus name is
-// unique cluster-wide, which is what the selection needs to survive a rebuild.
-fn rbac_binding_uid(b: &RbacBinding) -> String {
-    format!("{}|{}/{}", b.binding_kind, rbac_binding_ns(b), b.binding_name)
-}
-
-fn rbac_binding_ns(b: &RbacBinding) -> String {
-    match &b.scope {
-        crate::rbac::Scope::Namespace(ns) => ns.clone(),
-        crate::rbac::Scope::ClusterWide => String::new(),
-    }
-}
-
-// Collapse the subject strings scattered across every binding into one node per identity. A
-// ServiceAccount bound five times is one node with five children here, five unrelated rows in the
-// flat list — which is the whole point of the subject orientation.
-// `:rbac <ns>` narrows what is shown, never what is read: the fetch stays cluster-wide because an
-// aggregation edge, a template count or a "nobody binds this role" claim computed over a partial
-// list would be wrong. What the scope decides is which rows are drawn, and the rule is what "the
-// RBAC of a namespace" means — the bindings that grant *in* it, and the bindings that grant *to*
-// it:
-//
-//   * every RoleBinding of that namespace, whatever it grants and to whom;
-//   * every binding, ClusterRoleBinding included, whose subject is a ServiceAccount of that
-//     namespace — a cluster-wide grant handed to one of its accounts is this namespace's business,
-//     and usually the first thing to look at.
-//
-// A ClusterRoleBinding that only names kube-system accounts is left out: it grants in this
-// namespace as it does in every other one, and listing it here would drown the rows that are
-// actually about this namespace. The scope is stated in the title, so a row list nobody can read as
-// exhaustive is never presented as one.
-fn rbac_binding_in_ns(b: &RbacBinding, ns: &str) -> bool {
-    if matches!(&b.scope, crate::rbac::Scope::Namespace(n) if n == ns) {
-        return true;
-    }
-    b.subjects
-        .iter()
-        .any(|s| s.kind == "ServiceAccount" && s.namespace.as_deref() == Some(ns))
-}
-
-// The roles an in-scope binding points at: a ClusterRole granted into the namespace belongs to it,
-// even though the object itself is cluster-wide.
-fn rbac_roles_reached_in_ns(bindings: &[RbacBinding], ns: &str) -> std::collections::HashSet<usize> {
-    bindings
-        .iter()
-        .filter(|b| rbac_binding_in_ns(b, ns))
-        .filter_map(|b| b.role_idx)
-        .collect()
-}
-
-// A role is in scope when it lives in the namespace — an unbound Role there is still its RBAC — or
-// when a binding in scope grants it.
-fn rbac_role_in_ns(r: &RoleEntry, ri: usize, reached: &std::collections::HashSet<usize>, ns: &str) -> bool {
-    r.namespace == ns || reached.contains(&ri)
-}
-
-fn build_rbac_subjects(bindings: &[RbacBinding], sas: &[SaEntry]) -> Vec<RbacSubjectNode> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_key: std::collections::HashMap<String, RbacSubjectNode> =
-        std::collections::HashMap::new();
-
-    for (bi, b) in bindings.iter().enumerate() {
-        for (si, s) in b.subjects.iter().enumerate() {
-            // A RoleBinding may name a ServiceAccount without its namespace, meaning its own.
-            let ns = match (&s.namespace, &b.scope) {
-                (Some(ns), _) => ns.clone(),
-                (None, crate::rbac::Scope::Namespace(ns)) if s.kind == "ServiceAccount" => ns.clone(),
-                _ => String::new(),
-            };
-            let key = format!("{}|{}/{}", s.kind, ns, s.name);
-            let node = by_key.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                RbacSubjectNode {
-                    key: key.clone(),
-                    label: s.label(),
-                    kind: s.kind.clone(),
-                    namespace: ns.clone(),
-                    name: s.name.clone(),
-                    sa: b.sa_idx.get(si).copied().flatten(),
-                    bindings: Vec::new(),
-                    severity: RbacSeverity::Info,
-                }
-            });
-            if node.sa.is_none() {
-                node.sa = b.sa_idx.get(si).copied().flatten();
-            }
-            if !node.bindings.contains(&bi) {
-                node.bindings.push(bi);
-            }
-            node.severity = node.severity.max(b.severity);
-        }
-    }
-
-    // A ServiceAccount nobody binds is still worth a node: it is the other half of the "who can do
-    // what" question, and an unused SA with a mounted token is its own small finding.
-    for (i, sa) in sas.iter().enumerate() {
-        if !sa.exists || !sa.bindings.is_empty() {
-            continue;
-        }
-        let key = format!("ServiceAccount|{}/{}", sa.namespace, sa.name);
-        by_key.entry(key.clone()).or_insert_with(|| {
-            order.push(key.clone());
-            RbacSubjectNode {
-                key,
-                label: sa.label(),
-                kind: "ServiceAccount".to_string(),
-                namespace: sa.namespace.clone(),
-                name: sa.name.clone(),
-                sa: Some(i),
-                bindings: Vec::new(),
-                severity: RbacSeverity::Info,
-            }
-        });
-    }
-
-    let mut out: Vec<RbacSubjectNode> = order.into_iter().filter_map(|k| by_key.remove(&k)).collect();
-    out.sort_by_key(|n| (std::cmp::Reverse(n.severity as u8), n.label.clone()));
-    out
-}
-
-fn rbac_event_severity(s: RbacSeverity) -> Severity {
-    if s >= RbacSeverity::High {
-        Severity::Warning
-    } else {
-        Severity::Normal
-    }
-}
-
-// Snapshot records for the RBAC view. What each record points at decides what the shared `y`, `e`,
-// `h` and `Ctrl-D` act on — which is the whole reason the tree is worth building: `y` on a
-// ClusterRole node opens that ClusterRole, something the binding-only view could not do. Rows that
-// are not API objects (a rule, a namespace group) point at their nearest editable parent, and rows
-// with no object at all (a User, a Group, a ServiceAccount that does not exist) carry an empty kind,
-// which `current_object_ref` reads as "nothing to open".
-fn synthetic_rbac_binding_record(b: &RbacBinding, uid: &str) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: rbac_event_severity(b.severity),
-        reason: b.severity.label().to_string(),
-        api_version: "rbac.authorization.k8s.io/v1".to_string(),
-        kind: b.binding_kind.clone(),
-        namespace: rbac_binding_ns(b),
-        name: b.binding_name.clone(),
-        message: format!("{} · {}", b.role_ref.label(), b.risk_tags()),
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_rbac_role_record(r: &RoleEntry, uid: &str) -> EventRecord {
-    let mut message = format!("{} rules", r.rules.len());
-    if r.aggregated {
-        message.push_str(&format!(" · aggregates {}", r.aggregates.len()));
-    }
-    if r.is_template() {
-        message.push_str(&format!(" · template ×{}", r.bound_namespaces.len()));
-    } else if r.is_unbound() {
-        message.push_str(" · unbound");
-    }
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: rbac_event_severity(r.severity),
-        reason: r.severity.label().to_string(),
-        api_version: "rbac.authorization.k8s.io/v1".to_string(),
-        kind: r.kind.label().to_string(),
-        namespace: r.namespace.clone(),
-        name: r.name.clone(),
-        message,
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_rbac_subject_record(
-    n: &RbacSubjectNode,
-    sas: &[SaEntry],
-    uid: &str,
-) -> EventRecord {
-    let sa = n.sa.and_then(|i| sas.get(i));
-    // Only a ServiceAccount that actually exists is an object one can open.
-    let openable = n.kind == "ServiceAccount" && sa.map(|s| s.exists).unwrap_or(false);
-    let message = match sa {
-        Some(s) if !s.exists => "does not exist".to_string(),
-        Some(s) => {
-            let mut m = format!("{} bindings", n.bindings.len());
-            if s.automount == Some(false) {
-                m.push_str(" · automount off");
-            }
-            if s.image_pull_secrets > 0 {
-                m.push_str(&format!(" · {} imagePullSecrets", s.image_pull_secrets));
-            }
-            m
-        }
-        None => format!("{} bindings", n.bindings.len()),
-    };
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: rbac_event_severity(n.severity),
-        reason: n.severity.label().to_string(),
-        api_version: if openable { "v1".to_string() } else { String::new() },
-        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
-        namespace: n.namespace.clone(),
-        name: n.name.clone(),
-        message,
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_rbac_subject_leaf_record(
-    s: &crate::rbac::Subject,
-    sa: Option<&SaEntry>,
-    uid: &str,
-) -> EventRecord {
-    let openable = s.kind == "ServiceAccount" && sa.map(|x| x.exists).unwrap_or(false);
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: s.kind.clone(),
-        api_version: if openable { "v1".to_string() } else { String::new() },
-        kind: if openable { "ServiceAccount".to_string() } else { String::new() },
-        namespace: sa.map(|x| x.namespace.clone()).unwrap_or_default(),
-        name: s.name.clone(),
-        message: if sa.map(|x| !x.exists).unwrap_or(false) {
-            "does not exist".to_string()
-        } else {
-            s.label()
-        },
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_rbac_rule_record(r: &RoleEntry, rule: &RbacRule, uid: &str) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "rule".to_string(),
-        api_version: "rbac.authorization.k8s.io/v1".to_string(),
-        kind: r.kind.label().to_string(),
-        namespace: r.namespace.clone(),
-        name: r.name.clone(),
-        message: format!(
-            "verbs {} · res {} · grp {}",
-            join_or_star(&rule.verbs),
-            join_or_star(&rule.resources),
-            join_or_star(&rule.api_groups)
-        ),
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_rbac_nsgroup_record(r: &RoleEntry, ns: &str, uid: &str) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "namespace".to_string(),
-        api_version: "rbac.authorization.k8s.io/v1".to_string(),
-        kind: r.kind.label().to_string(),
-        namespace: r.namespace.clone(),
-        name: r.name.clone(),
-        message: format!("granted in {ns}"),
-        component: "rbac".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
 fn rbac_sev_color(s: RbacSeverity) -> Color {
     match s {
         RbacSeverity::Critical => Color::Red,
@@ -24302,7 +23671,7 @@ fn draw_rbac_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app.rbac_rows.iter().filter_map(|row| {
-        let RbacRow::Binding { idx, .. } = row else { return None };
+        let RbacRow::Binding { idx, .. } = &row.row else { return None };
         let b = app.rbac_view_bindings.get(*idx)?;
         let color = rbac_sev_color(b.severity);
         let subject = match b.subjects.split_first() {
@@ -24432,7 +23801,7 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     // First pass sizes the NODE column, which everything to its right depends on.
-    let labels: Vec<String> = app.rbac_rows.iter().map(|r| rbac_row_label(app, r)).collect();
+    let labels: Vec<String> = app.rbac_rows.iter().map(|r| rbac_row_label(app, &r.row)).collect();
     let name_w = labels
         .iter()
         .map(|l| l.chars().count())
@@ -24453,7 +23822,7 @@ fn draw_rbac_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(vi, row)| {
             let label = labels[vi].clone();
-            match row {
+            match &row.row {
                 RbacRow::Subject { idx, .. } => {
                     let Some(n) = app.rbac_subjects.get(*idx) else {
                         return Row::new(vec![Cell::from(label)]);
@@ -25021,10 +24390,6 @@ fn rbac_finding_line(fd: &RbacFinding, tag_w: usize) -> Line<'static> {
         ),
         Span::raw(fd.detail.clone()),
     ])
-}
-
-fn join_or_star(v: &[String]) -> String {
-    if v.is_empty() { "—".to_string() } else { v.join(",") }
 }
 
 fn vuln_sev_color(s: VulnSev) -> Color {

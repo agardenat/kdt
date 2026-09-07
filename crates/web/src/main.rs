@@ -20,6 +20,7 @@ mod kyverno;
 mod lang;
 mod objects;
 mod portal;
+mod rbac;
 mod rancher;
 mod session;
 mod workloads;
@@ -179,6 +180,9 @@ async fn main() -> Result<()> {
         // l'action nommée dans le corps, et sept routes qui partagent la même résolution de cible
         // se seraient répété la même chose sept fois.
         .route("/api/v1/identity/write", post(identity::write))
+        // La vue RBAC n'écrit rien : elle lit, elle score, et les gestes génériques suffisent à
+        // agir sur l'objet d'une ligne.
+        .route("/api/v1/rbac", get(rbac::list))
         .route("/api/v1/rancher", get(rancher::list))
         .route("/api/v1/rancher/write", post(rancher::write))
         .route("/api/v1/kyverno", get(kyverno::list))

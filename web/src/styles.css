@@ -1020,3 +1020,39 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .ky-badge.degraded { background: var(--err); }
 .ky-badge.inactive { background: var(--warn); }
 .ky-badge.unknown { background: var(--dim); }
+
+/* --- Vue RBAC ----------------------------------------------------------------------------------
+   La sévérité est le verdict de kdt, calculé par liaison ; ces classes ne font que la peindre. */
+.cell.sev-critical { color: var(--err); font-weight: 600; }
+.cell.sev-high { color: #e8590c; font-weight: 600; }
+.cell.sev-medium { color: var(--warn); }
+.cell.sev-low { color: var(--info); }
+.cell.sev-info { color: var(--dim); }
+:root:not([data-theme="light"]) .cell.sev-high, :root[data-theme="dark"] .cell.sev-high { color: #ff922b; }
+
+/* Une liaison critique garde son lit rouge où qu'elle ait défilé. */
+.tbody .tr.rbac-crit {
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  border-left-color: var(--err);
+}
+.tbody .tr.rbac-crit:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.rbac-sev-info { color: var(--muted); }
+.tbody .tr.rbac-role .cell.id { color: var(--info); }
+.tbody .tr.rbac-subject { font-weight: 600; }
+.tbody .tr.rbac-nsgroup .cell.id { color: #b950c8; }
+.tbody .tr.rbac-rule { color: var(--warn); }
+.tbody .tr.rbac-leaf { color: var(--muted); }
+
+/* Kyverno, Rancher et les gestionnaires d'add-ons posent des objets sans passer par kubectl : ils
+   sont attribués, donc ni verts comme du GitOps ni rouges comme un grant orphelin. */
+.cell.prov-owned, .detail .prov-owned { color: #b950c8; }
+:root:not([data-theme="light"]) .cell.prov-owned,
+:root:not([data-theme="light"]) .detail .prov-owned,
+:root[data-theme="dark"] .cell.prov-owned,
+:root[data-theme="dark"] .detail .prov-owned { color: #d48ade; }
+
+/* Les tons génériques d'une cellule. Ils manquaient : une classe `err` posée sur une `.cell` ne
+   trouvait aucune règle, et l'origine d'un grant orphelin se lisait comme n'importe quelle autre. */
+.cell.ok { color: var(--ok); }
+.cell.warn { color: var(--warn); }
+.cell.err { color: var(--err); }

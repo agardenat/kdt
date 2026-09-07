@@ -376,6 +376,57 @@ export interface Strings {
   kyCategory: string;
   kyNotReadyNote: string;
 
+  // --- Vue RBAC. Le jargon reste en anglais des deux côtés : `binding`, `role`, `subject`,
+  // `verb`, `namespace` n'ont pas d'équivalent qu'on emploierait vraiment.
+  rbacFlat: string;
+  rbacBySubject: string;
+  rbacByBinding: string;
+  rbacByRole: string;
+  rbacOrientHelp: string;
+  rbacMinSev: string;
+  rbacMinSevHelp: string;
+  rbacEmpty: string;
+  rbacDetail: string;
+  rbacFold: string;
+  rbacBindings: string;
+  rbacRoles: string;
+  rbacAccounts: string;
+  rbacSaDegraded: string;
+  rbacSaMissing: string;
+  rbacSaMissingDetail: string;
+  rbacExternalSubject: string;
+  rbacReadOnly: string;
+  rbacNoRule: string;
+  rbacNoGrant: string;
+  rbacGrants: string;
+  rbacFindings: string;
+  rbacRules: string;
+  rbacAggregation: string;
+  rbacAggregatesNone: string;
+  rbacAggregationPartial: string;
+  rbacFeeds: string;
+  rbacVia: string;
+  rbacViaClusterrole: string;
+  rbacAggregatedLabel: string;
+  rbacBound: string;
+  rbacBoundCluster: string;
+  rbacBoundNs: string;
+  rbacTemplate: string;
+  rbacUnbound: string;
+  rbacNRules: string;
+  rbacNBindings: string;
+  rbacAutomount: string;
+  rbacAutomountOn: string;
+  rbacAutomountOff: string;
+  rbacAutomountDefault: string;
+  rbacSecrets: string;
+  rbacOrigin: string;
+  rbacSource: string;
+  rbacScopeLabel: string;
+  rbacSubjects: string;
+  rbacRoleLabel: string;
+  rbacGrantedIn: string;
+
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
@@ -780,6 +831,61 @@ const FR: Strings = {
   kyCategory: "category",
   kyNotReadyNote: "Cette policy ne peut pas s'évaluer : elle ne protège rien.",
 
+  rbacFlat: "audit",
+  rbacBySubject: "par identité",
+  rbacByBinding: "par liaison",
+  rbacByRole: "par rôle",
+  rbacOrientHelp:
+    "Le même graphe par quatre bouts. « par rôle » est la seule lecture qui montre un ClusterRole re-accordé namespace par namespace comme un seul nœud.",
+  rbacMinSev: "sévérité",
+  rbacMinSevHelp:
+    "Le plancher : sur un vrai cluster l'essentiel des liaisons est de la plomberie en lecture seule, et tout afficher revient à ne rien montrer.",
+  rbacEmpty: "Aucune liaison ne correspond.",
+  rbacDetail: "RBAC",
+  rbacFold: "Plier / déplier",
+  rbacBindings: "liaisons",
+  rbacRoles: "rôles",
+  rbacAccounts: "comptes",
+  rbacSaDegraded:
+    "La liste des ServiceAccounts n'a pas pu être lue : aucun « ce compte n'existe pas » n'est affirmé.",
+  rbacSaMissing: "compte absent",
+  rbacSaMissingDetail:
+    "Aucun ServiceAccount de ce nom : la liaison n'accorde rien aujourd'hui, et accordera tout dès que quelqu'un créera le compte.",
+  rbacExternalSubject:
+    "Identité extérieure : le cluster ne stocke rien de plus qu'un nom rendu par l'authentificateur.",
+  rbacReadOnly: "lecture seule",
+  rbacNoRule: "aucune règle",
+  rbacNoGrant: "aucune liaison",
+  rbacGrants: "Ce qu'elle détient",
+  rbacFindings: "Constats",
+  rbacRules: "Règles",
+  rbacAggregation: "Composé de",
+  rbacAggregatesNone: "aucun contributeur",
+  rbacAggregationPartial:
+    "Un sélecteur d'agrégation utilise matchExpressions, qui n'est pas évalué : l'union des règles est une borne basse.",
+  rbacFeeds: "Alimente",
+  rbacVia: "via",
+  rbacViaClusterrole: "ClusterRole lié dans {scope}",
+  rbacAggregatedLabel: "règles issues de l'agrégation",
+  rbacBound: "lié",
+  rbacBoundCluster: "{n} liaison(s) cluster",
+  rbacBoundNs: "{n} namespace(s)",
+  rbacTemplate: "modèle ×{n}",
+  rbacUnbound: "personne ne le lie",
+  rbacNRules: "{n} règles",
+  rbacNBindings: "{n} liaisons",
+  rbacAutomount: "automount",
+  rbacAutomountOn: "oui",
+  rbacAutomountOff: "non",
+  rbacAutomountDefault: "défaut du namespace",
+  rbacSecrets: "secrets",
+  rbacOrigin: "origine",
+  rbacSource: "source",
+  rbacScopeLabel: "portée",
+  rbacSubjects: "sujets",
+  rbacRoleLabel: "rôle",
+  rbacGrantedIn: "accordé dans",
+
   filterAll: "tout",
   filterProblems: "problèmes",
 
@@ -1178,6 +1284,61 @@ const EN: Strings = {
   kySeverity: "severity",
   kyCategory: "category",
   kyNotReadyNote: "This policy cannot evaluate: it protects nothing.",
+
+  rbacFlat: "audit",
+  rbacBySubject: "by identity",
+  rbacByBinding: "by binding",
+  rbacByRole: "by role",
+  rbacOrientHelp:
+    "The same graph from four ends. \u201cby role\u201d is the only reading that shows a ClusterRole re-granted namespace by namespace as one node.",
+  rbacMinSev: "severity",
+  rbacMinSevHelp:
+    "The floor: on a real cluster most bindings are read-only plumbing, and showing everything amounts to showing nothing.",
+  rbacEmpty: "No binding matches.",
+  rbacDetail: "RBAC",
+  rbacFold: "Fold / unfold",
+  rbacBindings: "bindings",
+  rbacRoles: "roles",
+  rbacAccounts: "accounts",
+  rbacSaDegraded:
+    "The ServiceAccount list could not be read: no \u201cthis account does not exist\u201d is claimed.",
+  rbacSaMissing: "account missing",
+  rbacSaMissingDetail:
+    "No ServiceAccount by that name: the binding grants nothing today, and grants everything the moment someone creates the account.",
+  rbacExternalSubject:
+    "External identity: the cluster stores nothing beyond a name handed over by the authenticator.",
+  rbacReadOnly: "read-only",
+  rbacNoRule: "no rule",
+  rbacNoGrant: "no binding",
+  rbacGrants: "What it holds",
+  rbacFindings: "Findings",
+  rbacRules: "Rules",
+  rbacAggregation: "Composed of",
+  rbacAggregatesNone: "no contributor",
+  rbacAggregationPartial:
+    "An aggregation selector uses matchExpressions, which is not evaluated: the rule union is a lower bound.",
+  rbacFeeds: "Feeds",
+  rbacVia: "via",
+  rbacViaClusterrole: "ClusterRole bound in {scope}",
+  rbacAggregatedLabel: "rules pulled in by aggregation",
+  rbacBound: "bound",
+  rbacBoundCluster: "{n} cluster binding(s)",
+  rbacBoundNs: "{n} namespace(s)",
+  rbacTemplate: "template \u00d7{n}",
+  rbacUnbound: "nobody binds it",
+  rbacNRules: "{n} rules",
+  rbacNBindings: "{n} bindings",
+  rbacAutomount: "automount",
+  rbacAutomountOn: "yes",
+  rbacAutomountOff: "no",
+  rbacAutomountDefault: "namespace default",
+  rbacSecrets: "secrets",
+  rbacOrigin: "origin",
+  rbacSource: "source",
+  rbacScopeLabel: "scope",
+  rbacSubjects: "subjects",
+  rbacRoleLabel: "role",
+  rbacGrantedIn: "granted in",
 
   filterAll: "all",
   filterProblems: "problems",
