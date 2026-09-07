@@ -32,6 +32,11 @@ import type {
   RbacOrient,
   RbacPayload,
   RbacSeverity,
+  VelContentsPayload,
+  VeleroPayload,
+  VelLogPayload,
+  VelRestoreRequest,
+  VelWorld,
   IssuedToken,
   ObjectYaml,
   RancherPayload,
@@ -497,4 +502,80 @@ export function rbac(
   const params = new URLSearchParams({ orient, min_sev: minSev });
   if (namespace) params.set("ns", namespace);
   return get<RbacPayload>(`/api/v1/rbac?${params.toString()}`);
+}
+
+/**
+ * L'inventaire velero de la portée.
+ *
+ * Le monde, le regroupement et le filtre partent au serveur : le regroupement sous le Schedule et
+ * le seau des orphelins sont des règles de kdt, et le filtre garde un Schedule au-dessus d'un
+ * backup en échec — l'écarter isolerait le backup du contexte qu'on vient chercher.
+ */
+export function velero(
+  namespace: string,
+  world: VelWorld,
+  group: boolean,
+  problems: boolean,
+  lang: Lang,
+): Promise<VeleroPayload> {
+  const params = new URLSearchParams({
+    world,
+    group: String(group),
+    problems: String(problems),
+    lang,
+  });
+  if (namespace) params.set("ns", namespace);
+  return get<VeleroPayload>(`/api/v1/velero?${params.toString()}`);
+}
+
+/**
+ * Ce qu'un backup contient, téléchargé à la demande.
+ *
+ * Jamais dans la liste : un backup peut tenir des dizaines de milliers d'objets, et la liste n'a
+ * pas à les payer pour tout le monde.
+ */
+export function veleroContents(
+  namespace: string,
+  name: string,
+  uid: string,
+  lang: Lang,
+): Promise<VelContentsPayload> {
+  const params = new URLSearchParams({ namespace, name, uid, lang });
+  return get<VelContentsPayload>(`/api/v1/velero/contents?${params.toString()}`);
+}
+
+/**
+ * Le log d'un run.
+ *
+ * Il dit **quel** objet a produit l'avertissement qu'un backup `Completed` rapporte ; l'objet
+ * lui-même n'en porte que le compte. `source` dit d'où viennent les lignes.
+ */
+export function veleroLogs(
+  namespace: string,
+  kind: "Backup" | "Restore",
+  name: string,
+  lang: Lang,
+): Promise<VelLogPayload> {
+  const params = new URLSearchParams({ namespace, kind, name, lang });
+  return get<VelLogPayload>(`/api/v1/velero/logs?${params.toString()}`);
+}
+
+/**
+ * Une écriture velero : lancer un run, mettre en pause, restaurer, supprimer.
+ *
+ * Le navigateur ne nomme que le namespace et le nom : le template d'un Schedule et l'UID d'un backup
+ * sont **relus sur le cluster**, parce qu'un spec ou un UID venu d'ici ferait agir sur autre chose
+ * que ce que la ligne montre.
+ */
+export function veleroWrite(
+  request: {
+    action: "backup-now" | "pause" | "restore" | "delete-backup";
+    namespace: string;
+    name: string;
+    paused?: boolean;
+    restore?: VelRestoreRequest;
+  },
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/velero/write", { ...request, lang });
 }

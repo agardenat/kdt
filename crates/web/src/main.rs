@@ -23,6 +23,7 @@ mod portal;
 mod rbac;
 mod rancher;
 mod session;
+mod velero;
 mod workloads;
 
 use std::sync::Arc;
@@ -182,6 +183,14 @@ async fn main() -> Result<()> {
         .route("/api/v1/identity/write", post(identity::write))
         // La vue RBAC n'écrit rien : elle lit, elle score, et les gestes génériques suffisent à
         // agir sur l'objet d'une ligne.
+        .route("/api/v1/velero", get(velero::list))
+        // Le contenu d'un backup vit dans le stockage objet : il se télécharge à la demande, jamais
+        // dans la liste — un backup peut en tenir des dizaines de milliers d'objets.
+        .route("/api/v1/velero/contents", get(velero::contents))
+        .route("/api/v1/velero/logs", get(velero::logs))
+        // Les quatre écritures — lancer un run, mettre en pause, restaurer, supprimer — sous une
+        // seule route : elles ne se distinguent que par l'action nommée dans le corps.
+        .route("/api/v1/velero/write", post(velero::write))
         .route("/api/v1/rbac", get(rbac::list))
         .route("/api/v1/rancher", get(rancher::list))
         .route("/api/v1/rancher/write", post(rancher::write))

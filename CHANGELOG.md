@@ -14,7 +14,7 @@ Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-we
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, neuf vues
+`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, dix vues
 répondent, le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
@@ -256,6 +256,36 @@ répondent, le reste n'existe pas.
   « personne ne lie ce rôle » calculés sur une liste partielle seraient faux. C'est la seule vue en
   graphe qui accepte une portée, et la règle de ce qu'un namespace contient — ses RoleBindings,
   plus les liaisons accordées à ses ServiceAccounts — est celle de kdt.
+
+- **feat(web)** — la vue Velero, qui répond à la seule question qu'on pose à un système de
+  sauvegarde : *si le cluster brûle maintenant, qu'est-ce qui revient ?* La réponse est éparpillée
+  sur six kinds et deux silences, et c'est ce que la vue rassemble.
+
+  Un backup `PartiallyFailed` n'est pas une nuance de succès : il est rouge, à côté de `Failed`,
+  parce qu'il est allé au bout **sans** tout capturer. Un Schedule qui cesse de se déclencher ne
+  laisse ni Event, ni condition, ni compteur de runs manqués — kdt réévalue le cron lui-même, et
+  c'est ce calcul-là qui remplit la colonne EXPIRE. Un namespace qui porte un PVC qu'aucun schedule
+  ne couvre est nommé au-dessus de la table : rien d'autre sur le cluster ne le dit.
+
+  Le contenu d'un backup se déplie à la demande — namespaces, kinds, objets — et se télécharge
+  depuis le stockage objet, jamais avec la liste. Il n'y a **pas de repli** : un bucket injoignable
+  est rapporté comme tel, jamais rendu comme un backup qui n'aurait rien capturé. Chaque objet
+  capturé porte son GVK réel, donc les gestes génériques ouvrent l'objet **vivant** — la question
+  qu'on se pose devant un backup est justement s'il existe encore et s'il ressemble encore à ce qui
+  a été pris.
+
+  Le log d'un run est là, avec sa source : l'URL signée pointe l'adresse que *le cluster* utilise,
+  et quand elle n'est pas joignable les lignes viennent du controller — partielles, et dites comme
+  telles plutôt que lues comme un log complet.
+
+  Les quatre écritures suivent : lancer un run depuis un schedule, mettre en pause ou reprendre,
+  restaurer — tout, ou à la carte par namespaces, kinds, namespace cible et labels — et supprimer.
+  La suppression passe par un `DeleteBackupRequest` et non par l'objet : supprimer le Backup ne
+  supprime rien, le contrôleur de synchronisation le recrée depuis le bucket une minute plus tard.
+  Le template d'un schedule et l'UID d'un backup sont **relus sur le cluster** : un spec ou un UID
+  venu du navigateur ferait agir sur autre chose que ce que la ligne montre. Écraser les objets
+  vivants demande de retaper le nom du backup, et une liste de namespaces vidée est refusée — elle
+  restaurerait tout, l'inverse de ce qu'elle demande.
 
 - **feat(web)** — le `Ctrl-D` de kdt arrive sur le web, dans toutes les vues : les garde-fous
   d'abord — déployé par un moteur GitOps, point d'entrée GitOps, cascade d'un Namespace ou d'une

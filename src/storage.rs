@@ -55,6 +55,17 @@ pub struct Hint {
     pub text: String,
 }
 
+/// La sévérité d'un enregistrement synthétique bâti sur des constats.
+///
+/// Partagée par toutes les vues qui en produisent — stockage, velero, k8ssandra — parce qu'un même
+/// constat doit peser pareil partout : `Warn` et `Danger` réveillent quelqu'un, `Info` non.
+pub fn hints_severity(hints: &[Hint]) -> crate::events::Severity {
+    match hints.iter().map(|h| h.level).max() {
+        Some(HintLevel::Danger) | Some(HintLevel::Warn) => crate::events::Severity::Warning,
+        _ => crate::events::Severity::Normal,
+    }
+}
+
 fn info(text: String) -> Hint { Hint { level: HintLevel::Info, text } }
 fn warn(text: String) -> Hint { Hint { level: HintLevel::Warn, text } }
 fn danger(text: String) -> Hint { Hint { level: HintLevel::Danger, text } }

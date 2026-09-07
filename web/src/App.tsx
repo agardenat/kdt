@@ -12,6 +12,7 @@ import FluxView from "./FluxView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
 import RbacView from "./RbacView";
+import VeleroView from "./VeleroView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
@@ -30,7 +31,8 @@ type ViewId =
   | "identity"
   | "rancher"
   | "kyverno"
-  | "rbac";
+  | "rbac"
+  | "velero";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -52,7 +54,7 @@ const VIEWS: Array<{
   { id: "workloads", label: "Workloads", key: "w", ready: true },
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
   { id: "argocd", label: "Argo CD", key: "a", needs: "argocd" },
-  { id: "velero", label: "Velero", key: "v", needs: "velero" },
+  { id: "velero", label: "Velero", key: "v", ready: true, needs: "velero" },
   { id: "capacity", label: "Capacity", key: "c" },
   { id: "storage", label: "Storage", key: "s" },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
@@ -307,7 +309,8 @@ export default function App() {
     view === "workloads" ||
     view === "data" ||
     view === "certs" ||
-    view === "rbac";
+    view === "rbac" ||
+    view === "velero";
   const scopelessReason =
     view === "identity"
       ? st.identScopeless
@@ -507,6 +510,18 @@ export default function App() {
               lang={lang}
               st={st}
               query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "velero" ? (
+            <VeleroView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
               panelHeight={panelHeight}
               onPanelHeight={setPanelHeight}
               panelOpen={panelOpen}

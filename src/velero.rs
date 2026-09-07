@@ -27,12 +27,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
+use k8s_openapi::jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Namespace, PersistentVolumeClaim};
 use kube::api::{Api, DynamicObject, ListParams, Patch, PatchParams, PostParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::{json, Value};
 
+use crate::events::{EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
 pub use crate::storage::{Hint, HintLevel};
 
@@ -307,7 +309,7 @@ impl Spec {
 
 // --- Rows ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelSchedule {
     pub namespace: String,
     pub name: String,
@@ -332,6 +334,7 @@ pub struct VelSchedule {
     pub storage_location: Option<String>,
     // The template a manual run has to reproduce, kept verbatim so the write is a copy and not a
     // re-derivation of a spec with two dozen optional fields.
+    #[serde(skip)]
     pub template: Value,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
@@ -354,7 +357,7 @@ impl VelSchedule {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelBackup {
     pub namespace: String,
     pub name: String,
@@ -421,7 +424,7 @@ impl VelBackup {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelRestore {
     pub namespace: String,
     pub name: String,
@@ -450,7 +453,7 @@ impl VelRestore {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelLocation {
     pub namespace: String,
     pub name: String,
@@ -487,7 +490,7 @@ impl VelLocation {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelSnapLocation {
     pub namespace: String,
     pub name: String,
@@ -500,7 +503,7 @@ pub struct VelSnapLocation {
     pub hints: Vec<Hint>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct VelRepo {
     pub namespace: String,
     pub name: String,
@@ -517,7 +520,7 @@ pub struct VelRepo {
 
 // What the velero installation itself looks like. A view about backups that cannot say "the
 // controller is not running" would spend its findings blaming the schedules.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ServerFacts {
     pub namespace: String,
     pub found: bool,
@@ -1911,9 +1914,9 @@ pub async fn fetch_run_log(
     namespace: String,
     kind: &'static str,
     name: String,
+    st: &'static Strings,
     state: SharedVelLog,
 ) {
-    let st = crate::lang::active();
     let key = format!("{}|{}/{}", kind, namespace, name);
     {
         let mut s = state.lock().expect("velero log poisoned");
@@ -1921,9 +1924,9 @@ pub async fn fetch_run_log(
     }
 
     let target = if kind == "Restore" { "RestoreLog" } else { "BackupLog" };
-    let (lines, source, error) = match download_run_log(&client, &namespace, target, &name).await {
+    let (lines, source, error) = match download_run_log(&client, &namespace, target, &name, st).await {
         Ok(text) => (split_lines(text), LogSource::Download, None),
-        Err(download_err) => match server_log(&client, &namespace, &name).await {
+        Err(download_err) => match server_log(&client, &namespace, &name, st).await {
             Ok(lines) => (lines, LogSource::Server, Some(download_err)),
             Err(server_err) => (
                 Vec::new(),
@@ -1953,8 +1956,9 @@ async fn download_run_log(
     namespace: &str,
     target: &str,
     name: &str,
+    st: &'static Strings,
 ) -> Result<String, String> {
-    download_target(client, namespace, target, name).await.map(|b| gunzip(&b))
+    download_target(client, namespace, target, name, st).await.map(|b| gunzip(&b))
 }
 
 // Ask velero for a pre-signed URL, then read what is behind it. The request object is removed
@@ -1969,8 +1973,8 @@ async fn download_target(
     namespace: &str,
     target: &str,
     name: &str,
+    st: &'static Strings,
 ) -> Result<Vec<u8>, String> {
-    let st = crate::lang::active();
     let api = crate::yaml::dynamic_api(client, API_V1, "DownloadRequest", namespace).await?;
     let body = json!({
         "apiVersion": API_V1,
@@ -2038,9 +2042,13 @@ fn split_lines(text: String) -> Vec<String> {
 // The controller's own account of the run, pulled from the velero pod and narrowed to the lines
 // naming it. Partial by nature — it only goes back as far as the running pod's log does — which is
 // why it is the fallback and never the first choice.
-async fn server_log(client: &Client, namespace: &str, name: &str) -> Result<Vec<String>, String> {
+async fn server_log(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    st: &'static Strings,
+) -> Result<Vec<String>, String> {
     use k8s_openapi::api::core::v1::Pod;
-    let st = crate::lang::active();
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
     let pod = list
@@ -2081,7 +2089,7 @@ async fn server_log(client: &Client, namespace: &str, name: &str) -> Result<Vec<
 //
 // Velero serves it as `BackupResourceList`, a gzipped `map[string][]string` keyed by
 // `group/version/Kind` and holding `namespace/name` (or a bare `name` for cluster-scoped objects).
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, serde::Serialize)]
 pub struct VelContents {
     // "ns/backup" of the backup this belongs to. Same anti-race rule as `VelLog`: a result whose key
     // no longer matches is dropped rather than shown under another backup.
@@ -2094,7 +2102,7 @@ pub struct VelContents {
 
 // One namespace of the backup. `namespace` is empty for the cluster-scoped objects — an empty string
 // cannot collide with a real namespace, which a reserved name like "cluster-wide" could.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct VelNsContent {
     pub namespace: String,
     pub kinds: Vec<VelKindContent>,
@@ -2106,7 +2114,7 @@ impl VelNsContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct VelKindContent {
     pub api_version: String,
     pub kind: String,
@@ -2133,16 +2141,16 @@ pub async fn fetch_contents(
     namespace: String,
     backup: String,
     s3_url: Option<String>,
+    st: &'static Strings,
     state: SharedVelContents,
 ) {
-    let st = crate::lang::active();
     let key = format!("{}/{}", namespace, backup);
     {
         let mut s = state.lock().expect("velero contents poisoned");
         *s = VelContents { key: key.clone(), loading: true, ..VelContents::default() };
     }
 
-    let outcome = match download_target(&client, &namespace, "BackupResourceList", &backup).await {
+    let outcome = match download_target(&client, &namespace, "BackupResourceList", &backup, st).await {
         Ok(bytes) => parse_resource_list(&gunzip(&bytes)),
         Err(e) => Err(match s3_url.as_deref() {
             Some(url) if internal_endpoint(url) => {
@@ -2335,7 +2343,7 @@ fn to_object(pairs: &[(String, String)]) -> Value {
 // Note what is deliberately absent — a list of object names. Velero has no such field: a restore
 // selects by namespace, by resource and by label, never by name. Offering a per-object tick box
 // would be a promise the API cannot keep.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RestoreOptions {
     // `includedNamespaces`. Empty means every namespace the backup holds.
     pub namespaces: Vec<String>,
@@ -2486,6 +2494,707 @@ async fn create(
         .await
         .map_err(crate::edit::api_error_text)?;
     Ok(created.metadata.name.unwrap_or_default())
+}
+
+// --- What both interfaces share: worlds, rows, verdicts, records ---------------------------------
+//
+// This moved out of `ui.rs` when kdt-web grew a velero view. The grouping of backups under their
+// schedule, the orphan bucket, the phase colours and the synthetic records are the answer this view
+// exists to give; written twice they would drift, and a backup view that drifts is one that says a
+// backup is fine when it is not.
+
+/// The three readings of the same fetch. `g` moves between them without refetching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VelWorld {
+    /// Schedules and the backups they produced — the "what comes back?" reading.
+    #[default]
+    Backups,
+    Restores,
+    /// Storage locations, snapshot locations and file-system repositories.
+    Infra,
+}
+
+impl VelWorld {
+    pub fn next(self) -> Self {
+        match self {
+            VelWorld::Backups => VelWorld::Restores,
+            VelWorld::Restores => VelWorld::Infra,
+            VelWorld::Infra => VelWorld::Backups,
+        }
+    }
+}
+
+/// What a phase means for whoever has to restore from it.
+///
+/// The point of the view is that **`PartiallyFailed` is not a shade of success**: it ran to
+/// completion having failed to capture items, so it is red, next to `Failed`.
+pub fn phase_tone(phase: &str) -> LineColor {
+    match phase {
+        "Completed" | "Available" | "Ready" | "Enabled" => LineColor::Ok,
+        "PartiallyFailed"
+        | "FinalizingPartiallyFailed"
+        | "WaitingForPluginOperationsPartiallyFailed"
+        | "Failed"
+        | "FailedValidation"
+        | "Unavailable"
+        | "NotReady" => LineColor::Err,
+        "InProgress" | "New" | "Queued" | "ReadyToStart" | "Finalizing"
+        | "WaitingForPluginOperations" => LineColor::Info,
+        "Deleting" => LineColor::Warn,
+        _ => LineColor::Dim,
+    }
+}
+
+/// The worst tone among a row's hints, or `None` when it has nothing to say.
+pub fn hints_tone(hints: &[Hint]) -> Option<LineColor> {
+    match hints.iter().map(|h| h.level).max() {
+        Some(HintLevel::Danger) => Some(LineColor::Err),
+        Some(HintLevel::Warn) => Some(LineColor::Warn),
+        Some(HintLevel::Info) => Some(LineColor::Info),
+        None => None,
+    }
+}
+
+/// One row of the velero view, in any of the three worlds.
+#[derive(Debug, Clone)]
+pub enum VelRow {
+    Schedule(Box<VelSchedule>),
+    Backup(Box<VelBackup>),
+    Restore(Box<VelRestore>),
+    Location(VelLocation),
+    SnapLocation(VelSnapLocation),
+    Repo(VelRepo),
+    /// The parent row that collects the backups no schedule claims — a manual run, or one whose
+    /// schedule has since been deleted.
+    Orphans,
+    /// The three levels of a backup's contents. They stand for what the backup *holds*, not for
+    /// velero objects — which is why the two grouping levels carry no kind at all, and why the
+    /// namespace they name is the captured one rather than velero's own.
+    CtNs { backup_uid: String, namespace: String, objects: usize, kinds: usize },
+    CtKind { backup_uid: String, namespace: String, kind: String, objects: usize },
+    CtObject { api_version: String, kind: String, namespace: String, name: String },
+}
+
+impl VelRow {
+    pub fn hints(&self) -> &[Hint] {
+        match self {
+            VelRow::Schedule(s) => &s.hints,
+            VelRow::Backup(b) => &b.hints,
+            VelRow::Restore(r) => &r.hints,
+            VelRow::Location(l) => &l.hints,
+            VelRow::SnapLocation(l) => &l.hints,
+            VelRow::Repo(r) => &r.hints,
+            VelRow::Orphans
+            | VelRow::CtNs { .. }
+            | VelRow::CtKind { .. }
+            | VelRow::CtObject { .. } => &[],
+        }
+    }
+
+    pub fn has_problem(&self) -> bool {
+        self.hints().iter().any(|h| h.level >= HintLevel::Warn)
+    }
+
+    /// The fold key of a row that has children, `None` for a leaf.
+    pub fn fold_key(&self) -> Option<String> {
+        match self {
+            VelRow::Schedule(s) => Some(s.key()),
+            VelRow::Orphans => Some("|orphans".to_string()),
+            _ => None,
+        }
+    }
+
+    /// A contents row stands for something inside a backup rather than for a velero object. The
+    /// gestures that reach out to the cluster have to tell the two apart.
+    pub fn is_contents(&self) -> bool {
+        matches!(
+            self,
+            VelRow::CtNs { .. } | VelRow::CtKind { .. } | VelRow::CtObject { .. }
+        )
+    }
+
+    /// The key this row expands under. Three levels, each prefixed by the one above so a namespace
+    /// of one backup never folds the same-named namespace of another.
+    pub fn contents_key(&self) -> Option<String> {
+        match self {
+            VelRow::Backup(b) => Some(b.uid.clone()),
+            VelRow::CtNs { backup_uid, namespace, .. } => {
+                Some(format!("{}|{}", backup_uid, namespace))
+            }
+            VelRow::CtKind { backup_uid, namespace, kind, .. } => {
+                Some(format!("{}|{}|{}", backup_uid, namespace, kind))
+            }
+            // An object is a leaf: there is nothing under it to unfold.
+            _ => None,
+        }
+    }
+
+    /// The identity of the row, stable across refreshes.
+    pub fn uid(&self) -> String {
+        match self {
+            VelRow::Schedule(s) => s.uid.clone(),
+            VelRow::Backup(b) => b.uid.clone(),
+            VelRow::Restore(r) => r.uid.clone(),
+            VelRow::Location(l) => l.uid.clone(),
+            VelRow::SnapLocation(l) => l.uid.clone(),
+            VelRow::Repo(r) => r.uid.clone(),
+            VelRow::Orphans => "vel|orphans".to_string(),
+            VelRow::CtNs { backup_uid, namespace, .. } => format!("ct|{backup_uid}|{namespace}"),
+            VelRow::CtKind { backup_uid, namespace, kind, .. } => {
+                format!("ct|{backup_uid}|{namespace}|{kind}")
+            }
+            VelRow::CtObject { api_version, kind, namespace, name } => {
+                format!("cto|{api_version}|{kind}|{namespace}/{name}")
+            }
+        }
+    }
+
+    /// How deep the row sits when the backups are grouped under their schedule.
+    pub fn depth(&self, grouped: bool) -> usize {
+        match self {
+            VelRow::Schedule(_) | VelRow::Orphans => 0,
+            VelRow::Backup(_) if grouped => 1,
+            VelRow::Backup(_) => 0,
+            VelRow::Restore(_) | VelRow::Location(_) | VelRow::SnapLocation(_) | VelRow::Repo(_) => 0,
+            VelRow::CtNs { .. } => usize::from(grouped) + 1,
+            VelRow::CtKind { .. } => usize::from(grouped) + 2,
+            VelRow::CtObject { .. } => usize::from(grouped) + 3,
+        }
+    }
+}
+
+/// The rows of one world, filtered and grouped — everything but the contents of a backup, which are
+/// downloaded on demand and spliced in by [`contents_rows`].
+///
+/// `problems_only` never hides a schedule above a failing backup: dropping it would strand the
+/// backup and lose the context one came for.
+pub fn build_vel_rows(
+    state: &VeleroState,
+    world: VelWorld,
+    grouped: bool,
+    problems_only: bool,
+    ns: Option<&str>,
+    collapsed: &HashSet<String>,
+) -> Vec<VelRow> {
+    let ns_ok = |x: &str| ns.is_none_or(|f| f == x);
+    let worse = |hints: &[Hint]| hints.iter().any(|h| h.level >= HintLevel::Warn);
+    let mut rows: Vec<VelRow> = Vec::new();
+
+    match world {
+        VelWorld::Backups if grouped => {
+            for s in state.schedules.iter().filter(|s| ns_ok(&s.namespace)) {
+                let mine: Vec<&VelBackup> = state
+                    .backups
+                    .iter()
+                    .filter(|b| b.schedule.as_deref() == Some(s.name.as_str()))
+                    .collect();
+                let keep = !problems_only
+                    || worse(&s.hints)
+                    || mine.iter().any(|b| worse(&b.hints));
+                if !keep {
+                    continue;
+                }
+                let folded = collapsed.contains(&s.key());
+                rows.push(VelRow::Schedule(Box::new(s.clone())));
+                if folded {
+                    continue;
+                }
+                for b in mine {
+                    if problems_only && !worse(&b.hints) {
+                        continue;
+                    }
+                    rows.push(VelRow::Backup(Box::new(b.clone())));
+                }
+            }
+            // Backups no schedule claims: a manual run, or one whose schedule was deleted out from
+            // under it. They would otherwise simply not be in the view.
+            let known: HashSet<&str> = state.schedules.iter().map(|s| s.name.as_str()).collect();
+            let orphans: Vec<&VelBackup> = state
+                .backups
+                .iter()
+                .filter(|b| ns_ok(&b.namespace))
+                .filter(|b| b.schedule.as_deref().is_none_or(|name| !known.contains(name)))
+                .filter(|b| !problems_only || worse(&b.hints))
+                .collect();
+            if !orphans.is_empty() {
+                let folded = collapsed.contains("|orphans");
+                rows.push(VelRow::Orphans);
+                if !folded {
+                    for b in orphans {
+                        rows.push(VelRow::Backup(Box::new(b.clone())));
+                    }
+                }
+            }
+        }
+        VelWorld::Backups => {
+            for b in state.backups.iter().filter(|b| ns_ok(&b.namespace)) {
+                if problems_only && !worse(&b.hints) {
+                    continue;
+                }
+                rows.push(VelRow::Backup(Box::new(b.clone())));
+            }
+        }
+        VelWorld::Restores => {
+            for r in state.restores.iter().filter(|r| ns_ok(&r.namespace)) {
+                if problems_only && !worse(&r.hints) {
+                    continue;
+                }
+                rows.push(VelRow::Restore(Box::new(r.clone())));
+            }
+        }
+        VelWorld::Infra => {
+            for l in state.locations.iter().filter(|l| ns_ok(&l.namespace)) {
+                if problems_only && !worse(&l.hints) {
+                    continue;
+                }
+                rows.push(VelRow::Location(l.clone()));
+            }
+            for l in state.snap_locations.iter().filter(|l| ns_ok(&l.namespace)) {
+                if problems_only && !worse(&l.hints) {
+                    continue;
+                }
+                rows.push(VelRow::SnapLocation(l.clone()));
+            }
+            for r in state.repos.iter().filter(|r| ns_ok(&r.namespace)) {
+                if problems_only && !worse(&r.hints) {
+                    continue;
+                }
+                rows.push(VelRow::Repo(r.clone()));
+            }
+        }
+    }
+    rows
+}
+
+/// The contents of one backup, unfolded as far as `expanded` says.
+pub fn contents_rows(
+    backup_uid: &str,
+    contents: &VelContents,
+    expanded: &HashSet<String>,
+) -> Vec<VelRow> {
+    let mut rows = Vec::new();
+    // Downloading, failed, or captured nothing: all three are statements about the backup and
+    // belong in the detail panel. None of them may invent rows here.
+    for ns in &contents.namespaces {
+        let ns_key = format!("{}|{}", backup_uid, ns.namespace);
+        rows.push(VelRow::CtNs {
+            backup_uid: backup_uid.to_string(),
+            namespace: ns.namespace.clone(),
+            objects: ns.objects(),
+            kinds: ns.kinds.len(),
+        });
+        if !expanded.contains(&ns_key) {
+            continue;
+        }
+        for k in &ns.kinds {
+            let kind_key = format!("{}|{}", ns_key, k.kind);
+            rows.push(VelRow::CtKind {
+                backup_uid: backup_uid.to_string(),
+                namespace: ns.namespace.clone(),
+                kind: k.kind.clone(),
+                objects: k.names.len(),
+            });
+            if !expanded.contains(&kind_key) {
+                continue;
+            }
+            for name in &k.names {
+                rows.push(VelRow::CtObject {
+                    api_version: k.api_version.clone(),
+                    kind: k.kind.clone(),
+                    namespace: ns.namespace.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+    rows
+}
+
+// --- Synthetic records ---------------------------------------------------------------------------
+
+fn vel_record(
+    uid: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    reason: &str,
+    message: String,
+    hints: &[Hint],
+) -> EventRecord {
+    EventRecord {
+        uid: uid.to_string(),
+        time: Timestamp::now(),
+        severity: crate::storage::hints_severity(hints),
+        reason: reason.to_string(),
+        api_version: API_V1.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message,
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_schedule_record(
+    s: &VelSchedule,
+    backups: usize,
+    st: &'static Strings,
+) -> EventRecord {
+    let state = if s.paused { st.vel_state_paused } else { st.vel_state_enabled };
+    let last = match s.last_backup {
+        Some(t) => fill(st.refl_ago, &[("age", &age_of(t, now_secs()))]),
+        None => st.vel_never.to_string(),
+    };
+    vel_record(
+        &s.uid,
+        "Schedule",
+        &s.namespace,
+        &s.name,
+        if s.phase.is_empty() { "Schedule" } else { &s.phase },
+        fill(
+            st.vel_rec_schedule,
+            &[
+                ("cron", &s.cron),
+                ("state", state),
+                ("backups", &backups.to_string()),
+                ("last", &last),
+            ],
+        ),
+        &s.hints,
+    )
+}
+
+pub fn synthetic_backup_record(b: &VelBackup, st: &'static Strings) -> EventRecord {
+    let volumes = b.volume_snapshots_attempted + b.pvb_total as i64;
+    let expires = match b.expiration {
+        Some(e) if e > now_secs() => format_span(e - now_secs(), st),
+        Some(_) => st.vel_never.to_string(),
+        None => "—".to_string(),
+    };
+    vel_record(
+        &b.uid,
+        "Backup",
+        &b.namespace,
+        &b.name,
+        if b.phase.is_empty() { "New" } else { &b.phase },
+        fill(
+            st.vel_rec_backup,
+            &[
+                ("phase", &b.phase),
+                ("items", &b.items_backed_up.to_string()),
+                ("volumes", &volumes.to_string()),
+                ("expires", &expires),
+            ],
+        ),
+        &b.hints,
+    )
+}
+
+pub fn synthetic_restore_record(r: &VelRestore, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &r.uid,
+        "Restore",
+        &r.namespace,
+        &r.name,
+        if r.phase.is_empty() { "New" } else { &r.phase },
+        fill(
+            st.vel_rec_restore,
+            &[
+                ("phase", &r.phase),
+                ("backup", &r.backup),
+                ("items", &r.items_restored.to_string()),
+            ],
+        ),
+        &r.hints,
+    )
+}
+
+pub fn synthetic_location_record(l: &VelLocation, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &l.uid,
+        "BackupStorageLocation",
+        &l.namespace,
+        &l.name,
+        if l.phase.is_empty() { "Unknown" } else { &l.phase },
+        fill(
+            st.vel_rec_location,
+            &[
+                ("phase", &l.phase),
+                ("provider", &l.provider),
+                ("bucket", &l.bucket),
+                ("backups", &l.backups.to_string()),
+            ],
+        ),
+        &l.hints,
+    )
+}
+
+pub fn synthetic_snaploc_record(l: &VelSnapLocation, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &l.uid,
+        "VolumeSnapshotLocation",
+        &l.namespace,
+        &l.name,
+        if l.phase.is_empty() { "Unknown" } else { &l.phase },
+        fill(st.vel_rec_snaploc, &[("phase", &l.phase), ("provider", &l.provider)]),
+        &l.hints,
+    )
+}
+
+pub fn synthetic_repo_record(r: &VelRepo, st: &'static Strings) -> EventRecord {
+    vel_record(
+        &r.uid,
+        "BackupRepository",
+        &r.namespace,
+        &r.name,
+        if r.phase.is_empty() { "Unknown" } else { &r.phase },
+        fill(
+            st.vel_rec_repo,
+            &[
+                ("type", &r.repo_type),
+                ("phase", &r.phase),
+                ("ns", &r.volume_namespace),
+            ],
+        ),
+        &r.hints,
+    )
+}
+
+/// The parent row of the backups no schedule claims. It stands for no object, so it carries no
+/// kind: the generic gestures correctly find nothing to act on.
+pub fn synthetic_orphans_record(n: usize, st: &'static Strings) -> EventRecord {
+    EventRecord {
+        uid: "vel|orphans".to_string(),
+        time: Timestamp::now(),
+        severity: Severity::Normal,
+        reason: String::new(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: st.vel_orphan_backups.to_string(),
+        message: n.to_string(),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+// The two grouping levels of a backup's contents. Like the orphan header they stand for no object,
+// so they carry no kind and the generic gestures find nothing to act on. The uid keeps the backup in
+// it: two backups holding the same namespace are two different rows.
+pub fn synthetic_ct_ns_record(
+    backup_uid: &str,
+    ns: &VelNsContent,
+    st: &'static Strings,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("ct|{}|{}", backup_uid, ns.namespace),
+        time: Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Contents".to_string(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: ct_ns_label(&ns.namespace, st),
+        name: String::new(),
+        message: ct_counts(ns.objects(), ns.kinds.len(), st),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn synthetic_ct_kind_record(
+    backup_uid: &str,
+    namespace: &str,
+    k: &VelKindContent,
+    st: &'static Strings,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("ct|{}|{}|{}", backup_uid, namespace, k.kind),
+        time: Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Contents".to_string(),
+        api_version: String::new(),
+        // No kind, on purpose: this row is a heading over N objects, not one of them.
+        kind: String::new(),
+        namespace: ct_ns_label(namespace, st),
+        name: k.kind.clone(),
+        message: st.plural(k.names.len(), st.vel_ct_objects_one, st.vel_ct_objects_many),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// One captured object. This one *does* carry its real GVK, so the generic gestures open it **live**
+/// — which is the question one actually asks in front of a backup: does this still exist, and does
+/// it still look like what was captured?
+pub fn synthetic_ct_object_record(
+    k: &VelKindContent,
+    namespace: &str,
+    name: &str,
+) -> EventRecord {
+    EventRecord {
+        uid: format!("cto|{}|{}|{}/{}", k.api_version, k.kind, namespace, name),
+        time: Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Captured".to_string(),
+        api_version: k.api_version.clone(),
+        kind: k.kind.clone(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        message: format!("{} {}", k.kind, name),
+        component: "velero".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// "54 objects · 18 kinds", both counts pluralised — a namespace holding one of each would
+/// otherwise read as "1 objects · 1 kinds".
+pub fn ct_counts(objects: usize, kinds: usize, st: &'static Strings) -> String {
+    format!(
+        "{} · {}",
+        st.plural(objects, st.vel_ct_objects_one, st.vel_ct_objects_many),
+        st.plural(kinds, st.vel_ct_kinds_one, st.vel_ct_kinds_many),
+    )
+}
+
+/// Cluster-scoped objects have no namespace; the empty string that marks them would render as a
+/// blank cell that reads like missing data.
+pub fn ct_ns_label(namespace: &str, st: &'static Strings) -> String {
+    if namespace.is_empty() {
+        st.vel_ct_cluster_scoped.to_string()
+    } else {
+        namespace.to_string()
+    }
+}
+
+/// How many backups a row owns: the runs of a schedule, or the backups no schedule claims.
+///
+/// The count belongs to the row rather than to the object, and both interfaces read it the same way
+/// — a schedule that says "12 backups" in one and "0" in the other would be worse than saying
+/// nothing.
+pub fn row_child_count(state: &VeleroState, row: &VelRow) -> usize {
+    match row {
+        VelRow::Schedule(s) => state
+            .backups
+            .iter()
+            .filter(|b| b.schedule.as_deref() == Some(s.name.as_str()))
+            .count(),
+        VelRow::Orphans => {
+            let known: HashSet<&str> = state.schedules.iter().map(|s| s.name.as_str()).collect();
+            state
+                .backups
+                .iter()
+                .filter(|b| b.schedule.as_deref().is_none_or(|n| !known.contains(n)))
+                .count()
+        }
+        _ => 0,
+    }
+}
+
+/// The record a row points at, so rows and records stay index-aligned by construction.
+///
+/// `backups` is how many runs a schedule row owns: the count belongs to the row, not to the object.
+pub fn record_for_row(row: &VelRow, backups: usize, st: &'static Strings) -> EventRecord {
+    match row {
+        VelRow::Schedule(s) => synthetic_schedule_record(s, backups, st),
+        VelRow::Backup(b) => synthetic_backup_record(b, st),
+        VelRow::Restore(r) => synthetic_restore_record(r, st),
+        VelRow::Location(l) => synthetic_location_record(l, st),
+        VelRow::SnapLocation(l) => synthetic_snaploc_record(l, st),
+        VelRow::Repo(r) => synthetic_repo_record(r, st),
+        VelRow::Orphans => synthetic_orphans_record(backups, st),
+        VelRow::CtNs { backup_uid, namespace, objects, kinds } => EventRecord {
+            uid: format!("ct|{backup_uid}|{namespace}"),
+            time: Timestamp::now(),
+            severity: Severity::Normal,
+            reason: "Contents".to_string(),
+            api_version: String::new(),
+            kind: String::new(),
+            namespace: ct_ns_label(namespace, st),
+            name: String::new(),
+            message: ct_counts(*objects, *kinds, st),
+            component: "velero".to_string(),
+            host: String::new(),
+            count: 1,
+        },
+        VelRow::CtKind { backup_uid, namespace, kind, objects } => EventRecord {
+            uid: format!("ct|{backup_uid}|{namespace}|{kind}"),
+            time: Timestamp::now(),
+            severity: Severity::Normal,
+            reason: "Contents".to_string(),
+            api_version: String::new(),
+            kind: String::new(),
+            namespace: ct_ns_label(namespace, st),
+            name: kind.clone(),
+            message: st.plural(*objects, st.vel_ct_objects_one, st.vel_ct_objects_many),
+            component: "velero".to_string(),
+            host: String::new(),
+            count: 1,
+        },
+        VelRow::CtObject { api_version, kind, namespace, name } => EventRecord {
+            uid: format!("cto|{api_version}|{kind}|{namespace}/{name}"),
+            time: Timestamp::now(),
+            severity: Severity::Normal,
+            reason: "Captured".to_string(),
+            api_version: api_version.clone(),
+            kind: kind.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            message: format!("{kind} {name}"),
+            component: "velero".to_string(),
+            host: String::new(),
+            count: 1,
+        },
+    }
+}
+
+impl RestoreOptions {
+    /// The options a restore form produces, minus `includedResources` — which cannot be filled in
+    /// without asking the API server (see [`resolve_resources`]).
+    ///
+    /// Velero maps namespace by namespace. With several sources selected there is no single source
+    /// to map from, so the target is **not applied** rather than guessed at.
+    pub fn from_selection(
+        namespaces: Vec<String>,
+        target_ns: &str,
+        labels: &[(String, String)],
+        overwrite: bool,
+    ) -> RestoreOptions {
+        let target = target_ns.trim();
+        let namespace_mapping = match namespaces.as_slice() {
+            [only] if !target.is_empty() && target != only => {
+                Some((only.clone(), target.to_string()))
+            }
+            _ => None,
+        };
+        RestoreOptions {
+            namespaces,
+            namespace_mapping,
+            resources: Vec::new(),
+            label_selector: labels.to_vec(),
+            overwrite_existing: overwrite,
+        }
+    }
+}
+
+/// `team=a, env=prod` as velero's `matchLabels`. Anything without an `=` is dropped rather than
+/// guessed at.
+pub fn parse_labels(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
+
+fn now_secs() -> i64 {
+    Timestamp::now().as_second()
 }
 
 #[cfg(test)]

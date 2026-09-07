@@ -427,6 +427,97 @@ export interface Strings {
   rbacRoleLabel: string;
   rbacGrantedIn: string;
 
+  // --- Vue Velero. Le jargon reste en anglais des deux côtés : `backup`, `restore`, `schedule`,
+  // `snapshot`, `bucket` ne se disent pas autrement, et les constats viennent du serveur.
+  velBackups: string;
+  velRestores: string;
+  velInfra: string;
+  velGroup: string;
+  velGroupHelp: string;
+  velEmpty: string;
+  velNotInstalled: string;
+  velDetail: string;
+  velSelectRow: string;
+  velFold: string;
+  velRpo: string;
+  velNoBackup: string;
+  velProblems: string;
+  velServer: string;
+  velServerMissing: string;
+  velNodeAgent: string;
+  velNodeAgentAbsent: string;
+  velUncovered: string;
+  velUncoveredHelp: string;
+  velActions: string;
+  velBackupNow: string;
+  velBackupNowHelp: string;
+  velPause: string;
+  velPauseHelp: string;
+  velResume: string;
+  velResumeHelp: string;
+  velRestore: string;
+  velRestoreHelp: string;
+  velRestoreOpts: string;
+  velRestoreOptsHelp: string;
+  velDelete: string;
+  velDeleteHelp: string;
+  velNoAction: string;
+  velContents: string;
+  velContentsHelp: string;
+  velContentsLoading: string;
+  velContentsEmpty: string;
+  velClusterScoped: string;
+  velLogs: string;
+  velLogsHelp: string;
+  velLogsNoRun: string;
+  velLogSourceDownload: string;
+  velLogSourceServer: string;
+  velLogEmpty: string;
+  velRoNamespaces: string;
+  velRoNsManual: string;
+  velRoNsManualHelp: string;
+  velRoKinds: string;
+  velRoTarget: string;
+  velRoTargetHelp: string;
+  velRoLabels: string;
+  velRoLabelsHelp: string;
+  velRoOverwrite: string;
+  velRoOverwriteHelp: string;
+  velRoNoNs: string;
+  velRoConfirm: string;
+  velRoAll: string;
+  velRoNone: string;
+  velLblCron: string;
+  velLblNextRun: string;
+  velLblLastBackup: string;
+  velLblLastSkipped: string;
+  velLblTtl: string;
+  velLblScope: string;
+  velLblVolumes: string;
+  velLblLocation: string;
+  velLblPhase: string;
+  velLblSchedule: string;
+  velLblStarted: string;
+  velLblDuration: string;
+  velLblItems: string;
+  velLblCaptured: string;
+  velLblExpires: string;
+  velLblErrors: string;
+  velLblBackup: string;
+  velLblProvider: string;
+  velLblBucket: string;
+  velLblAccess: string;
+  velLblValidated: string;
+  velLblRepoType: string;
+  velLblMaintenance: string;
+  velLblRestores: string;
+  velLblFailedVolumes: string;
+  velNever: string;
+  velPaused: string;
+  velAllNamespaces: string;
+  velOverdue: string;
+  velGitops: string;
+
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
@@ -886,6 +977,109 @@ const FR: Strings = {
   rbacRoleLabel: "rôle",
   rbacGrantedIn: "accordé dans",
 
+  velBackups: "backups",
+  velRestores: "restores",
+  velInfra: "infra",
+  velGroup: "sous leur schedule",
+  velGroupHelp:
+    "Regroupe chaque backup sous le Schedule qui l'a produit, et rassemble à part ceux qu'aucun schedule ne réclame.",
+  velEmpty: "Rien à montrer dans cette portée.",
+  velNotInstalled: "Velero n'est pas installé sur ce cluster.",
+  velDetail: "Velero",
+  velSelectRow: "Choisissez une ligne pour agir dessus.",
+  velFold: "Plier / déplier",
+  velRpo: "dernier backup restaurable",
+  velNoBackup: "aucun backup restaurable",
+  velProblems: "constats",
+  velServer: "velero",
+  velServerMissing: "controller introuvable",
+  velNodeAgent: "node-agent",
+  velNodeAgentAbsent: "node-agent absent : fs-backup ne capture rien",
+  velUncovered: "namespaces non couverts",
+  velUncoveredHelp:
+    "Ces namespaces portent un PVC qu'aucun schedule ne couvre : leurs données ne sont pas sauvegardées, et rien d'autre ne le dit.",
+  velActions: "Actions",
+  velBackupNow: "lancer un backup",
+  velBackupNowHelp:
+    "Crée un Backup à partir du template du schedule, nommé et étiqueté comme le fait le contrôleur — y compris pour la rétention qui l'expirera.",
+  velPause: "mettre en pause",
+  velPauseHelp:
+    "spec.paused : le contrôleur cesse de créer des backups. Rien d'existant n'est touché.",
+  velResume: "reprendre",
+  velResumeHelp: "Le contrôleur recommence à créer des backups aux heures du cron.",
+  velRestore: "restaurer",
+  velRestoreHelp:
+    "Restaure tout le backup, là d'où il vient, en contournant les objets qui existent déjà.",
+  velRestoreOpts: "restaurer à la carte",
+  velRestoreOptsHelp:
+    "Choisir les namespaces, les kinds, la cible et les labels avant de restaurer.",
+  velDelete: "supprimer le backup",
+  velDeleteHelp:
+    "Dépose un DeleteBackupRequest : supprimer l'objet Backup ne supprime rien, le contrôleur de synchronisation le recrée depuis le bucket. La demande, elle, efface snapshots, fichiers et objet.",
+  velNoAction: "Aucune action sur cette ligne.",
+  velContents: "contenu",
+  velContentsHelp:
+    "Télécharge l'inventaire du backup depuis le stockage objet : ce qu'il contient réellement, namespace par namespace.",
+  velContentsLoading: "téléchargement…",
+  velContentsEmpty: "ce backup n'a rien capturé",
+  velClusterScoped: "objets cluster",
+  velLogs: "log du run",
+  velLogsHelp:
+    "Le seul endroit qui dise quel objet a produit l'avertissement qu'un backup « Completed » rapporte.",
+  velLogsNoRun: "Cette ligne n'est pas un run : seuls un backup et une restauration en ont un.",
+  velLogSourceDownload: "log du run",
+  velLogSourceServer:
+    "log du controller (repli) : l'URL signée n'était pas joignable, et ces lignes ne remontent qu'aussi loin que le pod courant.",
+  velLogEmpty: "log vide",
+  velRoNamespaces: "namespaces",
+  velRoNsManual: "namespaces (séparés par des virgules)",
+  velRoNsManualHelp:
+    "L'inventaire n'a pas pu être téléchargé : les namespaces se tapent, et le formulaire reste utilisable — c'est précisément le cas pour lequel il existe.",
+  velRoKinds: "kinds",
+  velRoTarget: "namespace cible",
+  velRoTargetHelp:
+    "Restaurer ailleurs que là d'où ça vient. Velero mappe namespace par namespace : avec plusieurs sources cochées il n'y a pas de source unique, et le champ n'est pas appliqué.",
+  velRoLabels: "labels",
+  velRoLabelsHelp: "team=a, env=prod — ne garde que les objets qui les portent.",
+  velRoOverwrite: "écraser ce qui existe",
+  velRoOverwriteHelp:
+    "existingResourcePolicy: update. Le seul réglage qui détruise quelque chose : il écrase les objets vivants au lieu de les contourner.",
+  velRoNoNs:
+    "Aucun namespace choisi. Une liste vide restaurerait tout le backup, ce qui est l'inverse de ce qu'une liste vidée demande.",
+  velRoConfirm: "retapez le nom du backup pour confirmer",
+  velRoAll: "tout",
+  velRoNone: "rien",
+  velLblCron: "cron",
+  velLblNextRun: "prochaine exécution",
+  velLblLastBackup: "dernier backup",
+  velLblLastSkipped: "dernier saut",
+  velLblTtl: "rétention",
+  velLblScope: "portée",
+  velLblVolumes: "volumes",
+  velLblLocation: "location",
+  velLblPhase: "phase",
+  velLblSchedule: "schedule",
+  velLblStarted: "démarré",
+  velLblDuration: "durée",
+  velLblItems: "objets",
+  velLblCaptured: "capturé",
+  velLblExpires: "expire",
+  velLblErrors: "erreurs / warnings",
+  velLblBackup: "backup",
+  velLblProvider: "provider",
+  velLblBucket: "bucket",
+  velLblAccess: "accès",
+  velLblValidated: "validé",
+  velLblRepoType: "type",
+  velLblMaintenance: "maintenance",
+  velLblRestores: "restaurations",
+  velLblFailedVolumes: "volumes en échec",
+  velNever: "jamais",
+  velPaused: "en pause",
+  velAllNamespaces: "tous les namespaces",
+  velOverdue: "en retard",
+  velGitops: "possédé par {engine} : une pause posée ici sera défaite à la prochaine réconciliation.",
+
   filterAll: "tout",
   filterProblems: "problèmes",
 
@@ -1339,6 +1533,107 @@ const EN: Strings = {
   rbacSubjects: "subjects",
   rbacRoleLabel: "role",
   rbacGrantedIn: "granted in",
+
+  velBackups: "backups",
+  velRestores: "restores",
+  velInfra: "infra",
+  velGroup: "under their schedule",
+  velGroupHelp:
+    "Groups every backup under the Schedule that produced it, and collects apart the ones no schedule claims.",
+  velEmpty: "Nothing to show in this scope.",
+  velNotInstalled: "Velero is not installed on this cluster.",
+  velDetail: "Velero",
+  velSelectRow: "Pick a row to act on it.",
+  velFold: "Fold / unfold",
+  velRpo: "last restorable backup",
+  velNoBackup: "no restorable backup",
+  velProblems: "findings",
+  velServer: "velero",
+  velServerMissing: "controller not found",
+  velNodeAgent: "node-agent",
+  velNodeAgentAbsent: "node-agent absent: fs-backup captures nothing",
+  velUncovered: "uncovered namespaces",
+  velUncoveredHelp:
+    "These namespaces hold a PVC no schedule covers: their data is not backed up, and nothing else says so.",
+  velActions: "Actions",
+  velBackupNow: "run a backup",
+  velBackupNowHelp:
+    "Creates a Backup from the schedule template, named and labelled the way the controller does \u2014 including for the retention that will expire it.",
+  velPause: "pause",
+  velPauseHelp: "spec.paused: the controller stops creating backups. Nothing existing is touched.",
+  velResume: "resume",
+  velResumeHelp: "The controller starts creating backups again at the cron times.",
+  velRestore: "restore",
+  velRestoreHelp:
+    "Restores the whole backup where it came from, stepping around the objects that already exist.",
+  velRestoreOpts: "restore selectively",
+  velRestoreOptsHelp: "Pick namespaces, kinds, target and labels before restoring.",
+  velDelete: "delete the backup",
+  velDeleteHelp:
+    "Files a DeleteBackupRequest: deleting the Backup object deletes nothing, the sync controller recreates it from the bucket. The request removes snapshots, files and object.",
+  velNoAction: "No action on this row.",
+  velContents: "contents",
+  velContentsHelp:
+    "Downloads the backup inventory from object storage: what it actually holds, namespace by namespace.",
+  velContentsLoading: "downloading\u2026",
+  velContentsEmpty: "this backup captured nothing",
+  velClusterScoped: "cluster objects",
+  velLogs: "run log",
+  velLogsHelp:
+    "The only place that says which item produced the warning a \u201cCompleted\u201d backup reports.",
+  velLogsNoRun: "This row is not a run: only a backup and a restore have one.",
+  velLogSourceDownload: "run log",
+  velLogSourceServer:
+    "controller log (fallback): the signed URL was unreachable, and these lines only go back as far as the current pod.",
+  velLogEmpty: "empty log",
+  velRoNamespaces: "namespaces",
+  velRoNsManual: "namespaces (comma separated)",
+  velRoNsManualHelp:
+    "The inventory could not be downloaded: namespaces are typed, and the form stays usable \u2014 which is exactly the case it exists for.",
+  velRoKinds: "kinds",
+  velRoTarget: "target namespace",
+  velRoTargetHelp:
+    "Restore somewhere else. Velero maps namespace by namespace: with several sources ticked there is no single source, and the field is not applied.",
+  velRoLabels: "labels",
+  velRoLabelsHelp: "team=a, env=prod \u2014 keeps only the objects carrying them.",
+  velRoOverwrite: "overwrite what exists",
+  velRoOverwriteHelp:
+    "existingResourcePolicy: update. The only setting here that destroys anything: it overwrites live objects instead of stepping around them.",
+  velRoNoNs:
+    "No namespace picked. An empty list would restore the whole backup, which is the opposite of what an emptied list asks for.",
+  velRoConfirm: "retype the backup name to confirm",
+  velRoAll: "all",
+  velRoNone: "none",
+  velLblCron: "cron",
+  velLblNextRun: "next run",
+  velLblLastBackup: "last backup",
+  velLblLastSkipped: "last skip",
+  velLblTtl: "retention",
+  velLblScope: "scope",
+  velLblVolumes: "volumes",
+  velLblLocation: "location",
+  velLblPhase: "phase",
+  velLblSchedule: "schedule",
+  velLblStarted: "started",
+  velLblDuration: "duration",
+  velLblItems: "items",
+  velLblCaptured: "captured",
+  velLblExpires: "expires",
+  velLblErrors: "errors / warnings",
+  velLblBackup: "backup",
+  velLblProvider: "provider",
+  velLblBucket: "bucket",
+  velLblAccess: "access",
+  velLblValidated: "validated",
+  velLblRepoType: "type",
+  velLblMaintenance: "maintenance",
+  velLblRestores: "restores",
+  velLblFailedVolumes: "failed volumes",
+  velNever: "never",
+  velPaused: "paused",
+  velAllNamespaces: "every namespace",
+  velOverdue: "overdue",
+  velGitops: "owned by {engine}: a pause set here is reverted at its next reconciliation.",
 
   filterAll: "all",
   filterProblems: "problems",

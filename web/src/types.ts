@@ -1053,6 +1053,245 @@ export interface RbacPayload {
   error: string | null;
 }
 
+// --- Vue Velero -----------------------------------------------------------------------------------
+//
+// La question qu'une vue de sauvegarde doit trancher est « si le cluster brûle maintenant, qu'est-ce
+// qui revient ? ». Elle est éparpillée sur six kinds et deux silences — un `PartiallyFailed` peint
+// comme un succès, et un Schedule qui cesse de se déclencher sans rien dire. Les règles viennent de
+// `kdt::velero` ; ce qui suit n'est que la forme de ce qu'il rend.
+
+/** Le monde lu. Les trois partagent une seule lecture du cluster. */
+export type VelWorld = "backups" | "restores" | "infra";
+
+/** Un constat de kdt, avec son niveau. */
+export interface VelHint {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+interface VelRowBase {
+  uid: string;
+  depth: number;
+  has_problem: boolean;
+  hints: VelHint[];
+  record: EventRecord;
+}
+
+export interface VelScheduleRow extends VelRowBase {
+  row: "schedule";
+  namespace: string;
+  name: string;
+  cron: string;
+  paused: boolean;
+  phase: string;
+  phase_tone: LineTone;
+  validation_errors: string[];
+  last_backup: number | null;
+  last_skipped: number | null;
+  ttl: number | null;
+  included_ns: string[];
+  excluded_ns: string[];
+  has_selector: boolean;
+  snapshot_volumes: boolean | null;
+  fs_backup_default: boolean;
+  snapshot_move_data: boolean;
+  storage_location: string | null;
+  /** Calculée par kdt, jamais lue : velero ne publie nulle part quand il déclenchera. */
+  next_run: number | null;
+  cron_ok: boolean;
+  /** Le moteur GitOps qui possède ce Schedule : une pause posée ici y sera défaite. */
+  gitops: string | null;
+  backups: number;
+  age: string;
+}
+
+export interface VelBackupRow extends VelRowBase {
+  row: "backup";
+  namespace: string;
+  name: string;
+  phase: string;
+  phase_tone: LineTone;
+  schedule: string | null;
+  storage_location: string;
+  started: number | null;
+  completed: number | null;
+  expiration: number | null;
+  errors: number;
+  warnings: number;
+  items_backed_up: number;
+  total_items: number;
+  failure_reason: string;
+  volume_snapshots_attempted: number;
+  volume_snapshots_completed: number;
+  included_ns: string[];
+  excluded_ns: string[];
+  ttl: number | null;
+  /** Une demande de suppression est déjà en vol pour lui. */
+  deleting: boolean;
+  delete_errors: string[];
+  pvb_total: number;
+  pvb_failed: string[];
+  restores: number;
+  volumes: number;
+  /** Il est allé au bout **sans** tout capturer : ce n'est pas une nuance de succès. */
+  partially_failed: boolean;
+  failed: boolean;
+  running: boolean;
+  usable: boolean;
+  age: string;
+}
+
+export interface VelRestoreRow extends VelRowBase {
+  row: "restore";
+  namespace: string;
+  name: string;
+  backup: string;
+  schedule: string | null;
+  phase: string;
+  phase_tone: LineTone;
+  started: number | null;
+  completed: number | null;
+  errors: number;
+  warnings: number;
+  failure_reason: string;
+  items_restored: number;
+  total_items: number;
+  existing_policy: string;
+  running: boolean;
+  age: string;
+}
+
+export interface VelLocationRow extends VelRowBase {
+  row: "location";
+  namespace: string;
+  name: string;
+  provider: string;
+  bucket: string;
+  prefix: string;
+  phase: string;
+  phase_tone: LineTone;
+  default: boolean;
+  access_mode: string;
+  last_validated: number | null;
+  s3_url: string;
+  public_url: string;
+  message: string;
+  backups: number;
+  read_only: boolean;
+  available: boolean;
+  age: string;
+}
+
+export interface VelSnapLocationRow extends VelRowBase {
+  row: "snaploc";
+  namespace: string;
+  name: string;
+  provider: string;
+  phase: string;
+  phase_tone: LineTone;
+  message: string;
+  age: string;
+}
+
+export interface VelRepoRow extends VelRowBase {
+  row: "repo";
+  namespace: string;
+  name: string;
+  volume_namespace: string;
+  repo_type: string;
+  phase: string;
+  phase_tone: LineTone;
+  message: string;
+  last_maintenance: number | null;
+  age: string;
+}
+
+/** L'en-tête des backups qu'aucun schedule ne réclame. Il ne désigne aucun objet. */
+export interface VelOrphansRow extends VelRowBase {
+  row: "orphans";
+  name: string;
+  backups: number;
+}
+
+export type VelRow =
+  | VelScheduleRow
+  | VelBackupRow
+  | VelRestoreRow
+  | VelLocationRow
+  | VelSnapLocationRow
+  | VelRepoRow
+  | VelOrphansRow;
+
+export interface VelServer {
+  found: boolean;
+  running: boolean;
+  namespace: string;
+  ready: number;
+  desired: number;
+  version: string;
+  /** Le DaemonSet qui exécute les sauvegardes de système de fichiers. `null` = absent. */
+  node_agent: { ready: number; desired: number } | null;
+}
+
+export interface VeleroPayload {
+  rows: VelRow[];
+  counts: { schedules: number; backups: number; restores: number; problems: number };
+  /** Quand le dernier backup **réellement restaurable** s'est terminé, en secondes epoch. */
+  last_success: number | null;
+  server: VelServer;
+  cluster_hints: VelHint[];
+  /** Namespaces portant un PVC qu'aucun schedule ne couvre : des données que personne ne protège. */
+  uncovered: string[];
+  installed: boolean;
+  error: string | null;
+}
+
+/** Un kind capturé, et les objets de ce kind dans un namespace du backup. */
+export interface VelKindContent {
+  api_version: string;
+  kind: string;
+  names: string[];
+}
+
+export interface VelNsContent {
+  /** Vide pour les objets cluster-scoped : une chaîne vide ne peut pas heurter un vrai namespace. */
+  namespace: string;
+  kinds: VelKindContent[];
+}
+
+/**
+ * Ce qu'un backup contient réellement.
+ *
+ * Pas de repli : la liste n'existe que dans le stockage objet. Un bucket injoignable est une erreur,
+ * jamais un backup qui n'aurait rien capturé.
+ */
+export interface VelContentsPayload {
+  key: string;
+  namespaces: VelNsContent[];
+  total: number;
+  error: string | null;
+  /** Un enregistrement par objet capturé, qui vise l'objet **vivant**. */
+  records: EventRecord[];
+}
+
+/** D'où viennent les lignes d'un log de run. Les deux sources ne contiennent pas la même chose. */
+export type VelLogSource = "download" | "server" | "none";
+
+export interface VelLogPayload {
+  lines: string[];
+  source: VelLogSource;
+  error: string | null;
+}
+
+/** Ce que le formulaire de restauration envoie. */
+export interface VelRestoreRequest {
+  namespaces: string[];
+  kinds: Array<{ apiVersion: string; kind: string }>;
+  target_ns: string;
+  labels: string;
+  overwrite: boolean;
+}
+
 // --- Gestes sur un objet quelconque ---------------------------------------------------------------
 
 /** Les deux rendus du YAML, comme l'overlay `y` du TUI. */
