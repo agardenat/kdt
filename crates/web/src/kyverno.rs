@@ -19,6 +19,13 @@
 //! `reportingComponent` est `kyverno-admission`. Le TUI les trouve dans le tampon qu'il tient déjà ;
 //! ici il faut les lire, et c'est la seule raison de cette seconde requête. Une lecture refusée
 //! laisse la section **muette** plutôt que d'affirmer qu'il n'y a eu aucun refus.
+//!
+//! # Le coût, dit franchement
+//!
+//! Chaque appel liste **tous** les PolicyReports du cluster et **tous** les évènements. C'est le
+//! prix de la jointure et celui des refus d'admission, et c'est ce que fait déjà la vue Events sur
+//! sa propre cadence. La page interroge donc toutes les 15 secondes, pas plus vite : un cluster où
+//! cette liste coûte cher est un cluster où elle coûterait cher au TUI aussi.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
