@@ -1659,6 +1659,12 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
 #[derive(Default, Debug, Clone)]
 pub struct ClusterInfo {
     pub server_version: Option<String>,
+    /// Faux quand la liste des nodes a été refusée.
+    ///
+    /// Sans ce champ, un refus RBAC et un cluster sans node rendent le même `0/0`, et le bandeau
+    /// affirmerait une santé qu'il n'a pas constatée. Les totaux CPU/mémoire viennent de la même
+    /// liste : ils ne veulent rien dire non plus quand elle manque.
+    pub nodes_readable: bool,
     pub node_count: usize,
     pub nodes_ready: usize,
     pub cpu_alloc_milli: i64,
@@ -1667,6 +1673,32 @@ pub struct ClusterInfo {
     pub mem_use_bytes: i64,
     pub metrics_available: bool,
     pub loaded: bool,
+}
+
+/// Le ton d'un taux d'occupation, du plus calme au plus tendu.
+///
+/// Quatre paliers et non trois : entre « il reste de la place » et « ça devient tendu » il y a un
+/// palier qui n'est pas encore un avertissement. C'est l'échelle que le bandeau du TUI peint
+/// depuis toujours, descendue ici pour que le bandeau du web peigne la même plutôt que d'en
+/// inventer une seconde.
+pub fn usage_tone(pct: i64) -> LineColor {
+    if pct >= 100 {
+        LineColor::Err
+    } else if pct >= 80 {
+        LineColor::Warn
+    } else if pct >= 50 {
+        LineColor::Info
+    } else {
+        LineColor::Ok
+    }
+}
+
+/// Le taux d'occupation en pourcentage, ou `None` quand il n'y a rien à quoi rapporter l'usage.
+///
+/// Un total nul n'est pas un cluster vide à 0 % : c'est une allocation qu'on n'a pas pu lire, et
+/// un `0 %` vert le ferait passer pour une bonne nouvelle.
+pub fn usage_pct(used: i64, total: i64) -> Option<i64> {
+    (total > 0).then(|| used.saturating_mul(100) / total)
 }
 
 pub type SharedClusterInfo = Arc<Mutex<ClusterInfo>>;
@@ -1684,7 +1716,9 @@ pub async fn fetch_cluster_info(client: Client, state: SharedClusterInfo) {
 
     let node_api: Api<Node> = Api::all(client.clone());
     let (mut cpu_alloc, mut mem_alloc, mut count, mut ready) = (0_i64, 0_i64, 0_usize, 0_usize);
+    let mut nodes_readable = false;
     if let Ok(list) = node_api.list(&ListParams::default()).await {
+        nodes_readable = true;
         count = list.items.len();
         for n in &list.items {
             if let Some(alloc) = n.status.as_ref().and_then(|s| s.allocatable.as_ref()) {
@@ -1707,6 +1741,7 @@ pub async fn fetch_cluster_info(client: Client, state: SharedClusterInfo) {
 
     let mut s = state.lock().expect("cluster info poisoned");
     s.server_version = version;
+    s.nodes_readable = nodes_readable;
     s.node_count = count;
     s.nodes_ready = ready;
     s.cpu_alloc_milli = cpu_alloc;

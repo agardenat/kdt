@@ -272,6 +272,38 @@ export interface Capabilities {
   rancher: boolean;
 }
 
+/**
+ * Une ressource du bandeau : ce qui est alloué, ce qui est utilisé, et à quel point c'est tendu.
+ *
+ * `used`, `pct` et `tone` sont `null` sans metrics-server : l'allocation se lit sur les nodes et
+ * reste vraie, l'usage ne se devine pas. Les quantités arrivent déjà formatées — `3.4`, `62Gi` —
+ * parce que c'est le serveur qui sait les écrire comme Kubernetes les dit.
+ */
+export interface ClusterResource {
+  used: string | null;
+  alloc: string;
+  pct: number | null;
+  /** Le palier d'occupation, choisi par kdt. Le front le peint, il ne le rejuge pas. */
+  tone: "ok" | "info" | "warn" | "err" | null;
+}
+
+/**
+ * Le bandeau : quel cluster on regarde, et dans quel état il est.
+ *
+ * `nodes`, `cpu` et `mem` sont `null` ensemble quand la liste des nodes a été refusée — ils en
+ * viennent tous les trois. Un `0/0 ready` vert affirmerait un cluster sain qu'on n'a pas regardé.
+ */
+export interface ClusterBanner {
+  cluster: string;
+  /** L'adresse de l'apiserver : ce qui rend un mauvais cluster évident. */
+  apiserver: string;
+  server_version: string | null;
+  nodes: { ready: number; total: number; tone: "ok" | "warn" } | null;
+  cpu: ClusterResource | null;
+  mem: ClusterResource | null;
+  metrics_available: boolean;
+}
+
 /** Qui est connecté. */
 export interface Identity {
   authenticated: true;

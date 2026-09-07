@@ -130,6 +130,12 @@ Arrêtée sur maquette le 2026-09-06. Front en React + Vite + TypeScript, dans `
   de kdt. Dans le TUI ce sont des modes (`n` / `0` changent la portée, `/` ouvre la recherche) ;
   ici ce sont deux contrôles toujours visibles, ce qui supprime au passage le piège du titre qui
   ment quand la portée change.
+- **Le bandeau du cluster**, dans cette même barre : le nom du cluster, la version de l'apiserver,
+  ses nodes prêts et la pression CPU/mémoire — la deuxième ligne du bandeau de kdt, aux mêmes
+  règles. Le nom vient de `KDT_WEB_CLUSTER`, sinon du `--context` visé, sinon de l'hôte de
+  l'apiserver ; l'adresse complète est sous le nom, parce que c'est elle qui rend un mauvais
+  cluster évident. Ce qui n'a pas été lu n'est pas peint : sans le droit de lister les nodes il
+  n'y a ni compte ni allocation, et le bandeau affiche un tiret au lieu d'un `0/0` vert.
 - **Rail vertical** : les vues, toutes visibles en permanence. C'est la palette `:` rendue
   explicite.
 - **Onglets horizontaux dans le panneau** : les « mondes » d'une vue, qui dans kdt se cyclent à la

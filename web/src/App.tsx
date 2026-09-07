@@ -13,10 +13,10 @@ import IdentityView from "./IdentityView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
-import { storedLang, storeLang, strings, type Lang } from "./i18n";
+import { storedLang, storeLang, strings, type Lang, type Strings } from "./i18n";
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
-import type { Capabilities, Identity } from "./types";
+import type { Capabilities, ClusterBanner, ClusterResource, Identity } from "./types";
 
 type ViewId = "events" | "flux" | "workloads" | "data" | "certs" | "identity" | "rancher";
 
@@ -61,6 +61,12 @@ export default function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [booting, setBooting] = useState(true);
+
+  // Le bandeau : quel cluster, dans quel état. Il vit ici parce qu'il vaut pour toutes les vues,
+  // et parce que la question qu'il tranche — « suis-je sur le bon cluster ? » — se pose avant
+  // d'en ouvrir une.
+  const [cluster, setCluster] = useState<ClusterBanner | null>(null);
+  const [clusterError, setClusterError] = useState<string | null>(null);
 
   const [view, setView] = useState<ViewId>("events");
   const [namespaces, setNamespaces] = useState<string[]>([]);
@@ -147,6 +153,44 @@ export default function App() {
       .catch(() => setCapabilities(null));
   }, [identity]);
 
+  // Le bandeau se relit, à la différence des add-ons : des nodes se remplacent, une version
+  // change, la pression monte. Un onglet caché ne relit rien — le compte se ferait payer par le
+  // cluster pour une page que personne ne regarde — et rattrape son retard en redevenant visible.
+  useEffect(() => {
+    if (!identity) return;
+    let alive = true;
+    const load = () => {
+      if (document.hidden) return;
+      api
+        .cluster()
+        .then((banner) => {
+          if (!alive) return;
+          setCluster(banner);
+          setClusterError(null);
+        })
+        .catch((e) => {
+          if (!alive) return;
+          // Une session expirée n'est pas une panne du bandeau : c'est l'application entière qui
+          // doit repasser par le portail, et le bandeau est souvent le premier à s'en apercevoir.
+          if (e instanceof api.NeedsAuth) setNeedsAuth(e.message);
+          // Le dernier état lu est gardé : le remplacer par du vide effacerait le nom du cluster
+          // sur un hoquet réseau, là où la question à laquelle il répond, elle, ne change pas.
+          else setClusterError(e instanceof Error ? e.message : String(e));
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 30_000);
+    const onVisible = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [identity]);
+
   const views = useMemo(
     // Tant que la sonde n'a pas répondu — ou qu'elle a échoué — tout reste affiché : filtrer sur
     // une réponse qu'on n'a pas revient à affirmer une absence qu'on n'a pas constatée.
@@ -214,6 +258,27 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <span className="name">kdt</span>
+          {cluster ? (
+            <>
+              {/* L'adresse de l'apiserver sous le nom : le nom est un libellé qu'on a donné,
+                  l'adresse est ce que le serveur a réellement joint. */}
+              <span className="ctx" title={`apiserver ${cluster.apiserver}`}>
+                {cluster.cluster}
+              </span>
+              <span
+                className="k8s"
+                title={cluster.server_version ? undefined : st.clusterVersionUnknown}
+              >
+                {cluster.server_version ?? "—"}
+              </span>
+            </>
+          ) : (
+            clusterError && (
+              <span className="ctx dim" title={clusterError}>
+                {st.clusterUnknown}
+              </span>
+            )
+          )}
         </div>
 
         <div className="scope">
@@ -264,6 +329,7 @@ export default function App() {
         </div>
 
         <div className="spacer" />
+        {cluster && <ClusterStats banner={cluster} st={st} />}
         <div className="who">
           <span className="sub">{identity.subject}</span>
           {identity.groups.map((g) => (
@@ -430,6 +496,82 @@ export default function App() {
         </section>
       </div>
     </div>
+  );
+}
+
+/**
+ * L'état du cluster, à droite de la barre : ses nodes, sa pression CPU et mémoire.
+ *
+ * Ce qui n'a pas été lu n'est pas peint en vert : sans le droit de lister les nodes il n'y a ni
+ * compte ni allocation, et le bandeau le dit au lieu d'afficher des zéros.
+ */
+function ClusterStats({ banner, st }: { banner: ClusterBanner; st: Strings }) {
+  if (!banner.nodes) {
+    return (
+      <div className="cstats">
+        <span className="cstat" title={st.clusterNodesDenied}>
+          <span className="lbl">nodes</span>
+          <span className="val dim">—</span>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="cstats">
+      <span className="cstat">
+        <span className="lbl">nodes</span>
+        <span className={`val tone-${banner.nodes.tone}`}>
+          {banner.nodes.ready}/{banner.nodes.total}
+        </span>
+      </span>
+      <Gauge label="CPU" resource={banner.cpu} noMetrics={st.clusterNoMetrics} />
+      <Gauge label="MEM" resource={banner.mem} noMetrics={st.clusterNoMetrics} />
+    </div>
+  );
+}
+
+/** Une ressource et son occupation, ou son allocation seule quand l'usage n'est pas mesuré. */
+function Gauge({
+  label,
+  resource,
+  noMetrics,
+}: {
+  label: string;
+  resource: ClusterResource | null;
+  noMetrics: string;
+}) {
+  if (!resource) return null;
+
+  // Sans metrics-server, l'allocation reste vraie et se dit seule : une jauge vide se lirait
+  // comme un cluster au repos.
+  if (resource.pct === null) {
+    return (
+      <span className="cstat" title={noMetrics}>
+        <span className="lbl">{label}</span>
+        <span className="val dim">{resource.alloc}</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className="cstat" title={`${resource.used} / ${resource.alloc}`}>
+      <span className="lbl">{label}</span>
+      <span className="track">
+        <span
+          className={`fill tone-${resource.tone}`}
+          // Au-delà de 100 % la barre est pleine ; c'est le pourcentage à côté qui dit de combien
+          // on dépasse, la barre ne saurait pas le montrer.
+          style={{ width: `${Math.min(100, resource.pct)}%` }}
+        />
+      </span>
+      <span className={`val tone-${resource.tone}`}>{resource.pct}%</span>
+      {/* Les quantités, comme dans le bandeau du TUI : le pourcentage dit la tension, ces deux
+          chiffres disent de quoi on parle — 9 % de quatre cœurs n'est pas 9 % de deux cents. */}
+      <span className="sub">
+        {resource.used}/{resource.alloc}
+      </span>
+    </span>
   );
 }
 

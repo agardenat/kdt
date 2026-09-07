@@ -230,6 +230,18 @@ répondent, le reste n'existe pas.
   La sortie par défaut ne supprime rien, comme dans kdt où `Entrée` annule : c'est le bouton
   d'annulation qui prend le focus, et celui qui supprime est une cible distincte, à distance.
 
+- **feat(web)** — le bandeau du cluster arrive dans la barre du haut : le nom du cluster, la
+  version de l'apiserver, ses nodes prêts et la pression CPU/mémoire. C'est ce que kdt affiche sur
+  la deuxième ligne de son en-tête, avec les mêmes paliers d'occupation — descendus dans
+  `events.rs` pour que les deux interfaces peignent la même couleur du même taux.
+
+  Le nom vient de `KDT_WEB_CLUSTER`, sinon du contexte visé, sinon de l'hôte de l'apiserver, dont
+  l'adresse complète accompagne le nom : c'est elle qui rend un mauvais cluster évident.
+
+  Ce qui n'a pas été lu n'est pas affiché : sans le droit de lister les nodes, il n'y a ni compte
+  de nodes ni allocation, et le bandeau le dit par un tiret au lieu d'un `0/0 ready` vert qui
+  affirmerait un cluster sain que personne n'a regardé. Le TUI corrige la même affirmation.
+
 - **fix(web)** — le panneau du haut restait accroché à la sélection : il apparaissait au premier
   clic et repartait au suivant, décalant la table de 300 px sous le curseur. Il reste désormais en
   place tant qu'il est déplié — sans sélection il montre son cadre et l'invite — et c'est le pli,

@@ -315,6 +315,13 @@ export interface Strings {
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
+
+  // --- Bandeau du cluster. Le jargon — nodes, CPU, MEM — n'est pas traduit : il ne se dit pas
+  // autrement en français, et ces trois mots sont les mêmes dans le TUI.
+  clusterUnknown: string;
+  clusterVersionUnknown: string;
+  clusterNodesDenied: string;
+  clusterNoMetrics: string;
 }
 
 const FR: Strings = {
@@ -634,6 +641,13 @@ const FR: Strings = {
 
   filterAll: "tout",
   filterProblems: "problèmes",
+
+  clusterUnknown: "cluster : état non lu",
+  clusterVersionUnknown: "L'apiserver n'a pas rendu sa version.",
+  clusterNodesDenied:
+    "La liste des nodes vous est refusée : ni compte de nodes, ni allocation CPU/mémoire.",
+  clusterNoMetrics:
+    "metrics-server ne répond pas : l'allocation est connue, l'usage ne l'est pas.",
 };
 
 const EN: Strings = {
@@ -952,6 +966,12 @@ const EN: Strings = {
 
   filterAll: "all",
   filterProblems: "problems",
+
+  clusterUnknown: "cluster: state not read",
+  clusterVersionUnknown: "The apiserver did not report its version.",
+  clusterNodesDenied:
+    "Listing nodes is denied to you: no node count, no CPU/memory allocation.",
+  clusterNoMetrics: "metrics-server is not answering: allocation is known, usage is not.",
 };
 
 export function strings(lang: Lang): Strings {

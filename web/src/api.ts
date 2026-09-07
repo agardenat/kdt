@@ -6,6 +6,7 @@
 
 import type {
   Capabilities,
+  ClusterBanner,
   CertActionTarget,
   CertFilter,
   CertsPayload,
@@ -95,6 +96,16 @@ export function identity(): Promise<Identity> {
 /** Les add-ons installés sur ce cluster, qui décident des vues à proposer. */
 export function capabilities(): Promise<Capabilities> {
   return get<Capabilities>("/api/v1/capabilities");
+}
+
+/**
+ * Le bandeau du cluster : son nom, sa version, ses nodes et sa pression.
+ *
+ * Relu régulièrement plutôt qu'une fois : ces chiffres bougent, et un bandeau figé ne dirait rien
+ * de plus que le nom — qui, lui, ne bouge pas.
+ */
+export function cluster(): Promise<ClusterBanner> {
+  return get<ClusterBanner>("/api/v1/cluster");
 }
 
 export function events(namespaces: string[]): Promise<EventsPayload> {

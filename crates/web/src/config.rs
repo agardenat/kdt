@@ -25,6 +25,14 @@ pub struct WebConfig {
     pub portal_url: String,
     /// Adresse d'écoute.
     pub listen: String,
+    /// Nom sous lequel ce cluster est connu, affiché dans le bandeau.
+    ///
+    /// Il n'existe nulle part dans Kubernetes : un cluster ne connaît pas son propre nom, et
+    /// l'adresse de son apiserver ne se retient pas. C'est donc un libellé qu'on donne — celui
+    /// qui figure dans le kubeconfig des équipes, pour que les deux désignent la même chose.
+    ///
+    /// Absent, le bandeau retombe sur le contexte visé, puis sur l'hôte de l'apiserver.
+    pub cluster_name: Option<String>,
     /// Répertoire du bundle du front, servi à la racine.
     ///
     /// Absent, kdt-web ne sert que son API : c'est ce qu'on veut en développement, où Vite sert
@@ -54,6 +62,7 @@ impl WebConfig {
                 .trim_end_matches('/')
                 .to_string(),
             listen: env("KDT_WEB_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string()),
+            cluster_name: env("KDT_WEB_CLUSTER"),
             assets: env("KDT_WEB_ASSETS"),
             session_key: env("KDT_WEB_SESSION_KEY"),
             session_ttl: duration_from_env("KDT_WEB_SESSION_TTL", Duration::from_secs(12 * 3600))?,

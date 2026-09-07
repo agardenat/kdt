@@ -17534,13 +17534,19 @@ fn cluster_banner_line(app: &App) -> Line<'static> {
         Span::styled("   k8s ", label),
         Span::styled(version, val),
         Span::styled("   nodes ", label),
-        Span::styled(
-            format!("{}/{} ready", info.nodes_ready, info.node_count),
-            Style::default().fg(if info.nodes_ready == info.node_count { Color::Green } else { Color::Yellow }),
-        ),
+        // Sans le droit de lister les nodes, un `0/0 ready` vert affirmerait un cluster sain
+        // qu'on n'a pas regardé : le tiret dit qu'on ne sait pas.
+        if info.nodes_readable {
+            Span::styled(
+                format!("{}/{} ready", info.nodes_ready, info.node_count),
+                Style::default().fg(if info.nodes_ready == info.node_count { Color::Green } else { Color::Yellow }),
+            )
+        } else {
+            Span::styled("—", label)
+        },
     ];
 
-    if info.metrics_available {
+    if info.metrics_available && info.cpu_alloc_milli > 0 {
         let cpu_pct = pct_local(info.cpu_use_milli, info.cpu_alloc_milli);
         let mem_pct = pct_local(info.mem_use_bytes, info.mem_alloc_bytes);
         spans.push(Span::styled("   CPU ", label));
@@ -17555,26 +17561,39 @@ fn cluster_banner_line(app: &App) -> Line<'static> {
             val,
         ));
         spans.push(Span::styled(format!(" ({}%)", mem_pct), Style::default().fg(pct_color(mem_pct))));
-    } else {
+    } else if info.nodes_readable {
         spans.push(Span::styled("   CPU alloc ", label));
         spans.push(Span::styled(format_cpu_milli(info.cpu_alloc_milli), val));
         spans.push(Span::styled("   MEM alloc ", label));
         spans.push(Span::styled(format_memory_bytes(info.mem_alloc_bytes), val));
-        spans.push(Span::styled("   (metrics-server indispo)", label));
+        if info.metrics_available {
+            // Des nodes lisibles, une allocation nulle : rien à rapporter l'usage à, donc pas de
+            // pourcentage — mais metrics-server répond, et le dire indisponible serait faux.
+            spans.push(Span::styled("   (allocation inconnue)", label));
+        } else {
+            spans.push(Span::styled("   (metrics-server indispo)", label));
+        }
+    } else {
+        // Les totaux viennent de la liste des nodes : sans elle, il n'y a rien d'autre à dire.
+        spans.push(Span::styled("   (liste des nodes refusée)", label));
     }
 
     Line::from(spans)
 }
 
 fn pct_local(v: i64, total: i64) -> i64 {
-    if total > 0 { v.saturating_mul(100) / total } else { 0 }
+    crate::events::usage_pct(v, total).unwrap_or(0)
 }
 
+// Les paliers vivent dans `events` : c'est un jugement sur le cluster, pas une affaire de
+// terminal, et kdt-web peint le même.
 fn pct_color(p: i64) -> Color {
-    if p >= 100 { Color::Red }
-    else if p >= 80 { Color::Yellow }
-    else if p >= 50 { Color::Cyan }
-    else { Color::Green }
+    match crate::events::usage_tone(p) {
+        LineColor::Err => Color::Red,
+        LineColor::Warn => Color::Yellow,
+        LineColor::Info => Color::Cyan,
+        _ => Color::Green,
+    }
 }
 
 fn incidence_bg(value: Option<i64>, alloc: i64) -> Option<Color> {

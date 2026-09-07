@@ -103,6 +103,38 @@ button, input { font: inherit; color: inherit; }
 .brand { display: flex; align-items: baseline; gap: .45rem; padding-right: .55rem; }
 .brand .name { font-weight: 700; letter-spacing: -.015em; font-size: 14.5px; }
 .brand .ctx { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.brand .ctx.dim { color: var(--dim); }
+.brand .k8s {
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
+  padding: .05rem .3rem; border: 1px solid var(--line); border-radius: 4px;
+}
+
+/* L'état du cluster, à droite de la barre. Même contenu que la deuxième ligne du bandeau du TUI,
+   dans la grammaire d'ici : des chiffres qu'on lit d'un coup d'œil, et une jauge pour la part
+   qui se compare à un total. */
+.cstats {
+  display: flex; align-items: center; gap: .7rem;
+  /* L'état du cluster et la personne connectée sont deux sujets : un filet les sépare, sinon les
+     chiffres du second se lisent comme la suite des premiers. */
+  padding-right: .75rem; border-right: 1px solid var(--line-soft);
+}
+.cstat { display: flex; align-items: center; gap: .3rem; white-space: nowrap; }
+.cstat .lbl { color: var(--dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.cstat .val { font-family: var(--mono); font-size: 12px; }
+.cstat .val.dim { color: var(--muted); }
+.cstat .sub { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.cstat .track {
+  width: 46px; height: 5px; border-radius: 3px; background: var(--sunk);
+  border: 1px solid var(--line-soft); overflow: hidden;
+}
+.cstat .fill { display: block; height: 100%; }
+.cstat .tone-ok { color: var(--ok); background: var(--ok); }
+.cstat .tone-info { color: var(--info); background: var(--info); }
+.cstat .tone-warn { color: var(--warn); background: var(--warn); }
+.cstat .tone-err { color: var(--err); background: var(--err); }
+/* Le texte n'hérite pas du fond de la jauge : ces deux règles partagent la classe de ton, et
+   seule la barre est peinte en aplat. */
+.cstat .val[class*="tone-"] { background: none; }
 
 .scope { position: relative; }
 .scope-btn {
@@ -304,8 +336,19 @@ button, input { font: inherit; color: inherit; }
 .statusbar .kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 .25rem; }
 .statusbar .err { color: var(--err); }
 
+/* Ce qui saute en premier quand la barre se resserre est ce qui se relit ailleurs : la pression
+   est dans les vues, le nom du cluster ne l'est nulle part. */
+@media (max-width: 1440px) {
+  .cstat .sub { display: none; }
+}
+@media (max-width: 1280px) {
+  .cstat .track { display: none; }
+}
+@media (max-width: 1180px) {
+  .cstats { display: none; }
+}
 @media (max-width: 1080px) {
-  .who .grp, .brand .ctx { display: none; }
+  .who .grp, .brand .k8s { display: none; }
 }
 
 /* ---------------------------------------------------------------- tons du verdict

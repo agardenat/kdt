@@ -11,6 +11,7 @@
 mod api;
 mod auth;
 mod certs;
+mod cluster;
 mod config;
 mod config_secrets;
 mod flux;
@@ -61,6 +62,11 @@ pub struct AppState {
     /// Il vient du compte de service du pod, ou du kubeconfig hors cluster — dans les deux cas on
     /// ne garde **que** l'adresse et la CA, jamais l'identité qu'il portait.
     pub kube: kube::Config,
+    /// Le nom du cluster affiché dans le bandeau.
+    ///
+    /// Décidé une fois au démarrage : il ne dépend ni de la requête ni de qui la fait, et le
+    /// recalculer à chaque appel donnerait l'illusion qu'il pourrait changer.
+    pub cluster_label: String,
 }
 
 #[tokio::main]
@@ -114,11 +120,25 @@ async fn main() -> Result<()> {
         info!("aucun bundle à servir : seule l'API répond (mode développement)");
     }
 
+    // Ce que le bandeau nomme : le libellé donné, sinon le contexte visé, sinon l'hôte de
+    // l'apiserver — qui n'est pas un nom, mais qui désigne sans ambiguïté et se reconnaît.
+    let cluster_label = config
+        .cluster_name
+        .clone()
+        .or_else(|| args.context.clone())
+        .unwrap_or_else(|| {
+            kube.cluster_url
+                .host()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| kube.cluster_url.to_string())
+        });
+
     let state = AppState {
         config: Arc::new(config.clone()),
         portal: Arc::new(Portal::new(&config.portal_url)),
         sessions: Arc::new(Sessions::new(config.session_ttl)),
         kube,
+        cluster_label,
     };
 
     let mut app = Router::new()
@@ -130,6 +150,7 @@ async fn main() -> Result<()> {
         .route("/auth/logout", post(auth::logout))
         .route("/api/v1/me", get(auth::me))
         .route("/api/v1/capabilities", get(api::capabilities))
+        .route("/api/v1/cluster", get(cluster::banner))
         .route("/api/v1/events", get(api::events))
         .route("/api/v1/logs", get(api::logs))
         .route("/api/v1/status", get(api::status))
