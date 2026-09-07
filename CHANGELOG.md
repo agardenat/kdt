@@ -8,6 +8,14 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-beta.2] — 2026-09-07
+
+- **fix(ci)** — la `2.0.0-beta.1` n'a livré que son image : les deux jobs de binaires cherchaient
+  `kdt-web` là où ils venaient de construire `kdt`, et se sont arrêtés avant de publier quoi que
+  ce soit. Depuis que le dépôt est un workspace, `cargo metadata --no-deps` rend deux paquets, et
+  `.packages[0]` n'est pas celui de la racine. Le nom est désormais désigné par son manifeste, et
+  l'étape échoue franchement si elle ne le trouve pas plutôt que d'exporter une variable vide.
+
 ## [2.0.0-beta.1] — 2026-09-07
 
 Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-web`, une interface web

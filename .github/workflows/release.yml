@@ -63,7 +63,14 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Get app name
-        run: echo "APP_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" >> $GITHUB_ENV
+        # Le paquet de la racine, désigné par son manifeste : depuis que le dépôt est un
+        # workspace, `.packages[0]` rendait `kdt-web`, dont ces deux jobs ne construisent aucun
+        # binaire — le tarball et `lipo` cherchaient alors un fichier qui n'existe pas.
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg m "$PWD/Cargo.toml" '.packages[] | select(.manifest_path == $m) | .name')
+          [ -n "$name" ] || { echo "paquet racine introuvable" >&2; exit 1; }
+          echo "APP_NAME=$name" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: brew install pkg-config
@@ -113,7 +120,14 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Get app name
-        run: echo "APP_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" >> $GITHUB_ENV
+        # Le paquet de la racine, désigné par son manifeste : depuis que le dépôt est un
+        # workspace, `.packages[0]` rendait `kdt-web`, dont ces deux jobs ne construisent aucun
+        # binaire — le tarball et `lipo` cherchaient alors un fichier qui n'existe pas.
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg m "$PWD/Cargo.toml" '.packages[] | select(.manifest_path == $m) | .name')
+          [ -n "$name" ] || { echo "paquet racine introuvable" >&2; exit 1; }
+          echo "APP_NAME=$name" >> $GITHUB_ENV
 
       - name: Install packaging tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools rpm
