@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
+import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
@@ -213,18 +214,11 @@ export default function FluxView({
 
   const actions = useMemo(() => buildActions(selectedRow, st), [selectedRow, st]);
 
-  // `Échap` ferme le menu avant tout le reste : c'est ce qui est ouvert par-dessus.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        setMenuOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [menuOpen]);
+  // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
+  // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
+  // rouvrirait dans le même geste.
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   return (
     <>
@@ -287,7 +281,7 @@ export default function FluxView({
               {st.fluxReveal}
             </label>
           )}
-          <div className="menu-anchor">
+          <div className="menu-anchor" ref={menuRef}>
             <button
               className="panel-toggle action"
               disabled={!selectedRow}

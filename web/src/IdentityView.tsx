@@ -17,6 +17,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { CopyButton } from "./copy";
+import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
@@ -114,19 +115,15 @@ export default function IdentityView({
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  // `Échap` ferme le menu avant tout le reste : c'est ce qui est ouvert par-dessus.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        setMenuOpen(false);
-        setForm(null);
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [menuOpen]);
+  // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
+  // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
+  // rouvrirait dans le même geste. Le formulaire en cours part avec le menu : rouvrir sur une
+  // saisie à moitié faite ferait agir sur un état qu'on ne relit pas.
+  const closeMenu = useCallback(() => {
+    setMenuOpen(false);
+    setForm(null);
+  }, []);
+  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   const users = payload?.users ?? [];
   const groups = payload?.groups ?? [];
@@ -309,7 +306,7 @@ export default function IdentityView({
         <div className="right">
           {busy && <span>{st.objWorking}</span>}
           {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
-          <div className="menu-anchor">
+          <div className="menu-anchor" ref={menuRef}>
             <button
               className="panel-toggle action"
               aria-expanded={menuOpen}

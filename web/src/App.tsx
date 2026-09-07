@@ -13,6 +13,7 @@ import IdentityView from "./IdentityView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
+import { useDismiss } from "./dismiss";
 import { storedLang, storeLang, strings, type Lang, type Strings } from "./i18n";
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
 import { apply as applyTheme, stored as storedTheme, toggled, type Theme } from "./theme";
@@ -245,16 +246,22 @@ export default function App() {
         e.preventDefault();
         filterRef.current?.focus();
       } else if (e.key === "Escape") {
-        if (scopeOpen) setScopeOpen(false);
-        else if (document.activeElement === filterRef.current) filterRef.current?.blur();
+        // Le sélecteur de portée n'est plus traité ici : `useDismiss` le ferme et coupe la
+        // propagation, donc cet `Échap`-là n'arrive jamais jusqu'à ce point.
+        if (document.activeElement === filterRef.current) filterRef.current?.blur();
         else if (panelOpen) setPanelOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [scopeOpen, panelOpen]);
+  }, [panelOpen]);
 
   const onNeedsAuth = useCallback((message: string) => setNeedsAuth(message), []);
+
+  // Le sélecteur de portée se referme au clic à côté, comme les menus des vues. La ref porte sur
+  // le bloc entier — bouton et liste — pour que le bouton reste le geste qui bascule.
+  const closeScope = useCallback(() => setScopeOpen(false), []);
+  const scopeRef = useDismiss<HTMLDivElement>(scopeOpen, closeScope);
 
   if (booting) return <div className="center" />;
 
@@ -314,7 +321,7 @@ export default function App() {
           )}
         </div>
 
-        <div className="scope">
+        <div className="scope" ref={scopeRef}>
           <button
             className="scope-btn"
             aria-expanded={scopeOpen}

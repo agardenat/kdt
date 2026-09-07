@@ -242,6 +242,11 @@ répondent, le reste n'existe pas.
   de nodes ni allocation, et le bandeau le dit par un tiret au lieu d'un `0/0 ready` vert qui
   affirmerait un cluster sain que personne n'a regardé. Le TUI corrige la même affirmation.
 
+- **fix(web)** — les listes déroulantes ne se refermaient qu'en recliquant sur le bouton qui les
+  avait ouvertes : un clic à côté les laissait ouvertes, par-dessus ce qu'on voulait atteindre.
+  Le clic hors du menu le referme désormais partout — sélecteur de portée et menus d'actions des
+  cinq vues — et `Échap` aussi, sans replier le panneau derrière.
+
 - **fix(web)** — le sélecteur de portée ne proposait rien : il fallait connaître le nom du
   namespace et le taper sans faute, une faute rendant une vue vide qu'on lit comme un cluster vide.
   Il liste désormais les namespaces et resserre la liste à la frappe, les choisis en tête avec de
