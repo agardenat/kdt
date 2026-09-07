@@ -579,14 +579,48 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 - **PDF rendering**: AI content is escaped before being evaluated as Typst markup, and code blocks
   go through `raw()` — no injection possible.
 
+## The web interface (beta)
+
+`kdt-web` serves the same views in a browser, backed by
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Ten views are
+live — events, workloads, Flux, Secrets/ConfigMaps, certificates, identity, Rancher, Kyverno,
+RBAC, Velero — along with the four gestures that apply to any object: YAML, edit, touch, delete.
+
+**Every request carries the credential of the person signed in**: the apiserver sees their name and
+groups, and the cluster's RBAC applies as-is. The pod's service account has no rights on any
+resource, and the chart installs neither Role nor ClusterRole.
+
+Two prerequisites, without which nobody can sign in: kdt-identity **1.1.0 or later**, which carries
+the authorization flow, and its chart's `webUrl` value set to the public address of kdt-web.
+
+```bash
+helm upgrade --install kdt-web deploy/helm/kdt-web -n kdt-web --create-namespace \
+    --set webUrl=https://kdt.example.com \
+    --set portalUrl=https://identity.example.com \
+    --set clusterName=<cluster name> \
+    --set ingress.enabled=true --set ingress.host=kdt.example.com
+```
+
+Image: `ghcr.io/agardenat/kdt-web:<version>`. The chart refuses what could not work — a plaintext
+`webUrl`, an ingress without TLS, a second replica — because the session cookie is `Secure` and
+sessions live in the process's memory.
+
+Design, split and trade-offs: [docs/kdt-web.md](docs/kdt-web.md).
+
 ## Development
 
 ```bash
-cargo build --release       # target/release/kdt
-packaging/build-deb.sh      # → dist/kdt_<version>_amd64.deb
-packaging/build-rpm.sh      # → dist/x86_64/kdt-<version>-1.x86_64.rpm
-packaging/build-all.sh      # both
+cargo build --release                 # target/release/kdt
+cargo build --release -p kdt-web      # the web server, the workspace's second binary
+packaging/build-deb.sh                # → dist/kdt_<version>_amd64.deb
+packaging/build-rpm.sh                # → dist/x86_64/kdt-<version>-1.x86_64.rpm
+packaging/build-all.sh                # both
 ```
+
+The repository is a workspace: the root package is `kdt`, the TUI, and `crates/web` is `kdt-web`,
+which reuses the domain modules instead of copying their rules. The packaging scripts build the TUI
+only; kdt-web ships as an image, whose recipe is the `Dockerfile` at the root, and its front-end
+lives in `web/` (React, Vite, TypeScript — `npm run build`).
 
 Release profile: `lto = thin`, `codegen-units = 1`, `panic = abort`, stripped symbols, `mimalloc`
 allocator. A static musl target is configured (`target/x86_64-unknown-linux-musl`) and is what the

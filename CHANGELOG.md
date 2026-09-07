@@ -8,14 +8,14 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
-## [2.0.0-alpha.1] — non publiée
+## [2.0.0-beta.1] — 2026-09-07
 
 Le dépôt porte désormais deux binaires : `kdt`, le TUI, inchangé, et `kdt-web`, une interface web
 qui parle au même métier. Le majeur marque cette refonte du dépôt, **pas une rupture d'usage** :
 rien de ce que fait le TUI ne change, et une mise à jour depuis la 1.26 ne retire rien.
 
-`alpha.1` dit l'état réel de `kdt-web` : le chemin d'authentification fonctionne, dix vues
-répondent, le reste n'existe pas.
+`beta.1` dit l'état réel de `kdt-web` : dix vues répondent, il se déploie par son image et son
+chart, et il tourne. Le reste n'existe pas.
 
 - **refactor** — kdt devient une bibliothèque en plus d'un binaire, sans qu'aucun fichier bouge.
   C'est ce qui permet à `kdt-web` de réutiliser les modules métier au lieu d'en copier les règles :
@@ -350,7 +350,7 @@ répondent, le reste n'existe pas.
 
 - **fix(ci)** — un tag de pré-version ne publiait pas ce qu'il annonçait : `action-gh-release` a
   `prerelease` à `false` par défaut, sans détection SemVer, et le job Homebrew n'avait aucune
-  condition — une `v2.0.0-alpha.1` aurait été marquée « dernière version » et poussée dans la
+  condition — une `v2.0.0-beta.1` aurait été marquée « dernière version » et poussée dans la
   formule du tap, basculant tout le monde sur une alpha.
 
 - **feat(web)** — kdt-web se déploie : une image `ghcr.io/agardenat/kdt-web` construite par le
@@ -366,6 +366,10 @@ répondent, le reste n'existe pas.
   la personne connectée. Il refuse ce qui ne pourrait pas fonctionner — un `webUrl` en clair ou
   terminé par un `/`, que le portail rejetterait au retour, et une seconde réplique, qui
   servirait une requête sur deux depuis un processus qui ne connaît pas le visiteur.
+
+- **docs** — le README, dans les deux langues, dit ce qu'est kdt-web : les dix vues, l'identité de
+  la personne connectée à chaque requête, les deux prérequis côté kdt-identity, et la commande
+  d'installation du chart. Le dépôt livrait un second binaire dont sa page d'accueil ne disait rien.
 
 - **fix(web)** — un lien profond répondait « page manquante » : `/events` servait bien
   l'interface, mais avec un code 404. Le navigateur affichait la page, et la supervision, les
