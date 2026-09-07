@@ -92,7 +92,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
-          # une v2.0.0-alpha.1 serait publiée comme la dernière version stable.
+          # une v2.0.0-beta.1 serait publiée comme la dernière version stable.
           prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: RELEASE_NOTES.md
           files: |
@@ -132,7 +132,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
-          # une v2.0.0-alpha.1 serait publiée comme la dernière version stable.
+          # une v2.0.0-beta.1 serait publiée comme la dernière version stable.
           prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: RELEASE_NOTES.md
           files: |

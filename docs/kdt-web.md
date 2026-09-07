@@ -321,25 +321,27 @@ la lecture du chart. Si le chart engendre une clé de signature de cookie à la 
 installation, le `lookup` Helm qui la relit ensuite fonctionne avec le helm-controller de Flux —
 le piège qui déconnecte tout le monde à chaque synchronisation ne se pose donc pas ici.
 
-**Version `2.0.0-alpha.1`**, une seule pour tout le workspace (`[workspace.package] version`),
+**Version `2.0.0-beta.1`**, une seule pour tout le workspace (`[workspace.package] version`),
 comme kdt-identity le fait pour ses trois crates : le dépôt n'a qu'un tag `v*` et qu'un CHANGELOG.
 Le major marque la refonte du dépôt et l'arrivée d'un second binaire, **pas une rupture d'usage du
-TUI** — à écrire explicitement dans le CHANGELOG. `alpha.1` dit que kdt-web n'est pas utilisable.
+TUI** — à écrire explicitement dans le CHANGELOG. La pré-version dit l'état de kdt-web : dix vues
+répondent et il se déploie, le reste n'existe pas.
 
-`packaging/common.sh` sait déjà épeler une pré-version : `2.0.0-alpha.1` devient `2.0.0~alpha.1`
-côté dpkg (le `~` trie sous tout, y compris la chaîne vide) et `Version: 2.0.0` +
-`Release: 0.alpha.1` côté rpm. Mais **taguer** une pré-version casserait deux choses :
+`packaging/common.sh` sait épeler une pré-version : `2.0.0-beta.1` devient `2.0.0~beta.1` côté
+dpkg (le `~` trie sous tout, y compris la chaîne vide) et `Version: 2.0.0` + `Release: 0.beta.1`
+côté rpm. **Taguer** une pré-version demandait deux corrections, faites toutes deux avant le
+premier tag :
 
 - `softprops/action-gh-release` a `prerelease` à `false` par défaut, sans détection SemVer : la
-  release serait publiée en « latest ». Ajouter `prerelease: ${{ contains(github.ref_name, '-') }}`
-  aux deux steps.
-- Le job `update-homebrew` n'a aucune condition : il écrirait `version "2.0.0-alpha.1"` dans la
-  formule du tap, et tout `brew upgrade kdt` basculerait sur l'alpha. Ajouter
+  release aurait été publiée en « latest ». Les deux steps portent désormais
+  `prerelease: ${{ contains(github.ref_name, '-') }}`.
+- Le job `update-homebrew` n'avait aucune condition : il aurait écrit la pré-version dans la
+  formule du tap, et tout `brew upgrade kdt` y aurait basculé. Il porte désormais
   `if: ${{ !contains(github.ref_name, '-') }}`.
 
-L'autre voie, celle déjà suivie pour `1.26.0-beta.1` : bumper `Cargo.toml` sans pousser de tag, et
-livrer la pré-version par `packaging/build-all.sh` en local. Rien à corriger dans la CI, et la
-pré-version se renomme en finale le jour venu, section du CHANGELOG comprise.
+L'autre voie reste ouverte, celle suivie pour `1.26.0-beta.1` : bumper `Cargo.toml` sans pousser de
+tag et livrer par `packaging/build-all.sh` en local. Une pré-version jamais taguée se renomme en
+finale le jour venu, section du CHANGELOG comprise ; une pré-version taguée, non.
 
 ## 9. Jalons
 
@@ -348,7 +350,7 @@ pré-version se renomme en finale le jour venu, section du CHANGELOG comprise.
    données factices. Aucun code métier, aucun backend.
 2. **Workspace et `kdt-core`** : aucun changement fonctionnel, validé par un build release musl et
    les 461 tests existants. Unifier `Hint` / `Severity` et dériver `Serialize` dans le même
-   mouvement. C'est là que la version passe à `2.0.0-alpha.1`.
+   mouvement. C'est là que la version est passée à `2.0.0-alpha.1`.
 3. **Flow d'autorisation** dans kdt-identity, et le lien optionnel depuis la page du portail.
 4. **kdt-web v0**, lecture seule : session, client kube par utilisateur, trois vues sans
    équivalent ailleurs — `diagnostic`, `flux`, `capacity` — branchées sur l'app blanche.
