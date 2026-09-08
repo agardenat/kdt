@@ -574,6 +574,51 @@ export interface Strings {
   stoMountedBy: string;
   stoBackend: string;
 
+  // --- Vue Nodes. Le jargon reste en anglais des deux côtés — node, cordon, drain, container,
+  // pod — et tout ce qui juge (alertes, constats de drain, constats de dimensionnement) est
+  // rédigé par le serveur. Ce qui suit est ce que le navigateur écrit lui-même.
+  ndEmpty: string;
+  ndInventory: string;
+  ndUsage: string;
+  ndUsageOf: string;
+  ndSelectNode: string;
+  ndActions: string;
+  ndCordon: string;
+  ndUncordon: string;
+  ndDrain: string;
+  ndDescCordon: string;
+  ndDescUncordon: string;
+  ndDescDrain: string;
+  ndSort: string;
+  ndSortMemReq: string;
+  ndSortCpuReq: string;
+  ndSortAlpha: string;
+  ndNoMetrics: string;
+  ndAlloc: string;
+  ndDiagnostic: string;
+  ndUser: string;
+  ndSystem: string;
+  ndTotal: string;
+  ndWaste: string;
+  ndSystemRow: string;
+  ndReadyShort: string;
+  ndDrainTitle: string;
+  ndDrainChecking: string;
+  ndDrainTarget: string;
+  ndDrainStays: string;
+  ndDrainStrictHelp: string;
+  ndDrainStrictPlaceholder: string;
+  ndDrainStrictMismatch: string;
+  ndDrainCancel: string;
+  ndDrainConfirm: string;
+  ndDrainReload: string;
+  ndDrainRunning: string;
+  ndDrainEvicted: string;
+  ndDrainWaiting: string;
+  ndDrainFailed: string;
+  ndDrainHelp: string;
+  ndScopeless: string;
+
   netpolEmpty: string;
   netpolCluster: string;
   netpolNoVerdict: string;
@@ -1195,6 +1240,51 @@ const FR: Strings = {
   stoMountedBy: "monté par",
   stoBackend: "backend",
 
+  ndEmpty: "Aucun node à montrer.",
+  ndInventory: "Nodes",
+  ndUsage: "Usage",
+  ndUsageOf: "usage de",
+  ndSelectNode: "Sélectionnez un node.",
+  ndActions: "Actions node",
+  ndCordon: "cordon",
+  ndUncordon: "uncordon",
+  ndDrain: "drain",
+  ndDescCordon: "Le scheduler ne place plus rien ici. Ce qui tourne déjà reste.",
+  ndDescUncordon: "Le node redevient éligible au scheduler.",
+  ndDescDrain:
+    "Cordonne le node puis évince ses pods. Les garde-fous disent d'abord ce que ça déplace.",
+  ndSort: "tri",
+  ndSortMemReq: "mem-req",
+  ndSortCpuReq: "cpu-req",
+  ndSortAlpha: "alpha",
+  ndNoMetrics:
+    "metrics-server ne répond pas : la réservation est connue, la consommation ne l'est pas.",
+  ndAlloc: "allocatable",
+  ndDiagnostic: "Diagnostic",
+  ndUser: "USER",
+  ndSystem: "SYS",
+  ndTotal: "TOTAL",
+  ndWaste: "réservé et jamais consommé",
+  ndSystemRow: "container de la plateforme",
+  ndReadyShort: "prêt",
+  ndDrainTitle: "Drain",
+  ndDrainChecking: "Vérification…",
+  ndDrainTarget: "Node à drainer",
+  ndDrainStays: "reste en place",
+  ndDrainStrictHelp: "Retapez le nom du node pour confirmer.",
+  ndDrainStrictPlaceholder: "nom du node",
+  ndDrainStrictMismatch: "Ce n'est pas {name}.",
+  ndDrainCancel: "Annuler",
+  ndDrainConfirm: "Drainer",
+  ndDrainReload: "Revérifier",
+  ndDrainRunning: "Éviction en cours…",
+  ndDrainEvicted: "évincés",
+  ndDrainWaiting: "retenus par un budget, réessayés",
+  ndDrainFailed: "en échec",
+  ndDrainHelp:
+    "Aucun constat ne bloque : ils disent ce qui va se passer, et de combien la confirmation coûte.",
+  ndScopeless: "Un node n'a pas de namespace : cette vue ignore la portée.",
+
   netpolEmpty: "Aucune policy dans cette portée.",
   netpolCluster: "(cluster)",
   netpolNoVerdict:
@@ -1808,6 +1898,50 @@ const EN: Strings = {
   stoNoClass: "(class missing)",
   stoMountedBy: "mounted by",
   stoBackend: "backend",
+
+  ndEmpty: "No node to show.",
+  ndInventory: "Nodes",
+  ndUsage: "Usage",
+  ndUsageOf: "usage of",
+  ndSelectNode: "Select a node.",
+  ndActions: "Node actions",
+  ndCordon: "cordon",
+  ndUncordon: "uncordon",
+  ndDrain: "drain",
+  ndDescCordon: "The scheduler places nothing here any more. What already runs stays.",
+  ndDescUncordon: "The node is eligible to the scheduler again.",
+  ndDescDrain:
+    "Cordons the node, then evicts its pods. The guard-rails first say what that moves.",
+  ndSort: "sort",
+  ndSortMemReq: "mem-req",
+  ndSortCpuReq: "cpu-req",
+  ndSortAlpha: "alpha",
+  ndNoMetrics: "metrics-server is not answering: reservation is known, consumption is not.",
+  ndAlloc: "allocatable",
+  ndDiagnostic: "Diagnosis",
+  ndUser: "USER",
+  ndSystem: "SYS",
+  ndTotal: "TOTAL",
+  ndWaste: "reserved and never used",
+  ndSystemRow: "platform container",
+  ndReadyShort: "ready",
+  ndDrainTitle: "Drain",
+  ndDrainChecking: "Checking…",
+  ndDrainTarget: "Node to drain",
+  ndDrainStays: "stay in place",
+  ndDrainStrictHelp: "Type the node name again to confirm.",
+  ndDrainStrictPlaceholder: "node name",
+  ndDrainStrictMismatch: "That is not {name}.",
+  ndDrainCancel: "Cancel",
+  ndDrainConfirm: "Drain",
+  ndDrainReload: "Check again",
+  ndDrainRunning: "Evicting…",
+  ndDrainEvicted: "evicted",
+  ndDrainWaiting: "held by a budget, being retried",
+  ndDrainFailed: "failed",
+  ndDrainHelp:
+    "No finding blocks anything: they say what is about to happen, and how much the confirmation costs.",
+  ndScopeless: "A node has no namespace: this view ignores the scope.",
 
   netpolEmpty: "No policy in this scope.",
   netpolCluster: "(cluster)",

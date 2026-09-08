@@ -589,10 +589,18 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Treize vues
-répondent — évènements, workloads, Flux, Velero, capacité, stockage, Secrets/ConfigMaps,
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Quatorze vues
+répondent — évènements, workloads, nodes, Flux, Velero, capacité, stockage, Secrets/ConfigMaps,
 certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les cinq gestes qui
 portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
+
+**La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge et
+les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
+quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…) et le cumul
+user / système / total. Les trois gestes du menu `o` y sont : cordon et uncordon passent tout de
+suite, le drain ouvre d'abord ses garde-fous — ce qui partirait, ce qui resterait, les budgets qui
+refuseront — puis s'exécute au fil de l'eau. Un constat grave y demande de retaper le nom du node,
+et le serveur rejoue les garde-fous juste avant d'évincer.
 
 **Chaque requête part avec le credential de la personne connectée** : l'apiserver voit son nom et
 ses groupes, et le RBAC du cluster s'applique tel quel. Le compte de service du pod n'a aucun droit

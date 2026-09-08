@@ -905,6 +905,10 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .detail .ok, .editor .ok { color: var(--ok); }
 .detail .warn, .editor .warn { color: var(--warn); }
 .detail .err, .editor .err { color: var(--err); }
+/* Le cinquième ton manquait, et il est celui d'un palier intermédiaire : une réservation à 60 %
+   n'est pas un avertissement, mais elle n'est pas non plus au repos. Sans cette règle elle se
+   peignait comme du texte ordinaire, donc comme une valeur calme. */
+.detail .info, .editor .info { color: var(--info); }
 
 /* Le groupe à trois états est dessiné pour la barre des vues, où il suit un onglet. Dans la barre
    d'un contenu du panneau, sa marge s'ajoute à l'espacement et le décale pour rien. */
@@ -1263,3 +1267,14 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
   padding: .35rem .9rem; border: 0; border-radius: 7px;
   background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; font-size: 12px;
 }
+
+/* ---------------------------------------------------------------- vue Nodes
+
+   Un container de la plateforme est en retrait : le tri le garde en dernier, et cette nuance dit
+   pourquoi. Ce n'est pas un verdict — un DaemonSet du CNI n'a rien d'anormal — donc c'est de la
+   nuance et non une couleur de la palette.
+
+   Seules les trois colonnes d'identité s'éteignent, jamais les quantités ni les constats : un
+   container de kube-system qui touche sa limite mémoire est exactement ce qu'on veut voir rouge. */
+.tbody .tr.nd-system .cell.mono,
+.tbody .tr.nd-system .cell.id { color: var(--dim); }

@@ -109,7 +109,7 @@ use crate::capacity::{
     NodeRoom, Qos as CapQos, QuotaPressure, SharedCapacity, WorkloadSizing,
 };
 use crate::exec;
-use crate::nodeops::{self, new_node_op_state, Reason as NodeReason, SharedNodeOp};
+use crate::nodeops::{self, new_node_op_state, SharedNodeOp};
 use crate::yaml::{fetch_yaml, new_yaml_state, SharedYaml};
 
 // The `y` overlay: the YAML of the object selected in whichever view was on screen. Only the
@@ -899,8 +899,9 @@ use crate::events::{is_critical_reason,
     fetch_nodes, fetch_status, fetch_workload_logs, format_cpu_milli, format_memory_bytes,
     new_cluster_info_state,
     new_log_state, new_node_list_state, new_node_usage_state, new_ns_list_state, spawn_watcher,
-    EventRecord, LineColor, LogOpts, NodeSummary, Severity, SharedBuffer, SharedClusterInfo,
-    SharedLog, SharedNodeList, SharedNodeUsage, SharedNsList, SharedStatus,
+    sort_usage_rows, usage_totals, EventRecord, LineColor, LogOpts, NodeSummary, NodeUsageSort,
+    Severity, SharedBuffer, SharedClusterInfo, SharedLog, SharedNodeList, SharedNodeUsage,
+    SharedNsList, SharedStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1413,26 +1414,6 @@ fn ns_arg_to_opt(arg: &str) -> Option<String> {
         None
     } else {
         Some(a.to_string())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeUsageSort { MemReq, CpuReq, Alpha }
-
-impl NodeUsageSort {
-    fn next(self) -> Self {
-        match self {
-            NodeUsageSort::MemReq => NodeUsageSort::CpuReq,
-            NodeUsageSort::CpuReq => NodeUsageSort::Alpha,
-            NodeUsageSort::Alpha => NodeUsageSort::MemReq,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            NodeUsageSort::MemReq => "mem-req↓",
-            NodeUsageSort::CpuReq => "cpu-req↓",
-            NodeUsageSort::Alpha => "alpha",
-        }
     }
 }
 
@@ -11822,33 +11803,9 @@ impl App {
         })
     }
 
+    // La rédaction vit dans `events` : kdt-web ouvre le même panneau sur le même Node.
     fn synthetic_node_record(&self) -> Option<EventRecord> {
-        let n = self.selected_node()?;
-        let abnormal = if n.abnormal.is_empty() {
-            lang::t(self.ai_language).msg_no_abnormal_condition.to_string()
-        } else {
-            lang::fill(
-                lang::t(self.ai_language).msg_abnormal_conditions,
-                &[("list", &n.abnormal.join(", "))],
-            )
-        };
-        Some(EventRecord {
-            uid: format!("node-{}", n.name),
-            time: k8s_openapi::jiff::Timestamp::now(),
-            severity: if n.abnormal.is_empty() && n.schedulable && n.ready == "True" { Severity::Normal } else { Severity::Warning },
-            reason: "NodeStatus".to_string(),
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: String::new(),
-            name: n.name.clone(),
-            message: format!(
-                "Node ready={} schedulable={} version={}; {}",
-                n.ready, n.schedulable, n.version, abnormal,
-            ),
-            component: String::new(),
-            host: n.name.clone(),
-            count: 1,
-        })
+        Some(self.selected_node()?.record(lang::t(self.ai_language)))
     }
 
     // Apply the namespace picked in the selector: restart the event watcher scoped to it
@@ -14938,34 +14895,6 @@ fn draw_repair_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 // The localised sentence for one drain guard-rail. The pod lists are the point of most of these —
 // "some pods have no controller" is not actionable, "these three do" is — so they are spelled out,
 // capped at what fits without turning the panel into a listing.
-fn drain_reason_text(st: &lang::Strings, reason: &NodeReason) -> String {
-    let joined = |pods: &[String]| -> String {
-        const MAX: usize = 4;
-        if pods.len() <= MAX {
-            return pods.join(", ");
-        }
-        format!("{}, +{}", pods[..MAX].join(", "), pods.len() - MAX)
-    };
-    match reason {
-        NodeReason::Unmanaged { pods } => st.dr_unmanaged.replace("{d}", &joined(pods)),
-        NodeReason::PdbBlocked { pdbs } => st.dr_pdb_blocked.replace("{d}", &joined(pdbs)),
-        NodeReason::OnlySchedulable => st.dr_only_schedulable.to_string(),
-        NodeReason::PdbTight { pdbs } => st.dr_pdb_tight.replace("{d}", &joined(pdbs)),
-        NodeReason::NoRoom { cpu_short, mem_short } => match (cpu_short, mem_short) {
-            (true, true) => st.dr_no_room_both.to_string(),
-            (true, false) => st.dr_no_room_cpu.to_string(),
-            _ => st.dr_no_room_mem.to_string(),
-        },
-        NodeReason::PodTooBig { pods } => st.dr_pod_too_big.replace("{d}", &joined(pods)),
-        NodeReason::LocalStorage { pods } => st.dr_local_storage.replace("{d}", &joined(pods)),
-        NodeReason::StaticPods { pods } => st.dr_static_pods.replace("{d}", &joined(pods)),
-        NodeReason::ControlPlane => st.dr_control_plane.to_string(),
-        NodeReason::AlreadyCordoned => st.dr_already_cordoned.to_string(),
-        NodeReason::NotReady => st.dr_not_ready.to_string(),
-        NodeReason::DaemonSetPods { count } => st.plural(*count, st.dr_daemonsets_one, st.dr_daemonsets_many),
-    }
-}
-
 // Drain panel: the node, what the guard-rails found, how many pods are about to move, and the
 // confirmation matching the severity — then the same panel turns into the progress report, because
 // an eviction that a budget holds back is exactly what one stays to watch.
@@ -15020,7 +14949,7 @@ fn draw_node_op_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(marker, Style::default().fg(color)),
-                    Span::styled(drain_reason_text(st, r), Style::default().fg(color)),
+                    Span::styled(r.text(st), Style::default().fg(color)),
                 ]));
             }
         }
@@ -16408,56 +16337,23 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let mut excessive_lim = 0usize;
         let mut at_limit = 0usize;
 
-        let mut sorted_rows: Vec<&crate::events::PodUsageRow> = rows.iter().collect();
-        match app.node_usage_sort {
-            NodeUsageSort::MemReq => sorted_rows.sort_by(|a, b| {
-                a.is_system.cmp(&b.is_system)
-                    .then(b.mem_req.unwrap_or(-1).cmp(&a.mem_req.unwrap_or(-1)))
-                    .then(a.namespace.cmp(&b.namespace))
-                    .then(a.pod.cmp(&b.pod))
-                    .then(a.container.cmp(&b.container))
-            }),
-            NodeUsageSort::CpuReq => sorted_rows.sort_by(|a, b| {
-                a.is_system.cmp(&b.is_system)
-                    .then(b.cpu_req.unwrap_or(-1).cmp(&a.cpu_req.unwrap_or(-1)))
-                    .then(a.namespace.cmp(&b.namespace))
-                    .then(a.pod.cmp(&b.pod))
-                    .then(a.container.cmp(&b.container))
-            }),
-            NodeUsageSort::Alpha => sorted_rows.sort_by(|a, b| {
-                a.is_system.cmp(&b.is_system)
-                    .then(a.namespace.cmp(&b.namespace))
-                    .then(a.pod.cmp(&b.pod))
-                    .then(a.container.cmp(&b.container))
-            }),
-        }
+        let mut sorted_rows: Vec<crate::events::PodUsageRow> = rows.clone();
+        sort_usage_rows(&mut sorted_rows, app.node_usage_sort);
 
-        let body_rows: Vec<Row> = sorted_rows.iter().skip(app.node_usage_scroll).map(|&r| {
-            let cpu_at_limit = matches!((r.cpu_use, r.cpu_lim), (Some(u), Some(l)) if l > 0 && u >= l);
-            let mem_at_limit = matches!((r.mem_use, r.mem_lim), (Some(u), Some(l)) if l > 0 && u >= l);
-            if cpu_at_limit || mem_at_limit { at_limit += 1; }
+        let body_rows: Vec<Row> = sorted_rows.iter().skip(app.node_usage_scroll).map(|r| {
+            // Les constats sont ceux de `PodUsageRow` — kdt-web nomme les mêmes containers — et
+            // il ne reste ici que le choix des couleurs.
+            let issues = r.issues();
+            let has = |i: crate::events::UsageIssue| issues.contains(&i);
+            use crate::events::UsageIssue as UI;
+            if has(UI::CpuAtLimit) || has(UI::MemAtLimit) { at_limit += 1; }
+            if has(UI::CpuOversized) || has(UI::CpuFarOversized)
+                || has(UI::MemOversized) || has(UI::MemFarOversized) { over_req += 1; }
+            if has(UI::NoCpuRequest) || has(UI::NoMemRequest) { missing_req += 1; }
+            if has(UI::CpuLimitExcessive) || has(UI::MemLimitExcessive) { excessive_lim += 1; }
 
-            let cpu_use_color = if let (Some(u), Some(l)) = (r.cpu_use, r.cpu_lim) {
-                if l > 0 && u >= l { Color::Red }
-                else if l > 0 && u * 100 / l >= 80 { Color::Yellow }
-                else { Color::Green }
-            } else { Color::Gray };
-            let mem_use_color = if let (Some(u), Some(l)) = (r.mem_use, r.mem_lim) {
-                if l > 0 && u >= l { Color::Red }
-                else if l > 0 && u * 100 / l >= 80 { Color::Yellow }
-                else { Color::Green }
-            } else { Color::Gray };
-
-            let cpu_req_under_used = matches!((r.cpu_req, r.cpu_use), (Some(req), Some(use_)) if req > 0 && use_ * 100 / req < 30);
-            let mem_req_under_used = matches!((r.mem_req, r.mem_use), (Some(req), Some(use_)) if req > 0 && use_ * 100 / req < 30);
-            let cpu_extreme = matches!((r.cpu_req, r.cpu_use), (Some(req), Some(use_)) if req > 0 && use_ * 100 / req < 5);
-            let mem_extreme = matches!((r.mem_req, r.mem_use), (Some(req), Some(use_)) if req > 0 && use_ * 100 / req < 5);
-            if cpu_req_under_used || mem_req_under_used { over_req += 1; }
-            if r.cpu_req.is_none() || r.mem_req.is_none() { missing_req += 1; }
-
-            let cpu_lim_excessive = matches!((r.cpu_lim, r.cpu_req), (Some(lim), Some(req)) if req > 0 && lim > req * 4);
-            let mem_lim_excessive = matches!((r.mem_lim, r.mem_req), (Some(lim), Some(req)) if req > 0 && lim > req * 4);
-            if cpu_lim_excessive || mem_lim_excessive { excessive_lim += 1; }
+            let cpu_use_color = line_color(r.cpu_use_tone());
+            let mem_use_color = line_color(r.mem_use_tone());
 
             let cpu_req_bg = incidence_bg(r.cpu_req, alloc_cpu);
             let cpu_lim_bg = incidence_bg(r.cpu_lim, alloc_cpu);
@@ -16480,32 +16376,12 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let cpu_lim_style = if r.cpu_lim.is_none() { Style::default().fg(DIM) } else { apply_bg(cpu_lim_bg, false) };
             let mem_lim_style = apply_bg(mem_lim_bg, r.mem_lim.is_none());
 
-            let mut issues: Vec<&str> = Vec::new();
-            if r.cpu_req.is_none() { issues.push("noCpuReq"); }
-            if r.mem_req.is_none() { issues.push("noMemReq"); }
-            if r.mem_lim.is_none() { issues.push("noMemLim"); }
-            if cpu_extreme { issues.push("cpuOver!!"); }
-            else if cpu_req_under_used { issues.push("cpuOver"); }
-            if mem_extreme { issues.push("memOver!!"); }
-            else if mem_req_under_used { issues.push("memOver"); }
-            if cpu_lim_excessive { issues.push("cpuLim»"); }
-            if mem_lim_excessive { issues.push("memLim»"); }
-            if cpu_at_limit { issues.push("cpuMax"); }
-            if mem_at_limit { issues.push("OOMrisk"); }
-            let issues_text = issues.join(",");
-            let issues_color = if issues.iter().any(|s| matches!(*s, "OOMrisk" | "cpuMax" | "noMemReq" | "noCpuReq" | "noMemLim")) {
-                Color::Red
-            } else if !issues.is_empty() {
-                Color::Yellow
-            } else {
-                DIM
-            };
+            let issues_text = issues.iter().map(|i| i.tag()).collect::<Vec<_>>().join(",");
+            let issues_color = line_color(r.issues_tone());
 
             let ready_label = if r.ready { "Y" } else { "N" };
             let ready_color = if r.ready { Color::Green } else { Color::Red };
-            let restart_color = if r.restarts >= 5 { Color::Red } else if r.restarts >= 1 { Color::Yellow } else { DIM };
-
-            let _ = (cpu_req_under_used, mem_req_under_used, cpu_extreme, mem_extreme, cpu_lim_excessive, mem_lim_excessive);
+            let restart_color = line_color(r.restarts_tone());
 
             let ns_prefix = if r.is_system { "·" } else { " " };
             let ns_color = if r.is_system { SYS_DIM } else { DIM };
@@ -16601,28 +16477,18 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc_mem: i64) -> Vec<Line<'static>> {
     use crate::events::{format_cpu_milli, format_memory_bytes};
     let st = lang::active();
-    let (mut u_cr, mut u_cl, mut u_cu) = (0_i64, 0_i64, 0_i64);
-    let (mut u_mr, mut u_ml, mut u_mu) = (0_i64, 0_i64, 0_i64);
-    let (mut s_cr, mut s_cl, mut s_cu) = (0_i64, 0_i64, 0_i64);
-    let (mut s_mr, mut s_ml, mut s_mu) = (0_i64, 0_i64, 0_i64);
-    let (mut un, mut sn) = (0usize, 0usize);
-    for r in rows {
-        if r.is_system {
-            sn += 1;
-            s_cr += r.cpu_req.unwrap_or(0); s_cl += r.cpu_lim.unwrap_or(0); s_cu += r.cpu_use.unwrap_or(0);
-            s_mr += r.mem_req.unwrap_or(0); s_ml += r.mem_lim.unwrap_or(0); s_mu += r.mem_use.unwrap_or(0);
-        } else {
-            un += 1;
-            u_cr += r.cpu_req.unwrap_or(0); u_cl += r.cpu_lim.unwrap_or(0); u_cu += r.cpu_use.unwrap_or(0);
-            u_mr += r.mem_req.unwrap_or(0); u_ml += r.mem_lim.unwrap_or(0); u_mu += r.mem_use.unwrap_or(0);
-        }
-    }
-    let t_cr = u_cr + s_cr; let t_cl = u_cl + s_cl; let t_cu = u_cu + s_cu;
-    let t_mr = u_mr + s_mr; let t_ml = u_ml + s_ml; let t_mu = u_mu + s_mu;
-    let cpu_waste = (t_cr - t_cu).max(0);
-    let mem_waste = (t_mr - t_mu).max(0);
-    let waste_cpu_pct = if t_cr > 0 { cpu_waste * 100 / t_cr } else { 0 };
-    let waste_mem_pct = if t_mr > 0 { mem_waste * 100 / t_mr } else { 0 };
+    // Les cumuls sont une règle — la séparation user/système en est le cœur — et vivent dans
+    // `events`, où kdt-web les lit aussi. Il ne reste ici que la mise en forme.
+    let t = usage_totals(rows);
+    let (un, sn) = (t.user.count, t.system.count);
+    let (u_cr, u_cl, u_cu) = (t.user.cpu_req, t.user.cpu_lim, t.user.cpu_use);
+    let (u_mr, u_ml, u_mu) = (t.user.mem_req, t.user.mem_lim, t.user.mem_use);
+    let (s_cr, s_cl, s_cu) = (t.system.cpu_req, t.system.cpu_lim, t.system.cpu_use);
+    let (s_mr, s_ml, s_mu) = (t.system.mem_req, t.system.mem_lim, t.system.mem_use);
+    let (t_cr, t_cl, t_cu) = (t.total.cpu_req, t.total.cpu_lim, t.total.cpu_use);
+    let (t_mr, t_ml, t_mu) = (t.total.mem_req, t.total.mem_lim, t.total.mem_use);
+    let (cpu_waste, mem_waste) = (t.cpu_waste, t.mem_waste);
+    let (waste_cpu_pct, waste_mem_pct) = (t.cpu_waste_pct, t.mem_waste_pct);
 
     let label = |s: &'static str, color: Color| Span::styled(s, Style::default().fg(color).add_modifier(Modifier::BOLD));
     let val   = |s: String, color: Color| Span::styled(s, Style::default().fg(color));
@@ -17079,19 +16945,17 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = nodes.iter().map(|n| {
-        let ready_color = if n.ready == "True" { Color::Green } else { Color::Red };
-        let row_style = if !n.schedulable || !n.abnormal.is_empty() {
+        let ready_color = line_color(n.ready_tone());
+        // Les règles sont dans `NodeSummary` — ce qui compte pour une alerte, ce qui rend une ligne
+        // rouge — et kdt-web peint les mêmes. Ici on ne fait que la peinture.
+        let row_style = if !n.alerts().is_empty() {
             Style::default().fg(Color::White).bg(Color::Rgb(40, 0, 0))
         } else if n.ready != "True" {
             Style::default().fg(Color::Red)
         } else {
             Style::default()
         };
-        let alerts = {
-            let mut a = n.abnormal.clone();
-            if !n.schedulable { a.insert(0, "Cordoned".into()); }
-            if a.is_empty() { String::new() } else { a.join(",") }
-        };
+        let alerts = n.alerts().join(",");
         let alert_color = if alerts.is_empty() { DIM } else { Color::Red };
         Row::new(vec![
             Cell::from(n.name.clone()),

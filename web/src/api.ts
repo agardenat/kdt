@@ -33,6 +33,12 @@ import type {
   KyFilter,
   KyvernoPayload,
   NetpolPayload,
+  NodesPayload,
+  NodeUsagePayload,
+  NodeUsageSort,
+  DrainPreflight,
+  DrainProgress,
+  DrainDone,
   StoragePayload,
   RbacOrient,
   RbacPayload,
@@ -638,12 +644,28 @@ export function aiConfig(): Promise<AiConfigPayload> {
  * Les évènements : `meta` (fournisseur, modèle), `stage` (ce que le serveur est en train de
  * rassembler), `delta` (un morceau de la réponse), `error`, `done`.
  */
-export async function aiAnalyze(
+export function aiAnalyze(
   body: { record: EventRecord; provider: AiProviderChoice; lang: Lang },
   on: (event: { type: string; data: Record<string, string> }) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch("/api/v1/ai/analyze", {
+  return postStream("/api/v1/ai/analyze", body, on, signal);
+}
+
+/**
+ * Une réponse en flux, postée : le découpage SSE, une fois pour toutes.
+ *
+ * Deux appels s'en servent — l'analyse par l'IA et le drain d'un node — et ils ont la même forme
+ * pour la même raison : la cible se poste, la réponse arrive par morceaux, et l'attente est trop
+ * longue pour une seule réponse à la fin.
+ */
+async function postStream<T>(
+  path: string,
+  body: unknown,
+  on: (event: { type: string; data: T }) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch(path, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "text/event-stream" },
     credentials: "same-origin",
@@ -686,8 +708,68 @@ export async function aiAnalyze(
         else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
       }
       // Le battement de service est une trame sans donnée : elle ne dit rien, elle maintient.
-      if (data.length) on({ type: name, data: JSON.parse(data.join("\n")) });
+      if (data.length) on({ type: name, data: JSON.parse(data.join("\n")) as T });
       cut = buffer.indexOf("\n\n");
     }
   }
+}
+
+/* ------------------------------------------------------------------------ vue Nodes */
+
+/** Les nodes du cluster. Aucune portée : un node n'a pas de namespace. */
+export function nodes(lang: Lang): Promise<NodesPayload> {
+  return get<NodesPayload>(`/api/v1/nodes?lang=${lang}`);
+}
+
+/**
+ * L'usage par container d'un node — le `u` du TUI.
+ *
+ * Le tri part au serveur parce que c'en est un de kdt : les containers de la plateforme restent en
+ * dernier dans les trois ordres, et le rejouer ici finirait par ne pas donner la même table.
+ */
+export function nodeUsage(
+  node: string,
+  sort: NodeUsageSort,
+  lang: Lang,
+): Promise<NodeUsagePayload> {
+  const params = new URLSearchParams({ node, sort, lang });
+  return get<NodeUsagePayload>(`/api/v1/nodes/usage?${params.toString()}`);
+}
+
+/** Ce que les garde-fous trouvent avant un drain. Rien n'est évincé ici. */
+export function nodeDrainPreflight(node: string, lang: Lang): Promise<DrainPreflight> {
+  const params = new URLSearchParams({ node, lang });
+  return get<DrainPreflight>(`/api/v1/nodes/drain-preflight?${params.toString()}`);
+}
+
+/**
+ * Cordonne le node, ou le rend au scheduler.
+ *
+ * Un node déjà dans l'état demandé est répondu **sans écriture**, et c'est le serveur qui le
+ * constate en relisant le node — pas cette page, qui affiche ce qu'elle avait lu il y a dix
+ * secondes.
+ */
+export function nodeCordon(
+  node: string,
+  unschedulable: boolean,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/nodes/cordon", { node, unschedulable, lang });
+}
+
+/**
+ * Le drain, lu au fil de l'eau.
+ *
+ * Chaque pod qu'un budget retient est réessayé vingt-quatre fois à cinq secondes d'intervalle :
+ * l'appel dure, et le flux porte pendant ce temps ce que le panneau du TUI affiche — évincés,
+ * retenus, en échec. `confirm` est le nom retapé, revérifié côté serveur.
+ *
+ * Les évènements : `progress` puis `done`.
+ */
+export function nodeDrain(
+  body: { node: string; confirm: string; lang: Lang },
+  on: (event: { type: string; data: DrainProgress & DrainDone }) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  return postStream("/api/v1/nodes/drain", body, on, signal);
 }

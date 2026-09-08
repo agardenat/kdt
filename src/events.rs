@@ -1236,7 +1236,9 @@ pub fn format_age(t: &Timestamp) -> String {
     else { format!("{}d", secs / 86400) }
 }
 
-#[derive(Debug, Clone)]
+// `Serialize` : kdt-web affiche la même ligne que le TUI, avec les mêmes verdicts, plutôt que de
+// rejuger un node à partir de son manifeste.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeSummary {
     pub name: String,
     pub ready: String,
@@ -1245,6 +1247,75 @@ pub struct NodeSummary {
     pub version: String,
     pub schedulable: bool,
     pub abnormal: Vec<String>,
+}
+
+impl NodeSummary {
+    pub fn uid(&self) -> String {
+        format!("node-{}", self.name)
+    }
+
+    /// Ce que la colonne ALERTS montre : les conditions anormales, précédées de la mise hors
+    /// service quand elle a été posée.
+    ///
+    /// `Cordoned` passe en tête parce que c'est la seule de la liste qui soit un geste et non un
+    /// symptôme — celle qu'on cherche quand on se demande pourquoi rien ne se planifie ici.
+    pub fn alerts(&self) -> Vec<String> {
+        let mut out = self.abnormal.clone();
+        if !self.schedulable {
+            out.insert(0, "Cordoned".to_string());
+        }
+        out
+    }
+
+    /// Le ton de la cellule READY : la condition `Ready` du node, et rien d'autre.
+    pub fn ready_tone(&self) -> LineColor {
+        if self.ready == "True" {
+            LineColor::Ok
+        } else {
+            LineColor::Err
+        }
+    }
+
+    /// Le ton de la ligne. Un node cordonné le porte au même titre qu'une condition anormale :
+    /// c'est ce que peint le TUI, et pour la même raison — dans les deux cas ce node ne prend plus
+    /// ce qu'on croit qu'il prend.
+    pub fn tone(&self) -> LineColor {
+        if self.alerts().is_empty() && self.ready == "True" {
+            LineColor::Ok
+        } else {
+            LineColor::Err
+        }
+    }
+
+    /// L'enregistrement synthétique de la ligne : c'est lui qui donne à la vue `y`, `e`, `h`,
+    /// `Ctrl-D`, l'onglet Related et l'analyse IA, sur le Node lui-même.
+    pub fn record(&self, st: &crate::lang::Strings) -> EventRecord {
+        let abnormal = if self.abnormal.is_empty() {
+            st.msg_no_abnormal_condition.to_string()
+        } else {
+            fill(st.msg_abnormal_conditions, &[("list", &self.abnormal.join(", "))])
+        };
+        EventRecord {
+            uid: self.uid(),
+            time: Timestamp::now(),
+            severity: match self.tone() {
+                LineColor::Ok => Severity::Normal,
+                _ => Severity::Warning,
+            },
+            reason: "NodeStatus".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: String::new(),
+            name: self.name.clone(),
+            message: format!(
+                "Node ready={} schedulable={} version={}; {}",
+                self.ready, self.schedulable, self.version, abnormal,
+            ),
+            component: String::new(),
+            host: self.name.clone(),
+            count: 1,
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1260,17 +1331,26 @@ pub fn new_node_list_state() -> SharedNodeList {
     Arc::new(Mutex::new(NodeListState::default()))
 }
 
+/// L'inventaire des nodes, rendu plutôt que déposé dans un `Mutex`.
+///
+/// Le TUI redessine un état à chaque tick ; un appelant HTTP veut la réponse. Les deux passent par
+/// ici, donc une règle ajoutée à `node_summary` vaut pour les deux d'un coup.
+pub async fn nodes_inventory(client: &Client) -> Result<Vec<NodeSummary>, String> {
+    let api: Api<Node> = Api::all(client.clone());
+    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
+    let mut nodes: Vec<NodeSummary> = list.items.iter().map(node_summary).collect();
+    nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(nodes)
+}
+
 pub async fn fetch_nodes(client: Client, state: SharedNodeList) {
     {
         let mut s = state.lock().expect("node list poisoned");
         s.loading = true;
         s.error = None;
     }
-    let api: Api<Node> = Api::all(client);
-    match api.list(&ListParams::default()).await {
-        Ok(list) => {
-            let mut nodes: Vec<NodeSummary> = list.items.iter().map(node_summary).collect();
-            nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    match nodes_inventory(&client).await {
+        Ok(nodes) => {
             let mut s = state.lock().expect("node list poisoned");
             s.loading = false;
             s.nodes = nodes;
@@ -1278,7 +1358,7 @@ pub async fn fetch_nodes(client: Client, state: SharedNodeList) {
         Err(e) => {
             let mut s = state.lock().expect("node list poisoned");
             s.loading = false;
-            s.error = Some(e.to_string());
+            s.error = Some(e);
         }
     }
 }
@@ -1499,7 +1579,7 @@ pub fn format_memory_bytes(b: i64) -> String {
     else { format!("{}", b) }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PodUsageRow {
     pub namespace: String,
     pub pod: String,
@@ -1510,10 +1590,297 @@ pub struct PodUsageRow {
     pub mem_req: Option<i64>,
     pub mem_lim: Option<i64>,
     pub mem_use: Option<i64>,
+    #[serde(skip)]
     pub _phase: String, // captured for completeness; currently not displayed (underscore-prefixed)
     pub ready: bool,
     pub restarts: i32,
     pub is_system: bool,
+}
+
+/// Ce qu'un container a de discutable dans son dimensionnement, comme donnée.
+///
+/// C'est la colonne `ISSUES` de la vue usage du TUI, descendue ici : chaque entrée est un jugement
+/// sur le container — pas de requête déclarée, dix fois trop réservé, une limite qu'il touche — et
+/// deux interfaces qui le recalculeraient finiraient par ne pas nommer les mêmes containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageIssue {
+    /// Aucune requête CPU : le scheduler ne voit pas ce container quand il empile.
+    NoCpuRequest,
+    /// Aucune requête mémoire : idem, et c'est le premier tué sous pression.
+    NoMemRequest,
+    /// Aucune limite mémoire : rien n'arrête une fuite avant le node entier.
+    NoMemLimit,
+    /// Moins de 5 % de sa requête CPU consommés.
+    CpuFarOversized,
+    /// Moins de 30 % de sa requête CPU consommés.
+    CpuOversized,
+    MemFarOversized,
+    MemOversized,
+    /// Une limite plus de quatre fois la requête : la classe de QoS ne veut plus dire grand-chose.
+    CpuLimitExcessive,
+    MemLimitExcessive,
+    /// Consommation au niveau de la limite : throttlé (CPU) ou sur le point d'être tué (mémoire).
+    CpuAtLimit,
+    MemAtLimit,
+}
+
+impl UsageIssue {
+    /// L'étiquette courte de la colonne, la même dans les deux interfaces. Ce sont des mots-clés
+    /// de dimensionnement, pas des phrases : ils ne se traduisent pas plus que `OOMKilled`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            UsageIssue::NoCpuRequest => "noCpuReq",
+            UsageIssue::NoMemRequest => "noMemReq",
+            UsageIssue::NoMemLimit => "noMemLim",
+            UsageIssue::CpuFarOversized => "cpuOver!!",
+            UsageIssue::CpuOversized => "cpuOver",
+            UsageIssue::MemFarOversized => "memOver!!",
+            UsageIssue::MemOversized => "memOver",
+            UsageIssue::CpuLimitExcessive => "cpuLim»",
+            UsageIssue::MemLimitExcessive => "memLim»",
+            UsageIssue::CpuAtLimit => "cpuMax",
+            UsageIssue::MemAtLimit => "OOMrisk",
+        }
+    }
+
+    /// Celles qui peignent la ligne en rouge : ce qui coûte déjà, contre ce qui gâche.
+    pub fn severe(self) -> bool {
+        matches!(
+            self,
+            UsageIssue::NoCpuRequest
+                | UsageIssue::NoMemRequest
+                | UsageIssue::NoMemLimit
+                | UsageIssue::CpuAtLimit
+                | UsageIssue::MemAtLimit
+        )
+    }
+}
+
+// Une consommation qui touche sa limite. `l > 0` parce qu'une limite nulle n'est pas une limite.
+fn at_limit(use_: Option<i64>, lim: Option<i64>) -> bool {
+    matches!((use_, lim), (Some(u), Some(l)) if l > 0 && u >= l)
+}
+
+// Une réservation dont moins de `ratio` % sert réellement. Sans mesure, on ne dit rien : une
+// requête qu'on ne peut pas comparer n'est ni juste ni excessive.
+fn under_used(req: Option<i64>, use_: Option<i64>, ratio: i64) -> bool {
+    matches!((req, use_), (Some(r), Some(u)) if r > 0 && u * 100 / r < ratio)
+}
+
+fn limit_excessive(lim: Option<i64>, req: Option<i64>) -> bool {
+    matches!((lim, req), (Some(l), Some(r)) if r > 0 && l > r * 4)
+}
+
+impl PodUsageRow {
+    pub fn uid(&self) -> String {
+        format!("usage|{}|{}|{}", self.namespace, self.pod, self.container)
+    }
+
+    /// Les constats de dimensionnement de ce container, dans l'ordre où le TUI les écrit.
+    pub fn issues(&self) -> Vec<UsageIssue> {
+        let mut out = Vec::new();
+        if self.cpu_req.is_none() {
+            out.push(UsageIssue::NoCpuRequest);
+        }
+        if self.mem_req.is_none() {
+            out.push(UsageIssue::NoMemRequest);
+        }
+        if self.mem_lim.is_none() {
+            out.push(UsageIssue::NoMemLimit);
+        }
+        // Le pire des deux seulement : « dix fois trop » n'est pas un second constat par-dessus
+        // « trop », c'est le même en plus grave.
+        if under_used(self.cpu_req, self.cpu_use, 5) {
+            out.push(UsageIssue::CpuFarOversized);
+        } else if under_used(self.cpu_req, self.cpu_use, 30) {
+            out.push(UsageIssue::CpuOversized);
+        }
+        if under_used(self.mem_req, self.mem_use, 5) {
+            out.push(UsageIssue::MemFarOversized);
+        } else if under_used(self.mem_req, self.mem_use, 30) {
+            out.push(UsageIssue::MemOversized);
+        }
+        if limit_excessive(self.cpu_lim, self.cpu_req) {
+            out.push(UsageIssue::CpuLimitExcessive);
+        }
+        if limit_excessive(self.mem_lim, self.mem_req) {
+            out.push(UsageIssue::MemLimitExcessive);
+        }
+        if at_limit(self.cpu_use, self.cpu_lim) {
+            out.push(UsageIssue::CpuAtLimit);
+        }
+        if at_limit(self.mem_use, self.mem_lim) {
+            out.push(UsageIssue::MemAtLimit);
+        }
+        out
+    }
+
+    /// Le ton de la colonne `ISSUES` : rouge dès qu'un constat coûte déjà, jaune quand il ne fait
+    /// que gâcher, éteint quand il n'y a rien à dire.
+    pub fn issues_tone(&self) -> LineColor {
+        let issues = self.issues();
+        if issues.iter().any(|i| i.severe()) {
+            LineColor::Err
+        } else if issues.is_empty() {
+            LineColor::Dim
+        } else {
+            LineColor::Warn
+        }
+    }
+
+    /// Le ton d'une consommation face à sa limite : rouge à la limite, jaune à 80 %, vert sinon,
+    /// et éteint quand il n'y a rien à comparer.
+    pub fn use_tone(use_: Option<i64>, lim: Option<i64>) -> LineColor {
+        match (use_, lim) {
+            (Some(u), Some(l)) if l > 0 && u >= l => LineColor::Err,
+            (Some(u), Some(l)) if l > 0 && u * 100 / l >= 80 => LineColor::Warn,
+            (Some(_), Some(_)) => LineColor::Ok,
+            _ => LineColor::Dim,
+        }
+    }
+
+    pub fn cpu_use_tone(&self) -> LineColor {
+        Self::use_tone(self.cpu_use, self.cpu_lim)
+    }
+
+    pub fn mem_use_tone(&self) -> LineColor {
+        Self::use_tone(self.mem_use, self.mem_lim)
+    }
+
+    /// Le ton de la colonne des redémarrages, comme partout ailleurs dans kdt.
+    pub fn restarts_tone(&self) -> LineColor {
+        if self.restarts >= 5 {
+            LineColor::Err
+        } else if self.restarts >= 1 {
+            LineColor::Warn
+        } else {
+            LineColor::Dim
+        }
+    }
+}
+
+/// L'ordre de la table d'usage d'un node.
+///
+/// Une règle et non un goût : les trois tris gardent les containers système **en dernier**, parce
+/// que ce qu'on cherche en ouvrant cette vue est ce que le cluster héberge, pas ce qu'il est.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeUsageSort {
+    MemReq,
+    CpuReq,
+    Alpha,
+}
+
+impl NodeUsageSort {
+    pub fn next(self) -> Self {
+        match self {
+            NodeUsageSort::MemReq => NodeUsageSort::CpuReq,
+            NodeUsageSort::CpuReq => NodeUsageSort::Alpha,
+            NodeUsageSort::Alpha => NodeUsageSort::MemReq,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeUsageSort::MemReq => "mem-req↓",
+            NodeUsageSort::CpuReq => "cpu-req↓",
+            NodeUsageSort::Alpha => "alpha",
+        }
+    }
+
+    /// Le nom que porte le tri dans une requête, et celui qu'il faut savoir relire.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "cpu-req" => NodeUsageSort::CpuReq,
+            "alpha" => NodeUsageSort::Alpha,
+            _ => NodeUsageSort::MemReq,
+        }
+    }
+}
+
+/// Trie la table d'usage selon l'ordre demandé. Une requête absente est traitée comme la plus
+/// petite (`-1`) : un container sans réservation n'est pas le plus gros du node.
+pub fn sort_usage_rows(rows: &mut [PodUsageRow], sort: NodeUsageSort) {
+    let by_name = |a: &PodUsageRow, b: &PodUsageRow| {
+        a.namespace.cmp(&b.namespace).then(a.pod.cmp(&b.pod)).then(a.container.cmp(&b.container))
+    };
+    match sort {
+        NodeUsageSort::MemReq => rows.sort_by(|a, b| {
+            a.is_system
+                .cmp(&b.is_system)
+                .then(b.mem_req.unwrap_or(-1).cmp(&a.mem_req.unwrap_or(-1)))
+                .then(by_name(a, b))
+        }),
+        NodeUsageSort::CpuReq => rows.sort_by(|a, b| {
+            a.is_system
+                .cmp(&b.is_system)
+                .then(b.cpu_req.unwrap_or(-1).cmp(&a.cpu_req.unwrap_or(-1)))
+                .then(by_name(a, b))
+        }),
+        NodeUsageSort::Alpha => {
+            rows.sort_by(|a, b| a.is_system.cmp(&b.is_system).then(by_name(a, b)))
+        }
+    }
+}
+
+/// Un cumul de la table d'usage : combien de containers, et ce qu'ils réservent, permettent et
+/// consomment.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageBucket {
+    pub count: usize,
+    pub cpu_req: i64,
+    pub cpu_lim: i64,
+    pub cpu_use: i64,
+    pub mem_req: i64,
+    pub mem_lim: i64,
+    pub mem_use: i64,
+}
+
+impl UsageBucket {
+    fn add(&mut self, r: &PodUsageRow) {
+        self.count += 1;
+        self.cpu_req += r.cpu_req.unwrap_or(0);
+        self.cpu_lim += r.cpu_lim.unwrap_or(0);
+        self.cpu_use += r.cpu_use.unwrap_or(0);
+        self.mem_req += r.mem_req.unwrap_or(0);
+        self.mem_lim += r.mem_lim.unwrap_or(0);
+        self.mem_use += r.mem_use.unwrap_or(0);
+    }
+}
+
+/// Le bloc de diagnostic du bas de la vue usage : USER, SYS, TOTAL, et ce qui dort.
+///
+/// La séparation user/système est le cœur du bloc : un node à 90 % dont 60 % sont des DaemonSets
+/// de la plateforme ne se lit pas comme un node à 90 % d'applicatif.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageTotals {
+    pub user: UsageBucket,
+    pub system: UsageBucket,
+    pub total: UsageBucket,
+    /// Réservé et jamais consommé. Borné à zéro : consommer plus qu'on n'a réservé est permis, et
+    /// ce n'est pas du gâchis négatif.
+    pub cpu_waste: i64,
+    pub mem_waste: i64,
+    pub cpu_waste_pct: i64,
+    pub mem_waste_pct: i64,
+}
+
+pub fn usage_totals(rows: &[PodUsageRow]) -> UsageTotals {
+    let mut out = UsageTotals::default();
+    for r in rows {
+        if r.is_system {
+            out.system.add(r);
+        } else {
+            out.user.add(r);
+        }
+        out.total.add(r);
+    }
+    out.cpu_waste = (out.total.cpu_req - out.total.cpu_use).max(0);
+    out.mem_waste = (out.total.mem_req - out.total.mem_use).max(0);
+    out.cpu_waste_pct = usage_pct(out.cpu_waste, out.total.cpu_req).unwrap_or(0);
+    out.mem_waste_pct = usage_pct(out.mem_waste, out.total.mem_req).unwrap_or(0);
+    out
 }
 
 // Heuristic: namespaces managed by Kubernetes itself or common platform add-ons (cloud CNI/CSI,
@@ -1550,6 +1917,19 @@ pub struct NodeUsageState {
     pub alloc_mem_bytes: i64,
 }
 
+/// L'usage d'un node, rendu plutôt que déposé dans un `Mutex` — le patron de `pod_logs`.
+///
+/// `metrics_available` est faux sans metrics-server : toute la colonne « consommé » est alors
+/// `None`, et c'est bien `None` et non zéro qu'il faut porter — un zéro se lirait comme un
+/// container au repos.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NodeUsage {
+    pub rows: Vec<PodUsageRow>,
+    pub metrics_available: bool,
+    pub alloc_cpu_milli: i64,
+    pub alloc_mem_bytes: i64,
+}
+
 pub type SharedNodeUsage = Arc<Mutex<NodeUsageState>>;
 
 pub fn new_node_usage_state() -> SharedNodeUsage {
@@ -1569,6 +1949,36 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
         s.metrics_available = false;
     }
 
+    let result = node_usage(&client, &node_name, crate::lang::active()).await;
+    let mut s = state.lock().expect("node usage poisoned");
+    // Une réponse qui ne concerne plus le node affiché est jetée : la sélection a bougé pendant
+    // la lecture, et l'écraser afficherait l'usage d'un autre node sous le nom de celui-ci.
+    if s.current_node.as_deref() != Some(&node_name) {
+        return;
+    }
+    s.loading = false;
+    match result {
+        Ok(usage) => {
+            s.rows = usage.rows;
+            s.metrics_available = usage.metrics_available;
+            s.alloc_cpu_milli = usage.alloc_cpu_milli;
+            s.alloc_mem_bytes = usage.alloc_mem_bytes;
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
+
+/// Le tableau d'usage par container d'un node : les specs des pods (requests/limites) jointes aux
+/// mesures de metrics-server par `(namespace, pod, container)`.
+///
+/// Les pods terminés (`Succeeded`/`Failed`) sautent : ils ne tiennent plus rien sur ce node.
+pub async fn node_usage(
+    client: &Client,
+    node_name: &str,
+    st: &crate::lang::Strings,
+) -> Result<NodeUsage, String> {
+    let client = client.clone();
+    let node_name = node_name.to_string();
     let node_api: Api<Node> = Api::all(client.clone());
     let (alloc_cpu, alloc_mem) = match node_api.get(&node_name).await {
         Ok(n) => {
@@ -1583,16 +1993,11 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
 
     let pod_api: Api<Pod> = Api::all(client.clone());
     let lp = ListParams::default().fields(&format!("spec.nodeName={}", node_name));
-    let pods = match pod_api.list(&lp).await {
-        Ok(l) => l.items,
-        Err(e) => {
-            let mut s = state.lock().expect("node usage poisoned");
-            if s.current_node.as_deref() != Some(&node_name) { return; }
-            s.loading = false;
-            s.error = Some(fill(crate::lang::active().ev_list_pods_failed, &[("e", &e.to_string())]));
-            return;
-        }
-    };
+    let pods = pod_api
+        .list(&lp)
+        .await
+        .map_err(|e| fill(st.ev_list_pods_failed, &[("e", &e.to_string())]))?
+        .items;
 
     let usage_map = fetch_pod_metrics_map(&client).await.unwrap_or_default();
     let metrics_available = !usage_map.is_empty();
@@ -1640,20 +2045,14 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
             }
         }
     }
-    rows.sort_by(|a, b|
-        a.is_system.cmp(&b.is_system)
-            .then(a.namespace.cmp(&b.namespace))
-            .then(a.pod.cmp(&b.pod))
-            .then(a.container.cmp(&b.container))
-    );
+    sort_usage_rows(&mut rows, NodeUsageSort::Alpha);
 
-    let mut s = state.lock().expect("node usage poisoned");
-    if s.current_node.as_deref() != Some(&node_name) { return; }
-    s.loading = false;
-    s.rows = rows;
-    s.metrics_available = metrics_available;
-    s.alloc_cpu_milli = alloc_cpu;
-    s.alloc_mem_bytes = alloc_mem;
+    Ok(NodeUsage {
+        rows,
+        metrics_available,
+        alloc_cpu_milli: alloc_cpu,
+        alloc_mem_bytes: alloc_mem,
+    })
 }
 
 #[derive(Default, Debug, Clone)]

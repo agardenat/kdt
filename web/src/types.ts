@@ -2001,3 +2001,169 @@ export type AiProviderChoice =
       api_key: string;
       context_window: number | null;
     };
+
+/* ------------------------------------------------------------------------ vue Nodes
+
+   Les machines du cluster, l'usage par container de l'une d'elles, et les garde-fous d'un drain.
+   Aucun de ces verdicts n'est calculé ici : le ton d'une ligne, la liste des alertes, les constats
+   d'un container et le niveau d'un constat de drain arrivent tout faits de `kdt`. */
+
+/** Un node du cluster, tel que la table le montre. */
+export interface NodeRow {
+  uid: string;
+  name: string;
+  /** La condition `Ready` telle quelle : `True`, `False` ou `Unknown`. */
+  ready: string;
+  roles: string;
+  version: string;
+  age: string;
+  schedulable: boolean;
+  /**
+   * Les conditions anormales, précédées de `Cordoned` quand le node a été mis hors service.
+   *
+   * L'ordre est une règle : le cordon est le seul de la liste qui soit un geste et non un
+   * symptôme, et c'est lui qu'on cherche quand rien ne se planifie plus ici.
+   */
+  alerts: string[];
+  abnormal: string[];
+  tone: LineTone;
+  /** La condition `Ready` seule — un node cordonné mais sain reste vert de ce côté-là. */
+  ready_tone: LineTone;
+  record: EventRecord;
+}
+
+export interface NodesPayload {
+  nodes: NodeRow[];
+}
+
+/** Ce qu'un container a de discutable dans son dimensionnement, nommé par kdt. */
+export interface UsageIssue {
+  kind: string;
+  /** Le mot de la colonne `ISSUES`, le même dans les deux interfaces. */
+  tag: string;
+  /** Vrai pour ce qui coûte déjà — à la limite, sans requête, sans limite mémoire. */
+  severe: boolean;
+}
+
+/**
+ * Un container d'un node : ce qu'il réserve, ce qu'il a le droit de prendre, ce qu'il prend.
+ *
+ * Les six quantités sont `null` plutôt que zéro quand elles ne sont pas connues — pas de mesure
+ * sans metrics-server, pas de requête quand rien n'est déclaré — et un zéro se lirait comme un
+ * container au repos.
+ */
+export interface NodeUsageRow {
+  uid: string;
+  namespace: string;
+  pod: string;
+  container: string;
+  /** Vrai pour ce que la plateforme héberge d'elle-même : le tri les garde en dernier. */
+  is_system: boolean;
+  ready: boolean;
+  restarts: number;
+  restarts_tone: LineTone;
+  cpu_req_text: string | null;
+  cpu_lim_text: string | null;
+  cpu_use_text: string | null;
+  mem_req_text: string | null;
+  mem_lim_text: string | null;
+  mem_use_text: string | null;
+  cpu_use_tone: LineTone;
+  mem_use_tone: LineTone;
+  issues: UsageIssue[];
+  issues_tone: LineTone;
+}
+
+/** Une quantité cumulée, et ce qu'elle pèse face à l'allocatable du node. */
+export interface UsageRatio {
+  text: string;
+  pct: number;
+  tone: LineTone;
+}
+
+/** Un cumul de la table : combien de containers, et les six quantités qu'ils totalisent. */
+export interface UsageBucket {
+  count: number;
+  cpu_req: UsageRatio;
+  cpu_lim: UsageRatio;
+  cpu_use: UsageRatio;
+  mem_req: UsageRatio;
+  mem_lim: UsageRatio;
+  mem_use: UsageRatio;
+}
+
+/**
+ * Le bloc de diagnostic du bas.
+ *
+ * La séparation user/système en est le cœur : un node à 90 % dont 60 % sont des DaemonSets de la
+ * plateforme ne se lit pas comme un node à 90 % d'applicatif.
+ */
+export interface UsageTotals {
+  user: UsageBucket;
+  system: UsageBucket;
+  total: UsageBucket;
+  cpu_waste_text: string;
+  mem_waste_text: string;
+  cpu_waste_pct: number;
+  mem_waste_pct: number;
+}
+
+export interface NodeUsagePayload {
+  node: string;
+  rows: NodeUsageRow[];
+  /** Faux sans metrics-server : toute la colonne « consommé » est alors `null`. */
+  metrics_available: boolean;
+  alloc: { cpu: number; mem: number; cpu_text: string; mem_text: string };
+  totals: UsageTotals;
+}
+
+/** L'ordre de la table d'usage. Les trois gardent les containers système en dernier. */
+export type NodeUsageSort = "mem-req" | "cpu-req" | "alpha";
+
+/** Un pod du node, et ce que le drain compte en faire. `skip` non nul : il reste. */
+export interface DrainCandidate {
+  namespace: string;
+  name: string;
+  skip: "daemon-set" | "mirror" | "finished" | "terminating" | null;
+}
+
+/** Une raison de réfléchir avant de drainer, avec la phrase que kdt rédige. */
+export interface DrainReason {
+  kind: string;
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/**
+ * Ce que les garde-fous ont trouvé.
+ *
+ * Aucun constat ne bloque : ils décident **combien** la confirmation coûte. `strict` est vrai dès
+ * qu'un constat est grave — ou que la vérification n'a pas pu conclure, ce qui n'est pas un feu
+ * vert. Le serveur rejoue tout cela juste avant d'évincer.
+ */
+export interface DrainPreflight {
+  reasons: DrainReason[];
+  candidates: DrainCandidate[];
+  to_evict: number;
+  skipped: number;
+  strict: boolean;
+  error: string | null;
+  plan: string;
+  skipped_label: string;
+  no_finding: string;
+}
+
+/** L'avancement d'un drain, tel que le panneau du TUI l'affiche pendant qu'il tourne. */
+export interface DrainProgress {
+  evicted: string[];
+  /** Les pods qu'un PodDisruptionBudget retient encore, et que le drain réessaie. */
+  waiting: string[];
+  failed: Array<{ pod: string; error: string }>;
+  to_evict: number;
+  running: boolean;
+}
+
+export interface DrainDone {
+  ok: boolean;
+  message: string;
+}

@@ -24,7 +24,11 @@ pub use crate::delete::Level;
 use crate::events::{parse_quantity_cpu_milli, parse_quantity_memory_bytes};
 
 // Why a pod on the node is left alone rather than evicted, matching what `kubectl drain` skips.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+//
+// `Serialize` here and below: kdt-web shows the same plan and the same findings as the panel, and
+// a browser that re-derived them from the raw objects would end up naming other pods.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Skip {
     // Owned by a DaemonSet: the controller would put it straight back on the same node.
     DaemonSet,
@@ -37,7 +41,7 @@ pub enum Skip {
 }
 
 // One pod of the node, and what the drain intends to do with it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize)]
 pub struct Candidate {
     pub namespace: String,
     pub name: String,
@@ -45,7 +49,8 @@ pub struct Candidate {
 }
 
 // One reason to think twice before draining, as data: the UI turns it into a localised sentence.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Reason {
     // No controller behind these pods: an eviction deletes them, and nothing recreates them.
     Unmanaged { pods: Vec<String> },
@@ -73,6 +78,41 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// La phrase du constat, rédigée par kdt.
+    ///
+    /// Elle vit ici et non dans la peinture : le panneau du TUI et celui du navigateur doivent dire
+    /// la même chose du même node, et deux rédactions divergeraient au premier constat ajouté. La
+    /// liste des pods est coupée à quatre — au-delà, ce qui compte est le nombre.
+    pub fn text(&self, st: &crate::lang::Strings) -> String {
+        let joined = |items: &[String]| -> String {
+            const MAX: usize = 4;
+            if items.len() <= MAX {
+                return items.join(", ");
+            }
+            format!("{}, +{}", items[..MAX].join(", "), items.len() - MAX)
+        };
+        match self {
+            Reason::Unmanaged { pods } => st.dr_unmanaged.replace("{d}", &joined(pods)),
+            Reason::PdbBlocked { pdbs } => st.dr_pdb_blocked.replace("{d}", &joined(pdbs)),
+            Reason::OnlySchedulable => st.dr_only_schedulable.to_string(),
+            Reason::PdbTight { pdbs } => st.dr_pdb_tight.replace("{d}", &joined(pdbs)),
+            Reason::NoRoom { cpu_short, mem_short } => match (cpu_short, mem_short) {
+                (true, true) => st.dr_no_room_both.to_string(),
+                (true, false) => st.dr_no_room_cpu.to_string(),
+                _ => st.dr_no_room_mem.to_string(),
+            },
+            Reason::PodTooBig { pods } => st.dr_pod_too_big.replace("{d}", &joined(pods)),
+            Reason::LocalStorage { pods } => st.dr_local_storage.replace("{d}", &joined(pods)),
+            Reason::StaticPods { pods } => st.dr_static_pods.replace("{d}", &joined(pods)),
+            Reason::ControlPlane => st.dr_control_plane.to_string(),
+            Reason::AlreadyCordoned => st.dr_already_cordoned.to_string(),
+            Reason::NotReady => st.dr_not_ready.to_string(),
+            Reason::DaemonSetPods { count } => {
+                st.plural(*count, st.dr_daemonsets_one, st.dr_daemonsets_many)
+            }
+        }
+    }
+
     pub fn level(&self) -> Level {
         match self {
             Reason::Unmanaged { .. } | Reason::PdbBlocked { .. } | Reason::OnlySchedulable => {
@@ -157,6 +197,39 @@ pub async fn preflight(client: Client, node: String, key: String, state: SharedN
             s.error = Some(e);
         }
     }
+}
+
+/// Ce que les garde-fous ont trouvé, rendu plutôt que déposé dans un `Mutex`.
+///
+/// Le TUI redessine un état à chaque tick, un appelant HTTP veut la réponse : les deux passent par
+/// [`preflight_once`], donc une règle ajoutée à [`assess`] vaut pour les deux d'un coup.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Findings {
+    pub reasons: Vec<Reason>,
+    pub candidates: Vec<Candidate>,
+}
+
+impl Findings {
+    /// Combien de pods partiraient réellement.
+    pub fn to_evict(&self) -> usize {
+        self.candidates.iter().filter(|c| c.skip.is_none()).count()
+    }
+
+    /// Combien le drain laisse en place — DaemonSets, pods statiques, pods déjà finis.
+    pub fn skipped(&self) -> usize {
+        self.candidates.len() - self.to_evict()
+    }
+
+    /// La confirmation stricte — retaper le nom — dès qu'un constat grave apparaît.
+    pub fn needs_strict_confirm(&self) -> bool {
+        self.reasons.iter().any(|r| r.level() == Level::Danger)
+    }
+}
+
+/// Les garde-fous du drain, sans rien évincer.
+pub async fn preflight_once(client: &Client, node: &str) -> Result<Findings, String> {
+    let (reasons, candidates) = collect(client, node).await?;
+    Ok(Findings { reasons, candidates })
 }
 
 async fn collect(client: &Client, node: &str) -> Result<(Vec<Reason>, Vec<Candidate>), String> {

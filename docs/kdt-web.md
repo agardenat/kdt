@@ -198,6 +198,41 @@ demanderait de résoudre soi-même puis de garantir qu'on joint la même adresse
 ne permet pas. `KDT_WEB_AI_ALLOW_CUSTOM=false` retire ce risque et ne laisse que les fournisseurs du
 déploiement.
 
+### La vue Nodes, et l'écriture qui dure
+
+`:nodes` est la première vue portée dont un geste **prend du temps**, et c'est ce qui décide de sa
+forme.
+
+Ses deux écrans deviennent deux mondes : **Nodes**, l'inventaire, et **Usage**, la table par
+container du node sélectionné — ce que `u` ouvre en plein écran dans le TUI. Elle n'entre pas dans
+le panneau du haut : treize colonnes n'y tiennent pas, et l'objet reste le node de toute façon,
+comme dans le TUI où `i` sur cet écran analyse le node et non un container. Le **cumul**
+user / système / total, lui, est bien un contenu de l'objet : il est dans le panneau, sous son
+propre onglet.
+
+Le menu `o` devient un menu de la barre d'actions, avec la convention de toutes les vues. Ce qu'il
+propose dépend de l'état lu : un node cordonné n'offre pas « cordon », il offre « uncordon ».
+
+Le **drain** est un overlay du panneau du haut, comme `Ctrl-D` : garde-fous d'abord, confirmation
+ensuite, et la même règle qu'ailleurs — un constat grave exige de retaper le nom du node. Trois
+choses le distinguent :
+
+- **il se lit en flux** (`POST /api/v1/nodes/drain`, SSE). Un pod qu'un `PodDisruptionBudget`
+  retient est réessayé vingt-quatre fois à cinq secondes d'intervalle : rendre une seule réponse à
+  la fin laisserait le navigateur devant deux minutes de silence. Le flux porte ce que le panneau du
+  TUI affiche pendant qu'il tourne — évincés, retenus, en échec — et le bloc de progression se
+  ramène sous les yeux à chaque morceau, la version web de l'ancrage en bas du panneau de kdt ;
+- **les garde-fous se rejouent côté serveur juste avant d'évincer**, et la confirmation forte y est
+  revérifiée. Entre l'ouverture du panneau et le clic, le node a pu se vider, se remplir, ou perdre
+  le budget qui le protégeait — et un garde-fou qui ne vit que dans la page se contourne en postant
+  la requête à la main ;
+- **le cordon relit l'état avant d'écrire**. Un node déjà dans l'état demandé est répondu sans
+  écriture, et c'est le cluster qui le dit, pas la liste que le navigateur avait sous les yeux.
+
+Fermer l'overlay pendant qu'un drain tourne coupe le flux, jamais le drain : les évictions déjà
+envoyées sont à l'apiserver. C'est le comportement du TUI, où quitter le panneau ne rappelle rien
+non plus.
+
 Reste à trancher, plus tard : une palette de commandes (⌘K) reprenant la grammaire `:`, et le sort
 de la grammaire clavier en général.
 

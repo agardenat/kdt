@@ -582,10 +582,18 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Thirteen views are
-live — events, workloads, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates, RBAC,
-Kyverno, identity, Rancher, network policies — along with the five gestures that apply to any
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Fourteen views are
+live — events, workloads, nodes, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates,
+RBAC, Kyverno, identity, Rancher, network policies — along with the five gestures that apply to any
 object: YAML, edit, touch, delete, AI analysis.
+
+**The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age
+and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
+quantities, its sizing findings (`noMemLim`, `cpuOver!!`, `OOMrisk`…) and the user / system / total
+tally. The three gestures of the `o` menu are there: cordon and uncordon go straight through, while
+the drain first shows its guard-rails — what would move, what would stay, which budgets will refuse
+— then runs as a live stream. A severe finding asks for the node name to be typed again, and the
+server replays the guard-rails right before it evicts.
 
 **Every request carries the credential of the person signed in**: the apiserver sees their name and
 groups, and the cluster's RBAC applies as-is. The pod's service account has no rights on any

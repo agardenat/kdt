@@ -33,6 +33,10 @@ import {
  * ferme. Leur onglet n'apparaît donc que tant qu'on y est, et disparaît dès qu'on va ailleurs —
  * sinon la barre d'onglets doublerait les boutons de la barre d'actions et on ne saurait plus
  * lequel des deux « YAML » sert à quoi.
+ *
+ * `custom` est le même contrat, ouvert aux vues : un overlay que kdt n'a que dans une vue — le
+ * panneau de drain d'un node — s'ouvre depuis la barre de cette vue et se referme pareil. Il n'y
+ * en a qu'un à la fois, parce qu'une vue qui en voudrait deux voudrait en fait deux onglets.
  */
 export type PanelTab =
   | "detail"
@@ -42,10 +46,11 @@ export type PanelTab =
   | "yaml"
   | "edit"
   | "delete"
-  | "ai";
+  | "ai"
+  | "custom";
 
 /** Les onglets qui ne vivent que le temps qu'on les regarde. */
-const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete", "ai"];
+const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete", "ai", "custom"];
 
 /** L'onglet de repli quand un overlay se ferme, ou quand la ligne visée disparaît. */
 function fallbackTab(hasDetail: boolean): PanelTab {
@@ -101,6 +106,7 @@ export function InspectPanel({
   lang,
   st,
   detail,
+  overlay,
   onDeleted,
   onNeedsAuth,
 }: {
@@ -113,6 +119,8 @@ export function InspectPanel({
   lang: Lang;
   st: Strings;
   detail?: DetailPane;
+  /** Un overlay propre à la vue, ouvert par un bouton de sa barre et refermé par sa croix. */
+  overlay?: DetailPane;
   /** L'objet vient d'être supprimé : la vue relit, et la ligne disparaîtra d'elle-même. */
   onDeleted?: (message: string) => void;
   onNeedsAuth: (message: string) => void;
@@ -127,7 +135,11 @@ export function InspectPanel({
   // L'onglet réellement affiché. Un overlay dont la cible a disparu — ligne désélectionnée, objet
   // supprimé — retombe sur ce qui reste lisible plutôt que de laisser un onglet sans contenu.
   const shown: PanelTab =
-    (OVERLAY_TABS.includes(tab) && !addressable) || (tab === "detail" && !detail)
+    (OVERLAY_TABS.includes(tab) && !addressable) ||
+    (tab === "detail" && !detail) ||
+    // La vue a retiré son overlay — le geste est fini, ou la ligne a changé de nature : l'onglet
+    // ne doit pas rester à l'écran sans rien derrière.
+    (tab === "custom" && !overlay)
       ? fallbackTab(Boolean(detail))
       : tab;
 
@@ -181,13 +193,15 @@ export function InspectPanel({
               referme l'overlay comme `Échap` referme celui du TUI. */}
           {OVERLAY_TABS.includes(shown) && (
             <button className="ptab-overlay" role="tab" aria-selected onClick={() => onTab(fallbackTab(Boolean(detail)))}>
-              {shown === "yaml"
-                ? st.actionYaml
-                : shown === "edit"
-                  ? st.actionEdit
-                  : shown === "ai"
-                    ? st.actionAi
-                    : st.actionDelete}
+              {shown === "custom"
+                ? (overlay?.label ?? "")
+                : shown === "yaml"
+                  ? st.actionYaml
+                  : shown === "edit"
+                    ? st.actionEdit
+                    : shown === "ai"
+                      ? st.actionAi
+                      : st.actionDelete}
               <span className="x">✕</span>
             </button>
           )}
@@ -226,6 +240,7 @@ export function InspectPanel({
           <>
             {/* L'onglet propre à la vue passe devant : quand il existe, c'est lui qu'on vient lire. */}
             {shown === "detail" && (detail?.node ?? null)}
+            {shown === "custom" && (overlay?.node ?? null)}
             {shown === "logs" &&
               (logs ? (
                 <LogsPane record={record} lang={lang} />

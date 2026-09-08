@@ -13,6 +13,7 @@ import FluxView from "./FluxView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
 import NetpolView from "./NetpolView";
+import NodesView from "./NodesView";
 import RbacView from "./RbacView";
 import StorageView from "./StorageView";
 import VeleroView from "./VeleroView";
@@ -31,6 +32,7 @@ type ViewId =
   | "flux"
   | "workloads"
   | "capacity"
+  | "nodes"
   | "storage"
   | "netpol"
   | "data"
@@ -62,6 +64,7 @@ const VIEWS: Array<{
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
   { id: "argocd", label: "Argo CD", key: "a", needs: "argocd" },
   { id: "velero", label: "Velero", key: "v", ready: true, needs: "velero" },
+  { id: "nodes", label: "Nodes", key: "n", ready: true },
   { id: "capacity", label: "Capacity", key: "c", ready: true },
   { id: "storage", label: "Storage", key: "s", ready: true },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
@@ -72,7 +75,7 @@ const VIEWS: Array<{
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
-  { id: "netpol", label: "NetPol", key: "n", ready: true },
+  { id: "netpol", label: "NetPol", key: "p", ready: true },
   { id: "diagnostic", label: "Diagnostic", key: "d" },
 ];
 
@@ -329,13 +332,15 @@ export default function App() {
     view === "storage" ||
     view === "netpol";
   const scopelessReason =
-    view === "identity"
-      ? st.identScopeless
-      : view === "rancher"
-        ? st.ranchScopeless
-        : view === "kyverno"
-          ? st.kyScopeless
-          : st.fluxScopeless;
+    view === "nodes"
+      ? st.ndScopeless
+      : view === "identity"
+        ? st.identScopeless
+        : view === "rancher"
+          ? st.ranchScopeless
+          : view === "kyverno"
+            ? st.kyScopeless
+            : st.fluxScopeless;
 
   return (
     <div className="app">
@@ -543,6 +548,17 @@ export default function App() {
               st={st}
               query={query}
               namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "nodes" ? (
+            <NodesView
+              lang={lang}
+              st={st}
+              query={query}
               panelHeight={panelHeight}
               onPanelHeight={setPanelHeight}
               panelOpen={panelOpen}

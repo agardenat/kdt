@@ -25,6 +25,7 @@ mod portal;
 mod rbac;
 mod rancher;
 mod netpol;
+mod nodes;
 mod session;
 mod storage;
 mod velero;
@@ -175,6 +176,15 @@ async fn main() -> Result<()> {
         // droit, et c'est le RBAC du cluster qui dit qui peut réconcilier quoi.
         .route("/api/v1/flux/reconcile", post(flux::reconcile))
         .route("/api/v1/flux/suspend", post(flux::suspend))
+        // La vue Nodes : l'inventaire, l'usage par container d'un node, et les trois gestes qui
+        // le sortent du jeu. Les écritures rejouent les garde-fous côté serveur — voir `nodes.rs`.
+        .route("/api/v1/nodes", get(nodes::list))
+        .route("/api/v1/nodes/usage", get(nodes::usage))
+        .route("/api/v1/nodes/drain-preflight", get(nodes::drain_preflight))
+        .route("/api/v1/nodes/cordon", post(nodes::cordon))
+        // En flux : un pod qu'un budget retient est réessayé pendant deux minutes, et le navigateur
+        // doit voir ce que le panneau du TUI montre pendant ce temps-là.
+        .route("/api/v1/nodes/drain", post(nodes::drain))
         .route("/api/v1/workloads", get(workloads::list))
         .route("/api/v1/workloads/scale", post(workloads::scale))
         .route("/api/v1/workloads/restart", post(workloads::restart))
