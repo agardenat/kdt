@@ -8,6 +8,37 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-beta.5] — 2026-09-08
+
+La vue **Nodes** arrive dans kdt-web, quatorzième vue et la première dont un geste **prend du
+temps** : le drain d'un node se lit en flux plutôt que d'attendre une réponse deux minutes.
+
+- **feat(web)** — vue **Nodes**, les deux écrans de `:nodes`. L'inventaire d'abord — `READY`, rôles,
+  version, âge, et les alertes avec `Cordoned` en tête, parce que c'est la seule de la liste qui
+  soit un geste et non un symptôme. Puis l'**usage par container** du node sélectionné, ce que `u`
+  ouvre dans le TUI : les six quantités, les constats de dimensionnement (`noMemLim`, `cpuOver!!`,
+  `OOMrisk`…), le tri qui garde les containers de la plateforme en dernier, et le cumul
+  user / système / total dans le panneau du haut.
+- **feat(web)** — **cordon et uncordon**, qui passent tout de suite comme dans kdt. Le menu n'offre
+  que ce qui changerait quelque chose : un node cordonné propose `uncordon`. L'état courant est
+  **relu côté serveur** avant d'écrire, pour qu'un node déjà dans l'état demandé soit répondu sans
+  écriture — et non sur la foi de ce que la page affichait.
+- **feat(web)** — le **drain**, avec les garde-fous de kdt : ce qui partirait, ce qui resterait, les
+  budgets qui refuseront, et les pods que rien ne recréerait. Un constat grave exige de retaper le
+  nom du node. La réponse est **en flux** (SSE) : un pod qu'un `PodDisruptionBudget` retient est
+  réessayé pendant deux minutes, et le panneau montre pendant ce temps les évincés, les retenus et
+  les échecs. Fermer l'overlay coupe le flux, jamais le drain.
+- **security(web)** — les garde-fous sont **rejoués côté serveur juste avant d'évincer**, et la
+  confirmation forte y est revérifiée : entre l'ouverture du panneau et le clic, le node a pu se
+  vider, se remplir, ou perdre le budget qui le protégeait — et un garde-fou qui ne vit que dans la
+  page se contourne en postant la requête à la main.
+- **refactor(events, nodeops)** — les verdicts de la vue quittent `ui.rs` pour le métier : le ton
+  d'une ligne de node et sa liste d'alertes, les onze constats de dimensionnement d'un container,
+  les trois ordres de tri, le cumul user/système, et la rédaction des constats de drain. Les deux
+  interfaces lisent désormais les mêmes règles au lieu d'en avoir chacune une copie.
+- **fix(web)** — le ton `info` n'était défini dans aucun contenu du panneau du haut : une valeur au
+  palier intermédiaire s'y peignait comme du texte ordinaire, donc comme une valeur calme.
+
 ## [2.0.0-beta.4] — 2026-09-08
 
 L'analyse par une IA — le `i` de kdt — arrive dans kdt-web, en **cinquième geste générique** :
