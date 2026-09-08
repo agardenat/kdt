@@ -8,6 +8,31 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-beta.4] — 2026-09-08
+
+L'analyse par une IA — le `i` de kdt — arrive dans kdt-web, en **cinquième geste générique** :
+offerte dans les treize vues, sur la ligne sélectionnée, avec la configuration réglable depuis
+l'application.
+
+- **feat(web)** — bouton d'analyse dans la barre d'actions de toutes les vues, réponse **en flux**
+  dans le panneau du haut (markdown rendu, blocs de commande copiables), et l'analyse qui survit au
+  changement d'onglet ou de vue : y revenir relit ce qui a été écrit au lieu de rappeler le modèle.
+- **feat(web)** — deux mondes de fournisseurs, qui coexistent. Ceux du déploiement viennent de
+  `KDT_WEB_AI_PROVIDERS` — même forme que le tableau `providers` du fichier de configuration de kdt
+  — et **leur clé ne sort jamais du pod** : le navigateur n'en apprend que le nom, le modèle et
+  l'hôte joint. Ceux qu'une personne déclare depuis le réglage vivent **dans son navigateur** et
+  accompagnent chaque requête ; le serveur ne les conserve pas.
+- **feat(chart)** — `ai.providers` (posé dans un Secret) ou `ai.existingSecret`, et
+  `ai.allowCustom`, qui décide si un navigateur peut nommer son propre endpoint. Une variable mal
+  formée est refusée **au démarrage**, pas à la première analyse.
+- **security(web)** — un endpoint nommé par un navigateur fait émettre une requête sortante au pod :
+  `https` exigé, adresses de bouclage, privées et de lien-local refusées — ce qui écarte au passage
+  le service de métadonnées du cloud. Un nom qui résout vers l'intérieur passerait : c'est le risque
+  résiduel que `ai.allowCustom=false` retire.
+- **refactor(ai)** — la construction du prompt quitte `ui.rs`, où la feature `tui` la rendait
+  inatteignable pour kdt-web : les deux interfaces envoient désormais le même prompt, et la table de
+  langue est passée en argument au lieu d'être lue dans un global de processus.
+
 ## [2.0.0-beta.3] — 2026-09-08
 
 Trois vues de plus dans kdt-web — **capacité, stockage et network policies** — qui portent le
