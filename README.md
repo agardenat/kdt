@@ -591,8 +591,8 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
 [kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Treize vues
 répondent — évènements, workloads, Flux, Velero, capacité, stockage, Secrets/ConfigMaps,
-certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les quatre gestes qui
-portent sur n'importe quel objet : YAML, édition, touch, suppression.
+certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les cinq gestes qui
+portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
 
 **Chaque requête part avec le credential de la personne connectée** : l'apiserver voit son nom et
 ses groupes, et le RBAC du cluster s'applique tel quel. Le compte de service du pod n'a aucun droit
@@ -609,6 +609,28 @@ helm upgrade --install kdt-web deploy/helm/kdt-web -n kdt-web --create-namespace
     --set clusterName=<nom du cluster> \
     --set ingress.enabled=true --set ingress.host=kdt.example.com
 ```
+
+**L'analyse par une IA** — le `i` de kdt — est offerte dans toutes les vues, sur la ligne
+sélectionnée : le bouton est dans la barre d'actions, à côté des quatre autres gestes, et la réponse
+s'écrit au fil de l'eau dans le panneau du haut. Le prompt est le même que celui du TUI, assemblé
+côté serveur à partir de ce que **votre** credential a pu lire — status, logs, évènements de
+l'objet, objets liés.
+
+Deux façons de déclarer un fournisseur, qui coexistent :
+
+- **par le déploiement** — un JSON `[{"name": …, "base_url": …, "api_key": …, "model": …,
+  "context_window": …}]`, la même forme que le tableau `providers` du fichier de configuration de
+  kdt. Il est posé dans un Secret (`ai.providers`, ou `ai.existingSecret` pour un Secret déjà en
+  place) et lu dans `KDT_WEB_AI_PROVIDERS`. **La clé ne sort jamais du pod** : le navigateur n'en
+  connaît que le nom, le modèle et l'hôte joint ;
+- **depuis l'interface** — le bouton ✨ de la barre du haut ouvre le réglage, où chacun déclare son
+  endpoint et sa clé. Elles restent **dans le navigateur** et accompagnent chaque analyse ; le
+  serveur ne les conserve pas. `ai.allowCustom=false` (`KDT_WEB_AI_ALLOW_CUSTOM`) ferme cette voie
+  et n'offre que les fournisseurs du déploiement.
+
+Un endpoint nommé par un navigateur fait émettre une requête sortante **au pod** : kdt-web exige
+`https` et refuse les adresses de bouclage, privées et de lien-local. Un nom qui résout vers
+l'intérieur du cluster passerait, lui — c'est le risque résiduel que `allowCustom: false` retire.
 
 Image : `ghcr.io/agardenat/kdt-web:<version>`. Le chart refuse ce qui ne pourrait pas fonctionner —
 une `webUrl` en clair, un ingress sans TLS, une seconde réplique — parce que le cookie de session

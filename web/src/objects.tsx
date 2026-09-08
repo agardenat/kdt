@@ -1,7 +1,7 @@
-// Les quatre gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le
-// toucher, le supprimer.
+// Les cinq gestes que kdt porte sur **n'importe quel** objet : lire son YAML, l'éditer, le
+// toucher, le supprimer, et l'envoyer à l'IA.
 //
-// Dans le TUI ce sont quatre touches — `y`, `e`, `h`, `Ctrl-D` — disponibles dans toutes les vues
+// Dans le TUI ce sont cinq touches — `y`, `e`, `h`, `Ctrl-D`, `i` — disponibles dans toutes les vues
 // parce qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici c'est la même chose,
 // dans la grammaire du web (mémoire `gui-affordances-not-tui-keys`) : **les actions vivent dans la
 // barre qui sépare les deux panneaux, et ce qu'elles ouvrent s'affiche dans le panneau du haut.**
@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api";
 import { NeedsAuth } from "./api";
+import { AiButton } from "./ai";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
 import type {
@@ -31,10 +32,10 @@ import type {
 } from "./types";
 
 /** L'onglet du panneau qu'un bouton de la barre ouvre. */
-export type ObjectTab = "yaml" | "edit" | "delete";
+export type ObjectTab = "yaml" | "edit" | "delete" | "ai";
 
 /**
- * Les trois boutons, posés dans la barre des onglets de la vue.
+ * Les boutons, posés dans la barre des onglets de la vue.
  *
  * Ils portent sur la ligne sélectionnée. Sans sélection ils sont éteints et le disent : proposer un
  * geste qui n'a pas de cible ferait chercher pourquoi il ne se passe rien.
@@ -120,6 +121,9 @@ export function ObjectActions({
       >
         {st.actionDelete}
       </button>
+      {/* Le geste `i` de kdt. Dernier de la barre et non premier : c'est celui qui fait sortir de
+          la donnée du cluster, et il se prend délibérément. */}
+      <AiButton usable={usable} st={st} onOpen={() => onOpen("ai")} />
       {busy && <span className="dim">{st.objWorking}</span>}
       {ack && <span className={ack.tone === "err" ? "err" : "ok"}>{ack.text}</span>}
     </div>

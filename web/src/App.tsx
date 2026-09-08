@@ -19,6 +19,7 @@ import VeleroView from "./VeleroView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
+import { AiSettings, openAiSettings, useAiSettingsOpen } from "./ai";
 import { useDismiss } from "./dismiss";
 import { storedLang, storeLang, strings, type Lang, type Strings } from "./i18n";
 import { clampPanelHeight, DEFAULT_PANEL_HEIGHT } from "./panel";
@@ -115,6 +116,9 @@ export default function App() {
     }
   });
   const [scopeOpen, setScopeOpen] = useState(false);
+  // Le réglage de l'IA est unique et vit ici, mais s'ouvre depuis n'importe quelle barre
+  // d'actions : l'état est dans le module `ai`, la coquille ne fait que le rendre.
+  const aiSettingsOpen = useAiSettingsOpen();
   // Les namespaces proposés par le sélecteur de portée. `null` tant qu'on n'a pas lu, et
   // `nsError` non nul quand la lecture a été refusée — un refus n'est pas un cluster sans
   // namespace, et la saisie libre reste alors le seul chemin.
@@ -335,6 +339,7 @@ export default function App() {
 
   return (
     <div className="app">
+      {aiSettingsOpen && <AiSettings st={st} />}
       <header className="topbar">
         <div className="brand">
           <span className="name">kdt</span>
@@ -431,6 +436,9 @@ export default function App() {
           }}
         >
           {lang.toUpperCase()}
+        </button>
+        <button className="icon-btn" title={st.aiSettings} onClick={openAiSettings}>
+          ✨
         </button>
         <button
           className="icon-btn"

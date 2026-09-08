@@ -25,6 +25,8 @@ secrecy = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# Le flux SSE de l'analyse IA : `ReceiverStream` fait d'un canal tokio le `Stream` qu'axum attend.
+tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

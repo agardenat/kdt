@@ -65,6 +65,30 @@ sessionKey: ""
 # longtemps et que lui seul peut révoquer : celle-ci ne fait que borner la validité du cookie.
 sessionTtl: 12h
 
+# L'analyse par une IA — le `i` de kdt, offert dans toutes les vues.
+#
+# Le prompt part **du pod** vers l'endpoint choisi, et il porte ce que le cluster a répondu : status,
+# logs, évènements, objets liés. Des logs peuvent contenir des secrets applicatifs : ne visez qu'un
+# endpoint de confiance. La politique réseau ci-dessous autorise déjà le 443 sortant.
+ai:
+  # Les fournisseurs de ce déploiement, clés comprises. Même forme que le tableau `providers` du
+  # fichier de configuration de kdt : un JSON d'objets
+  # `{name, base_url, api_key, model, context_window}`.
+  #
+  # Le chart en fait un Secret. Une clé API dans des values versionnées est un choix qui se prend :
+  # `existingSecret` est là pour ceux qui ne le prennent pas.
+  providers: ""
+  # Un Secret déjà en place qui porte le même JSON. Prioritaire sur `providers`.
+  existingSecret: ""
+  existingSecretKey: providers
+  # Est-ce qu'une personne peut déclarer son propre endpoint et sa propre clé depuis l'interface.
+  #
+  # C'est ce qui permet de se servir de l'IA sans que le cluster détienne la clé de qui que ce soit
+  # — la clé reste dans le navigateur. Le prix est une requête sortante vers une adresse qu'un
+  # navigateur nomme : kdt-web exige https et refuse les adresses internes, mais un nom qui résout
+  # vers l'intérieur du cluster passerait. `false` ferme ce monde-là.
+  allowCustom: true
+
 networkPolicy:
   # Refuse tout par défaut, n'ouvre que ce qui est nécessaire. kdt-web détient les credentials
   # des personnes connectées : il n'a rien à faire sur le réseau au-delà de l'apiserver, du

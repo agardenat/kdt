@@ -8,6 +8,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import * as api from "./api";
 import type { Lang, Strings } from "./i18n";
+import { AiPane } from "./ai";
 import { DeletePane, EditPane, YamlPane } from "./objects";
 import {
   hasLogs,
@@ -33,10 +34,18 @@ import {
  * sinon la barre d'onglets doublerait les boutons de la barre d'actions et on ne saurait plus
  * lequel des deux « YAML » sert à quoi.
  */
-export type PanelTab = "detail" | "logs" | "status" | "related" | "yaml" | "edit" | "delete";
+export type PanelTab =
+  | "detail"
+  | "logs"
+  | "status"
+  | "related"
+  | "yaml"
+  | "edit"
+  | "delete"
+  | "ai";
 
-/** Les trois onglets qui ne vivent que le temps qu'on les regarde. */
-const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete"];
+/** Les onglets qui ne vivent que le temps qu'on les regarde. */
+const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete", "ai"];
 
 /** L'onglet de repli quand un overlay se ferme, ou quand la ligne visée disparaît. */
 function fallbackTab(hasDetail: boolean): PanelTab {
@@ -172,7 +181,13 @@ export function InspectPanel({
               referme l'overlay comme `Échap` referme celui du TUI. */}
           {OVERLAY_TABS.includes(shown) && (
             <button className="ptab-overlay" role="tab" aria-selected onClick={() => onTab(fallbackTab(Boolean(detail)))}>
-              {shown === "yaml" ? st.actionYaml : shown === "edit" ? st.actionEdit : st.actionDelete}
+              {shown === "yaml"
+                ? st.actionYaml
+                : shown === "edit"
+                  ? st.actionEdit
+                  : shown === "ai"
+                    ? st.actionAi
+                    : st.actionDelete}
               <span className="x">✕</span>
             </button>
           )}
@@ -226,6 +241,17 @@ export function InspectPanel({
             {shown === "yaml" && <YamlPane key={record.uid} record={record} lang={lang} st={st} />}
             {shown === "edit" && (
               <EditPane
+                key={record.uid}
+                record={record}
+                lang={lang}
+                st={st}
+                onNeedsAuth={onNeedsAuth}
+              />
+            )}
+            {/* L'analyse survit à la fermeture de l'onglet : elle vit dans un état de module, pas
+                dans ce composant. Y revenir relit ce qui a été écrit, sans rappeler le modèle. */}
+            {shown === "ai" && (
+              <AiPane
                 key={record.uid}
                 record={record}
                 lang={lang}

@@ -1189,3 +1189,77 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .grp-count {
   margin-left: .5rem; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
 }
+
+/* ---------------------------------------------------------------- l'analyse par l'IA
+
+   Le bouton porte l'accent comme les autres commandes qui agissent, mais pas le poids de celles
+   qui écrivent sur le cluster : celui-ci n'écrit rien, il fait sortir de la donnée. */
+.panel-toggle.ai { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.panel-toggle.ai:hover:not(:disabled) { background: var(--row-sel); border-color: var(--accent); }
+
+.aipane { display: flex; flex-direction: column; min-height: 0; }
+.pane-warn { color: var(--warn); font-size: 12px; margin: .2rem 0 .5rem; }
+
+/* La réponse se lit comme un texte, pas comme un tableau : une mesure bornée, et de l'air entre
+   les blocs. Ce qui déborde — une commande longue — défile dans son propre bloc. */
+.ai-md { font-size: 12.5px; line-height: 1.6; max-width: 78ch; }
+.ai-md h3 { font-size: 13px; margin: .9rem 0 .3rem; }
+.ai-md h4 { font-size: 12.5px; margin: .75rem 0 .25rem; color: var(--muted); }
+.ai-md p { margin: .35rem 0; white-space: pre-wrap; word-break: break-word; }
+.ai-md ul { margin: .35rem 0; padding-left: 1.1rem; }
+.ai-md li { margin: .18rem 0; }
+.ai-md code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--sunk);
+  padding: .05rem .3rem; border-radius: 4px;
+}
+
+.ai-code {
+  margin: .5rem 0; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--sunk); overflow: hidden;
+}
+.ai-code-hd {
+  display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+  padding: .2rem .45rem; border-bottom: 1px solid var(--line); font-size: 11px;
+}
+.ai-code pre {
+  margin: 0; padding: .5rem .6rem; font-family: var(--mono); font-size: 11.5px;
+  line-height: 1.5; white-space: pre; overflow-x: auto;
+}
+
+/* ---------------------------------------------------------------- le réglage de l'IA
+
+   Une fenêtre modale, et c'est la seule de l'interface : le réglage ne porte sur aucune ligne et
+   n'a donc pas de place dans le panneau du haut, qui montre toujours l'objet sélectionné. */
+.modal {
+  position: fixed; inset: 0; z-index: 40; display: grid; place-items: center;
+  background: rgba(10, 10, 16, .45); padding: 1.5rem;
+}
+.modal-box {
+  width: min(46rem, 100%); max-height: 85dvh; overflow: auto;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: var(--shadow-pop); padding: 1rem 1.2rem 1.2rem;
+}
+.modal-hd { display: flex; align-items: center; justify-content: space-between; }
+.modal-hd h2 { font-size: 14px; margin: 0; }
+.modal-box h3 { font-size: 12px; margin: 1rem 0 .35rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.modal-note { color: var(--muted); font-size: 11.5px; line-height: 1.55; margin: .5rem 0; }
+
+.ai-list { list-style: none; margin: 0; padding: 0; }
+.ai-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: .6rem;
+  padding: .3rem 0; border-bottom: 1px solid var(--line-soft);
+}
+.ai-list label { display: flex; align-items: center; gap: .55rem; font-size: 12px; cursor: pointer; }
+.ai-row-actions { display: flex; gap: .35rem; flex: none; }
+
+.ai-form { display: grid; gap: .5rem; margin: .7rem 0 0; }
+.ai-form label { display: grid; gap: .2rem; font-size: 11.5px; color: var(--muted); }
+.ai-form input {
+  height: 28px; padding: 0 .45rem; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12px; font-family: var(--mono);
+}
+.ai-form-actions { display: flex; justify-content: flex-end; gap: .5rem; }
+.ai-form-actions .cta {
+  padding: .35rem .9rem; border: 0; border-radius: 7px;
+  background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; font-size: 12px;
+}

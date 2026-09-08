@@ -8,6 +8,7 @@
 //! kdt-web sensible, ce sont les credentials qu'on lui confie — pas ses propres pouvoirs, qui
 //! sont nuls.
 
+mod ai;
 mod api;
 mod auth;
 mod capacity;
@@ -162,6 +163,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/logs", get(api::logs))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/related", post(api::related))
+        // Le `i` de kdt. La configuration d'abord — ce que ce serveur offre, et s'il accepte qu'on
+        // lui en nomme un autre — puis l'analyse elle-même, en flux.
+        .route("/api/v1/ai/config", get(ai::config))
+        .route("/api/v1/ai/analyze", post(ai::analyze))
         .route("/api/v1/flux", get(flux::tree))
         .route("/api/v1/flux/inventory", get(flux::inventory))
         .route("/api/v1/flux/logs", get(flux::logs))

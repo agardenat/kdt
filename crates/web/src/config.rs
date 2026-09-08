@@ -48,6 +48,25 @@ pub struct WebConfig {
     /// Distincte du droit de session obtenu du portail, qui dure plus longtemps et que lui seul
     /// peut révoquer. Celle-ci ne fait que borner la validité du cookie.
     pub session_ttl: Duration,
+    /// Les fournisseurs d'IA que ce déploiement offre, clés comprises.
+    ///
+    /// Même forme que le tableau `providers` du fichier de configuration de kdt — le type est
+    /// littéralement le sien : les deux interfaces se règlent de la même façon, et une passerelle
+    /// interne déclarée pour l'une se déclare pareil pour l'autre.
+    ///
+    /// Ces clés ne sortent jamais du pod. Le navigateur n'apprend d'un fournisseur que son nom,
+    /// son modèle et l'hôte qu'il joint — de quoi choisir, et de quoi savoir où part la donnée.
+    ///
+    /// Vide, il ne reste que les fournisseurs personnels, et rien du tout si ceux-ci sont refusés :
+    /// l'interface éteint alors le bouton plutôt que d'ouvrir un réglage qui ne mènerait nulle part.
+    pub ai_providers: AiProviders,
+    /// Est-ce qu'une personne peut déclarer son propre endpoint depuis son navigateur.
+    ///
+    /// C'est ce qui rend le réglage possible « depuis l'app » sans que le serveur détienne la clé
+    /// de qui que ce soit — comme le fichier de configuration de kdt tient celle du TUI. Le prix
+    /// est une requête sortante vers une adresse que le navigateur nomme : `ai.rs` la borne, et
+    /// `false` la refuse tout court quand l'exploitant ne veut offrir que la sienne.
+    pub ai_allow_custom: bool,
 }
 
 impl WebConfig {
@@ -66,6 +85,8 @@ impl WebConfig {
             assets: env("KDT_WEB_ASSETS"),
             session_key: env("KDT_WEB_SESSION_KEY"),
             session_ttl: duration_from_env("KDT_WEB_SESSION_TTL", Duration::from_secs(12 * 3600))?,
+            ai_providers: ai_providers_from_env()?,
+            ai_allow_custom: bool_from_env("KDT_WEB_AI_ALLOW_CUSTOM", true)?,
         }
         .validated()
     }
@@ -121,4 +142,65 @@ fn duration_from_env(key: &'static str, default: Duration) -> Result<Duration, C
         }
     };
     Ok(Duration::from_secs(seconds))
+}
+
+/// Les fournisseurs d'IA, lus dans `KDT_WEB_AI_PROVIDERS` : un tableau JSON d'objets
+/// `{name, base_url, api_key, model, context_window}`.
+///
+/// Refusé au démarrage plutôt qu'à la première analyse : une variable mal formée est une erreur de
+/// déploiement, et la découvrir au moment où quelqu'un clique fait chercher la panne dans le
+/// mauvais endroit. La variable porte des clés, donc son contenu ne figure dans aucun message.
+fn ai_providers_from_env() -> Result<AiProviders, ConfigError> {
+    let Some(raw) = env("KDT_WEB_AI_PROVIDERS") else {
+        return Ok(AiProviders(Vec::new()));
+    };
+    let providers: Vec<kdt::config::AiProvider> = serde_json::from_str(&raw).map_err(|e| {
+        ConfigError::Invalid(
+            "KDT_WEB_AI_PROVIDERS",
+            format!("tableau JSON attendu : {e}"),
+        )
+    })?;
+    if providers.iter().any(|p| p.name.trim().is_empty()) {
+        return Err(ConfigError::Invalid(
+            "KDT_WEB_AI_PROVIDERS",
+            "chaque fournisseur doit porter un nom".to_string(),
+        ));
+    }
+    Ok(AiProviders(providers))
+}
+
+/// La liste des fournisseurs, dont le `Debug` ne dit que les noms.
+///
+/// `WebConfig` dérive `Debug`, et un `debug!(?config)` écrit un jour par commodité recopierait
+/// sinon les clés API dans les journaux du pod. Le type l'interdit, plutôt que la discipline.
+#[derive(Clone)]
+pub struct AiProviders(Vec<kdt::config::AiProvider>);
+
+impl std::fmt::Debug for AiProviders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|p| &p.name)).finish()
+    }
+}
+
+impl std::ops::Deref for AiProviders {
+    type Target = [kdt::config::AiProvider];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Un booléen d'environnement, aux mêmes mots que partout ailleurs. Ce qui n'est ni vrai ni faux
+/// est refusé : `KDT_WEB_AI_ALLOW_CUSTOM=no` doit fermer la porte, pas passer pour un défaut.
+fn bool_from_env(key: &'static str, default: bool) -> Result<bool, ConfigError> {
+    let Some(raw) = env(key) else {
+        return Ok(default);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(ConfigError::Invalid(
+            key,
+            format!("{other:?} : attendu true ou false"),
+        )),
+    }
 }

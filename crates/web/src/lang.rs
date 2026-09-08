@@ -18,3 +18,15 @@ pub fn lang_of(lang: &str) -> &'static Strings {
         AiLanguage::Fr
     })
 }
+
+/// La langue de la réponse du modèle, pour la même chaîne de requête.
+///
+/// Séparée de [`lang_of`] parce que les deux ne servent pas la même chose : l'une choisit la table
+/// de chaînes de kdt, l'autre le prompt système qui dit au modèle dans quelle langue répondre.
+pub fn ai_lang_of(lang: &str) -> AiLanguage {
+    if lang.eq_ignore_ascii_case("en") {
+        AiLanguage::En
+    } else {
+        AiLanguage::Fr
+    }
+}

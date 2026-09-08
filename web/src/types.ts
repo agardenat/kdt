@@ -1955,3 +1955,49 @@ export interface NetpolPayload {
   /** Seule l'erreur sur les natives : un CNI absent n'est pas une panne. */
   error: string | null;
 }
+
+/**
+ * Un fournisseur d'IA déclaré par l'exploitant, tel que le serveur consent à le décrire.
+ *
+ * Pas de clé : c'est tout l'intérêt de la déclarer côté serveur. L'hôte, lui, est ce qui dit **où
+ * part la donnée**, et c'est une question qu'on doit pouvoir se poser avant d'envoyer un log.
+ */
+export interface AiProviderInfo {
+  name: string;
+  model: string;
+  host: string;
+  context_window: number | null;
+}
+
+/** Ce que ce déploiement offre en matière d'IA. */
+export interface AiConfigPayload {
+  providers: AiProviderInfo[];
+  /** Le serveur accepte-t-il qu'un navigateur lui nomme son propre endpoint. */
+  allow_custom: boolean;
+}
+
+/**
+ * Un fournisseur personnel, saisi dans l'interface et gardé par le navigateur.
+ *
+ * Il vit dans le `localStorage`, comme la clé du TUI vit dans le fichier de configuration de kdt :
+ * le serveur ne la détient jamais, il ne fait que la porter le temps d'une analyse.
+ */
+export interface AiPersonalProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+  context_window: number | null;
+}
+
+/** Le fournisseur nommé dans une demande d'analyse. Le monde est dit, jamais deviné. */
+export type AiProviderChoice =
+  | { source: "server"; name: string }
+  | {
+      source: "custom";
+      base_url: string;
+      model: string;
+      api_key: string;
+      context_window: number | null;
+    };

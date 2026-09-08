@@ -47,6 +47,17 @@ spec:
                 secretKeyRef:
                   name: {{ include "kdt-web.fullname" . }}-session
                   key: session-key
+            - name: KDT_WEB_AI_ALLOW_CUSTOM
+              value: {{ .Values.ai.allowCustom | quote }}
+            {{- if or .Values.ai.providers .Values.ai.existingSecret }}
+            # Les clés ne transitent que par ce Secret : ni argument, ni valeur en clair dans le
+            # manifeste du pod, où `kubectl describe` les lirait.
+            - name: KDT_WEB_AI_PROVIDERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ai.existingSecret | default (printf "%s-ai" (include "kdt-web.fullname" .)) }}
+                  key: {{ .Values.ai.existingSecretKey | default "providers" }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
           # `/healthz` ne touche ni au cluster ni à une session : une sonde qui authentifierait

@@ -32,6 +32,39 @@ export interface Strings {
   actionEdit: string;
   actionTouch: string;
   actionDelete: string;
+
+  // --- Le geste `i` de kdt : envoyer ce qu'on regarde à un modèle. Ce que le serveur rédige —
+  // le prompt, les étapes de l'enrichissement — arrive déjà traduit ; ce qui suit est ce que le
+  // navigateur dit de lui-même.
+  actionAi: string;
+  aiHelp: string;
+  aiNoProvider: string;
+  aiNoProviderHelp: string;
+  aiSettings: string;
+  aiClose: string;
+  aiPrivacy: string;
+  aiServerProviders: string;
+  aiNoServerProvider: string;
+  aiPersonalProviders: string;
+  aiCustomRefused: string;
+  aiKeyStorage: string;
+  aiEdit: string;
+  aiForget: string;
+  aiName: string;
+  aiBaseUrl: string;
+  aiModel: string;
+  aiApiKey: string;
+  aiContextWindow: string;
+  aiContextHelp: string;
+  aiCancel: string;
+  aiSave: string;
+  aiAdd: string;
+  aiRerun: string;
+  aiStop: string;
+  aiWorking: string;
+  aiElapsed: string;
+  aiEmptyAnswer: string;
+  aiOtherTarget: string;
   emptyTitle: string;
   emptyScope: string;
   emptyFilter: string;
@@ -587,6 +620,38 @@ const FR: Strings = {
   actionEdit: "Éditer",
   actionTouch: "Toucher",
   actionDelete: "Supprimer",
+  actionAi: "✨ IA",
+  aiHelp: "Analyser cette ligne avec l'IA configurée",
+  aiNoProvider: "Aucun fournisseur d'IA n'est configuré.",
+  aiNoProviderHelp: "Aucun fournisseur d'IA configuré — cliquez pour en déclarer un",
+  aiSettings: "Réglage de l'IA",
+  aiClose: "Fermer",
+  aiPrivacy:
+    "L'analyse envoie à l'endpoint choisi le statut de l'objet, ses logs, ses évènements et les objets liés. Des logs peuvent contenir des secrets applicatifs : ne visez qu'un endpoint de confiance.",
+  aiServerProviders: "Fournisseurs de ce serveur",
+  aiNoServerProvider: "Ce serveur n'en déclare aucun.",
+  aiPersonalProviders: "Vos fournisseurs",
+  aiCustomRefused: "Ce serveur n'accepte que ses propres fournisseurs.",
+  aiKeyStorage:
+    "Votre clé reste dans ce navigateur et accompagne chaque analyse ; le serveur ne la conserve pas. Elle y est lisible par tout script qui s'exécuterait sur cette origine.",
+  aiEdit: "Modifier",
+  aiForget: "Oublier",
+  aiName: "Nom",
+  aiBaseUrl: "URL de base",
+  aiModel: "Modèle",
+  aiApiKey: "Clé API",
+  aiContextWindow: "Fenêtre de contexte",
+  aiContextHelp:
+    "En tokens. Renseignée, le prompt est taillé pour tenir dedans ; vide, il part entier.",
+  aiCancel: "Annuler",
+  aiSave: "Enregistrer",
+  aiAdd: "Ajouter un fournisseur",
+  aiRerun: "Relancer",
+  aiStop: "Arrêter",
+  aiWorking: "Analyse en cours…",
+  aiElapsed: "{s} s",
+  aiEmptyAnswer: "Le modèle n'a rien répondu.",
+  aiOtherTarget: "Cette analyse porte sur {target}.",
   emptyTitle: "Aucune ligne ne passe le filtre",
   emptyScope: "La portée est",
   emptyFilter: "le filtre est",
@@ -1175,6 +1240,38 @@ const EN: Strings = {
   actionEdit: "Edit",
   actionTouch: "Touch",
   actionDelete: "Delete",
+  actionAi: "✨ AI",
+  aiHelp: "Analyse this row with the configured AI",
+  aiNoProvider: "No AI provider is configured.",
+  aiNoProviderHelp: "No AI provider configured — click to declare one",
+  aiSettings: "AI settings",
+  aiClose: "Close",
+  aiPrivacy:
+    "The analysis sends the object's status, its logs, its events and related objects to the chosen endpoint. Logs may carry application secrets: only point at an endpoint you trust.",
+  aiServerProviders: "This server's providers",
+  aiNoServerProvider: "This server declares none.",
+  aiPersonalProviders: "Your providers",
+  aiCustomRefused: "This server only accepts its own providers.",
+  aiKeyStorage:
+    "Your key stays in this browser and travels with each analysis; the server does not keep it. Any script running on this origin can read it there.",
+  aiEdit: "Edit",
+  aiForget: "Forget",
+  aiName: "Name",
+  aiBaseUrl: "Base URL",
+  aiModel: "Model",
+  aiApiKey: "API key",
+  aiContextWindow: "Context window",
+  aiContextHelp:
+    "In tokens. Set, the prompt is trimmed to fit; empty, it is sent whole.",
+  aiCancel: "Cancel",
+  aiSave: "Save",
+  aiAdd: "Add a provider",
+  aiRerun: "Run again",
+  aiStop: "Stop",
+  aiWorking: "Analysing…",
+  aiElapsed: "{s}s",
+  aiEmptyAnswer: "The model answered nothing.",
+  aiOtherTarget: "This analysis is about {target}.",
   emptyTitle: "No row passes the filter",
   emptyScope: "Scope is",
   emptyFilter: "filter is",

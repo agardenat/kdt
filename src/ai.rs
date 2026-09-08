@@ -231,7 +231,9 @@ pub fn normalize_ai_content(s: &str) -> String {
 // Fire a streaming (SSE) chat completion, feeding the running accumulated raw content to `on_delta`
 // after each chunk. `on_delta` returns false to abort early (e.g. the request was superseded).
 // Returns the full raw (un-normalized) content on success.
-async fn stream_completion(
+// `pub` parce que kdt-web en a besoin : il rend les deltas au navigateur au fil de l'eau, en SSE,
+// au lieu de les déposer dans un état partagé qu'un rendu relit.
+pub async fn stream_completion(
     config: &AiConfig,
     lang: AiLanguage,
     prompt: &str,
@@ -351,4 +353,244 @@ pub async fn query_ai_direct(
 ) -> Result<String, String> {
     let raw = stream_completion(config, lang, prompt, Duration::from_secs(30), |_| true).await?;
     Ok(normalize_ai_content(&raw))
+}
+
+// ---------------------------------------------------------------------------
+// La construction du prompt.
+//
+// Elle vivait dans `ui.rs`, donc derrière la feature `tui` : kdt-web ne pouvait pas l'appeler, et
+// aurait fini par en écrire une seconde. Deux prompts pour la même question, ce sont deux réponses
+// différentes du même cluster — la règle qui vaut pour les verdicts vaut ici.
+//
+// Rien de ce qui suit ne connaît d'état : des chaînes, un `EventRecord`, et la table de langue
+// passée en argument plutôt que lue dans le global — un serveur répond à plusieurs personnes à la
+// fois, dont rien ne dit qu'elles lisent la même langue.
+// ---------------------------------------------------------------------------
+
+use crate::events::{EventRecord, LineColor, Severity};
+use crate::lang::Strings;
+
+// Char budgets for the high-volume free-text prompt sections. Logs and status are kept by their
+// tail (most recent/most diagnostic content) once over budget.
+pub const MAX_LOGS_CHARS: usize = 12_000;
+pub const MAX_STATUS_CHARS: usize = 6_000;
+const MAX_RELATED_LINES: usize = 50;
+/// Le nombre de lignes de log que le prompt emporte, et que son titre annonce.
+pub const PROMPT_LOG_LINES: usize = 200;
+
+// Collapse runs of identical consecutive lines into "<line>  (xN)" so repeated log/status spam does
+// not eat the token budget verbatim.
+pub fn collapse_repeats<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Option<(&'a str, usize)> = None;
+    let flush = |out: &mut Vec<String>, line: &str, n: usize| {
+        out.push(if n > 1 { format!("{line}  (x{n})") } else { line.to_string() });
+    };
+    for line in lines {
+        match run {
+            Some((prev, n)) if prev == line => run = Some((prev, n + 1)),
+            Some((prev, n)) => { flush(&mut out, prev, n); run = Some((line, 1)); }
+            None => run = Some((line, 1)),
+        }
+    }
+    if let Some((prev, n)) = run { flush(&mut out, prev, n); }
+    out
+}
+
+// Keep the last `max` chars of `s` (recent content is the most diagnostic for logs/status),
+// aligned to a char boundary and prefixed with an elision marker when truncated.
+pub fn cap_chars_tail(s: String, max: usize, st: &Strings) -> String {
+    if s.len() <= max { return s; }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) { start += 1; }
+    crate::lang::fill(st.prompt_truncated, &[("body", &s[start..])])
+}
+
+/// Les dernières lignes de log, repliées et plafonnées, telles que le prompt les porte.
+///
+/// `None` quand il n'y a rien : une section vide coûte des tokens et se lit comme un trou que le
+/// modèle peut chercher à combler. Une erreur de lecture, elle, n'est pas rien — c'est à l'appelant
+/// de la dire, parce qu'elle vient de sa propre source.
+pub fn prompt_logs_text(lines: &[String], st: &Strings) -> Option<String> {
+    if lines.is_empty() { return None; }
+    let start = lines.len().saturating_sub(PROMPT_LOG_LINES);
+    let collapsed = collapse_repeats(lines[start..].iter().map(|l| l.as_str()));
+    Some(cap_chars_tail(collapsed.join("\n"), MAX_LOGS_CHARS, st))
+}
+
+/// L'état de l'objet, mis en forme par kdt, replié et plafonné pour le prompt.
+///
+/// Le ton de chaque ligne est écarté : il peint l'écran, il n'ajoute rien à un texte que le modèle
+/// lit — et il coûterait un préfixe par ligne.
+pub fn prompt_status_text(lines: &[(LineColor, String)], st: &Strings) -> Option<String> {
+    if lines.is_empty() { return None; }
+    let collapsed = collapse_repeats(lines.iter().map(|(_, t)| t.as_str()));
+    Some(cap_chars_tail(collapsed.join("\n"), MAX_STATUS_CHARS, st))
+}
+
+// Aggregate the events of the same object into the prompt's "related events" section. Duplicates
+// (same severity/reason/message) collapse into one line, summing their occurrence counts and
+// keeping the most recent timestamp, then the 50 most recent lines are kept.
+pub fn related_events_text<'a>(
+    records: impl IntoIterator<Item = &'a EventRecord>,
+    rec: &EventRecord,
+) -> Option<String> {
+    use k8s_openapi::jiff::Timestamp;
+    let mut order: Vec<(Severity, String, String)> = Vec::new();
+    let mut agg: std::collections::HashMap<(Severity, String, String), (Timestamp, i64)> =
+        std::collections::HashMap::new();
+    for r in records
+        .into_iter()
+        .filter(|r| r.namespace == rec.namespace && r.name == rec.name && r.kind == rec.kind)
+    {
+        let key = (r.severity, r.reason.clone(), r.message.clone());
+        match agg.get_mut(&key) {
+            Some((time, count)) => {
+                *count += r.count.max(1) as i64;
+                if r.time > *time { *time = r.time; }
+            }
+            None => {
+                order.push(key.clone());
+                agg.insert(key, (r.time, r.count.max(1) as i64));
+            }
+        }
+    }
+    let mut related: Vec<(Timestamp, String)> = order
+        .into_iter()
+        .map(|key| {
+            let (time, count) = agg[&key];
+            let (sev, reason, message) = key;
+            let line = format!(
+                "[{}] {} {} (x{}) — {}",
+                time,
+                match sev { Severity::Warning => "WARN", Severity::Normal => "OK" },
+                reason, count, message,
+            );
+            (time, line)
+        })
+        .collect();
+    related.sort_by_key(|(t, _)| *t);
+    if related.len() > MAX_RELATED_LINES {
+        let drop = related.len() - MAX_RELATED_LINES;
+        related.drain(0..drop);
+    }
+    if related.is_empty() {
+        None
+    } else {
+        Some(related.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+// Rough char/token ratio for dense Kubernetes JSON, and tokens held back for the system prompt,
+// the model's answer, and a safety margin. Used to derive a char budget from the context window.
+const CHARS_PER_TOKEN_EST: usize = 3;
+const COMPLETION_RESERVE_TOKENS: usize = 4096;
+
+// Convert a provider context window (tokens) into a char budget for the whole user prompt.
+pub fn prompt_char_budget(context_window: Option<usize>) -> Option<usize> {
+    context_window
+        .map(|toks| toks.saturating_sub(COMPLETION_RESERVE_TOKENS).saturating_mul(CHARS_PER_TOKEN_EST))
+}
+
+// Assemble the enrichment sections within `budget` chars, dropping the lowest-priority ones (later
+// in the list) when the budget is exhausted and noting how many were omitted. At least the first
+// (highest-priority) section is always included even if it alone exceeds the budget.
+fn build_extra_block(extra: &[(String, String)], budget: Option<usize>, st: &Strings) -> String {
+    if extra.is_empty() { return st.prompt_none.to_string(); }
+    let mut out = String::new();
+    let mut omitted = 0;
+    for (i, (title, body)) in extra.iter().enumerate() {
+        let sep = if out.is_empty() { "" } else { "\n\n" };
+        let section = format!("{sep}### {title}\n```json\n{body}\n```");
+        if let Some(b) = budget {
+            if !out.is_empty() && out.len() + section.len() > b {
+                omitted = extra.len() - i;
+                break;
+            }
+        }
+        out.push_str(&section);
+    }
+    if omitted > 0 {
+        out.push_str(&st.plural(
+            omitted,
+            st.prompt_sections_omitted_one,
+            st.prompt_sections_omitted_many,
+        ));
+    }
+    out
+}
+
+// Assemble the full prompt sent to the model: event metadata, object status, recent logs, related
+// events, and enrichment sections. This is the complete payload transmitted to the AI endpoint.
+//
+// Mirrors `build_ai_prompt_inner`'s parameters plus the budget; grouping them would only move the
+// same list into a struct used at a single call site.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ai_prompt(
+    rec: &EventRecord,
+    ctx_label: &str,
+    ns_label: &str,
+    logs: Option<&str>,
+    status: Option<&str>,
+    related: Option<&str>,
+    extra: &[(String, String)],
+    char_budget: Option<usize>,
+    st: &Strings,
+) -> String {
+    // Two-pass: render the skeleton with a placeholder for the enrichment block, measure the fixed
+    // part, then fill the block with whatever fits in the remaining budget. With no enrichment at
+    // all there is no placeholder to substitute and the section is dropped along with it.
+    const PLACEHOLDER: &str = "\u{0}";
+    let has_extra = !extra.is_empty();
+    let ph = if has_extra { Some(PLACEHOLDER) } else { None };
+    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, logs, status, related, ph);
+    if !has_extra { return skeleton; }
+    let fixed_len = skeleton.len() - PLACEHOLDER.len();
+    let extra_budget = char_budget.map(|b| b.saturating_sub(fixed_len));
+    let extra_block = build_extra_block(extra, extra_budget, st);
+    skeleton.replace(PLACEHOLDER, &extra_block)
+}
+
+// Kept deliberately terse: every heading here is paid for on each analysis, and the model already
+// has its instructions from the system prompt — repeating them in the request only costs tokens and
+// nudges it towards finding something to say. Sections with nothing in them are not emitted at all.
+fn build_ai_prompt_inner(
+    rec: &EventRecord,
+    ctx_label: &str,
+    ns_label: &str,
+    logs: Option<&str>,
+    status: Option<&str>,
+    related: Option<&str>,
+    extra_block: Option<&str>,
+) -> String {
+    let mut out = format!(
+"# Événement Kubernetes
+cluster {ctx} · ns {ns_label}
+{time} {sev} {reason} · {kind} {api} · {ns}/{name} · {comp} · x{count}
+{msg}",
+        ctx = ctx_label,
+        ns_label = ns_label,
+        time = rec.time,
+        sev = match rec.severity { Severity::Warning => "Warning", Severity::Normal => "Normal" },
+        reason = rec.reason,
+        kind = rec.kind,
+        api = rec.api_version,
+        ns = rec.namespace,
+        name = rec.name,
+        comp = rec.component,
+        count = rec.count,
+        msg = rec.message,
+    );
+    for (title, body) in [
+        ("## Statut", status),
+        ("## Logs (200 dernières lignes)", logs),
+        ("## Événements liés", related),
+        ("## Contexte attaché", extra_block),
+    ] {
+        if let Some(body) = body {
+            out.push_str(&format!("\n\n{title}\n{body}"));
+        }
+    }
+    out.push_str("\n\n## Demande\nAnalyse ce contexte selon tes règles. Si des policies Kyverno ou des règles RBAC sont fournies, désigne la règle en cause et le patch minimal.");
+    out
 }

@@ -5,6 +5,8 @@
 // panne du cluster.
 
 import type {
+  AiConfigPayload,
+  AiProviderChoice,
   Capabilities,
   CapacityPayload,
   ClusterBanner,
@@ -618,4 +620,74 @@ export function storage(namespace: string, lang: Lang): Promise<StoragePayload> 
 export function netpol(namespace: string): Promise<NetpolPayload> {
   const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
   return get<NetpolPayload>(`/api/v1/netpol${query}`);
+}
+
+/** Ce que ce serveur offre en matière d'IA : ses fournisseurs, et s'il en accepte d'autres. */
+export function aiConfig(): Promise<AiConfigPayload> {
+  return get<AiConfigPayload>("/api/v1/ai/config");
+}
+
+/**
+ * L'analyse d'une ligne par l'IA, lue au fil de l'eau.
+ *
+ * `fetch` et non `EventSource` : la cible est un enregistrement entier, qui se poste. Le flux est
+ * du SSE tout de même — même découpage, mêmes noms d'évènements — parce que c'est ce qu'axum sait
+ * tenir ouvert à travers un proxy, et que le battement de service évite qu'il referme la
+ * connexion pendant que le modèle réfléchit.
+ *
+ * Les évènements : `meta` (fournisseur, modèle), `stage` (ce que le serveur est en train de
+ * rassembler), `delta` (un morceau de la réponse), `error`, `done`.
+ */
+export async function aiAnalyze(
+  body: { record: EventRecord; provider: AiProviderChoice; lang: Lang },
+  on: (event: { type: string; data: Record<string, string> }) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/v1/ai/analyze", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    credentials: "same-origin",
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    let detail = `le serveur a répondu ${response.status}`;
+    let reauthenticate = false;
+    try {
+      const payload = await response.json();
+      if (typeof payload?.error === "string") detail = payload.error;
+      reauthenticate = payload?.reauthenticate === true;
+    } catch {
+      // Une réponse qui n'est pas du JSON reste une erreur : le statut suffit à la nommer.
+    }
+    if (reauthenticate || response.status === 401) throw new NeedsAuth(detail);
+    throw new ApiError(detail);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // Une trame SSE se termine par une ligne vide ; ce qui suit la dernière est incomplet et
+    // attend le morceau suivant.
+    let cut = buffer.indexOf("\n\n");
+    while (cut >= 0) {
+      const frame = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      let name = "message";
+      const data: string[] = [];
+      for (const raw of frame.split("\n")) {
+        const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        if (line.startsWith("event:")) name = line.slice(6).trim();
+        else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+      }
+      // Le battement de service est une trame sans donnée : elle ne dit rien, elle maintient.
+      if (data.length) on({ type: name, data: JSON.parse(data.join("\n")) });
+      cut = buffer.indexOf("\n\n");
+    }
+  }
 }

@@ -167,6 +167,37 @@ explicite inverse, et le cas non stampé où seul `prefers-color-scheme` tranche
 La langue se bascule comme dans le TUI, par un bouton de la barre supérieure : le chrome change
 sur-le-champ, les phrases calculées suivent au refetch — voir §7.
 
+### L'analyse par une IA, et où vit sa configuration
+
+Le `i` de kdt est le cinquième geste générique : un bouton dans la barre d'actions, la réponse en
+flux dans le panneau du haut, et l'onglet qui n'existe que tant qu'on le regarde. Le prompt est
+celui du TUI — `kdt::ai::build_ai_prompt`, sorti de `ui.rs` pour l'occasion, parce qu'un second
+prompt aurait donné deux réponses différentes du même cluster.
+
+La question qui décide de tout est **où vit la clé**. Trois réponses possibles :
+
+1. *dans le serveur, pour tout le monde* — simple, mais tout le monde partage la même clé, le même
+   quota et la même trace côté fournisseur ;
+2. *dans le navigateur, qui appelle l'endpoint lui-même* — la clé ne traverse rien, mais l'appel
+   direct dépend du CORS du fournisseur, qu'aucun des grands n'ouvre, et le prompt doit de toute
+   façon être assemblé côté serveur, seul endroit où le credential de la personne lit le cluster ;
+3. *dans le navigateur, le serveur relayant* — la clé reste à la personne, le prompt reste assemblé
+   là où il peut l'être.
+
+Les deux mondes retenus sont **1 et 3**, ensemble. L'exploitant déclare ses fournisseurs dans
+`KDT_WEB_AI_PROVIDERS` — même forme que le tableau `providers` du fichier de configuration de kdt,
+littéralement le même type — et leurs clés ne sortent jamais du pod : le navigateur n'en apprend que
+le nom, le modèle et l'hôte joint. Chacun peut par ailleurs déclarer le sien depuis le réglage de
+l'interface ; il vit dans le `localStorage` et accompagne la requête.
+
+Ce troisième monde a un prix, qu'on nomme plutôt que de le découvrir : un endpoint choisi par un
+navigateur fait émettre une requête sortante **au pod**, ce qui est la définition d'une SSRF.
+`https` exigé, adresses de bouclage, privées et de lien-local refusées — ce qui écarte au passage le
+service de métadonnées du cloud. Un **nom** qui résout vers l'intérieur passerait : le vérifier
+demanderait de résoudre soi-même puis de garantir qu'on joint la même adresse, ce que la pile HTTP
+ne permet pas. `KDT_WEB_AI_ALLOW_CUSTOM=false` retire ce risque et ne laisse que les fournisseurs du
+déploiement.
+
 Reste à trancher, plus tard : une palette de commandes (⌘K) reprenant la grammaire `:`, et le sort
 de la grammaire clavier en général.
 
