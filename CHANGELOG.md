@@ -8,6 +8,41 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-beta.6] — 2026-09-08
+
+Trois défauts d'usage de kdt-web, et le même dans le TUI : des colonnes qui ne tombaient pas en
+face de leur en-tête, des panneaux qui se refermaient sous les yeux à chaque rafraîchissement, et
+un message d'erreur qui disait deux fois la même chose avant de disparaître trop vite.
+
+- **fix(web)** — les colonnes de **toutes** les tables tombent en face de leur en-tête. Les
+  gabarits sont écrits en `ch`, et un `ch` se mesure sur la police de la ligne : l'en-tête en
+  10,5 px donnait des colonnes plus étroites que le corps en 12,5 px, et l'écart s'accumulait de
+  colonne en colonne — jusqu'à vingt-huit pixels sur `CONTAINER`, qui passait à *gauche* de son
+  titre. La typographie de l'en-tête se pose désormais sur les cellules, et la ligne d'en-tête
+  porte le liseré de sévérité du corps, en transparent, pour partir des deux mêmes pixels.
+- **fix(web)** — dans la table d'usage d'un node, la dernière colonne se mesurait sur son contenu :
+  une ligne aux constats plus longs volait la largeur à la colonne souple d'avant elle, et les
+  lignes se décalaient les unes par rapport aux autres.
+- **fix(web, nodes)** — une seule colonne souple dans la table d'usage, et c'est la dernière.
+  `POD` prenait toute la largeur d'un écran large, et le nom du pod restait seul à gauche d'un vide
+  qui le séparait du container qu'il porte. Même correction dans la vue `u` du TUI, où `NS`, `POD`
+  et `CONTAINER` se taillent maintenant sur ce qu'elles ont à montrer.
+- **fix(web)** — `Related`, `Status` et `Logs` ne se vident plus à chaque passe de la vue. Une
+  lecture reconstruit ses enregistrements, l'objet visé n'a pas bougé pour autant : le panneau se
+  rafraîchit sans repasser par « Recherche… », et les sections dépliées de `Related` restent
+  ouvertes.
+- **fix(web)** — l'édition et la suppression ne rechargent plus par-dessus la saisie en cours. Le
+  texte tapé dans `e` et le nom retapé pour confirmer un `Ctrl-D` étaient effacés toutes les vingt
+  secondes par le rafraîchissement de la liste. Le YAML, lui, ne se redessine plus sous les yeux.
+- **fix(web)** — un message d'**échec** ne s'efface plus tout seul au bout de huit secondes : il
+  reste jusqu'au geste suivant, et un clic le referme. Un succès garde son minuteur, il n'y a rien
+  à y relire. Le message tient sur une ligne et s'élide, texte entier dans l'infobulle.
+- **fix(velero)** — l'inventaire d'un backup injoignable ne dit plus deux fois la même phrase.
+  `publicUrl` était nommé par le téléchargement *et* par son appelant ; il ne l'est plus que par
+  celui qui sait ce qu'il téléchargeait, et seulement quand c'est bien l'endpoint interne qui a
+  fait échouer la lecture. L'URL signée y perd sa signature — cent caractères de query qui
+  noyaient le seul nom d'hôte qui compte.
+
 ## [2.0.0-beta.5] — 2026-09-08
 
 La vue **Nodes** arrive dans kdt-web, quatorzième vue et la première dont un geste **prend du
