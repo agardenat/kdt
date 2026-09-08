@@ -582,9 +582,10 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Ten views are
-live — events, workloads, Flux, Secrets/ConfigMaps, certificates, identity, Rancher, Kyverno,
-RBAC, Velero — along with the four gestures that apply to any object: YAML, edit, touch, delete.
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Thirteen views are
+live — events, workloads, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates, RBAC,
+Kyverno, identity, Rancher, network policies — along with the four gestures that apply to any
+object: YAML, edit, touch, delete.
 
 **Every request carries the credential of the person signed in**: the apiserver sees their name and
 groups, and the cluster's RBAC applies as-is. The pod's service account has no rights on any

@@ -18,7 +18,8 @@ use kube::{discovery, Client};
 use crate::events::format_age;
 
 // Which controller owns a policy row. Drives the KIND badge and whether a posture verdict is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NetPolEngine {
     K8s,
     Cilium,
@@ -37,7 +38,8 @@ impl NetPolEngine {
 
 // The posture of one direction (ingress or egress) for the pods a *native* policy selects. Only the
 // native engine sets anything other than `Unknown`: its semantics are specified, the CNIs' are not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DirEffect {
     // The policy does not affect this direction (not in policyTypes): traffic is left to other policies.
     Unaffected,
@@ -51,7 +53,7 @@ pub enum DirEffect {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NetPolResource {
     pub engine: NetPolEngine,
     pub kind: String,
@@ -451,6 +453,52 @@ fn json_match_labels(sel: &serde_json::Value) -> String {
         .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or_default()))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+// --- Records ------------------------------------------------------------------------------------
+
+/// L'enregistrement qu'une ligne de policy représente, pour que `y`, `e`, `h`, `Ctrl-D` et l'onglet
+/// Related visent l'objet réel — la même identité dans le TUI et dans kdt-web.
+///
+/// Sévérité `Normal` toujours : une policy n'est ni saine ni malade, elle décrit une posture. Un
+/// verdict de sévérité reviendrait à décider qu'un `AllowAll` est une faute, ce que cette vue
+/// n'affirme pas.
+pub fn netpol_record(p: &NetPolResource) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("net|{}", p.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: p.kind.clone(),
+        api_version: p.api_version.clone(),
+        kind: p.kind.clone(),
+        namespace: p.namespace.clone(),
+        name: p.name.clone(),
+        message: format!(
+            "[{}] target={} ingress={} egress={}",
+            p.engine.label(),
+            p.target,
+            p.ingress,
+            p.egress
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// Le ton d'une direction. `Deny` est **vert** : une direction gouvernée sans rien d'autorisé est
+/// une posture fermée, c'est-à-dire ce qu'on cherche. `AllowAll` est le cas qui mérite un regard.
+///
+/// Aucun ton pour les CRD : leur `DirEffect` est `Unknown`, et peindre une couleur reviendrait à
+/// asserter une sémantique que ce module refuse d'inventer.
+pub fn dir_tone(effect: DirEffect) -> crate::events::LineColor {
+    use crate::events::LineColor;
+    match effect {
+        DirEffect::Deny => LineColor::Ok,
+        DirEffect::AllowAll => LineColor::Warn,
+        DirEffect::Selective => LineColor::Plain,
+        DirEffect::Unaffected | DirEffect::Unknown => LineColor::Dim,
+    }
 }
 
 #[cfg(test)]

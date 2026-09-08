@@ -72,7 +72,7 @@ fn danger(text: String) -> Hint { Hint { level: HintLevel::Danger, text } }
 
 // --- Rows ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PvcResource {
     pub namespace: String,
     pub name: String,
@@ -95,7 +95,7 @@ pub struct PvcResource {
     pub hints: Vec<Hint>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PvResource {
     pub name: String,
     pub capacity: String,
@@ -117,7 +117,7 @@ pub struct PvResource {
     pub hints: Vec<Hint>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ScResource {
     pub name: String,
     pub provisioner: String,
@@ -160,10 +160,53 @@ pub fn volume_in_class(pv: &PvResource, sc: &ScResource) -> bool {
 
 // --- Fetch --------------------------------------------------------------------------------------
 
+/// L'inventaire du stockage : les lignes diagnostiquées, et ce que la lecture a pu observer.
+///
+/// Séparé de l'état partagé du TUI pour que kdt-web appelle le même code sans passer par un
+/// `Mutex` qu'un serveur n'a que faire — et sans réimplémenter la moindre règle.
+#[derive(Debug, Clone)]
+pub struct StorageInventory {
+    pub diagnosed: Diagnosed,
+    /// Faux quand la liste des pods a été refusée : la règle « rien ne monte cette claim » se tait
+    /// alors, au lieu de rapporter une absence qu'elle n'a pas pu constater.
+    pub mounts_known: bool,
+}
+
 // One pass over everything the storage rules need. Claims are the only hard dependency: without
 // them the view has nothing to say, so a failure there is surfaced as the view's error. The rest is
 // enrichment — a role that cannot read PVs or pods degrades the diagnosis instead of blanking the
 // screen, and each rule that depends on missing data stays quiet rather than guessing.
+//
+// La table de chaînes est un paramètre : le TUI a une langue par processus, un serveur en a une par
+// requête, et c'est la seule différence entre les deux appels.
+pub async fn storage_inventory(
+    client: &Client,
+    namespace: Option<String>,
+    st: &'static Strings,
+) -> Result<StorageInventory, String> {
+    let classes_raw = list_classes(client).await.unwrap_or_default();
+    let pvs_raw = list_volumes(client).await.unwrap_or_default();
+    let pvcs_raw = list_claims(client, &namespace).await?;
+
+    let mounts = list_mounts(client, &namespace).await;
+    let mounts_known = mounts.is_some();
+    let mounts = mounts.unwrap_or_default();
+
+    // Provisioning events are only worth a round-trip when something is actually stuck: on a healthy
+    // cluster this is the common case and the request is skipped entirely.
+    let has_pending = pvcs_raw.iter().any(|c| c.phase == "Pending");
+    let events = if has_pending {
+        claim_events(client, &namespace).await
+    } else {
+        HashMap::new()
+    };
+
+    Ok(StorageInventory {
+        diagnosed: diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events, st),
+        mounts_known,
+    })
+}
+
 pub async fn fetch_storage(client: Client, namespace: Option<String>, state: SharedStorage) {
     let st = crate::lang::active();
     {
@@ -172,10 +215,8 @@ pub async fn fetch_storage(client: Client, namespace: Option<String>, state: Sha
         s.error = None;
     }
 
-    let classes_raw = list_classes(&client).await.unwrap_or_default();
-    let pvs_raw = list_volumes(&client).await.unwrap_or_default();
-    let pvcs_raw = match list_claims(&client, &namespace).await {
-        Ok(v) => v,
+    let inventory = match storage_inventory(&client, namespace, st).await {
+        Ok(inv) => inv,
         Err(e) => {
             let mut s = state.lock().expect("storage poisoned");
             s.loading = false;
@@ -184,30 +225,15 @@ pub async fn fetch_storage(client: Client, namespace: Option<String>, state: Sha
         }
     };
 
-    let mounts = list_mounts(&client, &namespace).await;
-    let mounts_known = mounts.is_some();
-    let mounts = mounts.unwrap_or_default();
-
-    // Provisioning events are only worth a round-trip when something is actually stuck: on a healthy
-    // cluster this is the common case and the request is skipped entirely.
-    let has_pending = pvcs_raw.iter().any(|c| c.phase == "Pending");
-    let events = if has_pending {
-        claim_events(&client, &namespace).await
-    } else {
-        HashMap::new()
-    };
-
-    let snap = diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events, st);
-
     let mut s = state.lock().expect("storage poisoned");
     s.loading = false;
     s.error = None;
-    s.pvcs = snap.pvcs;
-    s.pvs = snap.pvs;
-    s.classes = snap.classes;
-    s.cluster_hints = snap.cluster_hints;
-    s.released_bytes = snap.released_bytes;
-    s.mounts_known = mounts_known;
+    s.pvcs = inventory.diagnosed.pvcs;
+    s.pvs = inventory.diagnosed.pvs;
+    s.classes = inventory.diagnosed.classes;
+    s.cluster_hints = inventory.diagnosed.cluster_hints;
+    s.released_bytes = inventory.diagnosed.released_bytes;
+    s.mounts_known = inventory.mounts_known;
 }
 
 async fn list_classes(client: &Client) -> Result<Vec<ScResource>, String> {
@@ -528,6 +554,7 @@ pub fn parse_bytes(q: &str) -> Option<i64> {
 // --- Rules --------------------------------------------------------------------------------------
 
 // The diagnosed snapshot: same rows, with every hint attached.
+#[derive(Debug, Clone)]
 pub struct Diagnosed {
     pub pvcs: Vec<PvcResource>,
     pub pvs: Vec<PvResource>,
@@ -785,6 +812,107 @@ fn pending_hints(
         out.push(warn(fill(st.sto_pending_unexplained, &[("age", &pvc.age)])));
     }
     out
+}
+
+// --- Records ------------------------------------------------------------------------------------
+
+// L'enregistrement qu'une ligne de stockage représente. La sévérité vient du diagnostic et non de la
+// phase : une claim Pending sur une classe `WaitForFirstConsumer` est normale, et une claim Bound
+// dont le volume partira avec elle ne l'est pas — les règles ont déjà tranché.
+//
+// Ces trois fonctions vivent ici, et non dans le rendu, parce que kdt-web en a besoin exactement
+// comme le TUI : ce sont elles qui donnent à la vue `y`, `e`, `h`, `Ctrl-D` et l'onglet Related.
+
+/// Le ton d'une phase, lu comme un opérateur la lit : `Bound` va bien, `Pending` est une question,
+/// `Released`/`Failed`/`Lost` sont de l'argent ou de la donnée en jeu.
+pub fn phase_tone(phase: &str) -> crate::events::LineColor {
+    use crate::events::LineColor;
+    match phase {
+        "Bound" => LineColor::Ok,
+        "Available" => LineColor::Info,
+        // `Pending` et `Released` partagent le même ton : le TUI les nuance en jaune et orange,
+        // mais la palette partagée n'a qu'un avertissement, et inventer une sixième couleur pour
+        // l'un des deux ferait diverger les deux interfaces sur ce que la nuance veut dire.
+        "Pending" | "Released" => LineColor::Warn,
+        "Failed" | "Lost" => LineColor::Err,
+        _ => LineColor::Dim,
+    }
+}
+
+pub fn pvc_record(c: &PvcResource, st: &'static Strings) -> crate::events::EventRecord {
+    let mounts = c.mounted_by.join(",");
+    crate::events::EventRecord {
+        uid: format!("sto|{}", c.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: hints_severity(&c.hints),
+        reason: c.phase.clone(),
+        api_version: "v1".to_string(),
+        kind: "PersistentVolumeClaim".to_string(),
+        namespace: c.namespace.clone(),
+        name: c.name.clone(),
+        message: fill(
+            st.rec_pvc,
+            &[
+                ("size", if c.capacity.is_empty() { &c.requested } else { &c.capacity }),
+                ("modes", &c.access_modes),
+                ("class", c.storage_class.as_deref().unwrap_or("—")),
+                ("pv", c.volume_name.as_deref().unwrap_or("—")),
+                ("mounts", if c.mounted_by.is_empty() { "—" } else { &mounts }),
+            ],
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn pv_record(v: &PvResource) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("sto|{}", v.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: hints_severity(&v.hints),
+        reason: v.phase.clone(),
+        api_version: "v1".to_string(),
+        kind: "PersistentVolume".to_string(),
+        namespace: String::new(),
+        name: v.name.clone(),
+        message: format!(
+            "{} {} reclaim={} class={} claim={} {}",
+            v.capacity,
+            v.access_modes,
+            v.reclaim_policy,
+            v.storage_class,
+            v.claim.clone().unwrap_or_else(|| "—".to_string()),
+            v.source,
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn sc_record(c: &ScResource) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("sto|{}", c.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: hints_severity(&c.hints),
+        reason: "StorageClass".to_string(),
+        api_version: "storage.k8s.io/v1".to_string(),
+        kind: "StorageClass".to_string(),
+        namespace: String::new(),
+        name: c.name.clone(),
+        message: format!(
+            "{} reclaim={} binding={} expansion={}{}",
+            c.provisioner,
+            c.reclaim_policy,
+            c.binding_mode,
+            c.allow_expansion,
+            if c.is_default { " (default)" } else { "" },
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
 }
 
 #[cfg(test)]

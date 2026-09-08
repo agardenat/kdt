@@ -10,6 +10,7 @@
 
 mod api;
 mod auth;
+mod capacity;
 mod certs;
 mod cluster;
 mod config;
@@ -22,7 +23,9 @@ mod objects;
 mod portal;
 mod rbac;
 mod rancher;
+mod netpol;
 mod session;
+mod storage;
 mod velero;
 mod workloads;
 
@@ -198,6 +201,11 @@ async fn main() -> Result<()> {
         // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
         // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.
         .route("/api/v1/kyverno/purge", post(kyverno::purge))
+        // Les trois vues qui ne font que constater : elles lisent, elles diagnostiquent, et les
+        // gestes génériques suffisent à agir sur l'objet d'une ligne. Aucune route d'écriture.
+        .route("/api/v1/capacity", get(capacity::list))
+        .route("/api/v1/storage", get(storage::list))
+        .route("/api/v1/netpol", get(netpol::list))
         .route("/api/v1/certs", get(certs::list))
         // Les deux leviers de la chaîne : forcer la ré-émission, et relancer un cycle ACME bloqué
         // en supprimant la demande en cours.

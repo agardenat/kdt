@@ -58,14 +58,15 @@ const NEAR_LIMIT_PCT: i64 = 90;
 
 // Why a pod has nowhere to go. The distinction matters: no room is fixed by adding capacity, a
 // selector or a taint is fixed by changing the pod — and no amount of new nodes will help.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Homeless {
     NoRoom,
     Taints,
     Selector,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct HomelessPod {
     pub namespace: String,
     pub name: String,
@@ -75,7 +76,10 @@ pub struct HomelessPod {
 }
 
 // What losing the node would do, once its pods have been placed elsewhere on paper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Serialize` adjacent : les variantes sans donnée rendent `{"kind":"fits"}`, et `Homeless`
+// rend la liste des pods sous `pods`. Le navigateur lit un verdict, il ne le recalcule pas.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "pods", rename_all = "kebab-case")]
 pub enum Loss {
     // The only node that could take anything: there is no simulation to run.
     Alone,
@@ -96,7 +100,7 @@ impl Loss {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeRoom {
     pub name: String,
     pub ready: bool,
@@ -123,7 +127,8 @@ impl NodeRoom {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Qos {
     Guaranteed,
     Burstable,
@@ -140,7 +145,7 @@ impl Qos {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkloadSizing {
     pub namespace: String,
     pub kind: String,
@@ -165,7 +170,7 @@ impl WorkloadSizing {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QuotaItem {
     pub resource: String,
     pub used: i64,
@@ -182,7 +187,7 @@ impl QuotaItem {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QuotaPressure {
     pub namespace: String,
     pub name: String,
@@ -222,17 +227,28 @@ pub fn new_capacity_state() -> SharedCapacity {
 
 // --- Fetch --------------------------------------------------------------------------------------
 
+/// Ce qu'une passe de lecture a trouvé : l'analyse, et si metrics-server était là pour la nourrir.
+///
+/// Séparé de l'état partagé du TUI pour que kdt-web appelle le même code sans passer par un
+/// `Mutex` — et sans réimplémenter la moindre règle.
+#[derive(Debug, Clone)]
+pub struct CapacityInventory {
+    pub analysis: Analysis,
+    /// Faux sans metrics-server : chaque règle qui compare à une mesure se tait alors, plutôt que
+    /// de lire une absence comme un zéro.
+    pub metrics_available: bool,
+}
+
 // One pass over everything the rules cross-reference. Nodes and pods are mandatory; quotas,
 // ReplicaSets (to name a Deployment rather than its hash) and metrics degrade to "absent" so a
 // cluster that refuses one of them still gets every other finding.
-pub async fn fetch_capacity(client: Client, state: SharedCapacity) {
-    let st = crate::lang::active();
-    {
-        let mut s = state.lock().expect("capacity poisoned");
-        s.loading = true;
-        s.error = None;
-    }
-
+//
+// La table de chaînes est un paramètre : le TUI a une langue par processus, un serveur en a une par
+// requête, et c'est la seule différence entre les deux appels.
+pub async fn capacity_inventory(
+    client: &Client,
+    st: &'static Strings,
+) -> Result<CapacityInventory, String> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let pods_api: Api<Pod> = Api::all(client.clone());
     let quotas_api: Api<ResourceQuota> = Api::all(client.clone());
@@ -244,31 +260,42 @@ pub async fn fetch_capacity(client: Client, state: SharedCapacity) {
         pods_api.list(&lp),
         quotas_api.list(&lp),
         rs_api.list(&lp),
-        fetch_pod_usage(&client),
+        fetch_pod_usage(client),
     );
 
-    let nodes = match nodes {
-        Ok(l) => l.items,
-        Err(e) => return publish_error(&state, format!("nodes: {}", e)),
-    };
-    let pods = match pods {
-        Ok(l) => l.items,
-        Err(e) => return publish_error(&state, format!("pods: {}", e)),
-    };
+    let nodes = nodes.map_err(|e| format!("nodes: {}", e))?.items;
+    let pods = pods.map_err(|e| format!("pods: {}", e))?.items;
     let quotas = quotas.map(|l| l.items).unwrap_or_default();
     let owners = replicaset_owners(replicasets.map(|l| l.items).unwrap_or_default());
 
     let metrics_available = !usage.is_empty();
-    let computed = analyse(&nodes, &pods, &quotas, &owners, &usage, metrics_available, st);
+    Ok(CapacityInventory {
+        analysis: analyse(&nodes, &pods, &quotas, &owners, &usage, metrics_available, st),
+        metrics_available,
+    })
+}
+
+pub async fn fetch_capacity(client: Client, state: SharedCapacity) {
+    let st = crate::lang::active();
+    {
+        let mut s = state.lock().expect("capacity poisoned");
+        s.loading = true;
+        s.error = None;
+    }
+
+    let inventory = match capacity_inventory(&client, st).await {
+        Ok(inv) => inv,
+        Err(e) => return publish_error(&state, e),
+    };
 
     let mut s = state.lock().expect("capacity poisoned");
     s.loading = false;
     s.error = None;
-    s.nodes = computed.nodes;
-    s.workloads = computed.workloads;
-    s.quotas = computed.quotas;
-    s.cluster_hints = computed.cluster_hints;
-    s.metrics_available = metrics_available;
+    s.nodes = inventory.analysis.nodes;
+    s.workloads = inventory.analysis.workloads;
+    s.quotas = inventory.analysis.quotas;
+    s.cluster_hints = inventory.analysis.cluster_hints;
+    s.metrics_available = inventory.metrics_available;
 }
 
 fn publish_error(state: &SharedCapacity, msg: String) {
@@ -1078,6 +1105,174 @@ pub fn cpu_text(v: i64) -> String {
 
 pub fn mem_text(v: i64) -> String {
     format_memory_bytes(v)
+}
+
+// --- Verdicts and records -----------------------------------------------------------------------
+
+// Ce qui suit vivait dans le rendu du TUI. C'est descendu ici parce que ce sont des jugements sur le
+// cluster — à quel point un taux est tendu, quel objet une ligne désigne — et que kdt-web les
+// reprend tels quels. Deux implémentations peindraient deux couleurs du même node.
+
+/// À quel point un taux est tendu. Les seuils sont ceux des règles, pour qu'une cellule colorée et
+/// un constat ne se contredisent jamais.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tension {
+    Ok,
+    /// Ça se remplit, sans que rien ne soit encore refusé.
+    Watch,
+    /// Au seuil des règles : un pod normal ne rentre plus.
+    High,
+    /// Au-delà de ce qui existe.
+    Over,
+}
+
+pub fn tension(pct: i64) -> Tension {
+    if pct >= 100 {
+        Tension::Over
+    } else if pct >= RESERVED_WARN_PCT {
+        Tension::High
+    } else if pct >= 70 {
+        Tension::Watch
+    } else {
+        Tension::Ok
+    }
+}
+
+/// Le mot que porte la colonne « si ce node tombe ».
+pub fn loss_word(loss: &Loss, st: &'static Strings) -> &'static str {
+    match loss {
+        Loss::Alone => st.cap_loss_word_alone,
+        Loss::Fits => st.cap_loss_word_fits,
+        Loss::Tight => st.cap_loss_word_tight,
+        Loss::Homeless(_) => st.cap_loss_word_homeless,
+    }
+}
+
+/// La cellule courte de la colonne « IF LOST », dénombrement compris.
+pub fn loss_short(loss: &Loss, st: &'static Strings) -> String {
+    match loss {
+        Loss::Alone => st.cap_loss_alone_short.to_string(),
+        Loss::Fits => st.cap_loss_fits_short.to_string(),
+        Loss::Tight => st.cap_loss_tight_short.to_string(),
+        Loss::Homeless(v) => {
+            st.plural(v.len(), st.cap_loss_homeless_one_short, st.cap_loss_homeless_many_short)
+        }
+    }
+}
+
+/// Le ton de la colonne « si ce node tombe ». `Alone` n'est pas un verdict : il n'y a personne
+/// d'autre, donc il n'y a pas de simulation à faire.
+pub fn loss_tone(loss: &Loss) -> crate::events::LineColor {
+    use crate::events::LineColor;
+    match loss {
+        Loss::Alone => LineColor::Dim,
+        Loss::Fits => LineColor::Ok,
+        Loss::Tight => LineColor::Warn,
+        Loss::Homeless(_) => LineColor::Err,
+    }
+}
+
+/// Pourquoi un pod n'a nulle part où aller, en un mot.
+pub fn homeless_why(why: Homeless, st: &'static Strings) -> &'static str {
+    match why {
+        Homeless::NoRoom => st.cap_why_no_room,
+        Homeless::Taints => st.cap_why_taints,
+        Homeless::Selector => st.cap_why_selector,
+    }
+}
+
+// The apiVersion a workload kind lives under, so `y` on a capacity row fetches the right object.
+pub fn workload_api_version(kind: &str) -> &'static str {
+    match kind {
+        "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" => "apps/v1",
+        "Job" | "CronJob" => "batch/v1",
+        _ => "v1",
+    }
+}
+
+// Les constats sont rédigés en phrases complètes pour le panneau ; une cellule de table en prend la
+// tête.
+pub fn first_sentence(text: &str) -> String {
+    match text.find(" : ") {
+        Some(i) => text[..i].to_string(),
+        None => text.split(" — ").next().unwrap_or(text).to_string(),
+    }
+}
+
+// Adapt a capacity row into an EventRecord, so the search, the AI panel and the generic object
+// machinery (`y`, Related) work here as everywhere else. The identity is the *object* behind the
+// row — the Node, the workload, the ResourceQuota — not the finding about it.
+pub fn node_record(n: &NodeRoom, st: &'static Strings) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("cap|{}", n.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::storage::hints_severity(&n.hints),
+        reason: loss_word(&n.loss, st).to_string(),
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: String::new(),
+        name: n.name.clone(),
+        message: fill(
+            st.rec_node_capacity,
+            &[
+                ("cpureq", &cpu_text(n.req_cpu)),
+                ("cpualloc", &cpu_text(n.alloc_cpu)),
+                ("memreq", &mem_text(n.req_mem)),
+                ("memalloc", &mem_text(n.alloc_mem)),
+                ("pods", &n.pods.to_string()),
+                ("loss", &n.hints.first().map(|h| h.text.clone()).unwrap_or_default()),
+            ],
+        ),
+        component: String::new(),
+        host: n.name.clone(),
+        count: 1,
+    }
+}
+
+pub fn workload_record(w: &WorkloadSizing) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("cap|{}", w.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::storage::hints_severity(&w.hints),
+        reason: w.qos.label().to_string(),
+        api_version: workload_api_version(&w.kind).to_string(),
+        kind: w.kind.clone(),
+        namespace: w.namespace.clone(),
+        name: w.name.clone(),
+        message: format!(
+            "{} pod(s) · requests cpu {} mem {} · {}",
+            w.pods,
+            cpu_text(w.cpu_req),
+            mem_text(w.mem_req),
+            w.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn quota_record(q: &QuotaPressure) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!("cap|{}", q.uid()),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::storage::hints_severity(&q.hints),
+        reason: format!("{}%", q.worst_pct()),
+        api_version: "v1".to_string(),
+        kind: "ResourceQuota".to_string(),
+        namespace: q.namespace.clone(),
+        name: q.name.clone(),
+        message: q
+            .items
+            .iter()
+            .map(|i| format!("{} {}/{}", i.resource, i.used_text, i.hard_text))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
 }
 
 #[cfg(test)]

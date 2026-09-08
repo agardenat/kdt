@@ -1098,3 +1098,94 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .vel-form .form-row { margin-top: .5rem; }
 .vel-form .menu-note.err { color: var(--err); }
 .vel-form .delete-confirm { margin-top: .6rem; }
+
+/* --- Vues capacité, stockage et network policies -------------------------------------------------
+
+   Trois vues qui constatent : elles lisent, elles diagnostiquent, et rien de ce qui suit ne juge.
+   Les tons — la tension d'un taux, l'effet d'une direction, la phase d'un volume — arrivent tous du
+   serveur, calculés par les mêmes règles que le TUI. Ce qui suit n'est que du dessin. */
+
+/* Les tons d'une valeur du panneau. Ils existaient déjà pour les cellules de table ; le panneau les
+   recevait sans jamais les peindre, et une valeur « warn » s'y lisait comme une valeur normale. */
+.keys-row .v.ok { color: var(--ok); }
+.keys-row .v.warn { color: var(--warn); }
+.keys-row .v.err { color: var(--err); }
+.keys-row .v.info { color: var(--info); }
+.keys-row .v.dim { color: var(--dim); }
+
+/* Une phrase du serveur posée dans le panneau : le verdict de perte d'un node, le refus de juger
+   d'un moteur CNI. Ce n'est pas un constat de la liste, donc pas une puce — c'est une note. */
+.hint-note {
+  margin: .2rem 0 .5rem; font-size: 11.5px; line-height: 1.45;
+}
+.hint-note.ok { color: var(--ok); }
+.hint-note.warn { color: var(--warn); }
+.hint-note.err { color: var(--err); }
+.hint-note.info { color: var(--info); }
+.hint-note.dim, .hint-note.plain { color: var(--muted); }
+
+/* Les quatre niveaux de tension de `kdt::capacity`. Les seuils sont ceux des règles — 70, 90,
+   100 % — pour qu'une cellule colorée et un constat ne se contredisent jamais. `over` est en gras :
+   au-delà de ce qui existe, ce n'est plus une nuance. */
+.cap-ok { color: inherit; }
+.cap-watch { color: var(--warn); }
+.cap-high { color: #e8590c; }
+.cap-over { color: var(--err); font-weight: 600; }
+:root:not([data-theme="light"]) .cap-high, :root[data-theme="dark"] .cap-high { color: #ff922b; }
+/* Le total et le pourcentage accompagnent la quantité sans lui voler l'œil. */
+.cell .pct { color: var(--muted); font-weight: 400; }
+
+/* La QoS que le kubelet donne : `Guaranteed` est ce qu'on vise, `BestEffort` est ce qui se fait
+   tuer en premier. `Burstable` est la normale, donc elle ne se signale pas. */
+.cell.qos-guaranteed { color: var(--ok); }
+.cell.qos-burstable { color: var(--dim); }
+.cell.qos-best-effort { color: var(--warn); }
+
+/* L'état d'un node à côté de son nom : un écart à la norme, jamais la norme. Un node Ready et
+   schedulable ne porte rien. */
+.badge-node {
+  font-size: 10px; padding: 0 .3rem; border-radius: 3px; margin-left: .4rem;
+  border: 1px solid currentColor; font-family: var(--mono);
+}
+.badge-node.warn { color: var(--warn); }
+.badge-node.err { color: var(--err); }
+
+/* Ce qui appartient au cluster et à aucune ligne : pas de classe par défaut, deux classes par
+   défaut, les octets que plus personne ne peut atteindre. Une bande, pas une ligne de table — la
+   question qu'elle pose ne porte sur aucun objet en particulier. */
+.sto-band {
+  display: flex; flex-wrap: wrap; gap: .2rem 1.2rem;
+  padding: .3rem .85rem; border-bottom: 1px solid var(--line);
+  font-size: 11.5px; line-height: 1.5;
+}
+.sto-band.info { background: color-mix(in srgb, var(--info) 7%, transparent); }
+.sto-band.warn { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.sto-band.danger { background: color-mix(in srgb, var(--err) 8%, transparent); }
+.sto-band .waste { font-family: var(--mono); font-weight: 600; }
+.sto-band .danger { color: var(--err); }
+.sto-band .warn { color: var(--warn); }
+.sto-band .info { color: var(--muted); }
+
+/* La classe est le parent, le volume est ce qu'elle provisionne : l'indentation dit la
+   filiation, et la classe garde la graisse d'une racine. */
+.tbody .tr.sto-class .cell.id { font-weight: 600; }
+.tbody .tr.sto-volume .cell.id.nested { padding-left: 1.5rem; color: var(--fg); }
+.badge-default {
+  font-size: 10px; padding: 0 .3rem; border-radius: 3px; margin-left: .4rem;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);
+  font-weight: 600;
+}
+
+/* Le moteur qui possède une policy. Trois couleurs, comme dans le TUI : ce qui compte est de voir
+   d'un coup d'œil que deux mondes de politiques coexistent sur le même cluster. */
+.cell.engine-k8s { color: var(--info); font-weight: 600; }
+.cell.engine-cilium { color: #b950c8; font-weight: 600; }
+.cell.engine-calico { color: var(--accent); font-weight: 600; }
+:root:not([data-theme="light"]) .cell.engine-cilium,
+:root[data-theme="dark"] .cell.engine-cilium { color: #d08ce0; }
+
+/* Combien de volumes une classe provisionne, posé à côté de son nom : la colonne SIZE mesure des
+   octets, et y écrire un compte le ferait lire comme une taille. */
+.grp-count {
+  margin-left: .5rem; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+}

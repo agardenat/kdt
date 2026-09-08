@@ -6,6 +6,7 @@
 
 import type {
   Capabilities,
+  CapacityPayload,
   ClusterBanner,
   CertActionTarget,
   CertFilter,
@@ -29,6 +30,8 @@ import type {
   IdentityWriteResult,
   KyFilter,
   KyvernoPayload,
+  NetpolPayload,
+  StoragePayload,
   RbacOrient,
   RbacPayload,
   RbacSeverity,
@@ -578,4 +581,41 @@ export function veleroWrite(
   lang: Lang,
 ): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/velero/write", { ...request, lang });
+}
+
+/**
+ * Les trois mondes de la capacité, dans la portée.
+ *
+ * Les nodes ignorent la portée — ils n'ont pas de namespace — mais les workloads et les quotas la
+ * suivent, comme le titre du TUI qui compte ce que la portée contient.
+ *
+ * La langue part avec : la simulation de perte et les constats sont rédigés côté serveur.
+ */
+export function capacity(namespace: string, lang: Lang): Promise<CapacityPayload> {
+  const params = new URLSearchParams({ lang });
+  if (namespace) params.set("ns", namespace);
+  return get<CapacityPayload>(`/api/v1/capacity?${params.toString()}`);
+}
+
+/**
+ * L'inventaire du stockage de la portée, diagnostiqué.
+ *
+ * La portée ne porte que sur les claims : un PV et une StorageClass sont cluster-scoped, et les
+ * écarter couperait la vue de ce à quoi les claims se lient.
+ */
+export function storage(namespace: string, lang: Lang): Promise<StoragePayload> {
+  const params = new URLSearchParams({ lang });
+  if (namespace) params.set("ns", namespace);
+  return get<StoragePayload>(`/api/v1/storage?${params.toString()}`);
+}
+
+/**
+ * Les politiques réseau de la portée, tous moteurs confondus.
+ *
+ * Pas de langue : cette vue ne rédige aucun constat — elle rapporte ce que les politiques disent,
+ * et ne juge que ce dont la sémantique est spécifiée.
+ */
+export function netpol(namespace: string): Promise<NetpolPayload> {
+  const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
+  return get<NetpolPayload>(`/api/v1/netpol${query}`);
 }

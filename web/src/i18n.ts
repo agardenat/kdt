@@ -518,6 +518,34 @@ export interface Strings {
   velOverdue: string;
   velGitops: string;
 
+  // --- Vues capacité, stockage et network policies. Le jargon reste en anglais des deux côtés —
+  // node, workload, quota, claim, volume, class, ingress, egress — et les constats viennent du
+  // serveur déjà rédigés. Ce qui suit est ce que le navigateur écrit lui-même.
+  capEmpty: string;
+  capNoMetrics: string;
+  capReserved: string;
+  capUsed: string;
+  capIfLost: string;
+  capHomeless: string;
+  capOverview: string;
+  capNodeCordoned: string;
+  capNodeNotReady: string;
+  capSlots: string;
+
+  stoEmpty: string;
+  stoReleased: string;
+  stoMountsUnknown: string;
+  stoDeletes: string;
+  stoDefault: string;
+  stoNoClass: string;
+  stoMountedBy: string;
+  stoBackend: string;
+
+  netpolEmpty: string;
+  netpolCluster: string;
+  netpolNoVerdict: string;
+  netpolTarget: string;
+
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
@@ -1080,6 +1108,34 @@ const FR: Strings = {
   velOverdue: "en retard",
   velGitops: "possédé par {engine} : une pause posée ici sera défaite à la prochaine réconciliation.",
 
+  capEmpty: "Rien à montrer dans cette portée.",
+  capNoMetrics:
+    "metrics-server ne répond pas : la réservation est connue, la consommation ne l'est pas.",
+  capReserved: "réservé",
+  capUsed: "consommé",
+  capIfLost: "si ce node tombe",
+  capHomeless: "Pods sans point de chute",
+  capOverview: "Capacité",
+  capNodeCordoned: "cordonné",
+  capNodeNotReady: "NotReady",
+  capSlots: "slots de pods",
+
+  stoEmpty: "Rien à montrer dans cette portée.",
+  stoReleased: "{size} dorment en Released",
+  stoMountsUnknown:
+    "La liste des pods vous est refusée : « rien ne monte cette claim » n'est donc jamais affirmé.",
+  stoDeletes: "reclaimPolicy Delete : supprimer la claim supprime la donnée.",
+  stoDefault: "défaut",
+  stoNoClass: "(classe absente)",
+  stoMountedBy: "monté par",
+  stoBackend: "backend",
+
+  netpolEmpty: "Aucune policy dans cette portée.",
+  netpolCluster: "(cluster)",
+  netpolNoVerdict:
+    "Ce moteur n'a pas de verdict de posture : sa sémantique par défaut n'est pas celle du natif, et l'affirmer serait deviner.",
+  netpolTarget: "cible",
+
   filterAll: "tout",
   filterProblems: "problèmes",
 
@@ -1634,6 +1690,33 @@ const EN: Strings = {
   velAllNamespaces: "every namespace",
   velOverdue: "overdue",
   velGitops: "owned by {engine}: a pause set here is reverted at its next reconciliation.",
+
+  capEmpty: "Nothing to show in this scope.",
+  capNoMetrics: "metrics-server is not answering: reservation is known, consumption is not.",
+  capReserved: "reserved",
+  capUsed: "used",
+  capIfLost: "if this node goes",
+  capHomeless: "Pods with nowhere to go",
+  capOverview: "Capacity",
+  capNodeCordoned: "cordoned",
+  capNodeNotReady: "NotReady",
+  capSlots: "pod slots",
+
+  stoEmpty: "Nothing to show in this scope.",
+  stoReleased: "{size} sitting in Released",
+  stoMountsUnknown:
+    "Listing pods is denied to you: \"nothing mounts this claim\" is therefore never claimed.",
+  stoDeletes: "reclaimPolicy Delete: deleting the claim deletes the data.",
+  stoDefault: "default",
+  stoNoClass: "(class missing)",
+  stoMountedBy: "mounted by",
+  stoBackend: "backend",
+
+  netpolEmpty: "No policy in this scope.",
+  netpolCluster: "(cluster)",
+  netpolNoVerdict:
+    "This engine gets no posture verdict: its default semantics are not the native ones, and asserting them would be guessing.",
+  netpolTarget: "target",
 
   filterAll: "all",
   filterProblems: "problems",

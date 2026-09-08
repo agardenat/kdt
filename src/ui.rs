@@ -105,7 +105,7 @@ use crate::vulnerabilities::{
 };
 use crate::touch;
 use crate::capacity::{
-    self as cap, fetch_capacity, new_capacity_state, Homeless as CapHomeless, Loss as CapLoss,
+    self as cap, fetch_capacity, new_capacity_state, Loss as CapLoss,
     NodeRoom, Qos as CapQos, QuotaPressure, SharedCapacity, WorkloadSizing,
 };
 use crate::exec;
@@ -17261,26 +17261,7 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
             host: String::new(),
             count: 1,
         },
-        NetRow::NetPol(p) => EventRecord {
-            uid: format!("net|{}", p.uid),
-            time: now,
-            severity: Severity::Normal,
-            reason: p.kind.clone(),
-            api_version: p.api_version.clone(),
-            kind: p.kind.clone(),
-            namespace: p.namespace.clone(),
-            name: p.name.clone(),
-            message: format!(
-                "[{}] target={} ingress={} egress={}",
-                p.engine.label(),
-                p.target,
-                p.ingress,
-                p.egress
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
+        NetRow::NetPol(p) => crate::netpol::netpol_record(p),
     }
 }
 
@@ -17291,95 +17272,11 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
 // machinery (`y`, Related) work here as everywhere else. The identity is the *object* behind the
 // row — the Node, the workload, the ResourceQuota — not the finding about it.
 fn synthetic_capacity_record(row: &CapRow) -> EventRecord {
-    let now = k8s_openapi::jiff::Timestamp::now();
-    let severity = if row.has_problem() { Severity::Warning } else { Severity::Normal };
-    match row {
-        CapRow::Node(n) => EventRecord {
-            uid: format!("cap|{}", n.uid()),
-            time: now,
-            severity,
-            reason: loss_word(&n.loss).to_string(),
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: String::new(),
-            name: n.name.clone(),
-            message: lang::fill(
-                lang::active().rec_node_capacity,
-                &[
-                    ("cpureq", &cap::cpu_text(n.req_cpu)),
-                    ("cpualloc", &cap::cpu_text(n.alloc_cpu)),
-                    ("memreq", &cap::mem_text(n.req_mem)),
-                    ("memalloc", &cap::mem_text(n.alloc_mem)),
-                    ("pods", &n.pods.to_string()),
-                    (
-                        "loss",
-                        &n.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
-                    ),
-                ],
-            ),
-            component: String::new(),
-            host: n.name.clone(),
-            count: 1,
-        },
-        CapRow::Workload(w) => EventRecord {
-            uid: format!("cap|{}", w.uid()),
-            time: now,
-            severity,
-            reason: w.qos.label().to_string(),
-            api_version: workload_api_version(&w.kind).to_string(),
-            kind: w.kind.clone(),
-            namespace: w.namespace.clone(),
-            name: w.name.clone(),
-            message: format!(
-                "{} pod(s) · requests cpu {} mem {} · {}",
-                w.pods,
-                cap::cpu_text(w.cpu_req),
-                cap::mem_text(w.mem_req),
-                w.hints.first().map(|h| h.text.clone()).unwrap_or_default(),
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
-        CapRow::Quota(q) => EventRecord {
-            uid: format!("cap|{}", q.uid()),
-            time: now,
-            severity,
-            reason: format!("{}%", q.worst_pct()),
-            api_version: "v1".to_string(),
-            kind: "ResourceQuota".to_string(),
-            namespace: q.namespace.clone(),
-            name: q.name.clone(),
-            message: q
-                .items
-                .iter()
-                .map(|i| format!("{} {}/{}", i.resource, i.used_text, i.hard_text))
-                .collect::<Vec<_>>()
-                .join(" · "),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
-    }
-}
-
-// The apiVersion a workload kind lives under, so `y` on a capacity row fetches the right object.
-fn workload_api_version(kind: &str) -> &'static str {
-    match kind {
-        "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" => "apps/v1",
-        "Job" => "batch/v1",
-        "CronJob" => "batch/v1",
-        _ => "v1",
-    }
-}
-
-fn loss_word(loss: &CapLoss) -> &'static str {
     let st = lang::active();
-    match loss {
-        CapLoss::Alone => st.cap_loss_word_alone,
-        CapLoss::Fits => st.cap_loss_word_fits,
-        CapLoss::Tight => st.cap_loss_word_tight,
-        CapLoss::Homeless(_) => st.cap_loss_word_homeless,
+    match row {
+        CapRow::Node(n) => cap::node_record(n, st),
+        CapRow::Workload(w) => cap::workload_record(w),
+        CapRow::Quota(q) => cap::quota_record(q),
     }
 }
 
@@ -17480,80 +17377,11 @@ fn synthetic_refl_orphan_record(o: &ReflOrphan) -> EventRecord {
 }
 
 fn synthetic_storage_record(row: &StoRow) -> EventRecord {
-    let now = k8s_openapi::jiff::Timestamp::now();
-    let severity = |r: &StoRow| {
-        if r.has_problem() { Severity::Warning } else { Severity::Normal }
-    };
+    let st = lang::active();
     match row {
-        StoRow::Claim(c) => {
-            let mounts = c.mounted_by.join(",");
-            EventRecord {
-                uid: format!("sto|{}", c.uid),
-                time: now,
-                severity: severity(row),
-                reason: c.phase.clone(),
-                api_version: "v1".to_string(),
-                kind: "PersistentVolumeClaim".to_string(),
-                namespace: c.namespace.clone(),
-                name: c.name.clone(),
-                message: lang::fill(
-                    lang::active().rec_pvc,
-                    &[
-                        ("size", if c.capacity.is_empty() { &c.requested } else { &c.capacity }),
-                        ("modes", &c.access_modes),
-                        ("class", c.storage_class.as_deref().unwrap_or("—")),
-                        ("pv", c.volume_name.as_deref().unwrap_or("—")),
-                        ("mounts", if c.mounted_by.is_empty() { "—" } else { &mounts }),
-                    ],
-                ),
-                component: String::new(),
-                host: String::new(),
-                count: 1,
-            }
-        }
-        StoRow::Volume(v) => EventRecord {
-            uid: format!("sto|{}", v.uid),
-            time: now,
-            severity: severity(row),
-            reason: v.phase.clone(),
-            api_version: "v1".to_string(),
-            kind: "PersistentVolume".to_string(),
-            namespace: String::new(),
-            name: v.name.clone(),
-            message: format!(
-                "{} {} reclaim={} class={} claim={} {}",
-                v.capacity,
-                v.access_modes,
-                v.reclaim_policy,
-                v.storage_class,
-                v.claim.clone().unwrap_or_else(|| "—".to_string()),
-                v.source,
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
-        StoRow::Class(c) => EventRecord {
-            uid: format!("sto|{}", c.uid),
-            time: now,
-            severity: severity(row),
-            reason: "StorageClass".to_string(),
-            api_version: "storage.k8s.io/v1".to_string(),
-            kind: "StorageClass".to_string(),
-            namespace: String::new(),
-            name: c.name.clone(),
-            message: format!(
-                "{} reclaim={} binding={} expansion={}{}",
-                c.provisioner,
-                c.reclaim_policy,
-                c.binding_mode,
-                c.allow_expansion,
-                if c.is_default { " (default)" } else { "" },
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
+        StoRow::Claim(c) => crate::storage::pvc_record(c, st),
+        StoRow::Volume(v) => crate::storage::pv_record(v),
+        StoRow::Class(c) => crate::storage::sc_record(c),
     }
 }
 
@@ -18129,12 +17957,14 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // Color for a native direction verdict: a default-deny reads as hardening (green), an allow-all as a
 // permissive note (yellow); an unaffected/CRD direction stays dim. No verdict is a claim of a problem —
 // the coloring characterizes the posture, it does not judge it.
+// Le ton vient de `netpol`, la graisse reste ici : une posture fermée mérite d'être vue de loin,
+// et c'est une affaire de rendu, pas de verdict.
 fn dir_effect_style(effect: DirEffect) -> Style {
-    match effect {
-        DirEffect::Deny => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        DirEffect::AllowAll => Style::default().fg(Color::Yellow),
-        DirEffect::Selective => Style::default(),
-        DirEffect::Unaffected | DirEffect::Unknown => Style::default().fg(DIM),
+    let style = line_color_to_style(crate::netpol::dir_tone(effect));
+    if effect == DirEffect::Deny {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
     }
 }
 
@@ -22897,13 +22727,11 @@ fn sto_hint_color(hints: &[crate::storage::Hint]) -> Option<Color> {
 // The phase cell, coloured by what the phase actually means for the operator: Bound is fine, Pending
 // is a question, Released/Failed/Lost are money or data at stake.
 fn sto_phase_cell(phase: &str) -> Cell<'static> {
+    // Le ton vient de `storage`, partagé avec kdt-web. L'orange de `Released` reste une nuance du
+    // terminal : la palette partagée n'a qu'un avertissement, et c'est bien un avertissement.
     let color = match phase {
-        "Bound" => Color::Green,
-        "Available" => Color::Cyan,
-        "Pending" => Color::Yellow,
         "Released" => Color::Rgb(255, 140, 0),
-        "Failed" | "Lost" => Color::Red,
-        _ => DIM,
+        _ => line_color(crate::storage::phase_tone(phase)),
     };
     Cell::from(phase.to_string()).style(Style::default().fg(color))
 }
@@ -24917,18 +24745,12 @@ fn cap_row_cells(row: &CapRow) -> Row<'static> {
     let dim = Style::default().fg(DIM);
     match row {
         CapRow::Node(n) => {
-            let (loss_text, loss_color) = match &n.loss {
-                CapLoss::Alone => (st.cap_loss_alone_short.to_string(), DIM),
-                CapLoss::Fits => (st.cap_loss_fits_short.to_string(), Color::Green),
-                CapLoss::Tight => (st.cap_loss_tight_short.to_string(), Color::Rgb(255, 140, 0)),
-                CapLoss::Homeless(v) => (
-                    st.plural(
-                        v.len(),
-                        st.cap_loss_homeless_one_short,
-                        st.cap_loss_homeless_many_short,
-                    ),
-                    Color::Red,
-                ),
+            // Le libellé et le ton viennent de `capacity`, comme le verdict lui-même : l'orange de
+            // `Tight` est une nuance du terminal, pas un cinquième niveau de gravité.
+            let loss_text = cap::loss_short(&n.loss, st);
+            let loss_color = match n.loss {
+                CapLoss::Tight => Color::Rgb(255, 140, 0),
+                _ => line_color(cap::loss_tone(&n.loss)),
             };
             Row::new(vec![
                 Cell::from(n.name.clone()).style(name_style),
@@ -24982,7 +24804,7 @@ fn cap_row_cells(row: &CapRow) -> Row<'static> {
                 arrow(w.mem_req, w.mem_use, cap::mem_text),
                 Cell::from(w.qos.label()).style(Style::default().fg(qos_color)),
                 Cell::from(
-                    w.hints.first().map(|h| first_sentence(&h.text)).unwrap_or_default(),
+                    w.hints.first().map(|h| cap::first_sentence(&h.text)).unwrap_or_default(),
                 )
                 .style(Style::default().fg(flag.unwrap_or(DIM))),
             ])
@@ -25008,24 +24830,14 @@ fn ratio_text(used: String, total: String, pct: i64) -> String {
     format!("{}/{} ({}%)", used, total, pct)
 }
 
-// The same thresholds the rules use, so a coloured cell and a finding never disagree.
+// The same thresholds the rules use, so a coloured cell and a finding never disagree. Les seuils
+// sont ceux de `capacity::tension`, partagés avec kdt-web ; ceci ne fait que les peindre.
 fn pct_style(pct: i64) -> Style {
-    if pct >= 100 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if pct >= 90 {
-        Style::default().fg(Color::Rgb(255, 140, 0))
-    } else if pct >= 70 {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    }
-}
-
-// The findings are written as full sentences for the panel; a table cell takes the head of one.
-fn first_sentence(text: &str) -> String {
-    match text.find(" : ") {
-        Some(i) => text[..i].to_string(),
-        None => text.split(" — ").next().unwrap_or(text).to_string(),
+    match cap::tension(pct) {
+        cap::Tension::Over => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        cap::Tension::High => Style::default().fg(Color::Rgb(255, 140, 0)),
+        cap::Tension::Watch => Style::default().fg(Color::Yellow),
+        cap::Tension::Ok => Style::default(),
     }
 }
 
@@ -25161,11 +24973,7 @@ fn capacity_detail_lines(
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     )));
                     for p in pods {
-                        let why = match p.why {
-                            CapHomeless::NoRoom => st.cap_why_no_room,
-                            CapHomeless::Taints => st.cap_why_taints,
-                            CapHomeless::Selector => st.cap_why_selector,
-                        };
+                        let why = cap::homeless_why(p.why, st);
                         lines.push(Line::from(Span::styled(
                             lang::fill(
                                 st.cap_homeless_pod,

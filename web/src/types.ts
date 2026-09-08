@@ -1687,3 +1687,271 @@ export interface IssuedToken {
   user_label: string;
   ttl_minutes: number;
 }
+
+// --- Vue capacité -------------------------------------------------------------------------------
+
+/**
+ * À quel point un taux est tendu, tel que `kdt::capacity::tension` le juge.
+ *
+ * Les seuils sont ceux des règles — 100 %, 90 %, 70 % — pour qu'une cellule colorée et un constat
+ * ne se contredisent jamais. Le navigateur peint ce verdict, il ne refait pas la division.
+ */
+export type Tension = "ok" | "watch" | "high" | "over";
+
+/** Une ressource rapportée à ce qui existe, écrite avec les unités de kdt. */
+export interface CapRatio {
+  text: string;
+  total_text: string;
+  pct: number;
+  tension: Tension;
+}
+
+/** Pourquoi un pod n'aurait nulle part où aller. */
+export type HomelessWhy = "no-room" | "taints" | "selector";
+
+/**
+ * Un pod que la simulation ne replace pas.
+ *
+ * La distinction porte tout : « pas de place » se règle en ajoutant de la capacité, un taint ou un
+ * sélecteur se règle en changeant le pod — et aucun node neuf n'y changera rien.
+ */
+export interface HomelessPod {
+  namespace: string;
+  name: string;
+  why: HomelessWhy;
+  why_label: string;
+  cpu: number;
+  mem: number;
+  cpu_text: string;
+  mem_text: string;
+}
+
+/**
+ * Ce que la perte d'un node coûterait, une fois ses pods replacés sur le papier.
+ *
+ * `alone` n'est pas un verdict : il n'y a personne d'autre, donc il n'y a pas de simulation à
+ * faire. `pods` n'est présent que sur `homeless`.
+ */
+export interface CapLoss {
+  kind: "alone" | "fits" | "tight" | "homeless";
+  pods?: HomelessPod[];
+  /** Le mot court de la colonne « IF LOST », dénombrement compris. */
+  short: string;
+  /** Le même verdict en un mot, celui que porte l'enregistrement de la ligne. */
+  word: string;
+  tone: LineTone;
+  /** La phrase du panneau, rédigée par kdt : « tout se replace », « {n} pods sans place »… */
+  note: string;
+}
+
+/** Un node : ce qu'il a, ce qui est réservé dessus, et ce que sa perte coûterait. */
+export interface CapNodeRow {
+  uid: string;
+  name: string;
+  ready: boolean;
+  schedulable: boolean;
+  pods: number;
+  pod_capacity: number;
+  /** `null` quand l'allocatable ne dit pas combien de pods ce node accepte. */
+  pods_pct: number | null;
+  cpu_reserved: CapRatio;
+  mem_reserved: CapRatio;
+  /** `null` sans metrics-server : un zéro se lirait comme un node inactif. */
+  cpu_used: CapRatio | null;
+  mem_used: CapRatio | null;
+  cpu_limits_text: string;
+  mem_limits_text: string;
+  loss: CapLoss;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** La classe de qualité de service que le kubelet donne aux pods d'un workload. */
+export type Qos = "guaranteed" | "burstable" | "best-effort";
+
+/** Un workload et son dimensionnement : réservé, permis, consommé. */
+export interface CapWorkloadRow {
+  uid: string;
+  namespace: string;
+  kind: string;
+  name: string;
+  pods: number;
+  qos: Qos;
+  qos_label: string;
+  cpu_req_text: string;
+  cpu_lim_text: string;
+  mem_req_text: string;
+  mem_lim_text: string;
+  /** `null` sans metrics-server. */
+  cpu_use_text: string | null;
+  mem_use_text: string | null;
+  no_cpu_request: boolean;
+  no_mem_request: boolean;
+  no_mem_limit: boolean;
+  /** La tête du premier constat, coupée par kdt — la phrase entière est dans le panneau. */
+  finding: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Un compteur d'un `ResourceQuota`. L'unité suit la clé : un quota compte des objets comme du CPU. */
+export interface CapQuotaItem {
+  resource: string;
+  used_text: string;
+  hard_text: string;
+  pct: number;
+  tension: Tension;
+}
+
+export interface CapQuotaRow {
+  uid: string;
+  namespace: string;
+  name: string;
+  items: CapQuotaItem[];
+  /** Le compteur le plus tendu : celui qui refusera la prochaine création. */
+  worst_pct: number;
+  worst_tension: Tension;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+export interface CapacityPayload {
+  /** Cluster-scoped : les nodes ignorent la portée, la question « si celui-ci tombe » aussi. */
+  nodes: CapNodeRow[];
+  workloads: CapWorkloadRow[];
+  quotas: CapQuotaRow[];
+  cluster_hints: Hint[];
+  /** Faux sans metrics-server : toute la colonne « utilisé » est alors `null`. */
+  metrics_available: boolean;
+  /** Ce que la simulation vaut : un first-fit honnête, qui ne se fait pas passer pour le scheduler. */
+  simulation_note: string;
+}
+
+// --- Vue stockage -------------------------------------------------------------------------------
+
+/** Une claim : ce qu'un workload a demandé, et s'il l'a obtenu. */
+export interface PvcRow {
+  row: "pvc";
+  uid: string;
+  namespace: string;
+  name: string;
+  phase: string;
+  phase_tone: LineTone;
+  /** Ce que le volume donne, sinon ce qui a été demandé — le panneau montre les deux. */
+  size: string;
+  capacity: string;
+  requested: string;
+  access_modes: string;
+  volume_name: string | null;
+  /**
+   * `null` = champ absent (« prends la classe par défaut »). La chaîne vide est une décision :
+   * Kubernetes écrit ainsi « aucun provisionnement dynamique ». Les deux expliquent très
+   * différemment une claim Pending, donc elles restent distinctes.
+   */
+  storage_class: string | null;
+  age: string;
+  mounted_by: string[];
+  /** La classe telle que kdt la nomme : le nom, « classe par défaut », ou le refus explicite. */
+  class_label: string;
+  /** Les pods qui montent la claim, ou la phrase de kdt quand il n'y en a aucun. */
+  mounted_label: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Un volume : où vit la donnée, et ce qui lui arrivera quand la claim partira. */
+export interface PvRow {
+  row: "pv";
+  uid: string;
+  name: string;
+  capacity: string;
+  access_modes: string;
+  reclaim_policy: string;
+  /** `reclaimPolicy: Delete` : la politique qui perd la donnée sur un `kubectl delete pvc`. */
+  reclaim_deletes: boolean;
+  phase: string;
+  phase_tone: LineTone;
+  claim: string | null;
+  storage_class: string;
+  /** Où vivent les octets, en une ligne : `csi:driver`, `hostPath:/data`, `nfs:host:/export`… */
+  source: string;
+  /** La contrainte de `spec.nodeAffinity`, aplatie : la raison habituelle d'une claim Pending. */
+  node_affinity: string;
+  age: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Une classe : qui provisionne, et quand la liaison se fait. */
+export interface ScRow {
+  row: "sc";
+  uid: string;
+  name: string;
+  provisioner: string;
+  reclaim_policy: string;
+  binding_mode: string;
+  allow_expansion: boolean;
+  is_default: boolean;
+  age: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+export type StorageRow = PvcRow | PvRow | ScRow;
+
+export interface StoragePayload {
+  pvcs: PvcRow[];
+  pvs: PvRow[];
+  classes: ScRow[];
+  cluster_hints: Hint[];
+  /** Les octets que plus personne ne peut atteindre et que quelqu'un paie quand même. */
+  released_bytes: number;
+  released_text: string;
+  /** Faux quand les pods ont été refusés : « rien ne monte cette claim » n'est alors pas affirmé. */
+  mounts_known: boolean;
+}
+
+// --- Vue network policies -----------------------------------------------------------------------
+
+/** Le controller qui possède une politique. */
+export type NetPolEngine = "k8s" | "cilium" | "calico";
+
+/**
+ * L'effet d'une direction pour les pods qu'une politique sélectionne.
+ *
+ * Seul le moteur natif rend autre chose qu'`unknown` : sa sémantique est spécifiée, celle des CNI
+ * ne l'est pas, et l'affirmer serait deviner. `deny` est une **bonne** nouvelle — la direction est
+ * gouvernée et rien n'y est autorisé.
+ */
+export type DirEffect = "unaffected" | "deny" | "allow-all" | "selective" | "unknown";
+
+export interface NetPolRow {
+  uid: string;
+  engine: NetPolEngine;
+  engine_label: string;
+  kind: string;
+  api_version: string;
+  /** Vide pour les politiques cluster-scoped (CiliumClusterwide, GlobalNetworkPolicy). */
+  namespace: string;
+  cluster_scoped: boolean;
+  name: string;
+  /** Les pods/endpoints visés — « all pods » quand le sélecteur est vide. */
+  target: string;
+  /** Natif seulement : les `policyTypes` résolus. Vide pour les CRD. */
+  types: string;
+  ingress: string;
+  egress: string;
+  ingress_effect: DirEffect;
+  egress_effect: DirEffect;
+  ingress_tone: LineTone;
+  egress_tone: LineTone;
+  age: string;
+  record: EventRecord;
+}
+
+export interface NetpolPayload {
+  rows: NetPolRow[];
+  counts: { k8s: number; cilium: number; calico: number };
+  /** Seule l'erreur sur les natives : un CNI absent n'est pas une panne. */
+  error: string | null;
+}

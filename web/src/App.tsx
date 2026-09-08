@@ -6,12 +6,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
+import CapacityView from "./CapacityView";
 import CertsView from "./CertsView";
 import EventsView from "./EventsView";
 import FluxView from "./FluxView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
+import NetpolView from "./NetpolView";
 import RbacView from "./RbacView";
+import StorageView from "./StorageView";
 import VeleroView from "./VeleroView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
@@ -26,6 +29,9 @@ type ViewId =
   | "events"
   | "flux"
   | "workloads"
+  | "capacity"
+  | "storage"
+  | "netpol"
   | "data"
   | "certs"
   | "identity"
@@ -55,8 +61,8 @@ const VIEWS: Array<{
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
   { id: "argocd", label: "Argo CD", key: "a", needs: "argocd" },
   { id: "velero", label: "Velero", key: "v", ready: true, needs: "velero" },
-  { id: "capacity", label: "Capacity", key: "c" },
-  { id: "storage", label: "Storage", key: "s" },
+  { id: "capacity", label: "Capacity", key: "c", ready: true },
+  { id: "storage", label: "Storage", key: "s", ready: true },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r", ready: true },
@@ -65,7 +71,7 @@ const VIEWS: Array<{
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
-  { id: "netpol", label: "NetPol", key: "n" },
+  { id: "netpol", label: "NetPol", key: "n", ready: true },
   { id: "diagnostic", label: "Diagnostic", key: "d" },
 ];
 
@@ -310,7 +316,14 @@ export default function App() {
     view === "data" ||
     view === "certs" ||
     view === "rbac" ||
-    view === "velero";
+    view === "velero" ||
+    // Les trois vues de constat sont dans la portée, avec une nuance qu'elles disent elles-mêmes :
+    // les nodes et les StorageClass sont cluster-scoped, donc la portée ne les réduit pas — elle
+    // réduit les workloads, les quotas, les claims et les policies, qui sont bien des objets d'un
+    // namespace.
+    view === "capacity" ||
+    view === "storage" ||
+    view === "netpol";
   const scopelessReason =
     view === "identity"
       ? st.identScopeless
@@ -518,6 +531,42 @@ export default function App() {
             />
           ) : view === "velero" ? (
             <VeleroView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "capacity" ? (
+            <CapacityView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "storage" ? (
+            <StorageView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "netpol" ? (
+            <NetpolView
               lang={lang}
               st={st}
               query={query}

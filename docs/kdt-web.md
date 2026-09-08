@@ -142,8 +142,9 @@ Arrêtée sur maquette le 2026-09-06. Front en React + Vite + TypeScript, dans `
 - **Rail vertical** : les vues, toutes visibles en permanence. C'est la palette `:` rendue
   explicite.
 - **Onglets horizontaux dans le panneau** : les « mondes » d'une vue, qui dans kdt se cyclent à la
-  touche (`t`, `g`, `Espace`). PVC / PV / SC pour storage, Backups / Schedules / Restaurations /
-  Locations pour velero. Le mapping est exact.
+  touche (`t`, `g`, `Espace`). Claims / Volumes pour storage — les deux mondes du `g` de kdt, les
+  StorageClass étant les parents du second et non un troisième monde — Nodes / Workloads / Quotas
+  pour capacity, Backups / Schedules / Restaurations / Locations pour velero. Le mapping est exact.
 - **Drawer à droite** pour le détail d'une ligne, avec les onglets Logs / Status / Related / YAML.
   La liste reste visible, on enchaîne les sélections.
 - **Les arbres passent en graphique** : arbre Flux, workloads → pods → containers, chaîne

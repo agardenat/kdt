@@ -589,10 +589,10 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix vues
-répondent — évènements, workloads, Flux, Secrets/ConfigMaps, certificats, identity, Rancher,
-Kyverno, RBAC, Velero — avec les quatre gestes qui portent sur n'importe quel objet : YAML,
-édition, touch, suppression.
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Treize vues
+répondent — évènements, workloads, Flux, Velero, capacité, stockage, Secrets/ConfigMaps,
+certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les quatre gestes qui
+portent sur n'importe quel objet : YAML, édition, touch, suppression.
 
 **Chaque requête part avec le credential de la personne connectée** : l'apiserver voit son nom et
 ses groupes, et le RBAC du cluster s'applique tel quel. Le compte de service du pod n'a aucun droit
