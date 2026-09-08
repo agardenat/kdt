@@ -16420,8 +16420,17 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             ])
         }).collect();
 
+        // Une seule colonne souple, et c'est la dernière. Les trois colonnes de texte se taillent
+        // sur ce qu'elles ont à montrer : laissées souples au milieu de la ligne, elles avalaient
+        // toute la largeur d'un écran large et le nom du pod se retrouvait seul à gauche d'un trou
+        // de quarante colonnes, loin du container qu'il porte. Le mou restant se pose au bout de
+        // la ligne, où il ne sépare rien.
+        let ns_w = col_width(sorted_rows.iter().map(|r| r.namespace.as_str()), "NS", 8, 24);
+        let pod_w = col_width(sorted_rows.iter().map(|r| r.pod.as_str()), "POD", 20, 48);
+        let cont_w = col_width(sorted_rows.iter().map(|r| r.container.as_str()), "CONTAINER", 12, 28);
         let widths = [
-            Constraint::Length(1), Constraint::Length(20), Constraint::Min(20), Constraint::Length(20),
+            Constraint::Length(1), Constraint::Length(ns_w), Constraint::Length(pod_w),
+            Constraint::Length(cont_w),
             Constraint::Length(8), Constraint::Length(8), Constraint::Length(8),
             Constraint::Length(9), Constraint::Length(9), Constraint::Length(9),
             Constraint::Length(2), Constraint::Length(4), Constraint::Min(28),

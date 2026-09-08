@@ -10,6 +10,7 @@ import * as api from "./api";
 import type { Lang, Strings } from "./i18n";
 import { AiPane } from "./ai";
 import { DeletePane, EditPane, YamlPane } from "./objects";
+import { useRecordChanged } from "./record";
 import {
   hasLogs,
   toneLabel,
@@ -401,13 +402,18 @@ function StatusPane({ record, lang }: { record: EventRecord; lang: Lang }) {
   const [payload, setPayload] = useState<StatusPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let live = true;
+  if (useRecordChanged(record)) {
     setPayload(null);
     setError(null);
+  }
+
+  useEffect(() => {
+    let live = true;
     api
       .status(record)
-      .then((r) => live && setPayload(r))
+      // La lecture qui aboutit efface l'échec de la précédente : sans ça un refus passager resterait
+      // à l'écran sur une donnée qui, elle, s'est remise à arriver.
+      .then((r) => live && (setPayload(r), setError(null)))
       .catch((e) => live && setError(String(e.message ?? e)));
     return () => {
       live = false;
@@ -439,13 +445,19 @@ function RelatedPane({ record, lang }: { record: EventRecord; lang: Lang }) {
   const [sections, setSections] = useState<RelatedSection[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let live = true;
+  // Les sections dépliées sont dans le DOM : tant que la liste garde ses titres, `<details>` garde
+  // ce qui est ouvert. Ce qui les refermait, c'était de repasser par « Recherche… » à chaque
+  // rafraîchissement.
+  if (useRecordChanged(record)) {
     setSections(null);
     setError(null);
+  }
+
+  useEffect(() => {
+    let live = true;
     api
       .related(record)
-      .then((r) => live && setSections(r.sections))
+      .then((r) => live && (setSections(r.sections), setError(null)))
       .catch((e) => live && setError(String(e.message ?? e)));
     return () => {
       live = false;
@@ -494,21 +506,21 @@ function LogsPane({ record, lang }: { record: EventRecord; lang: Lang }) {
   // pour lui : ses lignes sont celles de son pod à lui, filtrées sur l'objet. La barre d'options
   // ne s'affiche donc que là où elle change quelque chose.
   const isPod = record.kind === "Pod";
-  const key = `${record.namespace}/${record.name}/${record.kind}`;
 
-  // L'objet change : le choix de container ne vaut plus, celui-ci n'existe pas forcément ailleurs.
-  useEffect(() => {
+  // L'objet change : le choix de container ne vaut plus, celui-ci n'existe pas forcément ailleurs,
+  // et les lignes affichées sont celles d'un autre pod.
+  if (useRecordChanged(record)) {
     setContainer("");
     setPrevious(false);
-  }, [key]);
+    setLogs(null);
+    setError(null);
+  }
 
   useEffect(() => {
     let live = true;
-    setLogs(null);
-    setError(null);
     api
       .logs(record, { container, previous })
-      .then((r) => live && setLogs(r))
+      .then((r) => live && (setLogs(r), setError(null)))
       .catch((e) => live && setError(String(e.message ?? e)));
     return () => {
       live = false;

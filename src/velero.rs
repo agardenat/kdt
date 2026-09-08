@@ -1958,7 +1958,43 @@ async fn download_run_log(
     name: &str,
     st: &'static Strings,
 ) -> Result<String, String> {
-    download_target(client, namespace, target, name, st).await.map(|b| gunzip(&b))
+    match download_target(client, namespace, target, name, st).await {
+        Ok(bytes) => Ok(gunzip(&bytes)),
+        Err(f) => Err(f.text(st)),
+    }
+}
+
+// What stopped the read. The distinction is not cosmetic: an unreachable signed URL has one known
+// cause and one known remedy — `spec.config.publicUrl` — while the rest have neither, and only the
+// caller knows what it was downloading. Naming the cause here *and* in the caller is what produced
+// the same sentence twice in one message.
+enum DownloadFailure {
+    // The signed URL did not answer. Carries the transport error, stripped of its query string.
+    Unreachable(String),
+    // Everything else: no URL served, an API refusal, an HTTP status.
+    Other(String),
+}
+
+impl DownloadFailure {
+    // The default rendering, for a caller with nothing more specific to say.
+    fn text(self, st: &'static Strings) -> String {
+        match self {
+            DownloadFailure::Unreachable(e) => fill(st.vel_dl_unreachable, &[("e", &e)]),
+            DownloadFailure::Other(e) => e,
+        }
+    }
+}
+
+// Drop the query string from a URL quoted inside an error message.
+//
+// A pre-signed URL carries its whole signature in the query — a hundred characters of
+// `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Signature` — which drown the one thing that matters:
+// the host this machine failed to reach. The URL stays, the signature goes.
+fn without_query(text: &str) -> String {
+    let Some(q) = text.find('?') else { return text.to_string() };
+    let rest = &text[q..];
+    let end = rest.find(')').unwrap_or(rest.len());
+    format!("{}…{}", &text[..q], &rest[end..])
 }
 
 // Ask velero for a pre-signed URL, then read what is behind it. The request object is removed
@@ -1974,19 +2010,22 @@ async fn download_target(
     target: &str,
     name: &str,
     st: &'static Strings,
-) -> Result<Vec<u8>, String> {
-    let api = crate::yaml::dynamic_api(client, API_V1, "DownloadRequest", namespace).await?;
+) -> Result<Vec<u8>, DownloadFailure> {
+    use DownloadFailure::{Other, Unreachable};
+    let api = crate::yaml::dynamic_api(client, API_V1, "DownloadRequest", namespace)
+        .await
+        .map_err(Other)?;
     let body = json!({
         "apiVersion": API_V1,
         "kind": "DownloadRequest",
         "metadata": { "generateName": format!("{}-", name), "namespace": namespace },
         "spec": { "target": { "kind": target, "name": name } },
     });
-    let obj: DynamicObject = serde_json::from_value(body).map_err(|e| e.to_string())?;
+    let obj: DynamicObject = serde_json::from_value(body).map_err(|e| Other(e.to_string()))?;
     let created = api
         .create(&PostParams::default(), &obj)
         .await
-        .map_err(crate::edit::api_error_text)?;
+        .map_err(|e| Other(crate::edit::api_error_text(e)))?;
     let request_name = created.metadata.name.clone().unwrap_or_default();
 
     let mut url = String::new();
@@ -2001,7 +2040,7 @@ async fn download_target(
     }
     let _ = api.delete(&request_name, &Default::default()).await;
     if url.is_empty() {
-        return Err(st.vel_log_no_url.to_string());
+        return Err(Other(st.vel_log_no_url.to_string()));
     }
 
     // A short connect timeout on purpose: the common failure is a hostname only the cluster can
@@ -2010,14 +2049,13 @@ async fn download_target(
         .connect_timeout(std::time::Duration::from_secs(4))
         .read_timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| e.to_string())?;
-    let resp = http.get(&url).send().await.map_err(|e| {
-        fill(st.vel_log_unreachable, &[("e", &e.to_string())])
-    })?;
+        .map_err(|e| Other(e.to_string()))?;
+    let resp =
+        http.get(&url).send().await.map_err(|e| Unreachable(without_query(&e.to_string())))?;
     if !resp.status().is_success() {
-        return Err(fill(st.vel_log_http, &[("code", resp.status().as_str())]));
+        return Err(Other(fill(st.vel_log_http, &[("code", resp.status().as_str())])));
     }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().await.map_err(|e| Other(without_query(&e.to_string())))?;
     Ok(bytes.to_vec())
 }
 
@@ -2150,14 +2188,19 @@ pub async fn fetch_contents(
         *s = VelContents { key: key.clone(), loading: true, ..VelContents::default() };
     }
 
-    let outcome = match download_target(&client, &namespace, "BackupResourceList", &backup, st).await {
+    // L'endpoint interne n'est nommé que quand c'est bien lui qui a fait échouer la lecture, et le
+    // diagnostic n'est posé qu'une fois : le reste des échecs — pas d'URL servie, refus de l'API,
+    // code HTTP — n'a rien à voir avec `publicUrl` et se rend tel quel.
+    let outcome = match download_target(&client, &namespace, "BackupResourceList", &backup, st).await
+    {
         Ok(bytes) => parse_resource_list(&gunzip(&bytes)),
-        Err(e) => Err(match s3_url.as_deref() {
+        Err(DownloadFailure::Unreachable(e)) => Err(match s3_url.as_deref() {
             Some(url) if internal_endpoint(url) => {
                 fill(st.vel_ct_internal_endpoint, &[("e", &e), ("url", url)])
             }
-            _ => e,
+            _ => fill(st.vel_dl_unreachable, &[("e", &e)]),
         }),
+        Err(other) => Err(other.text(st)),
     };
 
     let mut s = state.lock().expect("velero contents poisoned");
@@ -3558,6 +3601,21 @@ mod tests {
             .hints
             .iter()
             .any(|h| reads_as(&h.text, FR.vel_bsl_internal_endpoint)));
+    }
+
+    #[test]
+    fn a_signed_url_loses_its_signature_in_an_error() {
+        let e = "error sending request for url (http://minio.velero.svc.cluster.local:9000/velero/\
+                 backups/daily-1/daily-1-resource-list.json.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&\
+                 X-Amz-Signature=0baab0a2)";
+        assert_eq!(
+            without_query(e),
+            "error sending request for url (http://minio.velero.svc.cluster.local:9000/velero/\
+             backups/daily-1/daily-1-resource-list.json.gz…)"
+        );
+        // Nothing to strip, nothing changed.
+        let plain = "error sending request for url (http://minio.example.com:9000/velero)";
+        assert_eq!(without_query(plain), plain);
     }
 
     #[test]

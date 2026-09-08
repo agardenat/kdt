@@ -259,11 +259,18 @@ button, input { font: inherit; color: inherit; }
 /* ---------------------------------------------------------------- tableau */
 .tbl { min-width: 100%; width: max-content; font-size: 12.5px; }
 .tr { display: grid; align-items: center; column-gap: .9rem; padding: 0 .85rem; }
+/* La typographie de l'en-tête se pose sur les cellules, jamais sur la ligne.
+   Les gabarits de colonnes sont écrits en `ch`, et un `ch` se mesure sur la police de la grille :
+   une ligne d'en-tête en 10.5px donnait des colonnes plus étroites que le corps en 12.5px, et
+   toute la table se décalait entre son en-tête et ses lignes. */
 .thead .tr {
   position: sticky; top: 0; z-index: 5; background: var(--bg); height: 29px;
   border-bottom: 1px solid var(--line); color: var(--dim);
-  font-size: 10.5px; text-transform: uppercase; letter-spacing: .075em;
+  /* Le liseré de sévérité des lignes du corps, en transparent : sans lui l'en-tête aurait deux
+     pixels de moins à sa gauche, et toute la ligne serait décalée par rapport à ce qu'elle titre. */
+  border-left: 2px solid transparent;
 }
+.thead .cell { font-size: 10.5px; text-transform: uppercase; letter-spacing: .075em; }
 .tbody .tr {
   height: 30px; border-bottom: 1px solid var(--line-soft); cursor: pointer;
   border-left: 2px solid transparent;
@@ -344,6 +351,14 @@ button, input { font: inherit; color: inherit; }
 }
 .statusbar .kbd { border: 1px solid var(--line); border-radius: 4px; padding: 0 .25rem; }
 .statusbar .err { color: var(--err); }
+/* Le message du dernier geste. Il s'élide plutôt que de pousser le reste de la barre dehors : le
+   texte entier est dans l'infobulle, et un échec le garde aussi dans le panneau de l'objet. */
+.statusbar .toast {
+  background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
+  min-width: 0; max-width: 68ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.statusbar .toast.err { color: var(--err); }
+.statusbar .toast.ok { color: var(--ok); }
 
 /* Ce qui saute en premier quand la barre se resserre est ce qui se relit ailleurs : la pression
    est dans les vues, le nom du cluster ne l'est nulle part. */

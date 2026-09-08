@@ -15,6 +15,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { visibleRows } from "./tree";
@@ -72,7 +73,7 @@ export default function KyvernoView({
   // Les plis posés à la main. Ils gagnent toujours sur le pli que kdt propose — voir `collapsed`.
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -97,11 +98,7 @@ export default function KyvernoView({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
@@ -391,7 +388,7 @@ export default function KyvernoView({
         <span title={st.kyScopeless}>{lang === "fr" ? "tout le cluster" : "whole cluster"}</span>
         {payload && !payload.cel_installed && <span className="dim">{st.kyNoCel}</span>}
         {error && <span className="err">{error}</span>}
-        {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+        <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
         <span style={{ marginLeft: "auto" }}>
           <span className="kbd">/</span> {st.hintFilter} <span className="kbd">Esc</span>{" "}
           {st.hintClose}

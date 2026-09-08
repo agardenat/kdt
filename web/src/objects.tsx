@@ -21,6 +21,7 @@ import { NeedsAuth } from "./api";
 import { AiButton } from "./ai";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
+import { useTarget } from "./record";
 import type {
   DeletePreflight,
   DeleteReason,
@@ -149,19 +150,20 @@ export function YamlPane({
   const [doc, setDoc] = useState<ObjectYaml | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [neat, setNeat] = useState(true);
+  const target = useTarget(record);
 
+  // Une lecture par objet. Le pane est monté avec l'uid pour clé : il ne change jamais de cible en
+  // place, et relire à chaque passe de la vue redessinerait le document sous les yeux.
   useEffect(() => {
     let live = true;
-    setDoc(null);
-    setError(null);
     api
-      .objectYaml(record)
+      .objectYaml(target.current)
       .then((r) => live && setDoc(r))
       .catch((e) => live && setError(String((e as Error).message ?? e)));
     return () => {
       live = false;
     };
-  }, [record]);
+  }, [target]);
 
   if (error) return <p className="pane-err">{error}</p>;
   if (!doc) return <p className="pane-wait">{lang === "fr" ? "Lecture…" : "Reading…"}</p>;
@@ -211,20 +213,24 @@ export function EditPane({
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
 
+  const target = useTarget(record);
+
+  // `load` ne dépend pas de l'enregistrement mais de l'objet qu'il désigne : la vue en reconstruit
+  // un neuf à chaque passe, et recharger là-dessus écraserait le texte en cours d'écriture.
   const load = useCallback(async () => {
     setPreflight(null);
     setDiff(null);
     setDone(null);
     setError(null);
     try {
-      const payload = await api.objectEdit(record, lang);
+      const payload = await api.objectEdit(target.current, lang);
       setPreflight(payload);
       setText(payload.text);
     } catch (e) {
       if (e instanceof NeedsAuth) onNeedsAuth(e.message);
       else setError(String((e as Error).message ?? e));
     }
-  }, [record, lang, onNeedsAuth]);
+  }, [target, lang, onNeedsAuth]);
 
   useEffect(() => {
     void load();
@@ -405,18 +411,22 @@ export function DeletePane({
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
 
+  const target = useTarget(record);
+
+  // Même règle que pour l'édition, et la même raison : le nom retapé pour confirmer est une saisie,
+  // et une passe de la vue ne doit pas l'effacer.
   const load = useCallback(async () => {
     setPreflight(null);
     setError(null);
     setDone(null);
     setTyped("");
     try {
-      setPreflight(await api.objectDeletePreflight(record, lang));
+      setPreflight(await api.objectDeletePreflight(target.current, lang));
     } catch (e) {
       if (e instanceof NeedsAuth) onNeedsAuth(e.message);
       else setError(String((e as Error).message ?? e));
     }
-  }, [record, lang, onNeedsAuth]);
+  }, [target, lang, onNeedsAuth]);
 
   useEffect(() => {
     void load();

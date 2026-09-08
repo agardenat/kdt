@@ -19,6 +19,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { ObjectActions } from "./objects";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import type {
@@ -42,10 +43,18 @@ const NODE_COLUMNS =
  *
  * Les six colonnes de quantité portent le même gabarit — `1500m`, `3.9Gi` — donc la même largeur :
  * en donner moins à « use » qu'à « req » couperait la mémoire en plein milieu.
+ *
+ * Aucune piste ne se mesure sur le contenu : une dernière colonne en `max-content` prend une
+ * largeur différente selon la ligne, et c'est la piste souple d'avant elle qui paie la différence
+ * — les colonnes se décalent alors d'une ligne à l'autre.
+ *
+ * Une seule piste est souple, et c'est la dernière. `POD` bornée avale sinon toute la largeur d'un
+ * écran large, et le nom du pod se retrouve seul à gauche d'un vide qui le sépare du container
+ * qu'il porte. Le mou se pose au bout de la ligne, où il ne sépare rien.
  */
 const USAGE_COLUMNS =
-  "18px minmax(110px,18ch) minmax(180px,1.4fr) minmax(140px,22ch)" +
-  " 78px 78px 78px 78px 78px 78px 28px 44px minmax(200px,max-content)";
+  "18px minmax(110px,18ch) minmax(180px,42ch) minmax(140px,22ch)" +
+  " 78px 78px 78px 78px 78px 78px 28px 44px minmax(200px,1fr)";
 
 type World = "nodes" | "usage";
 
@@ -77,7 +86,7 @@ export default function NodesView({
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
 
   // L'usage du node sélectionné. Il ne se lit que dans son monde : c'est une liste de tous les pods
@@ -142,11 +151,7 @@ export default function NodesView({
     return () => window.clearInterval(timer);
   }, [world, selectedName, loadUsage]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
@@ -388,7 +393,7 @@ export default function NodesView({
         )}
         {error && <span className="err">{error}</span>}
         {usageError && world === "usage" && <span className="err">{usageError}</span>}
-        {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+        <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
         <span style={{ marginLeft: "auto" }}>
           <span className="kbd">/</span> {st.hintFilter} <span className="kbd">Esc</span>{" "}
           {st.hintClose}

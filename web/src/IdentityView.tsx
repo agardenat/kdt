@@ -19,6 +19,7 @@ import { ApiError, NeedsAuth } from "./api";
 import { CopyButton } from "./copy";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type {
@@ -80,7 +81,7 @@ export default function IdentityView({
   const [tab, setTab] = useState<PanelTab>("detail");
   const [menuOpen, setMenuOpen] = useState(false);
   const [form, setForm] = useState<Form>(null);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
   // Une invitation n'existe qu'une fois : elle ne va ni dans l'état de la liste, ni dans un log.
   // Elle vit ici, le temps qu'on la copie, et le bouton de fermeture la jette.
@@ -109,11 +110,7 @@ export default function IdentityView({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
   // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
@@ -305,7 +302,7 @@ export default function IdentityView({
 
         <div className="right">
           {busy && <span>{st.objWorking}</span>}
-          {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+          <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
           <div className="menu-anchor" ref={menuRef}>
             <button
               className="panel-toggle action"

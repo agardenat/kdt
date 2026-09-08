@@ -13,6 +13,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type {
@@ -64,7 +65,7 @@ export default function VeleroView({
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
   // Le contenu d'un backup, téléchargé à la demande : uid du backup → son inventaire.
   const [contents, setContents] = useState<Record<string, VelContentsPayload | "loading">>({});
@@ -95,11 +96,7 @@ export default function VeleroView({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
@@ -447,7 +444,7 @@ export default function VeleroView({
           </span>
         )}
         {error && <span className="err">{error}</span>}
-        {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+        <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
         <span style={{ marginLeft: "auto" }}>
           <span className="kbd">/</span> {st.hintFilter} <span className="kbd">Esc</span>{" "}
           {st.hintClose}

@@ -13,6 +13,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
@@ -88,7 +89,7 @@ export default function WorkloadsView({
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
 
   // La vue est dans la portée, contrairement à l'arbre Flux : elle liste des objets indépendants,
@@ -120,11 +121,7 @@ export default function WorkloadsView({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
   // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
@@ -391,7 +388,7 @@ export default function WorkloadsView({
           </span>
         )}
         {error && <span className="err">{error}</span>}
-        {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+        <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
         <span style={{ marginLeft: "auto" }}>
           <span className="kbd">/</span> {st.hintFilter} <span className="kbd">Esc</span>{" "}
           {st.hintClose}

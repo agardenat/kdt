@@ -9,6 +9,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
+import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
@@ -66,7 +67,7 @@ export default function FluxView({
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [toast, setToast] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   // Inventaires dépliés : uid de la Kustomization → ses objets appliqués.
   const [inventory, setInventory] = useState<Record<string, InventoryItem[]>>({});
 
@@ -95,12 +96,7 @@ export default function FluxView({
     return () => window.clearInterval(timer);
   }, [load]);
 
-  // Le message d'une action s'efface tout seul : c'est un accusé de réception, pas un état.
-  useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+  useToastTimeout(toast, setToast);
 
   const needle = query.trim().toLowerCase();
 
@@ -373,7 +369,7 @@ export default function FluxView({
         </span>
         <span title={st.fluxScopeless}>{lang === "fr" ? "tout le cluster" : "whole cluster"}</span>
         {error && <span className="err">{error}</span>}
-        {toast && <span className={toast.tone === "err" ? "err" : "ok"}>{toast.text}</span>}
+        <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
         <span style={{ marginLeft: "auto" }}>
           <span className="kbd">/</span> {st.hintFilter} <span className="kbd">Esc</span>{" "}
           {st.hintClose}
