@@ -8,6 +8,30 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-beta.3] — 2026-09-08
+
+Trois vues de plus dans kdt-web — **capacité, stockage et network policies** — qui portent le
+compte à treize. Elles ne font que constater : aucune n'écrit, et les quatre gestes génériques
+(YAML, édition, touch, suppression) suffisent à agir sur l'objet d'une ligne.
+
+- **feat(web)** — vue **capacité**, les trois mondes de `:capacity` : les nodes et ce que leur
+  perte coûterait (simulation first-fit, avec les pods qui n'auraient nulle part où aller et
+  pourquoi), le dimensionnement des workloads, et le `ResourceQuota` qui refusera le prochain
+  déploiement. Sans metrics-server la colonne « consommé » reste vide au lieu d'afficher des zéros.
+- **feat(web)** — vue **stockage**, les deux mondes de `:storage` : les claims et ce qui les
+  empêche de se lier, puis les volumes rangés sous la classe qui les provisionne. Les octets qui
+  dorment en `Released` et les constats du cluster — pas de classe par défaut, ou deux — sont dans
+  une bande au-dessus de la table. Une liste de pods refusée ne se lit jamais comme « rien ne
+  monte cette claim ».
+- **feat(web)** — vue **network policies** : les `NetworkPolicy` natives avec leur verdict de
+  posture par direction, et les CRD Cilium/Calico rendues factuellement — aucun verdict, parce que
+  le défaut allow/deny de chaque moteur n'est pas celui du natif.
+- **refactor** — les verdicts que le rendu du TUI portait encore descendent dans les modules
+  métier : la tension d'un taux, le ton d'une phase, le mot d'une perte de node, l'effet d'une
+  direction, et les enregistrements synthétiques des trois vues. Le TUI et kdt-web lisent
+  désormais les mêmes fonctions ; deux implémentations auraient fini par peindre deux couleurs du
+  même objet.
+
 ## [2.0.0-beta.2] — 2026-09-07
 
 - **fix(ci)** — la `2.0.0-beta.1` n'a livré que son image : les deux jobs de binaires cherchaient
