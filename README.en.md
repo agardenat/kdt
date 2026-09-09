@@ -629,6 +629,8 @@ helm repo add kdt https://agardenat.github.io/helm-charts
 helm repo update
 ```
 
+The same repository carries `kdt/kdt-identity`.
+
 ```bash
 helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
     --set webUrl=https://kdt.example.com \
