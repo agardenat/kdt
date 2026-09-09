@@ -8,6 +8,16 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.2] — 2026-09-09
+
+- **chore(release, web)** — le chart de kdt-web est publié dans un **dépôt Helm** :
+  `helm repo add kdt https://agardenat.github.io/helm-charts`, puis
+  `helm upgrade --install kdt-web kdt/kdt-web`. Plus de copie du dépôt avant d'installer. Le job
+  `chart` de `release.yml` y dépose l'archive sur le même tag `v*` que l'image, à la version du
+  tag, et reconstruit l'index ; kdt-identity publie le sien au même endroit. Les pré-versions y
+  figurent sans devenir ce qui s'installe : Helm ne retient une version instable que si `--devel`
+  ou un `--version` explicite la demande.
+
 ## [2.0.0-rc.1] — 2026-09-09
 
 La vue `:identity` et son portage web suivent kdt-identity 1.2 : l'annuaire d'entreprise peut être

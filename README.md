@@ -634,7 +634,12 @@ porte le flow d'autorisation, et la valeur `webUrl` renseignée dans son chart a
 publique de kdt-web.
 
 ```bash
-helm upgrade --install kdt-web deploy/helm/kdt-web -n kdt-web --create-namespace \
+helm repo add kdt https://agardenat.github.io/helm-charts
+helm repo update
+```
+
+```bash
+helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
     --set webUrl=https://kdt.example.com \
     --set portalUrl=https://identity.example.com \
     --set clusterName=<nom du cluster> \

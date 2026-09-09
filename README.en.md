@@ -625,7 +625,12 @@ Two prerequisites, without which nobody can sign in: kdt-identity **1.1.0 or lat
 the authorization flow, and its chart's `webUrl` value set to the public address of kdt-web.
 
 ```bash
-helm upgrade --install kdt-web deploy/helm/kdt-web -n kdt-web --create-namespace \
+helm repo add kdt https://agardenat.github.io/helm-charts
+helm repo update
+```
+
+```bash
+helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
     --set webUrl=https://kdt.example.com \
     --set portalUrl=https://identity.example.com \
     --set clusterName=<cluster name> \

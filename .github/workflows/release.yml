@@ -51,6 +51,59 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Le chart part avec l'image, vers le dépôt de charts servi par GitHub Pages : un
+  # `helm repo add kdt https://agardenat.github.io/helm-charts` suffit alors à l'installer, sans
+  # copie du dépôt. Une pré-version peut y figurer sans danger — Helm ne retient une version
+  # instable que si `--devel` ou un `--version` explicite la demande.
+  chart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Dépôt de charts
+        uses: actions/checkout@v4
+        with:
+          repository: agardenat/helm-charts
+          token: ${{ secrets.CHARTS_TOKEN }}
+          path: charts-repo
+
+      - name: Empaqueter et réindexer
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          url="https://agardenat.github.io/helm-charts"
+          # Deux dépôts publient dans le même index : un push peut être refusé parce que l'autre
+          # est passé entre-temps. On repart alors de l'état distant et on refait le paquet —
+          # `helm repo index` reconstruit l'index depuis les archives présentes, il n'y a aucune
+          # fusion à faire à la main.
+          for attempt in 1 2 3; do
+            git -C charts-repo fetch origin main
+            git -C charts-repo reset --hard origin/main
+            git -C charts-repo clean -fd
+            # Le tag fait foi : le chart publié porte la version qui a déclenché la CI, même si
+            # le Chart.yaml du dépôt n'avait pas été bumpé.
+            helm package deploy/helm/kdt-web \
+              --version "$version" --app-version "$version" --destination charts-repo
+            cd charts-repo
+            helm repo index . --url "$url"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .
+            if git diff --cached --quiet; then
+              echo "kdt-web $version est déjà publié"
+              exit 0
+            fi
+            git commit -m "kdt-web $version"
+            git push && exit 0
+            cd ..
+          done
+          echo "publication du chart refusée après trois tentatives" >&2
+          exit 1
+
   build-macos:
     runs-on: macos-latest
     permissions:

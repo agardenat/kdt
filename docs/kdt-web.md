@@ -425,7 +425,9 @@ finale le jour venu, section du CHANGELOG comprise ; une pré-version taguée, n
 
 La chaîne de livraison est en place : `Dockerfile` (musl, `FROM scratch`, avec le
 `LABEL org.opencontainers.image.source`), job `image` dans `release.yml` sur le même tag `v*`, et
-`deploy/helm/kdt-web`. Reste le geste qui ne se scripte pas : **passer le package GHCR en public**,
+`deploy/helm/kdt-web`, que le job `chart` dépose sur ce même tag dans `agardenat/helm-charts` — le
+dépôt Helm servi par GitHub Pages, où kdt-identity publie le sien : `helm repo add` suffit alors à
+installer l'un comme l'autre, sans copie de dépôt. Reste le geste qui ne se scripte pas : **passer le package GHCR en public**,
 une fois, depuis les réglages du package. Sans lui, l'absence d'`imagePullSecrets` dans le chart
 donne un `ImagePullBackOff` — et c'est bien le chart qui a raison, le binaire étant déjà distribué
 en deb, rpm et Homebrew.
