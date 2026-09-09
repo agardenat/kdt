@@ -297,6 +297,20 @@ export interface Strings {
   identDownload: string;
   identDownloadOpen: string;
   identDownloadClosed: string;
+  identAuth: string;
+  identAuthUnknown: string;
+  identSource: string;
+  identLdapDn: string;
+  identLdapUrl: string;
+  identLdapProfile: string;
+  identLdapBase: string;
+  identLdapResync: string;
+  identLdapMappings: string;
+  identMappingsUnreadable: string;
+  identMappingsMissing: string;
+  identInviteLdap: string;
+  identMembershipLdap: string;
+  identEnableLdap: string;
   identSubject: string;
   identGroupsLabel: string;
   identMembers: string;
@@ -938,6 +952,26 @@ const FR: Strings = {
   identDownload: "kubeconfig",
   identDownloadOpen: "téléchargement ouvert — cet accès échappe à la révocation",
   identDownloadClosed: "téléchargement fermé",
+  identAuth: "authentification",
+  identAuthUnknown:
+    "non déclarée (déploiement antérieur à 1.2, ou variable absente du pod)",
+  identSource: "source",
+  identLdapDn: "DN épinglé",
+  identLdapUrl: "annuaire",
+  identLdapProfile: "profil",
+  identLdapBase: "racine de recherche",
+  identLdapResync: "relecture",
+  identLdapMappings: "correspondances",
+  identMappingsUnreadable:
+    "Table de correspondance illisible : rien n'est affirmé sur ce qui alimente les groupes.",
+  identMappingsMissing:
+    "Déclarés dans la table sans exister ici — chacun sera créé à la première connexion d'un de ses membres :",
+  identInviteLdap:
+    "authMode ldap : les comptes naissent d'une connexion réussie contre l'annuaire, invite refuse de s'exécuter",
+  identMembershipLdap:
+    "sur un groupe alimenté depuis l'annuaire, l'écriture aboutit puis la relecture suivante la défait",
+  identEnableLdap:
+    "compte fédéré : si son entrée a disparu de l'annuaire, la relecture suivante le redésactivera",
   identSubject: "subject",
   identGroupsLabel: "groupes",
   identMembers: "membres",
@@ -1602,6 +1636,26 @@ const EN: Strings = {
   identDownload: "kubeconfig",
   identDownloadOpen: "download open — this access escapes revocation",
   identDownloadClosed: "download closed",
+  identAuth: "authentication",
+  identAuthUnknown:
+    "not declared (a pre-1.2 deployment, or the variable is absent from the pod)",
+  identSource: "source",
+  identLdapDn: "pinned DN",
+  identLdapUrl: "directory",
+  identLdapProfile: "profile",
+  identLdapBase: "search base",
+  identLdapResync: "re-read",
+  identLdapMappings: "mappings",
+  identMappingsUnreadable:
+    "The mapping table cannot be read: nothing is stated about what feeds the groups.",
+  identMappingsMissing:
+    "Declared in the table and absent here — each is created at the first sign-in of one of its members:",
+  identInviteLdap:
+    "authMode ldap: accounts are born of a successful sign-in against the directory, and invite refuses to run",
+  identMembershipLdap:
+    "on a group fed from the directory, the write lands and the next re-read undoes it",
+  identEnableLdap:
+    "federated account: if its directory entry is gone, the next re-read disables it again",
   identSubject: "subject",
   identGroupsLabel: "groups",
   identMembers: "members",

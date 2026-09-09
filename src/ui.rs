@@ -394,8 +394,8 @@ use crate::rancher::{
 
 use crate::identity::{
     apply_identity_write, fetch_identity, install_command, invitation_label, new_identity_state,
-    CredentialMode, Delivery, IdentGroup, IdentInvite, IdentUser, IdentityWrite, Invitation, Phase,
-    SharedIdentity, WriteOutcome, DEFAULT_VALIDITY,
+    AuthMode, CredentialMode, Delivery, Directory, IdentGroup, IdentInvite, IdentUser,
+    IdentityWrite, Invitation, Phase, SharedIdentity, Source, WriteOutcome, DEFAULT_VALIDITY,
 };
 
 // The two worlds of the identity view: the accounts, and the groups that carry the rights. One
@@ -8998,14 +8998,21 @@ impl App {
     // an empty cluster is not a dead end.
     fn open_identity_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
-        let controller = self.ident_state.lock().expect("identity poisoned").controller.clone();
+        let (controller, directory) = {
+            let s = self.ident_state.lock().expect("identity poisoned");
+            (s.controller.clone(), s.directory.clone())
+        };
         let row = self.ident_selected().cloned();
 
         let (title, items) = match &row {
             Some(IdentRow::User(u)) => {
                 // Inviting needs a pod to run in, and the account has to be able to act on it. Both
-                // are said in the entry rather than discovered after the confirmation.
-                let invite_desc = if u.disabled {
+                // are said in the entry rather than discovered after the confirmation. In `ldap`
+                // mode there is no invitation at all — upstream refuses the command — and saying so
+                // here is cheaper than an exec that comes back with a refusal.
+                let invite_desc = if directory.federated() {
+                    st.ident_invite_ldap.to_string()
+                } else if u.disabled {
                     st.ident_invite_disabled.to_string()
                 } else if controller.is_none() {
                     st.ident_invite_unavailable.to_string()
@@ -9035,16 +9042,24 @@ impl App {
                 });
                 items.push(ActionItem {
                     label: if u.disabled { st.k_ident_enable } else { st.k_ident_disable },
-                    desc: if u.disabled {
-                        st.desc_ident_enable.to_string()
-                    } else {
+                    desc: if !u.disabled {
                         st.desc_ident_disable.to_string()
+                    } else if u.source.federated() {
+                        // Re-enabling holds only as long as the entry is still in the directory:
+                        // the resync disables it again, and it is the same field either way.
+                        format!("{} · {}", st.desc_ident_enable, st.ident_enable_ldap)
+                    } else {
+                        st.desc_ident_enable.to_string()
                     },
                     action: MenuAction::IdentSetDisabled(!u.disabled),
                 });
                 items.push(ActionItem {
                     label: st.k_ident_membership,
-                    desc: st.desc_ident_membership.to_string(),
+                    desc: if directory.federated() {
+                        format!("{} · {}", st.desc_ident_membership, st.ident_membership_ldap)
+                    } else {
+                        st.desc_ident_membership.to_string()
+                    },
                     action: MenuAction::IdentMembership,
                 });
                 // Both creations, from either world. A group is created while looking at the
@@ -9068,7 +9083,11 @@ impl App {
                 vec![
                     ActionItem {
                         label: st.k_ident_membership,
-                        desc: st.desc_ident_membership.to_string(),
+                        desc: if g.source.federated() {
+                            format!("{} · {}", st.desc_ident_membership, st.ident_membership_ldap)
+                        } else {
+                            st.desc_ident_membership.to_string()
+                        },
                         action: MenuAction::IdentMembership,
                     },
                     ActionItem {
@@ -19319,7 +19338,7 @@ fn ident_sessions_cell(u: &IdentUser) -> Cell<'static> {
 }
 
 fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, creds_error, sessions_error, totals, operator, delivery) = {
+    let (loading, error, creds_error, sessions_error, totals, operator, delivery, directory, show_source) = {
         let s = app.ident_state.lock().expect("identity poisoned");
         let totals = IdentTotals {
             users: s.users.len(),
@@ -19342,6 +19361,8 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             totals,
             operator,
             s.delivery.clone(),
+            s.directory.clone(),
+            s.shows_source(),
         )
     };
 
@@ -19374,6 +19395,12 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         t.push_str(window);
                     }
                 }
+                // The second axis, and only when it is the exception: `local` is what every
+                // deployment was until 1.2, and a badge marks the departure from the norm.
+                if directory.federated() {
+                    t.push_str(" · ");
+                    t.push_str(AuthMode::Ldap.label());
+                }
                 // Said in the title, once, rather than as a dash on every row: the columns they
                 // silence are the ones nothing else can answer.
                 if let Some(e) = &creds_error {
@@ -19396,7 +19423,7 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         }
     };
 
-    let (header, rows, widths) = ident_table_parts(app.ident_world, &app.ident_rows, st);
+    let (header, rows, widths) = ident_table_parts(app.ident_world, &app.ident_rows, st, show_source);
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -19409,25 +19436,42 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 // The table itself, split out of the draw so a test can render it at several widths and check that
 // nothing eats the right border.
+///
+/// `show_source` buys the SOURCE column only where a directory is involved — the cluster
+/// authenticates against one, or some object still carries its label. Everywhere else it would be a
+/// column of dashes taking width from the ones that distinguish.
 fn ident_table_parts(
     world: IdentWorld,
     src: &[IdentRow],
     st: &'static Strings,
+    show_source: bool,
 ) -> (Row<'static>, Vec<Row<'static>>, Vec<Constraint>) {
     let header_style =
         Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    // The label's own value, verbatim: a row says `ldap` because the object says `ldap`.
+    let source_cell = |source: Source| {
+        if source.federated() {
+            Cell::from(AuthMode::Ldap.label()).style(Style::default().fg(Color::Cyan))
+        } else {
+            Cell::from("—").style(Style::default().fg(DIM))
+        }
+    };
     match world {
         IdentWorld::Users => {
-            let header = Row::new(vec![
+            let mut header_cells = vec![
                 Cell::from("NAME"), Cell::from("EMAIL"), Cell::from("PHASE"),
                 Cell::from("GROUPS"), Cell::from("INVITE"), Cell::from("SESS"),
-                Cell::from("AGE"),
-            ])
-            .style(header_style);
+            ];
+            if show_source {
+                header_cells.push(Cell::from("SRC"));
+            }
+            header_cells.push(Cell::from("AGE"));
+            let header = Row::new(header_cells).style(header_style);
             let rows = src
                 .iter()
                 .map(|row| match row {
-                    IdentRow::User(u) => Row::new(vec![
+                    IdentRow::User(u) => Row::new({
+                        let mut cells = vec![
                         Cell::from(u.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                         Cell::from(u.email.clone()).style(Style::default().fg(DIM)),
                         ident_phase_cell(u, st),
@@ -19445,8 +19489,13 @@ fn ident_table_parts(
                         }),
                         ident_invite_cell(u, st),
                         ident_sessions_cell(u),
-                        Cell::from(u.age.clone()).style(Style::default().fg(DIM)),
-                    ]),
+                        ];
+                        if show_source {
+                            cells.push(source_cell(u.source));
+                        }
+                        cells.push(Cell::from(u.age.clone()).style(Style::default().fg(DIM)));
+                        cells
+                    }),
                     _ => Row::new(vec![Cell::from("")]),
                 })
                 .collect();
@@ -19468,19 +19517,28 @@ fn ident_table_parts(
                 16,
                 34,
             );
-            let widths = vec![
+            let mut widths = vec![
                 Constraint::Length(name_w), Constraint::Length(email_w),
                 Constraint::Length(9), Constraint::Min(14), Constraint::Length(8),
-                Constraint::Length(4), Constraint::Length(5),
+                Constraint::Length(4),
             ];
+            if show_source {
+                widths.push(Constraint::Length(4));
+            }
+            widths.push(Constraint::Length(5));
             (header, rows, widths)
         }
         IdentWorld::Groups => {
-            let header = Row::new(vec![
+            let mut header_cells = vec![
                 Cell::from("NAME"), Cell::from("MEM"), Cell::from("UNKNOWN"),
-                Cell::from("RIGHTS"), Cell::from("DESCRIPTION"), Cell::from("AGE"),
-            ])
-            .style(header_style);
+                Cell::from("RIGHTS"),
+            ];
+            if show_source {
+                header_cells.push(Cell::from("SRC"));
+            }
+            header_cells.push(Cell::from("DESCRIPTION"));
+            header_cells.push(Cell::from("AGE"));
+            let header = Row::new(header_cells).style(header_style);
             let rows = src
                 .iter()
                 .map(|row| match row {
@@ -19499,15 +19557,21 @@ fn ident_table_parts(
                             Cell::from(g.unknown.join(","))
                                 .style(Style::default().fg(Color::Yellow))
                         };
-                        Row::new(vec![
+                        let mut cells = vec![
                             Cell::from(g.name.clone())
                                 .style(Style::default().add_modifier(Modifier::BOLD)),
                             Cell::from(count_cell(g.resolved.len())),
                             unknown,
                             rights,
+                        ];
+                        if show_source {
+                            cells.push(source_cell(g.source));
+                        }
+                        cells.push(
                             Cell::from(g.description.clone()).style(Style::default().fg(DIM)),
-                            Cell::from(g.age.clone()).style(Style::default().fg(DIM)),
-                        ])
+                        );
+                        cells.push(Cell::from(g.age.clone()).style(Style::default().fg(DIM)));
+                        Row::new(cells)
                     }
                     _ => Row::new(vec![Cell::from("")]),
                 })
@@ -19530,11 +19594,17 @@ fn ident_table_parts(
                 7,
                 24,
             );
-            let widths = vec![
+            let mut widths = vec![
                 Constraint::Length(name_w), Constraint::Length(3),
-                Constraint::Length(unknown_w), Constraint::Length(6), Constraint::Min(16),
-                Constraint::Length(5),
+                Constraint::Length(unknown_w), Constraint::Length(6),
             ];
+            if show_source {
+                widths.push(Constraint::Length(4));
+            }
+            // The description takes the slack, and the age closes the row: the last column is never
+            // a `Min`, or the right border pays for it.
+            widths.push(Constraint::Min(16));
+            widths.push(Constraint::Length(5));
             (header, rows, widths)
         }
     }
@@ -19668,6 +19738,16 @@ fn draw_identity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         if let Some(c) = &s.controller {
             lines.push(ident_label_line(st.ident_lbl_operator, c.namespace.clone()));
             lines.extend(ident_delivery_lines(&s.delivery, st));
+            lines.extend(ident_directory_lines(&s.directory, st));
+            // What the table declares and the cluster does not have yet. Never a fault: upstream
+            // creates each group at the first sign-in of one of its members.
+            let missing = s.missing_mapped_groups();
+            if !missing.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    lang::fill(st.ident_mappings_missing, &[("groups", &missing.join(", "))]),
+                    Style::default().fg(DIM),
+                )));
+            }
         }
         if let Some(e) = &s.creds_error {
             lines.push(Line::from(""));
@@ -19763,6 +19843,61 @@ fn ident_delivery_lines(delivery: &Delivery, st: &'static lang::Strings) -> Vec<
     out
 }
 
+// What the deployment declares about the directory. Stated only where it says something: a `local`
+// deployment has one line, and a pre-1.2 one has the line that names the absence — never a block of
+// empty fields.
+fn ident_directory_lines(
+    directory: &Directory,
+    st: &'static lang::Strings,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let Some(mode) = directory.auth_mode else {
+        out.push(ident_label_line(st.ident_lbl_auth, st.ident_auth_unknown.to_string()));
+        return out;
+    };
+    out.push(ident_label_line(st.ident_lbl_auth, mode.label().to_string()));
+    if mode == AuthMode::Local {
+        return out;
+    }
+    if let Some(url) = &directory.url {
+        // StartTLS is only worth naming when it is what carries the TLS: an `ldaps://` URL already
+        // says it, and upstream refuses to start on anything else.
+        let text = match directory.start_tls {
+            Some(true) => format!("{url} (StartTLS)"),
+            _ => url.clone(),
+        };
+        out.push(ident_label_line(st.ident_lbl_ldap_url, text));
+    }
+    if let Some(profile) = &directory.profile {
+        out.push(ident_label_line(st.ident_lbl_ldap_profile, profile.clone()));
+    }
+    if let Some(base) = &directory.search_base {
+        out.push(ident_label_line(st.ident_lbl_ldap_base, base.clone()));
+    }
+    if let Some(resync) = &directory.resync {
+        out.push(ident_label_line(st.ident_lbl_ldap_resync, resync.clone()));
+    }
+    if let Some(e) = &directory.mappings_error {
+        out.push(Line::from(Span::styled(
+            lang::fill(st.ident_mappings_unreadable, &[("e", e)]),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(mappings) = &directory.mappings {
+        out.push(ident_label_line(
+            st.ident_lbl_ldap_mappings,
+            mappings.len().to_string(),
+        ));
+        for m in mappings {
+            out.push(Line::from(vec![
+                Span::styled("  · ".to_string(), Style::default().fg(DIM)),
+                Span::raw(format!("{} → {}", m.dn, m.group)),
+            ]));
+        }
+    }
+    out
+}
+
 fn ident_detail_lines(
     row: &IdentRow,
     st: &'static lang::Strings,
@@ -19786,6 +19921,15 @@ fn ident_detail_lines(
             lines.push(label(st.ident_lbl_email, u.email.clone()));
             if !u.display_name.is_empty() {
                 lines.push(label(st.ident_lbl_display, u.display_name.clone()));
+            }
+            // Where the account comes from, and the DN it is pinned to. The pin is the barrier that
+            // keeps two directory logins normalising to the same name from sharing one account, so
+            // it is shown verbatim rather than summarised.
+            if u.source.federated() {
+                lines.push(label(st.ident_lbl_source, AuthMode::Ldap.label().to_string()));
+                if !u.ldap_dn.is_empty() {
+                    lines.push(label(st.ident_lbl_ldap_dn, u.ldap_dn.clone()));
+                }
             }
             // kdt's phase and the controller's are shown side by side whenever they differ, so a
             // `Locked` that exists only here is never mistaken for something the CRD says.
@@ -19881,6 +20025,14 @@ fn ident_detail_lines(
             lines.push(label(st.ident_lbl_subject, g.effective_subject()));
             if !g.description.is_empty() {
                 lines.push(label(st.ident_lbl_description, g.description.clone()));
+            }
+            // A federated group says so even when nothing maps to it any more — that gap is exactly
+            // what the hint below is about.
+            if g.source.federated() {
+                lines.push(label(st.ident_lbl_source, AuthMode::Ldap.label().to_string()));
+            }
+            if !g.ldap_dns.is_empty() {
+                lines.push(label(st.ident_lbl_ldap_mappings, g.ldap_dns.join(", ")));
             }
             lines.push(label(
                 st.ident_lbl_members,
@@ -30001,6 +30153,10 @@ mod identity_view_tests {
                 },
             ],
             uid: "ident|user|alice".to_string(),
+            // Federated, with a DN long enough to compete for the width the border needs.
+            source: Source::Ldap,
+            ldap_dn: "CN=Alice Martin,OU=Consultants,OU=Users,DC=corp,DC=example,DC=com"
+                .to_string(),
         }
     }
 
@@ -30024,6 +30180,26 @@ mod identity_view_tests {
                 text: "members sans compte : fantome".to_string(),
             }],
             uid: "ident|group|plateforme".to_string(),
+            source: Source::Ldap,
+            ldap_dns: vec![
+                "CN=K8s-Plateforme,OU=Groups,DC=corp,DC=example,DC=com".to_string(),
+            ],
+        }
+    }
+
+    fn directory() -> Directory {
+        Directory {
+            auth_mode: Some(AuthMode::Ldap),
+            url: Some("ldaps://dc01.corp.example.com:636".to_string()),
+            profile: Some("activedirectory".to_string()),
+            start_tls: Some(false),
+            search_base: Some("OU=Users,DC=corp,DC=example,DC=com".to_string()),
+            resync: Some("15m".to_string()),
+            mappings: Some(vec![crate::identity::GroupMapping {
+                dn: "CN=K8s-Plateforme,OU=Groups,DC=corp,DC=example,DC=com".to_string(),
+                group: "plateforme-astreinte".to_string(),
+            }]),
+            mappings_error: None,
         }
     }
 
@@ -30044,7 +30220,7 @@ mod identity_view_tests {
                     Terminal::new(TestBackend::new(width, 12)).expect("test terminal");
                 terminal
                     .draw(|f| {
-                        let (header, rows, widths) = ident_table_parts(world, &src, st);
+                        let (header, rows, widths) = ident_table_parts(world, &src, st, true);
                         let table = Table::new(rows, widths)
                             .header(header)
                             .block(Block::default().borders(Borders::ALL).title(" identity "))
@@ -30254,6 +30430,39 @@ mod identity_view_tests {
         assert!(oidc.contains("<= 5m"));
         assert!(!oidc.contains(st.ident_download_open));
         assert!(!oidc.contains(st.ident_download_closed));
+    }
+
+    // The second axis, and the same rule: an undeclared `authMode` is also what every deployment
+    // older than 1.2 looks like, so the absence is named rather than read as `local`.
+    #[test]
+    fn an_undeclared_auth_mode_states_nothing_about_a_directory() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let silent = text(ident_directory_lines(&Directory::default(), st));
+        assert!(silent.contains(st.ident_auth_unknown), "the absence must be named");
+        assert!(!silent.contains("ldaps://"));
+
+        // A `local` deployment says so and stops: it has no directory to describe.
+        let local = text(ident_directory_lines(
+            &Directory { auth_mode: Some(AuthMode::Local), ..Directory::default() },
+            st,
+        ));
+        assert!(local.contains("local"));
+        assert!(!local.contains(st.ident_lbl_ldap_url));
+
+        let ldap = text(ident_directory_lines(&directory(), st));
+        assert!(ldap.contains("ldaps://dc01.corp.example.com:636"));
+        assert!(ldap.contains("15m"), "the re-read delay is what a group removal waits on");
+        assert!(ldap.contains("plateforme-astreinte"), "the mapping table is what feeds a group");
+        // The URL already carries the TLS: StartTLS is only named when it is what provides it.
+        assert!(!ldap.contains("StartTLS"));
     }
 
     // `?` and `0` are different answers, and the column that carries the case for revoking must not

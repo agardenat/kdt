@@ -1910,6 +1910,84 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             ));
             status = worse(status, DiagStatus::Warn);
         }
+        // The second axis, since kdt-identity 1.2. Named only when the directory is what
+        // authenticates: `local` is what every deployment was, and a badge marks the exception.
+        if s.directory.federated() {
+            lines.push((
+                LineColor::Info,
+                fill(
+                    active().diag_identity_ldap,
+                    &[
+                        ("url", s.directory.url.as_deref().unwrap_or("—")),
+                        ("federated", &s.federated_users().to_string()),
+                        ("total", &s.users.len().to_string()),
+                        ("resync", s.directory.resync.as_deref().unwrap_or("ldap.resync")),
+                    ],
+                ),
+            ));
+            // Accounts the portal no longer authenticates. They reconcile, they look active, and
+            // nobody can sign in as them — which no object says on its own.
+            let orphans: Vec<&str> = s
+                .users
+                .iter()
+                .filter(|u| !u.source.federated())
+                .map(|u| u.name.as_str())
+                .take(8)
+                .collect();
+            if !orphans.is_empty() {
+                lines.push((
+                    LineColor::Warn,
+                    fill(active().diag_identity_local_in_ldap, &[("users", &orphans.join(", "))]),
+                ));
+                status = worse(status, DiagStatus::Warn);
+            }
+        }
+        // The two gaps in the mapping table, asked only when the table was actually read: an empty
+        // `ldap_dns` is also every deployment whose table kdt never saw.
+        if s.directory.mappings_known() {
+            let unmapped: Vec<&str> = s
+                .groups
+                .iter()
+                .filter(|g| g.source.federated() && g.ldap_dns.is_empty())
+                .map(|g| g.name.as_str())
+                .take(8)
+                .collect();
+            if !unmapped.is_empty() {
+                lines.push((
+                    LineColor::Warn,
+                    fill(active().diag_identity_ldap_unmapped, &[("groups", &unmapped.join(", "))]),
+                ));
+                status = worse(status, DiagStatus::Warn);
+            }
+            let untouched: Vec<&str> = s
+                .groups
+                .iter()
+                .filter(|g| !g.source.federated() && !g.ldap_dns.is_empty())
+                .map(|g| g.name.as_str())
+                .take(8)
+                .collect();
+            if !untouched.is_empty() {
+                lines.push((
+                    LineColor::Warn,
+                    fill(
+                        active().diag_identity_ldap_not_federated,
+                        &[("groups", &untouched.join(", "))],
+                    ),
+                ));
+                status = worse(status, DiagStatus::Warn);
+            }
+            // Declared and not there yet: what the next sign-in will create, never a fault.
+            let missing = s.missing_mapped_groups();
+            if !missing.is_empty() {
+                lines.push((
+                    LineColor::Info,
+                    fill(
+                        active().diag_identity_mapped_missing,
+                        &[("groups", &missing.join(", "))],
+                    ),
+                ));
+            }
+        }
         // The one access revocation cannot reach. Stated once for the cluster, and only as Info:
         // it is the chart's default and a deliberate trade, not a fault — but it is the fact that
         // decides whether "sessions closed" means the person is actually out.

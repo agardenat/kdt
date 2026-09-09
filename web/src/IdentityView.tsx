@@ -27,7 +27,9 @@ import type {
   Hint,
   IdentDelivery,
   IdentGroupRow,
+  IdentDirectory,
   IdentInvite,
+  IdentSource,
   IdentUserRow,
   IdentityPayload,
 } from "./types";
@@ -36,9 +38,21 @@ import type {
 const USER_COLUMNS =
   "minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px";
 
+/**
+ * Les mêmes, plus SRC avant l'âge.
+ *
+ * La colonne ne se paie que là où un annuaire est en jeu — le serveur tranche, avec la même règle
+ * que le TUI. Ailleurs ce serait une colonne de tirets prise sur celles qui distinguent.
+ */
+const USER_COLUMNS_SOURCE =
+  "minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px";
+
 /** `NAME MEM UNKNOWN RIGHTS DESCRIPTION AGE`. */
 const GROUP_COLUMNS =
   "minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px";
+
+const GROUP_COLUMNS_SOURCE =
+  "minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px";
 
 type World = "users" | "groups";
 type Filter = "all" | "problems";
@@ -233,7 +247,13 @@ export default function IdentityView({
             detail={{
               label: st.identDetail,
               node: selectedUser ? (
-                <UserDetail user={selectedUser} delivery={payload?.delivery} st={st} />
+                <UserDetail
+                  user={selectedUser}
+                  delivery={payload?.delivery}
+                  directory={payload?.directory}
+                  missing={payload?.missing_mapped_groups ?? []}
+                  st={st}
+                />
               ) : selectedGroup ? (
                 <GroupDetail group={selectedGroup} st={st} />
               ) : null,
@@ -321,6 +341,7 @@ export default function IdentityView({
                 group={world === "groups" ? selectedGroup : null}
                 groups={groups}
                 controller={controller}
+                directory={payload?.directory ?? null}
                 installed={payload?.installed ?? false}
                 installCommand={payload?.install_command ?? ""}
                 form={form}
@@ -369,6 +390,7 @@ export default function IdentityView({
           <UserTable
             rows={shownUsers}
             selected={selected}
+            showSource={payload?.shows_source ?? false}
             st={st}
             onSelect={(u) => {
               setSelected(u.uid);
@@ -379,6 +401,8 @@ export default function IdentityView({
           <GroupTable
             rows={shownGroups}
             selected={selected}
+            showSource={payload?.shows_source ?? false}
+            st={st}
             onSelect={(g) => {
               setSelected(g.uid);
               setTab("detail");
@@ -397,6 +421,7 @@ export default function IdentityView({
           </span>
         )}
         {payload?.delivery && <DeliveryStatus delivery={payload.delivery} st={st} />}
+        {payload?.directory && <DirectoryStatus directory={payload.directory} st={st} />}
         {/* Dit une fois, ici, plutôt qu'en tiret sur chaque ligne : les colonnes que ces deux
             lectures font taire sont celles que rien d'autre ne peut répondre. */}
         {payload?.creds_error && <span className="err">{payload.creds_error}</span>}
@@ -430,27 +455,61 @@ function DeliveryStatus({ delivery, st }: { delivery: IdentDelivery; st: Strings
   );
 }
 
+/**
+ * Le second axe, dit une fois : qui le portail reconnaît.
+ *
+ * `local` ne s'affiche pas — c'est ce qu'était tout déploiement jusqu'à 1.2, et un badge marque
+ * l'écart à la norme. Le mode non déclaré, lui, se dit : il n'est pas `local`, il est inconnu.
+ */
+function DirectoryStatus({ directory, st }: { directory: IdentDirectory; st: Strings }) {
+  if (!directory.auth_mode) {
+    return (
+      <span className="dim">
+        {st.identAuth}: {st.identAuthUnknown}
+      </span>
+    );
+  }
+  if (!directory.federated) return null;
+  return (
+    <>
+      <span>
+        {st.identAuth}: {directory.auth_mode}
+        {directory.url ? ` · ${directory.url}` : ""}
+      </span>
+      {/* Une table illisible n'est pas une table vide : ce qui se tait, ce sont les constats sur
+          ce qui alimente les groupes. */}
+      {directory.mappings_error && <span className="warn">{st.identMappingsUnreadable}</span>}
+    </>
+  );
+}
+
 function UserTable({
   rows,
   selected,
+  showSource,
   st,
   onSelect,
 }: {
   rows: IdentUserRow[];
   selected: string | null;
+  showSource: boolean;
   st: Strings;
   onSelect: (u: IdentUserRow) => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: USER_COLUMNS }}>
+        <div
+          className="tr"
+          style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
+        >
           <div className="cell">NAME</div>
           <div className="cell">EMAIL</div>
           <div className="cell">PHASE</div>
           <div className="cell">GROUPS</div>
           <div className="cell">INVITE</div>
           <div className="cell num">SESS</div>
+          {showSource && <div className="cell">SRC</div>}
           <div className="cell num">AGE</div>
         </div>
       </div>
@@ -459,7 +518,7 @@ function UserTable({
           <div
             key={u.uid}
             className={`tr sev-${u.record.tone}`}
-            style={{ gridTemplateColumns: USER_COLUMNS }}
+            style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
             aria-selected={selected === u.uid}
             tabIndex={0}
             onClick={() => onSelect(u)}
@@ -478,6 +537,9 @@ function UserTable({
             <div className={`cell num ${u.sessions_tone}`} title={st.identSessions}>
               {u.sessions_cell}
             </div>
+            {/* La valeur du label, telle quelle : la ligne dit `ldap` parce que l'objet dit
+                `ldap`. */}
+            {showSource && <SourceCell source={u.source} st={st} />}
             <div className="cell num dim">{u.age}</div>
           </div>
         ))}
@@ -486,23 +548,39 @@ function UserTable({
   );
 }
 
+function SourceCell({ source, st }: { source: IdentSource; st: Strings }) {
+  return (
+    <div className={`cell ${source === "ldap" ? "info" : "dim"}`} title={st.identSource}>
+      {source === "ldap" ? "ldap" : "—"}
+    </div>
+  );
+}
+
 function GroupTable({
   rows,
   selected,
+  showSource,
+  st,
   onSelect,
 }: {
   rows: IdentGroupRow[];
   selected: string | null;
+  showSource: boolean;
+  st: Strings;
   onSelect: (g: IdentGroupRow) => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: GROUP_COLUMNS }}>
+        <div
+          className="tr"
+          style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
+        >
           <div className="cell">NAME</div>
           <div className="cell num">MEM</div>
           <div className="cell">UNKNOWN</div>
           <div className="cell num">RIGHTS</div>
+          {showSource && <div className="cell">SRC</div>}
           <div className="cell">DESCRIPTION</div>
           <div className="cell num">AGE</div>
         </div>
@@ -512,7 +590,7 @@ function GroupTable({
           <div
             key={g.uid}
             className={`tr sev-${g.record.tone}`}
-            style={{ gridTemplateColumns: GROUP_COLUMNS }}
+            style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
             aria-selected={selected === g.uid}
             tabIndex={0}
             onClick={() => onSelect(g)}
@@ -530,6 +608,7 @@ function GroupTable({
             <div className={`cell num ${g.rights_tone}`}>
               {g.bindings.length ? g.bindings.length : "—"}
             </div>
+            {showSource && <SourceCell source={g.source} st={st} />}
             <div className="cell dim">{g.description}</div>
             <div className="cell num dim">{g.age}</div>
           </div>
@@ -543,10 +622,14 @@ function GroupTable({
 function UserDetail({
   user,
   delivery,
+  directory,
+  missing,
   st,
 }: {
   user: IdentUserRow;
   delivery?: IdentDelivery;
+  directory?: IdentDirectory;
+  missing: string[];
   st: Strings;
 }) {
   return (
@@ -556,6 +639,15 @@ function UserDetail({
       <Line label={st.identSubject} value={user.subject} mono />
       <Line label={st.identEmail} value={user.email} />
       {user.display_name && <Line label={st.identDisplayName} value={user.display_name} />}
+      {/* D'où vient le compte, et le DN auquel il est épinglé. L'épinglage est la barrière qui
+          empêche deux identifiants d'annuaire normalisés vers le même nom de partager un compte :
+          il est montré verbatim plutôt que résumé. */}
+      {user.source === "ldap" && (
+        <>
+          <Line label={st.identSource} value="ldap" />
+          {user.ldap_dn && <Line label={st.identLdapDn} value={user.ldap_dn} mono />}
+        </>
+      )}
       {/* La phase de kdt et celle du controller côte à côte quand elles diffèrent : un `Locked`
           qui n'existe qu'ici ne doit jamais passer pour ce que la CRD dit. */}
       {user.raw_phase && user.raw_phase !== user.phase_label && (
@@ -588,6 +680,7 @@ function UserDetail({
         tone={user.sessions_tone}
       />
       {delivery && <DeliveryLines delivery={delivery} st={st} />}
+      {directory && <DirectoryLines directory={directory} missing={missing} st={st} />}
       <Line label="age" value={user.age} />
       <Hints hints={user.hints} st={st} />
     </div>
@@ -616,6 +709,67 @@ function DeliveryLines({ delivery, st }: { delivery: IdentDelivery; st: Strings 
   );
 }
 
+/**
+ * Ce que le déploiement déclare de l'annuaire, et rien de plus.
+ *
+ * Un déploiement `local` tient en une ligne : il n'a pas d'annuaire à décrire. Un mode non déclaré
+ * en tient une aussi, celle qui nomme l'absence — jamais un bloc de champs vides.
+ */
+function DirectoryLines({
+  directory,
+  missing,
+  st,
+}: {
+  directory: IdentDirectory;
+  missing: string[];
+  st: Strings;
+}) {
+  if (!directory.auth_mode)
+    return <Line label={st.identAuth} value={st.identAuthUnknown} tone="dim" />;
+  if (!directory.federated) return <Line label={st.identAuth} value={directory.auth_mode} />;
+  return (
+    <>
+      <Line label={st.identAuth} value={directory.auth_mode} />
+      {directory.url && (
+        <Line
+          label={st.identLdapUrl}
+          value={directory.start_tls ? `${directory.url} (StartTLS)` : directory.url}
+          mono
+        />
+      )}
+      {directory.profile && <Line label={st.identLdapProfile} value={directory.profile} />}
+      {directory.search_base && <Line label={st.identLdapBase} value={directory.search_base} mono />}
+      {/* Le délai qu'un retrait de groupe côté annuaire attend pour devenir un retrait de droits. */}
+      {directory.resync && <Line label={st.identLdapResync} value={directory.resync} />}
+      {directory.mappings_error && (
+        <Line label={st.identLdapMappings} value={st.identMappingsUnreadable} tone="warn" />
+      )}
+      {directory.mappings && (
+        <>
+          <Line label={st.identLdapMappings} value={String(directory.mappings.length)} />
+          {directory.mappings.map((m) => (
+            <div className="keys-row" key={`${m.dn}→${m.group}`}>
+              <div className="k-col">
+                <span className="k" />
+              </div>
+              <span className="v mono">
+                · {m.dn} → {m.group}
+              </span>
+            </div>
+          ))}
+        </>
+      )}
+      {/* Déclarés dans la table et pas encore là : jamais une faute, l'amont crée chaque groupe à
+          la première connexion d'un de ses membres. */}
+      {missing.length > 0 && (
+        <p className="guard info">
+          <span className="gl">·</span> {st.identMappingsMissing} {missing.join(", ")}
+        </p>
+      )}
+    </>
+  );
+}
+
 function GroupDetail({ group, st }: { group: IdentGroupRow; st: Strings }) {
   return (
     <div className="detail">
@@ -629,6 +783,12 @@ function GroupDetail({ group, st }: { group: IdentGroupRow; st: Strings }) {
         <span className="v mono">{group.subject}</span>
       </div>
       {group.description && <Line label={st.identDescription} value={group.description} />}
+      {/* Un groupe fédéré le dit même quand plus rien ne l'alimente — cet écart-là est justement
+          ce que le constat en bas de panneau nomme. */}
+      {group.source === "ldap" && <Line label={st.identSource} value="ldap" />}
+      {group.ldap_dns.length > 0 && (
+        <Line label={st.identLdapMappings} value={group.ldap_dns.join(", ")} mono />
+      )}
       <Line
         label={st.identMembers}
         value={group.resolved.length ? group.resolved.join(", ") : st.identNone}
@@ -759,12 +919,23 @@ function InvitePanel({
  * compte qu'il est censé contenir — et les entrées qui ne peuvent pas aboutir le disent au lieu de
  * le découvrir après la confirmation.
  */
+/**
+ * L'aide de l'appartenance, avec ce que l'annuaire en fera.
+ *
+ * L'écriture aboutit : ce n'est pas un refus, et le dire comme un blocage serait faux. C'est la
+ * relecture suivante qui la défait, et c'est ce qu'il faut savoir avant de cliquer.
+ */
+function memberHelp(st: Strings, federated: boolean): string {
+  return federated ? `${st.identMemberHelp} · ${st.identMembershipLdap}` : st.identMemberHelp;
+}
+
 function IdentityMenu({
   st,
   user,
   group,
   groups,
   controller,
+  directory,
   installed,
   installCommand,
   form,
@@ -777,6 +948,7 @@ function IdentityMenu({
   group: IdentGroupRow | null;
   groups: IdentGroupRow[];
   controller: { namespace: string; pod: string; container: string } | null;
+  directory: IdentDirectory | null;
   installed: boolean;
   installCommand: string;
   form: Form;
@@ -804,10 +976,19 @@ function IdentityMenu({
         <div className="menu-list">
           {user && (
             <>
+              {/* En `ldap` l'invitation n'existe pas : les comptes naissent d'une connexion
+                  réussie, et la commande amont refuse de s'exécuter. Ce qui ne peut pas aboutir
+                  est éteint ici plutôt que découvert après la confirmation. */}
               <MenuItem
                 label={st.identInvite}
-                desc={controller ? st.identInviteHelp : st.identNoController}
-                disabled={!controller || user.disabled}
+                desc={
+                  directory?.federated
+                    ? st.identInviteLdap
+                    : controller
+                      ? st.identInviteHelp
+                      : st.identNoController
+                }
+                disabled={!controller || user.disabled || !!directory?.federated}
                 onClick={() => onForm({ kind: "invite" })}
               />
               {/* À côté d'inviter, parce que les deux tournent dans le pod et parlent d'accès. Le
@@ -821,12 +1002,18 @@ function IdentityMenu({
               />
               <MenuItem
                 label={user.disabled ? st.identEnable : st.identDisable}
-                desc={user.disabled ? st.identEnableHelp : st.identDisableHelp}
+                desc={
+                  !user.disabled
+                    ? st.identDisableHelp
+                    : user.source === "ldap"
+                      ? `${st.identEnableHelp} · ${st.identEnableLdap}`
+                      : st.identEnableHelp
+                }
                 onClick={() => onForm({ kind: "disabled", next: !user.disabled })}
               />
               <MenuItem
                 label={st.identAddMember}
-                desc={st.identMemberHelp}
+                desc={memberHelp(st, directory?.federated ?? false)}
                 disabled={groups.length === 0}
                 onClick={() => {
                   setTarget(groups[0]?.name ?? "");
@@ -837,7 +1024,7 @@ function IdentityMenu({
                   quoi il appartient, et l'écriture porte de toute façon sur le groupe. */}
               <MenuItem
                 label={st.identRemoveMember}
-                desc={st.identMemberHelp}
+                desc={memberHelp(st, directory?.federated ?? false)}
                 disabled={user.member_of.length === 0}
                 onClick={() => {
                   setTarget(user.member_of[0] ?? "");
@@ -849,7 +1036,7 @@ function IdentityMenu({
           {group && (
             <MenuItem
               label={st.identAddMember}
-              desc={st.identMemberHelp}
+              desc={memberHelp(st, group.source === "ldap")}
               onClick={() => {
                 setTarget("");
                 onForm({ kind: "add-member" });

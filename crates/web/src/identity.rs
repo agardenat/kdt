@@ -25,6 +25,15 @@
 //! l'amont défaute à `certificate`, mais l'absence décrit aussi un déploiement 0.1 qui ne révoque
 //! rien du tout.
 //!
+//! # Le mode d'authentification est un second axe
+//!
+//! `authMode: local` ou `ldap` dit qui le portail **reconnaît**, là où `credentialMode` dit ce
+//! qu'il **remet** : les quatre combinaisons sont valides. En `ldap`, les comptes naissent d'une
+//! connexion réussie, portent le label `identity.kdt.sh/source=ldap` et l'annotation qui épingle
+//! leur DN, et leur appartenance est réalignée sur l'annuaire à chaque relecture. Variable absente
+//! ⇒ on n'affirme rien, comme pour la délivrance : c'est aussi ce à quoi ressemble un déploiement
+//! antérieur à 1.2.
+//!
 //! # Les deux écritures qui ne passent pas par l'apiserver
 //!
 //! `invite` et `revoke` sont des commandes lancées **dans le pod controller** : elles ont besoin de
@@ -73,6 +82,10 @@ pub async fn list(
         "sessions_error": inv.sessions_error,
         "controller": inv.controller,
         "delivery": delivery_json(&inv.delivery),
+        "directory": directory_json(&inv.directory),
+        // La colonne SOURCE ne se paie que là où un annuaire est en jeu — soit le cluster
+        // s'authentifie contre lui, soit un objet en porte encore le label.
+        "shows_source": inv.shows_source(),
         "counts": {
             "users": inv.users.len(),
             "active": inv.active_users(),
@@ -86,7 +99,11 @@ pub async fn list(
             "connected": inv.connected_users(),
             "groups": inv.groups.len(),
             "unbound": inv.unbound_groups(),
+            "federated": inv.federated_users(),
         },
+        // Ce que la table déclare et que le cluster n'a pas encore : jamais une faute, l'amont
+        // crée chaque group à la première connexion d'un de ses members.
+        "missing_mapped_groups": inv.missing_mapped_groups(),
         "users": inv.users.iter().map(|u| user_json(u, st)).collect::<Vec<_>>(),
         "groups": inv.groups.iter().map(|g| group_json(g, st)).collect::<Vec<_>>(),
         // La commande d'installation, pour un cluster qui n'a pas kdt-identity : c'est le geste
@@ -107,6 +124,18 @@ fn delivery_json(d: &kdt::identity::Delivery) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
         object.insert("revocation_window".to_string(), d.revocation_window().into());
         object.insert("download_open".to_string(), d.download_open().into());
+    }
+    value
+}
+
+/// Ce que le déploiement déclare de l'annuaire, plus la seule question qu'on lui pose.
+///
+/// `federated` est une règle de kdt : le second axe se lit sur `authMode`, jamais sur la présence
+/// d'une URL — un déploiement repassé en `local` garde toute sa configuration LDAP dans son env.
+fn directory_json(d: &kdt::identity::Directory) -> serde_json::Value {
+    let mut value = serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("federated".to_string(), d.federated().into());
     }
     value
 }
@@ -381,6 +410,59 @@ mod tests {
         assert_eq!(v["rights_tone"], "warn");
         assert_eq!(v["record"]["reason"], "Unbound");
         assert!(v["bindings_labels"].as_array().unwrap().is_empty());
+    }
+
+    // Le second axe voyage entier : le front peint la colonne SOURCE, nomme le DN épinglé et dit
+    // ce qui alimente un group. Aucun de ces trois faits n'est sur l'objet que le navigateur voit.
+    #[test]
+    fn le_second_axe_voyage_avec_la_regle_qui_le_lit() {
+        use kdt::identity::{AuthMode, Directory, GroupMapping, Source};
+
+        let d = Directory {
+            auth_mode: Some(AuthMode::Ldap),
+            url: Some("ldaps://dc01.example.com:636".into()),
+            resync: Some("15m".into()),
+            mappings: Some(vec![GroupMapping {
+                dn: "CN=K8s-Admins,OU=Groups,DC=example,DC=com".into(),
+                group: "admins".into(),
+            }]),
+            ..Directory::default()
+        };
+        let v = directory_json(&d);
+        assert_eq!(v["auth_mode"], "ldap");
+        assert_eq!(v["federated"], true);
+        assert_eq!(v["resync"], "15m");
+        assert_eq!(v["mappings"][0]["group"], "admins");
+
+        // Mode absent : ni `local` ni `ldap`. C'est aussi ce à quoi ressemble un déploiement
+        // antérieur à 1.2, et le front ne doit pas peindre un axe qui n'a pas été déclaré.
+        let silent = directory_json(&Directory::default());
+        assert!(silent["auth_mode"].is_null());
+        assert_eq!(silent["federated"], false);
+        assert!(silent["mappings"].is_null());
+
+        let u = user_json(
+            &IdentUser {
+                source: Source::Ldap,
+                ldap_dn: "CN=Alice,DC=example,DC=com".into(),
+                ..user()
+            },
+            lang_of("fr"),
+        );
+        assert_eq!(u["source"], "ldap");
+        assert_eq!(u["ldap_dn"], "CN=Alice,DC=example,DC=com");
+
+        let g = group_json(
+            &IdentGroup {
+                name: "admins".into(),
+                source: Source::Ldap,
+                ldap_dns: vec!["CN=K8s-Admins,OU=Groups,DC=example,DC=com".into()],
+                ..IdentGroup::default()
+            },
+            lang_of("fr"),
+        );
+        assert_eq!(g["source"], "ldap");
+        assert_eq!(g["ldap_dns"][0], "CN=K8s-Admins,OU=Groups,DC=example,DC=com");
     }
 
     // Le mode absent n'est pas `certificate` : l'amont y défaute, mais l'absence décrit aussi un

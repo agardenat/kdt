@@ -1423,6 +1423,10 @@ export interface IdentUserRow {
   uid: string;
   /** L'identité que l'apiserver verra, préfixe compris. */
   subject: string;
+  /** D'où vient le compte, par le label `identity.kdt.sh/source`. Rien d'autre n'est déduit. */
+  source: IdentSource;
+  /** Le DN épinglé à la création, revérifié à chaque connexion. Vide sur un compte local. */
+  ldap_dn: string;
   record: EventRecord;
 }
 
@@ -1443,7 +1447,38 @@ export interface IdentGroupRow {
   age: string;
   hints: Hint[];
   uid: string;
+  /** D'où vient le group : un group fédéré est réécrit à chaque relecture de l'annuaire. */
+  source: IdentSource;
+  /** Les groupes d'annuaire qui l'alimentent, par DN. Vide n'est pas « aucun » : c'est aussi
+   *  tout déploiement dont kdt n'a jamais vu la table. */
+  ldap_dns: string[];
   record: EventRecord;
+}
+
+/** D'où vient un compte ou un group, par le label que le mode LDAP pose. */
+export type IdentSource = "local" | "ldap";
+
+/**
+ * Ce que le déploiement déclare de l'annuaire — le second axe.
+ *
+ * `auth_mode` peut être `null` pour la même raison que le mode de délivrance : l'amont y défaute à
+ * `local`, mais l'absence décrit aussi un déploiement antérieur à 1.2, qui n'avait pas d'axe du
+ * tout. `mappings` à `null` n'est pas une table vide — l'amont refuse de démarrer sur une table
+ * vide, alors qu'une table jamais lue est le cas de tous les déploiements en `local`.
+ */
+export interface IdentDirectory {
+  auth_mode: "local" | "ldap" | null;
+  url: string | null;
+  profile: string | null;
+  start_tls: boolean | null;
+  search_base: string | null;
+  /** Le délai qu'un retrait de groupe attend pour devenir un retrait de droits. */
+  resync: string | null;
+  mappings: { dn: string; group: string }[] | null;
+  /** La variable est là et illisible : les verdicts sur la table se taisent. */
+  mappings_error: string | null;
+  /** L'annuaire est ce qui authentifie ici. Se lit sur `auth_mode`, jamais sur la présence d'URL. */
+  federated: boolean;
 }
 
 /**
@@ -1473,6 +1508,9 @@ export interface IdentityPayload {
   sessions_error: string | null;
   controller: { namespace: string; pod: string; container: string } | null;
   delivery: IdentDelivery;
+  directory: IdentDirectory;
+  /** La colonne SOURCE ne se paie que là où un annuaire est en jeu. */
+  shows_source: boolean;
   counts: {
     users: number;
     active: number;
@@ -1480,9 +1518,12 @@ export interface IdentityPayload {
     connected: number;
     groups: number;
     unbound: number;
+    federated: number;
   };
   users: IdentUserRow[];
   groups: IdentGroupRow[];
+  /** Déclarés dans la table et pas encore créés : chacun naîtra à la première connexion. */
+  missing_mapped_groups: string[];
   install_command: string;
 }
 
