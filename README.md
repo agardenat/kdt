@@ -374,35 +374,47 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     déploiement antérieur à 1.0, qui ne révoque pas. Le panneau de détail ajoute le droit de session
     (`refreshTtl`) et, en mode certificat seulement, l'état de `portal.kubeconfigDownload` — le seul
     accès que ni `revoke` ni `spec.disabled` n'atteignent.
-  - Le **mode d'authentification** est un second axe, indépendant du précédent : `authMode: local`
-    ou `ldap`, lu dans la même variable d'environnement du pod contrôleur
+  - Le **mode d'authentification** est un second axe, indépendant du précédent : `authMode: local`,
+    `ldap` ou `oidc`, lu dans la même variable d'environnement du pod contrôleur
     (`KDT_IDENTITY_AUTH_MODE`), dit qui le portail **reconnaît** là où `credentialMode` dit ce
-    qu'il **remet**. Les quatre combinaisons existent. Variable absente ⇒ kdt n'affirme rien, comme
-    pour la délivrance : c'est aussi ce à quoi ressemble un déploiement antérieur à 1.2. En `ldap`,
-    le titre le porte, et le panneau ajoute l'URL de l'annuaire, le profil, la racine de recherche,
-    le délai de relecture (`ldap.resync`) et la table `ldap.groupMappings` telle qu'elle est
-    déclarée, DN par DN.
-  - Une colonne **SRC** apparaît dans les deux mondes dès qu'un annuaire est en jeu — le cluster
-    s'authentifie contre lui, ou un objet en porte encore le label. Elle vaut `ldap` sur ce que le
-    label `identity.kdt.sh/source` marque, `—` ailleurs, et rien d'autre n'est déduit : ni le nom,
-    ni la forme de l'adresse. Le détail d'un compte fédéré ajoute son **DN épinglé**
-    (`identity.kdt.sh/ldap-dn`), que l'amont revérifie à chaque connexion.
-  - Les écarts que le mode LDAP crée et qu'aucun objet ne dit seul : un compte **local** dans un
-    déploiement `ldap` (plus personne ne peut s'y connecter, et `invite` refuse de s'exécuter), un
-    compte **fédéré** dans un déploiement `local` (ni mot de passe ni TOTP, il faut l'inviter), un
-    group marqué `source=ldap` **absent de la table** (plus rien ne l'alimente), un group **déclaré
-    dans la table sans le label** (le contrôleur laisse ses membres intacts et se contente de le
-    journaliser). Les groups de la table qui n'existent pas encore sont listés sans être blâmés :
-    chacun naît à la première connexion d'un de ses membres. Une table illisible tait ces constats
-    plutôt que de se lire comme une table vide.
+    qu'il **remet**. Toutes les combinaisons existent. Variable absente ⇒ kdt n'affirme rien, comme
+    pour la délivrance : c'est aussi ce à quoi ressemble un déploiement antérieur à 1.2. Le titre
+    porte le mode dès qu'il n'est pas `local`, et le panneau décrit la source avec ses propres
+    faits :
+    - en `ldap`, l'URL de l'annuaire, le profil, la racine de recherche, le délai de relecture
+      (`ldap.resync`) et la table `ldap.groupMappings` telle qu'elle est déclarée, DN par DN ;
+    - en `oidc`, l'émetteur, le nom du fournisseur, l'identifiant d'application, les claims
+      surchargés (épinglage, groupes) et la table `oidcAuth.groupMappings`, claim par claim. L'accès
+      à l'API du fournisseur (`oidcAuth.graph`) est dit **y compris quand il est absent** : sans
+      lui, rien n'est relu, le contrôleur ne désactive aucun compte, et `refreshTtl` est plafonné à
+      24 h par l'amont. kdt ne rend alors **aucun** délai de relecture plutôt qu'un délai court.
+  - Une colonne **SRC** apparaît dans les deux mondes dès qu'une source extérieure est en jeu — le
+    cluster s'authentifie contre elle, ou un objet en porte encore le label. Elle vaut `ldap` ou
+    `oidc` selon ce que le label `identity.kdt.sh/source` marque, `—` ailleurs, et rien d'autre
+    n'est déduit : ni le nom, ni la forme de l'adresse. Les deux sources ne sont jamais fondues en
+    un mot commun : celle qui gouverne un compte décide d'où il se corrige. Le détail d'un compte
+    fédéré ajoute la **valeur épinglée** que l'amont revérifie à chaque connexion — le DN
+    (`identity.kdt.sh/ldap-dn`) ou le sujet du jeton (`identity.kdt.sh/oidc-subject`), lu dans
+    l'annotation de sa propre source et jamais dans celle de l'autre.
+  - Les écarts qu'un mode fédéré crée et qu'aucun objet ne dit seul : un compte **local** dans un
+    déploiement `ldap` ou `oidc` (plus personne ne peut s'y connecter, et `invite` refuse de
+    s'exécuter), un compte **fédéré** dans un déploiement `local` (ni mot de passe ni TOTP, il faut
+    l'inviter), un compte gouverné par **l'autre source** que celle qui authentifie (l'amont refuse
+    la connexion plutôt que d'adopter le compte), un group marqué comme fédéré **absent de la
+    table** (plus rien ne l'alimente), un group **déclaré dans la table sans le label** (le
+    contrôleur laisse ses membres intacts et se contente de le journaliser). Un compte fédéré
+    désactivé nomme la relecture qui a pu le faire — et, en `oidc` sans accès à l'API, dit que seule
+    une main a pu le désactiver. Les groups de la table qui n'existent pas encore sont listés sans
+    être blâmés : chacun naît à la première connexion d'un de ses membres. Une table illisible tait
+    ces constats plutôt que de se lire comme une table vide.
   - `o` : **inviter** (voir plus bas), **fermer les sessions** (`kdt-identity-server revoke` dans le
     pod contrôleur : déconnecte tous les postes, le compte reste habilité et peut rouvrir une
     session — c'est `spec.disabled` qui coupe), **désactiver / réactiver** (`spec.disabled` : le
     contrôleur ferme les sessions et le portail refuse la connexion, l'accès en cours s'arrête au
     prochain renouvellement), **appartenance**
     (sélecteur : depuis un compte il coche ses groups, depuis un group il coche ses comptes ; sur
-    un group alimenté depuis l'annuaire, l'écriture aboutit puis la relecture suivante la défait, et
-    l'entrée du menu le dit),
+    un group alimenté depuis la source d'identité, l'écriture aboutit puis la source la défait à la
+    relecture ou à la connexion suivante, et l'entrée du menu le dit),
     **créer** un user ou un group, **copier le subject** RBAC tel que le contrôleur le publie. Les
     deux créations sont proposées depuis les deux mondes, et la vue bascule sur le monde de l'objet
     créé pour se poser dessus. Sur un cluster sans kdt-identity, `o` propose de **copier la séquence

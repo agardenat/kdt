@@ -27,7 +27,7 @@ import type {
   Hint,
   IdentDelivery,
   IdentGroupRow,
-  IdentDirectory,
+  IdentFederation,
   IdentInvite,
   IdentSource,
   IdentUserRow,
@@ -250,7 +250,7 @@ export default function IdentityView({
                 <UserDetail
                   user={selectedUser}
                   delivery={payload?.delivery}
-                  directory={payload?.directory}
+                  federation={payload?.federation}
                   missing={payload?.missing_mapped_groups ?? []}
                   st={st}
                 />
@@ -341,7 +341,7 @@ export default function IdentityView({
                 group={world === "groups" ? selectedGroup : null}
                 groups={groups}
                 controller={controller}
-                directory={payload?.directory ?? null}
+                federation={payload?.federation ?? null}
                 installed={payload?.installed ?? false}
                 installCommand={payload?.install_command ?? ""}
                 form={form}
@@ -421,7 +421,7 @@ export default function IdentityView({
           </span>
         )}
         {payload?.delivery && <DeliveryStatus delivery={payload.delivery} st={st} />}
-        {payload?.directory && <DirectoryStatus directory={payload.directory} st={st} />}
+        {payload?.federation && <FederationStatus federation={payload.federation} st={st} />}
         {/* Dit une fois, ici, plutôt qu'en tiret sur chaque ligne : les colonnes que ces deux
             lectures font taire sont celles que rien d'autre ne peut répondre. */}
         {payload?.creds_error && <span className="err">{payload.creds_error}</span>}
@@ -460,25 +460,32 @@ function DeliveryStatus({ delivery, st }: { delivery: IdentDelivery; st: Strings
  *
  * `local` ne s'affiche pas — c'est ce qu'était tout déploiement jusqu'à 1.2, et un badge marque
  * l'écart à la norme. Le mode non déclaré, lui, se dit : il n'est pas `local`, il est inconnu.
+ *
+ * Le mode est nommé tel quel, `ldap` ou `oidc` : ce ne sont pas la même nouvelle pour qui le lit,
+ * et la source est désignée par ce qui l'identifie — une URL d'annuaire, l'émetteur d'un jeton.
  */
-function DirectoryStatus({ directory, st }: { directory: IdentDirectory; st: Strings }) {
-  if (!directory.auth_mode) {
+function FederationStatus({ federation, st }: { federation: IdentFederation; st: Strings }) {
+  if (!federation.auth_mode) {
     return (
       <span className="dim">
         {st.identAuth}: {st.identAuthUnknown}
       </span>
     );
   }
-  if (!directory.federated) return null;
+  if (!federation.federated) return null;
+  const source =
+    federation.auth_mode === "oidc"
+      ? (federation.oidc.provider_name ?? federation.oidc.issuer)
+      : federation.ldap.url;
   return (
     <>
       <span>
-        {st.identAuth}: {directory.auth_mode}
-        {directory.url ? ` · ${directory.url}` : ""}
+        {st.identAuth}: {federation.auth_mode}
+        {source ? ` · ${source}` : ""}
       </span>
       {/* Une table illisible n'est pas une table vide : ce qui se tait, ce sont les constats sur
           ce qui alimente les groupes. */}
-      {directory.mappings_error && <span className="warn">{st.identMappingsUnreadable}</span>}
+      {federation.mappings_error && <span className="warn">{st.identMappingsUnreadable}</span>}
     </>
   );
 }
@@ -537,8 +544,9 @@ function UserTable({
             <div className={`cell num ${u.sessions_tone}`} title={st.identSessions}>
               {u.sessions_cell}
             </div>
-            {/* La valeur du label, telle quelle : la ligne dit `ldap` parce que l'objet dit
-                `ldap`. */}
+            {/* La valeur du label, telle quelle : la ligne dit `oidc` parce que l'objet dit
+                `oidc`. Les deux sources fédérées ne sont jamais fondues en un mot commun — celle
+                qui gouverne un compte décide d'où il se corrige. */}
             {showSource && <SourceCell source={u.source} st={st} />}
             <div className="cell num dim">{u.age}</div>
           </div>
@@ -549,9 +557,10 @@ function UserTable({
 }
 
 function SourceCell({ source, st }: { source: IdentSource; st: Strings }) {
+  const federated = source !== "local";
   return (
-    <div className={`cell ${source === "ldap" ? "info" : "dim"}`} title={st.identSource}>
-      {source === "ldap" ? "ldap" : "—"}
+    <div className={`cell ${federated ? "info" : "dim"}`} title={st.identSource}>
+      {federated ? source : "—"}
     </div>
   );
 }
@@ -622,13 +631,13 @@ function GroupTable({
 function UserDetail({
   user,
   delivery,
-  directory,
+  federation,
   missing,
   st,
 }: {
   user: IdentUserRow;
   delivery?: IdentDelivery;
-  directory?: IdentDirectory;
+  federation?: IdentFederation;
   missing: string[];
   st: Strings;
 }) {
@@ -639,13 +648,19 @@ function UserDetail({
       <Line label={st.identSubject} value={user.subject} mono />
       <Line label={st.identEmail} value={user.email} />
       {user.display_name && <Line label={st.identDisplayName} value={user.display_name} />}
-      {/* D'où vient le compte, et le DN auquel il est épinglé. L'épinglage est la barrière qui
-          empêche deux identifiants d'annuaire normalisés vers le même nom de partager un compte :
-          il est montré verbatim plutôt que résumé. */}
-      {user.source === "ldap" && (
+      {/* D'où vient le compte, et la valeur à laquelle il est épinglé. L'épinglage est la barrière
+          qui empêche deux identifiants normalisés vers le même nom de partager un compte : il est
+          montré verbatim plutôt que résumé, sous le nom que sa propre source lui donne. */}
+      {user.source !== "local" && (
         <>
-          <Line label={st.identSource} value="ldap" />
-          {user.ldap_dn && <Line label={st.identLdapDn} value={user.ldap_dn} mono />}
+          <Line label={st.identSource} value={user.source} />
+          {user.pin && (
+            <Line
+              label={user.source === "oidc" ? st.identOidcSubject : st.identLdapDn}
+              value={user.pin}
+              mono
+            />
+          )}
         </>
       )}
       {/* La phase de kdt et celle du controller côte à côte quand elles diffèrent : un `Locked`
@@ -680,7 +695,7 @@ function UserDetail({
         tone={user.sessions_tone}
       />
       {delivery && <DeliveryLines delivery={delivery} st={st} />}
-      {directory && <DirectoryLines directory={directory} missing={missing} st={st} />}
+      {federation && <FederationLines federation={federation} missing={missing} st={st} />}
       <Line label="age" value={user.age} />
       <Hints hints={user.hints} st={st} />
     </div>
@@ -710,50 +725,90 @@ function DeliveryLines({ delivery, st }: { delivery: IdentDelivery; st: Strings 
 }
 
 /**
- * Ce que le déploiement déclare de l'annuaire, et rien de plus.
+ * Ce que le déploiement déclare de la source d'identité, et rien de plus.
  *
- * Un déploiement `local` tient en une ligne : il n'a pas d'annuaire à décrire. Un mode non déclaré
- * en tient une aussi, celle qui nomme l'absence — jamais un bloc de champs vides.
+ * Un déploiement `local` tient en une ligne : il n'a pas de source extérieure à décrire. Un mode non
+ * déclaré en tient une aussi, celle qui nomme l'absence — jamais un bloc de champs vides.
+ *
+ * Les deux modes fédérés se décrivent avec leurs propres faits, et aucun n'est dit dans les termes
+ * de l'autre : un annuaire a une URL, une racine de recherche et un délai de relecture ; un
+ * fournisseur a un émetteur, le claim sur lequel ses comptes sont épinglés, et un accès à son API
+ * qui peut tout simplement ne pas être déclaré.
  */
-function DirectoryLines({
-  directory,
+function FederationLines({
+  federation,
   missing,
   st,
 }: {
-  directory: IdentDirectory;
+  federation: IdentFederation;
   missing: string[];
   st: Strings;
 }) {
-  if (!directory.auth_mode)
+  if (!federation.auth_mode)
     return <Line label={st.identAuth} value={st.identAuthUnknown} tone="dim" />;
-  if (!directory.federated) return <Line label={st.identAuth} value={directory.auth_mode} />;
+  if (!federation.federated) return <Line label={st.identAuth} value={federation.auth_mode} />;
+  const { ldap, oidc } = federation;
   return (
     <>
-      <Line label={st.identAuth} value={directory.auth_mode} />
-      {directory.url && (
-        <Line
-          label={st.identLdapUrl}
-          value={directory.start_tls ? `${directory.url} (StartTLS)` : directory.url}
-          mono
-        />
-      )}
-      {directory.profile && <Line label={st.identLdapProfile} value={directory.profile} />}
-      {directory.search_base && <Line label={st.identLdapBase} value={directory.search_base} mono />}
-      {/* Le délai qu'un retrait de groupe côté annuaire attend pour devenir un retrait de droits. */}
-      {directory.resync && <Line label={st.identLdapResync} value={directory.resync} />}
-      {directory.mappings_error && (
-        <Line label={st.identLdapMappings} value={st.identMappingsUnreadable} tone="warn" />
-      )}
-      {directory.mappings && (
+      <Line label={st.identAuth} value={federation.auth_mode} />
+      {federation.auth_mode === "ldap" ? (
         <>
-          <Line label={st.identLdapMappings} value={String(directory.mappings.length)} />
-          {directory.mappings.map((m) => (
-            <div className="keys-row" key={`${m.dn}→${m.group}`}>
+          {ldap.url && (
+            <Line
+              label={st.identLdapUrl}
+              value={ldap.start_tls ? `${ldap.url} (StartTLS)` : ldap.url}
+              mono
+            />
+          )}
+          {ldap.profile && <Line label={st.identLdapProfile} value={ldap.profile} />}
+          {ldap.search_base && <Line label={st.identLdapBase} value={ldap.search_base} mono />}
+          {/* Le délai qu'un retrait de groupe côté annuaire attend pour devenir un retrait de
+              droits. */}
+          {ldap.resync && <Line label={st.identLdapResync} value={ldap.resync} />}
+        </>
+      ) : (
+        <>
+          {oidc.issuer && <Line label={st.identOidcIssuer} value={oidc.issuer} mono />}
+          {oidc.provider_name && <Line label={st.identOidcProvider} value={oidc.provider_name} />}
+          {oidc.client_id && <Line label={st.identOidcClient} value={oidc.client_id} mono />}
+          {/* Un claim absent n'est pas affiché : le chart n'en écrit un que s'il surcharge le
+              défaut amont, et nommer `sub` ici ferait passer un défaut pour un fait lu. */}
+          {oidc.subject_claim && (
+            <Line label={st.identOidcSubjectClaim} value={oidc.subject_claim} mono />
+          )}
+          {oidc.groups_claim && (
+            <Line label={st.identOidcGroupsClaim} value={oidc.groups_claim} mono />
+          )}
+          {/* L'accès à l'API du fournisseur, et son absence — qui est ce dont dépendent deux
+              comportements, pas un détail manquant. Elle est donc dite, jamais laissée blanche. */}
+          {oidc.graph ? (
+            <Line
+              label={st.identOidcGraph}
+              value={[oidc.graph.endpoint ?? oidc.graph.tenant_id, oidc.graph.resync]
+                .filter(Boolean)
+                .join(" · ")}
+              mono
+            />
+          ) : (
+            <p className="guard dim">
+              <span className="gl">·</span> {st.identOidcGraphOff}
+            </p>
+          )}
+        </>
+      )}
+      {federation.mappings_error && (
+        <Line label={st.identMappings} value={st.identMappingsUnreadable} tone="warn" />
+      )}
+      {federation.mappings && (
+        <>
+          <Line label={st.identMappings} value={String(federation.mappings.length)} />
+          {federation.mappings.map((m) => (
+            <div className="keys-row" key={`${m.key}→${m.group}`}>
               <div className="k-col">
                 <span className="k" />
               </div>
               <span className="v mono">
-                · {m.dn} → {m.group}
+                · {m.key} → {m.group}
               </span>
             </div>
           ))}
@@ -785,9 +840,9 @@ function GroupDetail({ group, st }: { group: IdentGroupRow; st: Strings }) {
       {group.description && <Line label={st.identDescription} value={group.description} />}
       {/* Un groupe fédéré le dit même quand plus rien ne l'alimente — cet écart-là est justement
           ce que le constat en bas de panneau nomme. */}
-      {group.source === "ldap" && <Line label={st.identSource} value="ldap" />}
-      {group.ldap_dns.length > 0 && (
-        <Line label={st.identLdapMappings} value={group.ldap_dns.join(", ")} mono />
+      {group.source !== "local" && <Line label={st.identSource} value={group.source} />}
+      {group.source_keys.length > 0 && (
+        <Line label={st.identMappings} value={group.source_keys.join(", ")} mono />
       )}
       <Line
         label={st.identMembers}
@@ -920,13 +975,14 @@ function InvitePanel({
  * le découvrir après la confirmation.
  */
 /**
- * L'aide de l'appartenance, avec ce que l'annuaire en fera.
+ * L'aide de l'appartenance, avec ce que la source d'identité en fera.
  *
  * L'écriture aboutit : ce n'est pas un refus, et le dire comme un blocage serait faux. C'est la
- * relecture suivante qui la défait, et c'est ce qu'il faut savoir avant de cliquer.
+ * source qui la défait, à la relecture ou à la connexion suivante, et c'est ce qu'il faut savoir
+ * avant de cliquer.
  */
 function memberHelp(st: Strings, federated: boolean): string {
-  return federated ? `${st.identMemberHelp} · ${st.identMembershipLdap}` : st.identMemberHelp;
+  return federated ? `${st.identMemberHelp} · ${st.identMembershipFederated}` : st.identMemberHelp;
 }
 
 function IdentityMenu({
@@ -935,7 +991,7 @@ function IdentityMenu({
   group,
   groups,
   controller,
-  directory,
+  federation,
   installed,
   installCommand,
   form,
@@ -948,7 +1004,7 @@ function IdentityMenu({
   group: IdentGroupRow | null;
   groups: IdentGroupRow[];
   controller: { namespace: string; pod: string; container: string } | null;
-  directory: IdentDirectory | null;
+  federation: IdentFederation | null;
   installed: boolean;
   installCommand: string;
   form: Form;
@@ -976,19 +1032,19 @@ function IdentityMenu({
         <div className="menu-list">
           {user && (
             <>
-              {/* En `ldap` l'invitation n'existe pas : les comptes naissent d'une connexion
-                  réussie, et la commande amont refuse de s'exécuter. Ce qui ne peut pas aboutir
-                  est éteint ici plutôt que découvert après la confirmation. */}
+              {/* Dans un mode fédéré l'invitation n'existe pas : les comptes naissent d'une
+                  connexion réussie, et la commande amont refuse de s'exécuter. Ce qui ne peut pas
+                  aboutir est éteint ici plutôt que découvert après la confirmation. */}
               <MenuItem
                 label={st.identInvite}
                 desc={
-                  directory?.federated
-                    ? st.identInviteLdap
+                  federation?.federated
+                    ? st.identInviteFederated
                     : controller
                       ? st.identInviteHelp
                       : st.identNoController
                 }
-                disabled={!controller || user.disabled || !!directory?.federated}
+                disabled={!controller || user.disabled || !!federation?.federated}
                 onClick={() => onForm({ kind: "invite" })}
               />
               {/* À côté d'inviter, parce que les deux tournent dans le pod et parlent d'accès. Le
@@ -1005,15 +1061,17 @@ function IdentityMenu({
                 desc={
                   !user.disabled
                     ? st.identDisableHelp
-                    : user.source === "ldap"
-                      ? `${st.identEnableHelp} · ${st.identEnableLdap}`
+                    : /* Réactiver ne tient que tant que la source reconnaît la personne — et
+                         seulement là où il y a une relecture pour le défaire. */
+                      user.source !== "local" && federation?.resync
+                      ? `${st.identEnableHelp} · ${st.identEnableFederated}`
                       : st.identEnableHelp
                 }
                 onClick={() => onForm({ kind: "disabled", next: !user.disabled })}
               />
               <MenuItem
                 label={st.identAddMember}
-                desc={memberHelp(st, directory?.federated ?? false)}
+                desc={memberHelp(st, federation?.federated ?? false)}
                 disabled={groups.length === 0}
                 onClick={() => {
                   setTarget(groups[0]?.name ?? "");
@@ -1024,7 +1082,7 @@ function IdentityMenu({
                   quoi il appartient, et l'écriture porte de toute façon sur le groupe. */}
               <MenuItem
                 label={st.identRemoveMember}
-                desc={memberHelp(st, directory?.federated ?? false)}
+                desc={memberHelp(st, federation?.federated ?? false)}
                 disabled={user.member_of.length === 0}
                 onClick={() => {
                   setTarget(user.member_of[0] ?? "");
@@ -1036,7 +1094,7 @@ function IdentityMenu({
           {group && (
             <MenuItem
               label={st.identAddMember}
-              desc={memberHelp(st, group.source === "ldap")}
+              desc={memberHelp(st, group.source !== "local")}
               onClick={() => {
                 setTarget("");
                 onForm({ kind: "add-member" });

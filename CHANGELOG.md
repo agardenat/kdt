@@ -10,6 +10,32 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 
 ## [2.0.0-rc.2] — 2026-09-09
 
+- **feat(identity, web)** — les vues `:identity` et sa jumelle web suivent kdt-identity 1.3 : un
+  **fournisseur OpenID Connect** peut être ce qui authentifie, à côté de l'annuaire. `authMode` a
+  désormais trois valeurs, et le second axe n'est plus « l'annuaire ou rien » — les deux sources
+  fédérées sont lues, nommées et jugées chacune avec ses propres faits.
+
+  La colonne **SRC** dit `oidc` là où l'objet dit `oidc` : les deux sources ne sont jamais fondues
+  en un mot commun, parce que celle qui gouverne un compte décide d'où il se corrige. Le détail
+  d'un compte fédéré nomme la valeur épinglée que l'amont revérifie à chaque connexion — le DN ou
+  le sujet du jeton —, lue dans l'annotation de sa **propre** source et jamais dans celle de
+  l'autre : un DN relu comme un sujet de jeton épinglerait un compte sur une valeur que rien ne
+  vérifie.
+
+  Le panneau décrit le fournisseur avec ses faits à lui : émetteur, nom, identifiant
+  d'application, claims surchargés, et la table `oidcAuth.groupMappings` claim par claim. L'accès
+  à l'API du fournisseur (`oidcAuth.graph`) est dit **y compris quand il est absent**, parce que
+  cette absence est un comportement et non un détail manquant : sans lui rien n'est relu, le
+  contrôleur ne désactive aucun compte, et l'amont plafonne `refreshTtl` à 24 h. kdt ne rend alors
+  **aucun** délai de relecture — un délai court et pas de relecture du tout ne se lisent pas
+  pareil, et un compte fédéré désactivé dit dans ce cas que seule une main a pu le faire.
+
+  Trois écarts s'ajoutent à ceux que le mode ldap avait apportés : un compte **local** sous un
+  fournisseur (le mot de passe y est refusé à trois endroits chez l'amont), un compte gouverné par
+  **l'autre source** que celle qui authentifie (l'amont refuse la connexion plutôt que d'adopter un
+  compte qui ne vient pas de sa source), et le constat de désactivation ci-dessus. Le diagnostic
+  suit, avec la même distinction entre « relu toutes les 15 minutes » et « jamais relu ».
+
 - **chore(release, web)** — le chart de kdt-web est publié dans un **dépôt Helm** :
   `helm repo add kdt https://agardenat.github.io/helm-charts`, puis
   `helm upgrade --install kdt-web kdt/kdt-web`. Plus de copie du dépôt avant d'installer. Le job

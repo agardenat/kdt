@@ -1910,20 +1910,42 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             ));
             status = worse(status, DiagStatus::Warn);
         }
-        // The second axis, since kdt-identity 1.2. Named only when the directory is what
-        // authenticates: `local` is what every deployment was, and a badge marks the exception.
-        if s.directory.federated() {
+        // The second axis, since kdt-identity 1.2, and its two sources since 1.3. Named only when
+        // something outside the cluster is what authenticates: `local` is what every deployment
+        // was, and a badge marks the exception.
+        if let Some(mode) = s.federation.auth_mode.filter(|_| s.federation.federated()) {
+            // The source is named by what identifies it: a directory by its URL, a provider by its
+            // issuer. Neither is invented — an undeclared one leaves the dash.
+            let source = match mode {
+                crate::identity::AuthMode::Oidc => s.federation.oidc.issuer.as_deref(),
+                _ => s.federation.ldap.url.as_deref(),
+            }
+            .unwrap_or("—");
+            // No re-read is not a short one: in `oidc` without the provider API the controller
+            // re-reads nothing at all, and naming a delay there would invent one.
             lines.push((
                 LineColor::Info,
-                fill(
-                    active().diag_identity_ldap,
-                    &[
-                        ("url", s.directory.url.as_deref().unwrap_or("—")),
-                        ("federated", &s.federated_users().to_string()),
-                        ("total", &s.users.len().to_string()),
-                        ("resync", s.directory.resync.as_deref().unwrap_or("ldap.resync")),
-                    ],
-                ),
+                match s.federation.resync() {
+                    Some(resync) => fill(
+                        active().diag_identity_federated,
+                        &[
+                            ("mode", mode.label()),
+                            ("source", source),
+                            ("federated", &s.federated_users().to_string()),
+                            ("total", &s.users.len().to_string()),
+                            ("resync", resync),
+                        ],
+                    ),
+                    None => fill(
+                        active().diag_identity_federated_no_resync,
+                        &[
+                            ("mode", mode.label()),
+                            ("source", source),
+                            ("federated", &s.federated_users().to_string()),
+                            ("total", &s.users.len().to_string()),
+                        ],
+                    ),
+                },
             ));
             // Accounts the portal no longer authenticates. They reconcile, they look active, and
             // nobody can sign in as them — which no object says on its own.
@@ -1937,32 +1959,39 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             if !orphans.is_empty() {
                 lines.push((
                     LineColor::Warn,
-                    fill(active().diag_identity_local_in_ldap, &[("users", &orphans.join(", "))]),
+                    fill(
+                        active().diag_identity_local_in_federated,
+                        &[("mode", mode.label()), ("users", &orphans.join(", "))],
+                    ),
                 ));
                 status = worse(status, DiagStatus::Warn);
             }
         }
         // The two gaps in the mapping table, asked only when the table was actually read: an empty
-        // `ldap_dns` is also every deployment whose table kdt never saw.
-        if s.directory.mappings_known() {
+        // `source_keys` is also every deployment whose table kdt never saw.
+        if s.federation.mappings_known() {
+            let setting = s.federation.mapping_setting();
             let unmapped: Vec<&str> = s
                 .groups
                 .iter()
-                .filter(|g| g.source.federated() && g.ldap_dns.is_empty())
+                .filter(|g| g.source.federated() && g.source_keys.is_empty())
                 .map(|g| g.name.as_str())
                 .take(8)
                 .collect();
             if !unmapped.is_empty() {
                 lines.push((
                     LineColor::Warn,
-                    fill(active().diag_identity_ldap_unmapped, &[("groups", &unmapped.join(", "))]),
+                    fill(
+                        active().diag_identity_unmapped,
+                        &[("setting", setting), ("groups", &unmapped.join(", "))],
+                    ),
                 ));
                 status = worse(status, DiagStatus::Warn);
             }
             let untouched: Vec<&str> = s
                 .groups
                 .iter()
-                .filter(|g| !g.source.federated() && !g.ldap_dns.is_empty())
+                .filter(|g| !g.source.federated() && !g.source_keys.is_empty())
                 .map(|g| g.name.as_str())
                 .take(8)
                 .collect();
@@ -1970,8 +1999,8 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 lines.push((
                     LineColor::Warn,
                     fill(
-                        active().diag_identity_ldap_not_federated,
-                        &[("groups", &untouched.join(", "))],
+                        active().diag_identity_mapped_not_federated,
+                        &[("setting", setting), ("groups", &untouched.join(", "))],
                     ),
                 ));
                 status = worse(status, DiagStatus::Warn);

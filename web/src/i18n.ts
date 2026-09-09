@@ -305,12 +305,20 @@ export interface Strings {
   identLdapProfile: string;
   identLdapBase: string;
   identLdapResync: string;
-  identLdapMappings: string;
+  identOidcSubject: string;
+  identOidcIssuer: string;
+  identOidcProvider: string;
+  identOidcClient: string;
+  identOidcSubjectClaim: string;
+  identOidcGroupsClaim: string;
+  identOidcGraph: string;
+  identOidcGraphOff: string;
+  identMappings: string;
   identMappingsUnreadable: string;
   identMappingsMissing: string;
-  identInviteLdap: string;
-  identMembershipLdap: string;
-  identEnableLdap: string;
+  identInviteFederated: string;
+  identMembershipFederated: string;
+  identEnableFederated: string;
   identSubject: string;
   identGroupsLabel: string;
   identMembers: string;
@@ -961,17 +969,26 @@ const FR: Strings = {
   identLdapProfile: "profil",
   identLdapBase: "racine de recherche",
   identLdapResync: "relecture",
-  identLdapMappings: "correspondances",
+  identOidcSubject: "sujet épinglé",
+  identOidcIssuer: "émetteur",
+  identOidcProvider: "fournisseur",
+  identOidcClient: "application",
+  identOidcSubjectClaim: "claim d'épinglage",
+  identOidcGroupsClaim: "claim des groupes",
+  identOidcGraph: "API du fournisseur",
+  identOidcGraphOff:
+    "API du fournisseur non déclarée : l'appartenance n'est relue qu'à la connexion, aucun compte n'est désactivé par le contrôleur, et refreshTtl est plafonné à 24 h.",
+  identMappings: "correspondances",
   identMappingsUnreadable:
     "Table de correspondance illisible : rien n'est affirmé sur ce qui alimente les groupes.",
   identMappingsMissing:
     "Déclarés dans la table sans exister ici — chacun sera créé à la première connexion d'un de ses membres :",
-  identInviteLdap:
-    "authMode ldap : les comptes naissent d'une connexion réussie contre l'annuaire, invite refuse de s'exécuter",
-  identMembershipLdap:
-    "sur un groupe alimenté depuis l'annuaire, l'écriture aboutit puis la relecture suivante la défait",
-  identEnableLdap:
-    "compte fédéré : si son entrée a disparu de l'annuaire, la relecture suivante le redésactivera",
+  identInviteFederated:
+    "les comptes naissent d'une connexion réussie contre la source d'identité, invite refuse de s'exécuter",
+  identMembershipFederated:
+    "sur un groupe alimenté depuis la source d'identité, l'écriture aboutit puis la source la défait à la relecture ou à la connexion suivante",
+  identEnableFederated:
+    "compte fédéré : si la source ne le reconnaît plus, la relecture suivante le redésactivera",
   identSubject: "subject",
   identGroupsLabel: "groupes",
   identMembers: "membres",
@@ -1645,17 +1662,26 @@ const EN: Strings = {
   identLdapProfile: "profile",
   identLdapBase: "search base",
   identLdapResync: "re-read",
-  identLdapMappings: "mappings",
+  identOidcSubject: "pinned subject",
+  identOidcIssuer: "issuer",
+  identOidcProvider: "provider",
+  identOidcClient: "application",
+  identOidcSubjectClaim: "pinning claim",
+  identOidcGroupsClaim: "groups claim",
+  identOidcGraph: "provider API",
+  identOidcGraphOff:
+    "The provider API is not declared: membership is re-read only at sign-in, no account is disabled by the controller, and refreshTtl is capped at 24h.",
+  identMappings: "mappings",
   identMappingsUnreadable:
     "The mapping table cannot be read: nothing is stated about what feeds the groups.",
   identMappingsMissing:
     "Declared in the table and absent here — each is created at the first sign-in of one of its members:",
-  identInviteLdap:
-    "authMode ldap: accounts are born of a successful sign-in against the directory, and invite refuses to run",
-  identMembershipLdap:
-    "on a group fed from the directory, the write lands and the next re-read undoes it",
-  identEnableLdap:
-    "federated account: if its directory entry is gone, the next re-read disables it again",
+  identInviteFederated:
+    "accounts are born of a successful sign-in against the identity source, and invite refuses to run",
+  identMembershipFederated:
+    "on a group fed from the identity source, the write lands and the source undoes it at the next re-read or sign-in",
+  identEnableFederated:
+    "federated account: if the source no longer recognises it, the next re-read disables it again",
   identSubject: "subject",
   identGroupsLabel: "groups",
   identMembers: "members",

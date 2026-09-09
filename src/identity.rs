@@ -100,7 +100,10 @@ const ENV_REFRESH_TTL: &str = "KDT_IDENTITY_REFRESH_TTL";
 const ENV_KUBECONFIG_DOWNLOAD: &str = "KDT_IDENTITY_KUBECONFIG_DOWNLOAD";
 
 /// The second axis, since 1.2: who the portal *recognises*, where the variables above say what it
-/// *hands out*. The four combinations are valid, which is why this is not a third delivery mode.
+/// *hands out*. The combinations are all valid, which is why this is not a third delivery mode.
+///
+/// Two sources answer to it since 1.3 — a directory and an OpenID Connect provider — read from two
+/// blocks of variables the chart writes one or the other of, never both.
 const ENV_AUTH_MODE: &str = "KDT_IDENTITY_AUTH_MODE";
 const ENV_LDAP_URL: &str = "KDT_IDENTITY_LDAP_URL";
 const ENV_LDAP_PROFILE: &str = "KDT_IDENTITY_LDAP_PROFILE";
@@ -111,11 +114,33 @@ const ENV_LDAP_RESYNC: &str = "KDT_IDENTITY_LDAP_RESYNC";
 /// unambiguous shape inside an environment variable.
 const ENV_LDAP_MAPPINGS: &str = "KDT_IDENTITY_LDAP_GROUP_MAPPINGS";
 
-/// What the LDAP mode marks the objects it creates with. Both are metadata: upstream deliberately
-/// left the CRD untouched, so this is the only place the provenance of an account is written.
+/// What the provider mode declares. The name and the claims are only written when a value overrides
+/// a default, so an absent one says "the upstream default", never "nothing".
+const ENV_OIDC_ISSUER: &str = "KDT_IDENTITY_AUTH_OIDC_ISSUER";
+const ENV_OIDC_CLIENT_ID: &str = "KDT_IDENTITY_AUTH_OIDC_CLIENT_ID";
+const ENV_OIDC_PROVIDER_NAME: &str = "KDT_IDENTITY_AUTH_OIDC_PROVIDER_NAME";
+const ENV_OIDC_SUBJECT_CLAIM: &str = "KDT_IDENTITY_AUTH_OIDC_SUBJECT_CLAIM";
+const ENV_OIDC_GROUPS_CLAIM: &str = "KDT_IDENTITY_AUTH_OIDC_GROUPS_CLAIM";
+/// Same shape as the directory's, and the same reason: JSON is what an environment variable carries
+/// unambiguously. The key is spelled `claim` there and `dn` here, for the same field.
+const ENV_OIDC_MAPPINGS: &str = "KDT_IDENTITY_AUTH_OIDC_GROUP_MAPPINGS";
+/// The provider's own API, declared or not — and that is the fact two verdicts hang on. Without it
+/// the controller re-reads nothing and disables nobody, and upstream caps `refreshTtl` at 24 h to
+/// bound the lag that follows.
+const ENV_OIDC_GRAPH_TENANT: &str = "KDT_IDENTITY_AUTH_OIDC_GRAPH_TENANT_ID";
+const ENV_OIDC_GRAPH_ENDPOINT: &str = "KDT_IDENTITY_AUTH_OIDC_GRAPH_ENDPOINT";
+const ENV_OIDC_GRAPH_RESYNC: &str = "KDT_IDENTITY_AUTH_OIDC_GRAPH_RESYNC";
+
+/// What a federated mode marks the objects it creates with. All of it is metadata: upstream
+/// deliberately left the CRD untouched, so this is the only place the provenance of an account is
+/// written.
 const LABEL_SOURCE: &str = "identity.kdt.sh/source";
 const SOURCE_LDAP: &str = "ldap";
+const SOURCE_OIDC: &str = "oidc";
+/// One pin annotation per source, as upstream writes them. Two and not one shared: a deployment
+/// moved from a directory to a provider must not have its DNs re-read as token subjects.
 const ANN_LDAP_DN: &str = "identity.kdt.sh/ldap-dn";
+const ANN_OIDC_SUBJECT: &str = "identity.kdt.sh/oidc-subject";
 
 /// Default validity offered for a new invitation, matching the upstream default.
 pub const DEFAULT_VALIDITY: &str = "72h";
@@ -241,7 +266,7 @@ impl Delivery {
 }
 
 /// Who this deployment recognises. Orthogonal to [`CredentialMode`]: `credentialMode` says what the
-/// portal hands out, `authMode` who it authenticates, and the four combinations are valid.
+/// portal hands out, `authMode` who it authenticates, and every combination of the two is valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
@@ -250,6 +275,9 @@ pub enum AuthMode {
     /// A bind on the directory. Accounts are born of a successful sign-in, membership is reported
     /// from the directory groups, and the second factor is whatever the directory imposes.
     Ldap,
+    /// A redirection to an OpenID Connect provider. The portal holds no password and refuses one —
+    /// upstream blocks it at three places — so what the provider imposes governs the cluster too.
+    Oidc,
 }
 
 impl AuthMode {
@@ -257,47 +285,76 @@ impl AuthMode {
         match self {
             AuthMode::Local => "local",
             AuthMode::Ldap => "ldap",
+            AuthMode::Oidc => "oidc",
+        }
+    }
+
+    /// The provenance this mode writes on what it creates. `None` for `local`, which creates
+    /// nothing of itself: an account is invited there, never born of a sign-in.
+    pub fn source(&self) -> Option<Source> {
+        match self {
+            AuthMode::Local => None,
+            AuthMode::Ldap => Some(Source::Ldap),
+            AuthMode::Oidc => Some(Source::Oidc),
         }
     }
 }
 
-/// Where an account or a group comes from, by the label the LDAP mode writes.
+/// Where an account or a group comes from, by the label a federated mode writes.
 ///
-/// The test is upstream's own — the label present and equal to `ldap` — and nothing else is
-/// inferred: a name that looks like a directory login says nothing, and a deployment in `ldap` mode
-/// still carries the local accounts it had before the switch.
+/// The test is upstream's own — the label present, and the value it carries — and nothing else is
+/// inferred: a name that looks like a directory login says nothing, and a deployment in `oidc` mode
+/// still carries every account it had before the switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     #[default]
     Local,
     Ldap,
+    Oidc,
 }
 
 impl Source {
     pub fn federated(&self) -> bool {
-        *self == Source::Ldap
+        *self != Source::Local
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Source::Local => "local",
+            Source::Ldap => SOURCE_LDAP,
+            Source::Oidc => SOURCE_OIDC,
+        }
+    }
+
+    /// The annotation holding the value the account is pinned to. `None` for a local account, which
+    /// is pinned to nothing: its name *is* its identity.
+    pub fn pin_annotation(&self) -> Option<&'static str> {
+        match self {
+            Source::Local => None,
+            Source::Ldap => Some(ANN_LDAP_DN),
+            Source::Oidc => Some(ANN_OIDC_SUBJECT),
+        }
     }
 }
 
-/// One declared correspondence: a directory group, by DN, and the `KdtGroup` it opens.
+/// One declared correspondence: a group of the source — a DN for a directory, the value as it
+/// appears in the claim for a provider — and the `KdtGroup` it opens.
+///
+/// The chart spells that key `dn` in one mode and `claim` in the other, for the same field. Both
+/// are read; what leaves here is `key`, which is true of either.
 ///
 /// Both directions are many-to-many upstream, so this is a list and not a map either way round.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupMapping {
-    pub dn: String,
+    #[serde(alias = "dn", alias = "claim")]
+    pub key: String,
     pub group: String,
 }
 
-/// What the deployment declares about the directory, read off the same controller pod as
-/// [`Delivery`].
-///
-/// `auth_mode` is an `Option` for the same reason the delivery mode is: upstream defaults it to
-/// `local`, but an absent variable also describes a pre-1.2 deployment that had no second axis at
-/// all — and saying "local" there would be restating a default as a fact.
+/// What the deployment declares about the directory, when a directory is what authenticates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-pub struct Directory {
-    pub auth_mode: Option<AuthMode>,
+pub struct LdapFacts {
     pub url: Option<String>,
     pub profile: Option<String>,
     pub start_tls: Option<bool>,
@@ -305,6 +362,46 @@ pub struct Directory {
     /// How often the controller re-reads the directory. It is the delay a group removal takes to
     /// become a rights removal, which is the only reason to show it.
     pub resync: Option<String>,
+}
+
+/// What it declares about the provider, when a provider is what authenticates.
+///
+/// The claims are `None` far more often than they are set: the chart writes one only when the
+/// values override the upstream default, so an absent claim names a default rather than a gap.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OidcFacts {
+    pub issuer: Option<String>,
+    /// The readable name of the provider, as the portal's own sign-in button shows it.
+    pub provider_name: Option<String>,
+    pub client_id: Option<String>,
+    /// The claim the account is pinned on, when the deployment names one. Upstream defaults it to
+    /// `sub`, which is not restated here: an absent variable also describes a chart that wrote none.
+    pub subject_claim: Option<String>,
+    pub groups_claim: Option<String>,
+    /// The provider's API, when the deployment declares it. `None` decides two things at once: the
+    /// controller re-reads nothing, and it disables nobody — a departure is then seen at the next
+    /// interactive sign-in and nowhere else.
+    pub graph: Option<GraphFacts>,
+}
+
+/// The declared access to the provider's API.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GraphFacts {
+    pub tenant_id: Option<String>,
+    pub endpoint: Option<String>,
+    /// How often membership is re-read. The delay a group removal — or a closed account — waits on.
+    pub resync: Option<String>,
+}
+
+/// What the deployment declares about who it authenticates, read off the same controller pod as
+/// [`Delivery`].
+///
+/// `auth_mode` is an `Option` for the same reason the delivery mode is: upstream defaults it to
+/// `local`, but an absent variable also describes a pre-1.2 deployment that had no second axis at
+/// all — and saying "local" there would be restating a default as a fact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Federation {
+    pub auth_mode: Option<AuthMode>,
     /// `None` when the variable is absent — which is not an empty table. Upstream refuses to start
     /// on an empty one, so "declared and empty" is a state this cluster cannot be in, while "not
     /// declared" is every cluster in `local` mode.
@@ -312,22 +409,50 @@ pub struct Directory {
     /// Set when the variable is there and unreadable. Says which verdicts are silenced rather than
     /// letting them read as "nothing is mapped".
     pub mappings_error: Option<String>,
+    pub ldap: LdapFacts,
+    pub oidc: OidcFacts,
 }
 
-impl Directory {
-    /// Whether the directory is what authenticates here.
+impl Federation {
+    /// Whether something outside the cluster is what authenticates here.
     pub fn federated(&self) -> bool {
-        self.auth_mode == Some(AuthMode::Ldap)
+        self.source().is_some()
     }
 
-    /// The directory groups that feed one `KdtGroup`, by DN. Empty when nothing maps to it — or
-    /// when the table was never read, which [`Directory::mappings_known`] tells apart.
-    pub fn dns_for(&self, group: &str) -> Vec<String> {
+    /// The provenance this deployment writes, when it writes one.
+    pub fn source(&self) -> Option<Source> {
+        self.auth_mode.and_then(|m| m.source())
+    }
+
+    /// The delay a membership change at the source waits on before it becomes a rights change.
+    ///
+    /// `None` in `oidc` without the provider's API: nothing is re-read at all there, and naming a
+    /// delay would invent one — the change lands at the next interactive sign-in instead.
+    pub fn resync(&self) -> Option<&str> {
+        match self.auth_mode? {
+            AuthMode::Local => None,
+            AuthMode::Ldap => self.ldap.resync.as_deref(),
+            AuthMode::Oidc => self.oidc.graph.as_ref()?.resync.as_deref(),
+        }
+    }
+
+    /// The chart value the mapping table is written in, so a verdict names the setting to edit
+    /// rather than "the table".
+    pub fn mapping_setting(&self) -> &'static str {
+        match self.auth_mode {
+            Some(AuthMode::Oidc) => "oidcAuth.groupMappings",
+            _ => "ldap.groupMappings",
+        }
+    }
+
+    /// The groups of the source that feed one `KdtGroup`. Empty when nothing maps to it — or when
+    /// the table was never read, which [`Federation::mappings_known`] tells apart.
+    pub fn keys_for(&self, group: &str) -> Vec<String> {
         self.mappings
             .iter()
             .flatten()
             .filter(|m| m.group == group)
-            .map(|m| m.dn.clone())
+            .map(|m| m.key.clone())
             .collect()
     }
 
@@ -402,12 +527,13 @@ pub struct IdentUser {
     pub age: String,
     pub hints: Vec<Hint>,
     pub uid: String,
-    /// Where the account comes from, by the label. Local unless the directory created it.
+    /// Where the account comes from, by the label. Local unless a federated mode created it.
     pub source: Source,
-    /// The DN the account is pinned to, from the annotation. Re-checked upstream at every sign-in:
-    /// two directory logins can normalise to the same resource name, and the pin is what keeps the
-    /// second from landing on the first one's account.
-    pub ldap_dn: String,
+    /// The value the account is pinned to, from the annotation of its source: a DN for a directory,
+    /// the token subject for a provider. Re-checked upstream at every sign-in — two logins can
+    /// normalise to the same resource name, and the pin is what keeps the second from landing on
+    /// the first one's account.
+    pub pin: String,
 }
 
 impl IdentUser {
@@ -471,9 +597,10 @@ pub struct IdentGroup {
     /// Where the group comes from, by the label. A federated group has its `spec.members` rewritten
     /// at every sign-in and every resync, which is what makes editing it by hand pointless.
     pub source: Source,
-    /// The directory groups that feed it, by DN, when the mapping table could be read. Empty is not
-    /// "none": it is also every deployment whose table kdt never saw.
-    pub ldap_dns: Vec<String>,
+    /// The groups of the source that feed it — DNs for a directory, claim values for a provider —
+    /// when the mapping table could be read. Empty is not "none": it is also every deployment whose
+    /// table kdt never saw.
+    pub source_keys: Vec<String>,
 }
 
 impl IdentGroup {
@@ -518,7 +645,7 @@ pub struct IdentityState {
     /// What the deployment declares about how it delivers and revokes access.
     pub delivery: Delivery,
     /// What it declares about who it authenticates. The second axis, read off the same pod.
-    pub directory: Directory,
+    pub federation: Federation,
     /// Why the credential Secrets could not be read, when that is the case. One statement for the
     /// whole view rather than a dash on every row.
     pub creds_error: Option<String>,
@@ -535,7 +662,7 @@ impl IdentityState {
         self.users.iter().filter(|u| u.phase == Phase::Active).count()
     }
 
-    /// Groups nothing references. The number that says whether this directory grants anything at
+    /// Groups nothing references. The number that says whether this deployment grants anything at
     /// all.
     pub fn unbound_groups(&self) -> usize {
         self.groups.iter().filter(|g| g.bindings.is_empty()).count()
@@ -549,15 +676,16 @@ impl IdentityState {
             .count()
     }
 
-    /// Accounts the directory created.
+    /// Accounts a federated mode created.
     pub fn federated_users(&self) -> usize {
         self.users.iter().filter(|u| u.source.federated()).count()
     }
 
-    /// Whether the SOURCE column is worth its width: either the directory authenticates here, or
-    /// some object carries its label — a cluster that switched back to `local` keeps both.
+    /// Whether the SOURCE column is worth its width: either a source outside the cluster
+    /// authenticates here, or some object carries its label — a cluster that switched back to
+    /// `local` keeps both.
     pub fn shows_source(&self) -> bool {
-        self.directory.federated()
+        self.federation.federated()
             || self.users.iter().any(|u| u.source.federated())
             || self.groups.iter().any(|g| g.source.federated())
     }
@@ -567,7 +695,7 @@ impl IdentityState {
     /// a fault.
     pub fn missing_mapped_groups(&self) -> Vec<String> {
         let present: BTreeSet<&str> = self.groups.iter().map(|g| g.name.as_str()).collect();
-        self.directory
+        self.federation
             .managed_groups()
             .into_iter()
             .filter(|g| !present.contains(g.as_str()))
@@ -684,13 +812,13 @@ pub async fn identity_inventory(client: &Client, st: &'static Strings) -> Identi
         None => (BTreeMap::new(), None, BTreeMap::new(), None),
     };
 
-    let (controller, delivery, directory) = match controller {
+    let (controller, delivery, federation) = match controller {
         Some((c, d, dir)) => (Some(c), d, dir),
-        None => (None, Delivery::default(), Directory::default()),
+        None => (None, Delivery::default(), Federation::default()),
     };
 
     let mut next = IdentityState {
-        groups: build_groups(st, &group_objs, &user_objs, &bindings, &directory),
+        groups: build_groups(st, &group_objs, &user_objs, &bindings, &federation),
         users: build_users(
             st,
             &user_objs,
@@ -698,11 +826,11 @@ pub async fn identity_inventory(client: &Client, st: &'static Strings) -> Identi
             &creds,
             creds_error.is_some(),
             &sessions,
-            &directory,
+            &federation,
         ),
         controller,
         delivery,
-        directory,
+        federation,
         creds_error,
         sessions_error,
         installed: true,
@@ -787,7 +915,7 @@ pub async fn controller_ref(client: &Client) -> Option<ControllerRef> {
     find_controller(client).await.map(|(c, ..)| c)
 }
 
-async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery, Directory)> {
+async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery, Federation)> {
     let pods: Api<Pod> = Api::all(client.clone());
     let list = pods
         .list(&ListParams::default().labels(CONTROLLER_SELECTOR))
@@ -811,7 +939,7 @@ async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery, Di
             .find(|c| c.name == CONTROLLER_CONTAINER)
             .or_else(|| if containers.len() == 1 { containers.first() } else { None })?;
         let delivery = delivery_from_env(container);
-        let directory = directory_from_env(container);
+        let federation = federation_from_env(container);
         Some((
             ControllerRef {
                 namespace: p.metadata.namespace.clone().unwrap_or_default(),
@@ -819,7 +947,7 @@ async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery, Di
                 container: container.name.clone(),
             },
             delivery,
-            directory,
+            federation,
         ))
     })
 }
@@ -858,13 +986,27 @@ fn delivery_from_env(container: &k8s_openapi::api::core::v1::Container) -> Deliv
     }
 }
 
-/// What the deployment declares about the directory, from the same literal `env` values.
+/// What the deployment declares about who it authenticates, from the same literal `env` values.
 ///
-/// The chart only writes the `ldap.*` variables in `authMode: ldap`, so a `local` deployment yields
-/// a mode and nothing else — which is exactly what it has to say.
-fn directory_from_env(container: &k8s_openapi::api::core::v1::Container) -> Directory {
+/// The chart writes the `ldap.*` block in `authMode: ldap` and the `oidcAuth.*` one in
+/// `authMode: oidc`, never both — so a `local` deployment yields a mode and nothing else, which is
+/// exactly what it has to say.
+fn federation_from_env(container: &k8s_openapi::api::core::v1::Container) -> Federation {
     let get = |key: &str| env_value(container, key);
-    let raw_mappings = get(ENV_LDAP_MAPPINGS);
+    let auth_mode = get(ENV_AUTH_MODE).and_then(|v| match v.as_str() {
+        "local" => Some(AuthMode::Local),
+        "ldap" => Some(AuthMode::Ldap),
+        "oidc" => Some(AuthMode::Oidc),
+        _ => None,
+    });
+
+    // The table each mode declares. Read by the mode when there is one, and otherwise by whichever
+    // variable is there — a deployment moved back to `local` keeps the block it came from.
+    let raw_mappings = match auth_mode {
+        Some(AuthMode::Oidc) => get(ENV_OIDC_MAPPINGS),
+        Some(AuthMode::Ldap) => get(ENV_LDAP_MAPPINGS),
+        _ => get(ENV_LDAP_MAPPINGS).or_else(|| get(ENV_OIDC_MAPPINGS)),
+    };
     // The table is either read or reported unreadable. Falling back to an empty list would make
     // every group look unmapped, and the verdicts that follow from that are the wrong ones.
     let (mappings, mappings_error) = match raw_mappings.as_deref() {
@@ -874,23 +1016,38 @@ fn directory_from_env(container: &k8s_openapi::api::core::v1::Container) -> Dire
             Err(e) => (None, Some(e.to_string())),
         },
     };
-    Directory {
-        auth_mode: get(ENV_AUTH_MODE).and_then(|v| match v.as_str() {
-            "local" => Some(AuthMode::Local),
-            "ldap" => Some(AuthMode::Ldap),
-            _ => None,
-        }),
-        url: get(ENV_LDAP_URL),
-        profile: get(ENV_LDAP_PROFILE),
-        start_tls: get(ENV_LDAP_START_TLS).and_then(|v| match v.as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        }),
-        search_base: get(ENV_LDAP_SEARCH_BASE),
-        resync: get(ENV_LDAP_RESYNC),
+
+    // The provider's API is declared by its tenant, which the chart requires as soon as the access
+    // is on. No variable, no access — and that absence is a verdict, not a missing detail.
+    let graph = get(ENV_OIDC_GRAPH_TENANT).map(|tenant| GraphFacts {
+        tenant_id: Some(tenant),
+        endpoint: get(ENV_OIDC_GRAPH_ENDPOINT),
+        resync: get(ENV_OIDC_GRAPH_RESYNC),
+    });
+
+    Federation {
+        auth_mode,
         mappings,
         mappings_error,
+        ldap: LdapFacts {
+            url: get(ENV_LDAP_URL),
+            profile: get(ENV_LDAP_PROFILE),
+            start_tls: get(ENV_LDAP_START_TLS).and_then(|v| match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }),
+            search_base: get(ENV_LDAP_SEARCH_BASE),
+            resync: get(ENV_LDAP_RESYNC),
+        },
+        oidc: OidcFacts {
+            issuer: get(ENV_OIDC_ISSUER),
+            provider_name: get(ENV_OIDC_PROVIDER_NAME),
+            client_id: get(ENV_OIDC_CLIENT_ID),
+            subject_claim: get(ENV_OIDC_SUBJECT_CLAIM),
+            groups_claim: get(ENV_OIDC_GROUPS_CLAIM),
+            graph,
+        },
     }
 }
 
@@ -1031,19 +1188,20 @@ fn now_secs() -> i64 {
 
 // --- Builders ------------------------------------------------------------------------------------
 
-/// Whether an object carries the directory's label, tested the way upstream tests it.
+/// Which source's label an object carries, tested the way upstream tests it: the label present, and
+/// its value. An unknown value is not a federated object — a source kdt does not know is a source
+/// whose rules it cannot state.
 fn source_of(o: &DynamicObject) -> Source {
-    let labelled = o
+    match o
         .metadata
         .labels
         .as_ref()
         .and_then(|l| l.get(LABEL_SOURCE))
-        .map(|v| v == SOURCE_LDAP)
-        .unwrap_or(false);
-    if labelled {
-        Source::Ldap
-    } else {
-        Source::Local
+        .map(String::as_str)
+    {
+        Some(SOURCE_LDAP) => Source::Ldap,
+        Some(SOURCE_OIDC) => Source::Oidc,
+        _ => Source::Local,
     }
 }
 
@@ -1054,7 +1212,7 @@ fn build_users(
     creds: &BTreeMap<String, CredentialFacts>,
     creds_unreadable: bool,
     sessions: &BTreeMap<String, SessionFacts>,
-    directory: &Directory,
+    federation: &Federation,
 ) -> Vec<IdentUser> {
     // Who is listed where, straight off `spec.members` — the source of truth. `status.memberOf` is
     // derived and can lag a reconciliation behind, so it is not what the "still a member" checks
@@ -1112,6 +1270,9 @@ fn build_users(
             };
 
             let member_of = arr_at(&status, "memberOf");
+            // Read once: the pin is looked up in the annotation of *this* object's source, never in
+            // both — a DN re-read as a token subject would pin an account to a value nothing checks.
+            let source = source_of(o);
             let age = o
                 .metadata
                 .creation_timestamp
@@ -1132,18 +1293,15 @@ fn build_users(
                 age,
                 uid: o.metadata.uid.clone().unwrap_or_default(),
                 hints: Vec::new(),
-                source: source_of(o),
-                ldap_dn: o
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get(ANN_LDAP_DN))
-                    .cloned()
+                source,
+                pin: source
+                    .pin_annotation()
+                    .and_then(|key| o.metadata.annotations.as_ref()?.get(key).cloned())
                     .unwrap_or_default(),
                 name,
             };
             user.hints =
-                user_hints(st, &user, listed_in.get(&user.name).map(Vec::as_slice), directory);
+                user_hints(st, &user, listed_in.get(&user.name).map(Vec::as_slice), federation);
             user
         })
         .collect();
@@ -1156,30 +1314,54 @@ fn user_hints(
     st: &'static Strings,
     u: &IdentUser,
     listed_in: Option<&[String]>,
-    directory: &Directory,
+    federation: &Federation,
 ) -> Vec<Hint> {
     let mut out = Vec::new();
 
-    // The two halves of a mode change, and the only two that leave an account nobody can sign in
-    // as. Neither is visible on the object: one is a label the other lacks, the other a variable on
-    // a pod in another namespace — which is precisely why they are stated here.
-    match (directory.auth_mode, u.source) {
+    // What a mode change leaves behind, and every shape of it leaves an account nobody can sign in
+    // as. None of it is visible on the object: one half is a label it lacks or carries, the other a
+    // variable on a pod in another namespace — which is precisely why they are stated here.
+    match (federation.auth_mode, u.source) {
         (Some(AuthMode::Ldap), Source::Local) => {
             out.push(warn(st.ident_hint_local_in_ldap.to_string()));
         }
-        (Some(AuthMode::Local), Source::Ldap) => {
-            out.push(warn(st.ident_hint_ldap_in_local.to_string()));
+        (Some(AuthMode::Oidc), Source::Local) => {
+            out.push(warn(st.ident_hint_local_in_oidc.to_string()));
+        }
+        (Some(AuthMode::Local), source) if source.federated() => {
+            out.push(warn(fill(
+                st.ident_hint_federated_in_local,
+                &[("source", source.label())],
+            )));
+        }
+        // Federated by one source while another authenticates. Upstream refuses that sign-in by
+        // name — the account exists and is not governed by the source presenting the identity — so
+        // this is not a lag that resolves itself.
+        (Some(mode), source)
+            if source.federated() && mode.source().is_some_and(|m| m != source) =>
+        {
+            out.push(warn(fill(
+                st.ident_hint_other_source,
+                &[("source", source.label()), ("mode", mode.label())],
+            )));
         }
         _ => {}
     }
 
     // Disabled and federated: kdt cannot tell an administrator's hand from the controller's, and
-    // says so rather than picking one. The resync is what would have done it, and how long it took.
+    // says so rather than picking one. The re-read is what would have done it, and how long it
+    // took — except where there is none, and then the hand is the only explanation left.
     if u.disabled && u.source.federated() {
-        out.push(info(fill(
-            st.ident_hint_ldap_disabled,
-            &[("resync", directory.resync.as_deref().unwrap_or("ldap.resync"))],
-        )));
+        out.push(info(match (u.source, federation.resync()) {
+            (Source::Oidc, None) => st.ident_hint_oidc_disabled_manual.to_string(),
+            (Source::Oidc, Some(resync)) => {
+                fill(st.ident_hint_oidc_disabled, &[("resync", resync)])
+            }
+            (_, resync) => fill(
+                st.ident_hint_ldap_disabled,
+                &[("resync", resync.unwrap_or("ldap.resync"))],
+            ),
+        }));
     }
 
     if u.phase == Phase::Locked && !u.disabled {
@@ -1240,7 +1422,7 @@ fn build_groups(
     objs: &[DynamicObject],
     users: &[DynamicObject],
     bindings: &BTreeMap<String, Vec<BindingRef>>,
-    directory: &Directory,
+    federation: &Federation,
 ) -> Vec<IdentGroup> {
     let known: BTreeSet<String> =
         users.iter().filter_map(|o| o.metadata.name.clone()).collect();
@@ -1286,13 +1468,13 @@ fn build_groups(
                 uid: o.metadata.uid.clone().unwrap_or_default(),
                 hints: Vec::new(),
                 source: source_of(o),
-                ldap_dns: Vec::new(),
+                source_keys: Vec::new(),
                 name,
             };
-            group.ldap_dns = directory.dns_for(&group.name);
+            group.source_keys = federation.keys_for(&group.name);
             group.bindings =
                 bindings.get(&group.effective_subject()).cloned().unwrap_or_default();
-            group.hints = group_hints(st, &group, directory);
+            group.hints = group_hints(st, &group, federation);
             group
         })
         .collect();
@@ -1301,35 +1483,44 @@ fn build_groups(
     out
 }
 
-fn group_hints(st: &'static Strings, g: &IdentGroup, directory: &Directory) -> Vec<Hint> {
+fn group_hints(st: &'static Strings, g: &IdentGroup, federation: &Federation) -> Vec<Hint> {
     let mut out = Vec::new();
 
-    // A federated group is rewritten at every sign-in and every resync. Adding a member by hand
+    // A federated group is rewritten at every sign-in and every re-read. Adding a member by hand
     // works, reconciles, and is gone by the next round — the kind of silence this view exists for.
     if g.source.federated() {
         out.push(info(fill(
-            st.ident_hint_ldap_group,
-            &[("dns", &if g.ldap_dns.is_empty() {
-                st.ident_none.to_string()
-            } else {
-                g.ldap_dns.join(", ")
-            })],
+            st.ident_hint_federated_group,
+            &[
+                ("source", g.source.label()),
+                ("keys", &if g.source_keys.is_empty() {
+                    st.ident_none.to_string()
+                } else {
+                    g.source_keys.join(", ")
+                }),
+            ],
         )));
     }
 
-    // Only ever asked when the table was actually read: `ldap_dns` is empty both for a group
+    // Only ever asked when the table was actually read: `source_keys` is empty both for a group
     // nothing maps to and for a deployment whose table kdt never saw, and the two are not the same
     // news.
-    if directory.mappings_known() {
-        if g.source.federated() && g.ldap_dns.is_empty() {
-            out.push(warn(st.ident_hint_ldap_group_unmapped.to_string()));
+    if federation.mappings_known() {
+        if g.source.federated() && g.source_keys.is_empty() {
+            out.push(warn(fill(
+                st.ident_hint_group_unmapped,
+                &[("setting", federation.mapping_setting())],
+            )));
         }
         // Upstream refuses to write a group it did not create — it logs and moves on. From the
         // outside the table looks applied and the membership never moves.
-        if !g.source.federated() && !g.ldap_dns.is_empty() {
+        if !g.source.federated() && !g.source_keys.is_empty() {
             out.push(warn(fill(
                 st.ident_hint_mapped_not_federated,
-                &[("dns", &g.ldap_dns.join(", "))],
+                &[
+                    ("setting", federation.mapping_setting()),
+                    ("keys", &g.source_keys.join(", ")),
+                ],
             )));
         }
     }
@@ -1424,13 +1615,14 @@ pub fn user_record(u: &IdentUser, st: &'static Strings) -> EventRecord {
     if !u.member_of.is_empty() {
         parts.push(format!("{}={}", st.ident_lbl_groups, u.member_of.join(",")));
     }
-    // The DN goes in the message so `/` finds the account from what the directory calls it — which
-    // is the only name an operator holding a support ticket is likely to have.
+    // The pin goes in the message so `/` finds the account from what its source calls it — which is
+    // the only name an operator holding a support ticket is likely to have.
     if u.source.federated() {
-        parts.push(if u.ldap_dn.is_empty() {
-            SOURCE_LDAP.to_string()
+        let source = u.source.label();
+        parts.push(if u.pin.is_empty() {
+            source.to_string()
         } else {
-            format!("{SOURCE_LDAP} {}", u.ldap_dn)
+            format!("{source} {}", u.pin)
         });
     }
     hint_record(
@@ -1454,8 +1646,8 @@ pub fn group_record(g: &IdentGroup, st: &'static Strings) -> EventRecord {
     if !g.members.is_empty() {
         parts.push(format!("{}={}", st.ident_lbl_members, g.members.join(",")));
     }
-    for dn in &g.ldap_dns {
-        parts.push(format!("{SOURCE_LDAP} {dn}"));
+    for key in &g.source_keys {
+        parts.push(format!("{} {key}", g.source.label()));
     }
     // The bindings go in the message so a search finds the group from a ClusterRole name — which is
     // how one asks "who has edit here" starting from the role.
@@ -1939,7 +2131,7 @@ mod tests {
     fn unknown_members_come_from_the_status_when_it_has_landed() {
         let users = vec![user_obj("alice", "Active", false, &["lecteurs"])];
         let groups = vec![group_obj("lecteurs", &["alice", "fantome"], Some(&["alice"]))];
-        let rows = build_groups(&FR, &groups, &users, &BTreeMap::new(), &Directory::default());
+        let rows = build_groups(&FR, &groups, &users, &BTreeMap::new(), &Federation::default());
         assert_eq!(rows[0].unknown, vec!["fantome".to_string()]);
         assert!(rows[0].hints.iter().any(|h| h.text.contains("fantome")));
     }
@@ -1950,7 +2142,7 @@ mod tests {
         // controller has said anything, which is the opposite of what is known.
         let users = vec![user_obj("alice", "Active", false, &[])];
         let groups = vec![group_obj("ops", &["alice", "fantome"], None)];
-        let rows = build_groups(&FR, &groups, &users, &BTreeMap::new(), &Directory::default());
+        let rows = build_groups(&FR, &groups, &users, &BTreeMap::new(), &Federation::default());
         assert_eq!(rows[0].resolved, vec!["alice".to_string()]);
         assert_eq!(rows[0].unknown, vec!["fantome".to_string()]);
     }
@@ -1958,7 +2150,7 @@ mod tests {
     #[test]
     fn a_group_nothing_references_is_named_without_being_raised_to_a_warning() {
         let groups = vec![group_obj("ops", &[], Some(&[]))];
-        let rows = build_groups(&FR, &groups, &[], &BTreeMap::new(), &Directory::default());
+        let rows = build_groups(&FR, &groups, &[], &BTreeMap::new(), &Federation::default());
         assert!(rows[0].bindings.is_empty());
         assert!(rows[0].hints.iter().all(|h| h.level == HintLevel::Info));
     }
@@ -1976,7 +2168,7 @@ mod tests {
             }],
         );
         let groups = vec![group_obj("ops", &[], Some(&[]))];
-        let rows = build_groups(&FR, &groups, &[], &bindings, &Directory::default());
+        let rows = build_groups(&FR, &groups, &[], &bindings, &Federation::default());
         assert_eq!(rows[0].bindings.len(), 1);
         assert_eq!(
             rows[0].bindings[0].label(),
@@ -2006,7 +2198,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Active", false, &["ops"])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
         assert_eq!(rows[0].phase, Phase::Locked);
         // The controller's own word is kept, so the detail panel can show both.
         assert_eq!(rows[0].raw_phase, "Active");
@@ -2021,16 +2213,16 @@ mod tests {
             CredentialFacts { locked_until: Some(now_secs() + 600), ..CredentialFacts::default() },
         );
         let users = vec![user_obj("alice", "Active", true, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
         assert_eq!(rows[0].phase, Phase::Disabled);
     }
 
     #[test]
     fn an_unreadable_secret_does_not_read_as_never_invited() {
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true, &BTreeMap::new(), &Federation::default());
         assert_eq!(rows[0].invitation, Invitation::Unreadable);
-        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Directory::default());
+        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
         assert_eq!(readable[0].invitation, Invitation::None);
     }
 
@@ -2045,7 +2237,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
         assert!(matches!(rows[0].invitation, Invitation::Expired { .. }));
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Warn));
 
@@ -2056,7 +2248,7 @@ mod tests {
                 ..CredentialFacts::default()
             },
         );
-        let live = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Directory::default());
+        let live = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
         assert!(matches!(live[0].invitation, Invitation::Pending { .. }));
         assert!(live[0].hints.is_empty());
         assert_eq!(invitation_label(&live[0].invitation, &FR), "1h");
@@ -2078,14 +2270,14 @@ mod tests {
         // `status.memberOf` can lag; `spec.members` is the source of truth for "still listed".
         let users = vec![user_obj("alice", "Active", true, &[])];
         let groups = vec![group_obj("ops", &["alice"], Some(&["alice"]))];
-        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
         assert!(rows[0].hints.iter().any(|h| h.text.contains("ops")));
     }
 
     #[test]
     fn an_active_account_in_no_group_is_noted_without_alarm() {
         let users = vec![user_obj("alice", "Active", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Directory::default());
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Info));
         assert!(rows[0].hints.iter().all(|h| h.level != HintLevel::Warn));
     }
@@ -2227,34 +2419,38 @@ mod tests {
         assert!(cmd.starts_with("git clone"));
     }
 
-    // --- The directory, the second axis ----------------------------------------------------------
+    // --- The federation, the second axis ----------------------------------------------------------
 
-    fn ldap_user_obj(name: &str, dn: Option<&str>) -> DynamicObject {
+    fn federated_user_obj(name: &str, source: Source, pin: Option<&str>) -> DynamicObject {
         let mut body = serde_json::json!({
             "apiVersion": API_IDENTITY,
             "kind": KIND_USER,
             "metadata": {
                 "name": name,
                 "uid": format!("uid-{name}"),
-                "labels": { LABEL_SOURCE: SOURCE_LDAP },
+                "labels": { LABEL_SOURCE: source.label() },
             },
             "spec": { "email": format!("{name}@example.com") },
             "status": { "phase": "Active" },
         });
-        if let Some(dn) = dn {
-            body["metadata"]["annotations"] = serde_json::json!({ ANN_LDAP_DN: dn });
+        if let (Some(pin), Some(key)) = (pin, source.pin_annotation()) {
+            body["metadata"]["annotations"] = serde_json::json!({ key: pin });
         }
         serde_json::from_value(body).unwrap()
     }
 
-    fn ldap_group_obj(name: &str, members: &[&str]) -> DynamicObject {
+    fn ldap_user_obj(name: &str, dn: Option<&str>) -> DynamicObject {
+        federated_user_obj(name, Source::Ldap, dn)
+    }
+
+    fn federated_group_obj(name: &str, source: Source, members: &[&str]) -> DynamicObject {
         let body = serde_json::json!({
             "apiVersion": API_IDENTITY,
             "kind": KIND_GROUP,
             "metadata": {
                 "name": name,
                 "uid": format!("uid-{name}"),
-                "labels": { LABEL_SOURCE: SOURCE_LDAP },
+                "labels": { LABEL_SOURCE: source.label() },
             },
             "spec": { "members": members },
             "status": { "subject": format!("kdt:{name}") },
@@ -2262,25 +2458,55 @@ mod tests {
         serde_json::from_value(body).unwrap()
     }
 
-    fn ldap_directory(mappings: Option<Vec<(&str, &str)>>) -> Directory {
-        Directory {
+    fn ldap_group_obj(name: &str, members: &[&str]) -> DynamicObject {
+        federated_group_obj(name, Source::Ldap, members)
+    }
+
+    fn mapping_table(mappings: Option<Vec<(&str, &str)>>) -> Option<Vec<GroupMapping>> {
+        mappings.map(|list| {
+            list.into_iter()
+                .map(|(key, group)| GroupMapping {
+                    key: key.to_string(),
+                    group: group.to_string(),
+                })
+                .collect()
+        })
+    }
+
+    fn ldap_federation(mappings: Option<Vec<(&str, &str)>>) -> Federation {
+        Federation {
             auth_mode: Some(AuthMode::Ldap),
-            url: Some("ldaps://dc01.example.com:636".to_string()),
-            resync: Some("15m".to_string()),
-            mappings: mappings.map(|list| {
-                list.into_iter()
-                    .map(|(dn, group)| GroupMapping {
-                        dn: dn.to_string(),
-                        group: group.to_string(),
-                    })
-                    .collect()
-            }),
-            ..Directory::default()
+            ldap: LdapFacts {
+                url: Some("ldaps://dc01.example.com:636".to_string()),
+                resync: Some("15m".to_string()),
+                ..LdapFacts::default()
+            },
+            mappings: mapping_table(mappings),
+            ..Federation::default()
+        }
+    }
+
+    fn oidc_federation(graph: bool, mappings: Option<Vec<(&str, &str)>>) -> Federation {
+        Federation {
+            auth_mode: Some(AuthMode::Oidc),
+            oidc: OidcFacts {
+                issuer: Some("https://login.microsoftonline.com/tenant/v2.0".to_string()),
+                provider_name: Some("Entra ID".to_string()),
+                subject_claim: Some("oid".to_string()),
+                graph: graph.then(|| GraphFacts {
+                    tenant_id: Some("tenant".to_string()),
+                    resync: Some("15m".to_string()),
+                    ..GraphFacts::default()
+                }),
+                ..OidcFacts::default()
+            },
+            mappings: mapping_table(mappings),
+            ..Federation::default()
         }
     }
 
     #[test]
-    fn the_directory_is_read_off_the_same_literal_env_values() {
+    fn the_federation_is_read_off_the_same_literal_env_values() {
         use k8s_openapi::api::core::v1::{Container, EnvVar};
         let var = |name: &str, value: &str| EnvVar {
             name: name.to_string(),
@@ -2301,17 +2527,18 @@ mod tests {
             ]),
             ..Container::default()
         };
-        let d = directory_from_env(&container);
+        let d = federation_from_env(&container);
         assert_eq!(d.auth_mode, Some(AuthMode::Ldap));
         assert!(d.federated());
-        assert_eq!(d.resync.as_deref(), Some("15m"));
+        assert_eq!(d.source(), Some(Source::Ldap));
+        assert_eq!(d.resync(), Some("15m"));
         assert_eq!(d.managed_groups(), vec!["admins".to_string()]);
-        assert_eq!(d.dns_for("admins").len(), 1);
-        assert!(d.dns_for("devs").is_empty());
+        assert_eq!(d.keys_for("admins").len(), 1);
+        assert!(d.keys_for("devs").is_empty());
 
         // No variable at all is not `local`: it is also every deployment older than 1.2, and the
         // absence has to stay tellable from a declared mode.
-        let silent = directory_from_env(&Container::default());
+        let silent = federation_from_env(&Container::default());
         assert_eq!(silent.auth_mode, None);
         assert!(!silent.federated());
         assert!(!silent.mappings_known());
@@ -2330,7 +2557,7 @@ mod tests {
             }]),
             ..Container::default()
         };
-        let d = directory_from_env(&container);
+        let d = federation_from_env(&container);
         assert!(d.mappings.is_none());
         assert!(!d.mappings_known());
         assert!(d.mappings_error.is_some());
@@ -2359,14 +2586,17 @@ mod tests {
             &BTreeMap::new(),
             false,
             &BTreeMap::new(),
-            &ldap_directory(None),
+            &ldap_federation(None),
         );
         assert_eq!(ldap[0].name, "alice");
         assert_eq!(ldap[0].source, Source::Local);
         assert!(ldap[0].hints.iter().any(|h| h.text == FR.ident_hint_local_in_ldap));
         assert_eq!(ldap[1].source, Source::Ldap);
-        assert_eq!(ldap[1].ldap_dn, "CN=Bob,DC=example,DC=com");
-        assert!(!ldap[1].hints.iter().any(|h| h.text == FR.ident_hint_ldap_in_local));
+        assert_eq!(ldap[1].pin, "CN=Bob,DC=example,DC=com");
+        assert!(!ldap[1]
+            .hints
+            .iter()
+            .any(|h| h.text.starts_with("compte fédéré (ldap) alors que")));
 
         let local = build_users(
             &FR,
@@ -2375,10 +2605,13 @@ mod tests {
             &BTreeMap::new(),
             false,
             &BTreeMap::new(),
-            &Directory { auth_mode: Some(AuthMode::Local), ..Directory::default() },
+            &Federation { auth_mode: Some(AuthMode::Local), ..Federation::default() },
         );
         assert!(!local[0].hints.iter().any(|h| h.text == FR.ident_hint_local_in_ldap));
-        assert!(local[1].hints.iter().any(|h| h.text == FR.ident_hint_ldap_in_local));
+        assert!(local[1]
+            .hints
+            .iter()
+            .any(|h| h.text == fill(FR.ident_hint_federated_in_local, &[("source", "ldap")])));
 
         // An undeclared mode judges neither: a pre-1.2 deployment carries no such variable, and
         // both accounts are then simply accounts.
@@ -2389,11 +2622,14 @@ mod tests {
             &BTreeMap::new(),
             false,
             &BTreeMap::new(),
-            &Directory::default(),
+            &Federation::default(),
         );
         for u in &silent {
             assert!(!u.hints.iter().any(|h| h.text == FR.ident_hint_local_in_ldap));
-            assert!(!u.hints.iter().any(|h| h.text == FR.ident_hint_ldap_in_local));
+            assert!(!u
+                .hints
+                .iter()
+                .any(|h| h.text.starts_with("compte fédéré (ldap) alors que")));
         }
     }
 
@@ -2402,7 +2638,7 @@ mod tests {
     // neither — it logs and moves on.
     #[test]
     fn a_group_nothing_feeds_is_named_from_whichever_side_the_gap_is_on() {
-        let directory = ldap_directory(Some(vec![
+        let federation = ldap_federation(Some(vec![
             ("CN=K8s-Admins,OU=Groups,DC=example,DC=com", "admins"),
             ("CN=K8s-Devs,OU=Groups,DC=example,DC=com", "devs"),
         ]));
@@ -2413,15 +2649,16 @@ mod tests {
             // In the table, and never created by the directory.
             group_obj("devs", &["alice"], None),
         ];
-        let rows = build_groups(&FR, &groups, &[], &BTreeMap::new(), &directory);
+        let rows = build_groups(&FR, &groups, &[], &BTreeMap::new(), &federation);
 
         assert_eq!(rows[0].name, "admins");
         assert_eq!(rows[0].source, Source::Ldap);
-        assert_eq!(rows[0].ldap_dns.len(), 1);
-        assert!(rows[0].hints.iter().any(|h| h.text.starts_with("alimenté depuis l'annuaire")));
+        assert_eq!(rows[0].source_keys.len(), 1);
+        assert!(rows[0].hints.iter().any(|h| h.text.starts_with("alimenté depuis ldap")));
 
         assert_eq!(rows[1].name, "astreinte");
-        assert!(rows[1].hints.iter().any(|h| h.text == FR.ident_hint_ldap_group_unmapped));
+        assert!(rows[1].hints.iter().any(|h| h.text
+            == fill(FR.ident_hint_group_unmapped, &[("setting", "ldap.groupMappings")])));
 
         assert_eq!(rows[2].name, "devs");
         assert_eq!(rows[2].source, Source::Local);
@@ -2434,7 +2671,7 @@ mod tests {
     fn a_mapped_group_that_does_not_exist_yet_is_listed_and_not_blamed() {
         let state = IdentityState {
             groups: vec![IdentGroup { name: "admins".to_string(), ..IdentGroup::default() }],
-            directory: ldap_directory(Some(vec![
+            federation: ldap_federation(Some(vec![
                 ("CN=K8s-Admins,OU=Groups,DC=example,DC=com", "admins"),
                 ("CN=K8s-Devs,OU=Groups,DC=example,DC=com", "devs"),
             ])),
@@ -2459,7 +2696,7 @@ mod tests {
                 source: Source::Ldap,
                 ..IdentUser::default()
             }],
-            directory: Directory { auth_mode: Some(AuthMode::Local), ..Directory::default() },
+            federation: Federation { auth_mode: Some(AuthMode::Local), ..Federation::default() },
             ..IdentityState::default()
         };
         assert!(switched_back.shows_source());
@@ -2469,10 +2706,155 @@ mod tests {
         // most there, since every row is a local account nobody can use any more.
         let migrating = IdentityState {
             users: vec![IdentUser { name: "alice".to_string(), ..IdentUser::default() }],
-            directory: ldap_directory(None),
+            federation: ldap_federation(None),
             ..IdentityState::default()
         };
         assert!(migrating.shows_source());
     }
 
+    // The provider block is read from its own variables, and the table it declares names its key
+    // `claim` where the directory's names it `dn`. Both are the same field, and reading only one
+    // spelling would leave every group unmapped on half the deployments.
+    #[test]
+    fn the_provider_is_read_from_its_own_variables_and_its_own_spelling_of_the_table() {
+        use k8s_openapi::api::core::v1::{Container, EnvVar};
+        let var = |name: &str, value: &str| EnvVar {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+            ..EnvVar::default()
+        };
+        let container = Container {
+            name: "controller".to_string(),
+            env: Some(vec![
+                var(ENV_AUTH_MODE, "oidc"),
+                var(ENV_OIDC_ISSUER, "https://login.microsoftonline.com/tenant/v2.0"),
+                var(ENV_OIDC_CLIENT_ID, "a-client"),
+                var(ENV_OIDC_PROVIDER_NAME, "Entra ID"),
+                var(ENV_OIDC_SUBJECT_CLAIM, "oid"),
+                var(
+                    ENV_OIDC_MAPPINGS,
+                    r#"[{"claim":"8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11","group":"admins"}]"#,
+                ),
+            ]),
+            ..Container::default()
+        };
+        let d = federation_from_env(&container);
+        assert_eq!(d.auth_mode, Some(AuthMode::Oidc));
+        assert_eq!(d.source(), Some(Source::Oidc));
+        assert_eq!(d.oidc.provider_name.as_deref(), Some("Entra ID"));
+        assert_eq!(d.oidc.subject_claim.as_deref(), Some("oid"));
+        assert_eq!(d.managed_groups(), vec!["admins".to_string()]);
+        assert_eq!(d.keys_for("admins"), vec!["8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11".to_string()]);
+        assert_eq!(d.mapping_setting(), "oidcAuth.groupMappings");
+        // No access to the provider's API declared: nothing is re-read, and no delay may be named.
+        assert!(d.oidc.graph.is_none());
+        assert_eq!(d.resync(), None);
+
+        let with_graph = Container {
+            env: Some(vec![
+                var(ENV_AUTH_MODE, "oidc"),
+                var(ENV_OIDC_GRAPH_TENANT, "tenant"),
+                var(ENV_OIDC_GRAPH_RESYNC, "15m"),
+            ]),
+            ..Container::default()
+        };
+        let g = federation_from_env(&with_graph);
+        assert_eq!(g.oidc.graph.as_ref().and_then(|x| x.tenant_id.as_deref()), Some("tenant"));
+        assert_eq!(g.resync(), Some("15m"));
+    }
+
+    // Each source has its own pin annotation, and an account is only ever read through its own. A
+    // DN re-read as a token subject would pin an account to a value nothing checks.
+    #[test]
+    fn an_account_is_pinned_through_the_annotation_of_its_own_source() {
+        let objs = vec![
+            federated_user_obj("alice", Source::Oidc, Some("00000000-1111-2222-3333-444444444444")),
+            ldap_user_obj("bob", Some("CN=Bob,DC=example,DC=com")),
+        ];
+        let rows = build_users(
+            &FR,
+            &objs,
+            &[],
+            &BTreeMap::new(),
+            false,
+            &BTreeMap::new(),
+            &oidc_federation(true, None),
+        );
+        assert_eq!(rows[0].source, Source::Oidc);
+        assert_eq!(rows[0].pin, "00000000-1111-2222-3333-444444444444");
+        // Each account keeps its own pin: bob is the directory's, and it is read through the
+        // directory's annotation even while the provider is what authenticates.
+        assert_eq!(rows[1].source, Source::Ldap);
+        assert_eq!(rows[1].pin, "CN=Bob,DC=example,DC=com");
+        // Governed by the directory while the provider authenticates: upstream refuses that
+        // sign-in by name, so it is a warning and not a lag that resolves itself.
+        assert!(rows[1].hints.iter().any(|h| h.text
+            == fill(FR.ident_hint_other_source, &[("source", "ldap"), ("mode", "oidc")])));
+
+        // And the annotation of the other source is never borrowed: an object labelled `oidc`
+        // carrying only a DN is pinned to nothing, which is what upstream re-checks against.
+        let mut mislabelled = [federated_user_obj("carol", Source::Oidc, None)];
+        mislabelled[0].metadata.annotations =
+            Some([(ANN_LDAP_DN.to_string(), "CN=Carol,DC=example,DC=com".to_string())].into());
+        let rows = build_users(
+            &FR,
+            &mislabelled,
+            &[],
+            &BTreeMap::new(),
+            false,
+            &BTreeMap::new(),
+            &oidc_federation(true, None),
+        );
+        assert!(rows[0].pin.is_empty(), "a DN is not read through the provider's annotation");
+    }
+
+    // A local account in `oidc` is the state the mode change leaves behind: the portal refuses a
+    // password at three places, and `invite` refuses to run.
+    #[test]
+    fn a_local_account_under_a_provider_is_named() {
+        let objs = vec![user_obj("alice", "Active", false, &[])];
+        let rows = build_users(
+            &FR,
+            &objs,
+            &[],
+            &BTreeMap::new(),
+            false,
+            &BTreeMap::new(),
+            &oidc_federation(false, None),
+        );
+        assert!(rows[0].hints.iter().any(|h| h.text == FR.ident_hint_local_in_oidc));
+    }
+
+    // Without the provider's API nothing is re-read, so a disabled federated account can only have
+    // been disabled by hand. Naming a delay there would invent a mechanism the deployment lacks.
+    #[test]
+    fn a_disabled_provider_account_names_a_delay_only_where_one_exists() {
+        let mut disabled: DynamicObject = federated_user_obj("alice", Source::Oidc, Some("oid-1"));
+        disabled.data["spec"]["disabled"] = serde_json::Value::Bool(true);
+
+        let without = build_users(
+            &FR,
+            std::slice::from_ref(&disabled),
+            &[],
+            &BTreeMap::new(),
+            false,
+            &BTreeMap::new(),
+            &oidc_federation(false, None),
+        );
+        assert!(without[0].hints.iter().any(|h| h.text == FR.ident_hint_oidc_disabled_manual));
+
+        let with = build_users(
+            &FR,
+            std::slice::from_ref(&disabled),
+            &[],
+            &BTreeMap::new(),
+            false,
+            &BTreeMap::new(),
+            &oidc_federation(true, None),
+        );
+        assert!(with[0]
+            .hints
+            .iter()
+            .any(|h| h.text == fill(FR.ident_hint_oidc_disabled, &[("resync", "15m")])));
+    }
 }

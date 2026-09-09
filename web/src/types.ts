@@ -1425,8 +1425,9 @@ export interface IdentUserRow {
   subject: string;
   /** D'où vient le compte, par le label `identity.kdt.sh/source`. Rien d'autre n'est déduit. */
   source: IdentSource;
-  /** Le DN épinglé à la création, revérifié à chaque connexion. Vide sur un compte local. */
-  ldap_dn: string;
+  /** La valeur épinglée à la création et revérifiée à chaque connexion : un DN pour un annuaire, le
+   *  sujet du jeton pour un fournisseur. Vide sur un compte local, qui n'est épinglé à rien. */
+  pin: string;
   record: EventRecord;
 }
 
@@ -1447,38 +1448,74 @@ export interface IdentGroupRow {
   age: string;
   hints: Hint[];
   uid: string;
-  /** D'où vient le group : un group fédéré est réécrit à chaque relecture de l'annuaire. */
+  /** D'où vient le group : un group fédéré est réécrit à chaque relecture de sa source. */
   source: IdentSource;
-  /** Les groupes d'annuaire qui l'alimentent, par DN. Vide n'est pas « aucun » : c'est aussi
-   *  tout déploiement dont kdt n'a jamais vu la table. */
-  ldap_dns: string[];
+  /** Les groupes de la source qui l'alimentent — des DN pour un annuaire, des valeurs de claim pour
+   *  un fournisseur. Vide n'est pas « aucun » : c'est aussi tout déploiement dont kdt n'a jamais vu
+   *  la table. */
+  source_keys: string[];
   record: EventRecord;
 }
 
-/** D'où vient un compte ou un group, par le label que le mode LDAP pose. */
-export type IdentSource = "local" | "ldap";
+/** D'où vient un compte ou un group, par le label que pose le mode qui l'a créé. */
+export type IdentSource = "local" | "ldap" | "oidc";
 
-/**
- * Ce que le déploiement déclare de l'annuaire — le second axe.
- *
- * `auth_mode` peut être `null` pour la même raison que le mode de délivrance : l'amont y défaute à
- * `local`, mais l'absence décrit aussi un déploiement antérieur à 1.2, qui n'avait pas d'axe du
- * tout. `mappings` à `null` n'est pas une table vide — l'amont refuse de démarrer sur une table
- * vide, alors qu'une table jamais lue est le cas de tous les déploiements en `local`.
- */
-export interface IdentDirectory {
-  auth_mode: "local" | "ldap" | null;
+/** Ce que le déploiement déclare de l'annuaire, quand c'est un annuaire qui authentifie. */
+export interface IdentLdapFacts {
   url: string | null;
   profile: string | null;
   start_tls: boolean | null;
   search_base: string | null;
   /** Le délai qu'un retrait de groupe attend pour devenir un retrait de droits. */
   resync: string | null;
-  mappings: { dn: string; group: string }[] | null;
+}
+
+/**
+ * Ce qu'il déclare du fournisseur, quand c'est un fournisseur qui authentifie.
+ *
+ * Les claims sont `null` bien plus souvent qu'ils ne sont posés : le chart n'en écrit un que s'il
+ * surcharge le défaut amont, donc un claim absent nomme un défaut et non un manque.
+ */
+export interface IdentOidcFacts {
+  issuer: string | null;
+  provider_name: string | null;
+  client_id: string | null;
+  subject_claim: string | null;
+  groups_claim: string | null;
+  /** L'accès à l'API du fournisseur, quand il est déclaré. `null` décide deux choses d'un coup :
+   *  rien n'est relu, et le contrôleur ne désactive aucun compte de lui-même. */
+  graph: IdentOidcGraph | null;
+}
+
+export interface IdentOidcGraph {
+  tenant_id: string | null;
+  endpoint: string | null;
+  resync: string | null;
+}
+
+/**
+ * Ce que le déploiement déclare de la source d'identité — le second axe.
+ *
+ * `auth_mode` peut être `null` pour la même raison que le mode de délivrance : l'amont y défaute à
+ * `local`, mais l'absence décrit aussi un déploiement antérieur à 1.2, qui n'avait pas d'axe du
+ * tout. `mappings` à `null` n'est pas une table vide — l'amont refuse de démarrer sur une table
+ * vide, alors qu'une table jamais lue est le cas de tous les déploiements en `local`.
+ */
+export interface IdentFederation {
+  auth_mode: "local" | "ldap" | "oidc" | null;
+  mappings: { key: string; group: string }[] | null;
   /** La variable est là et illisible : les verdicts sur la table se taisent. */
   mappings_error: string | null;
-  /** L'annuaire est ce qui authentifie ici. Se lit sur `auth_mode`, jamais sur la présence d'URL. */
+  ldap: IdentLdapFacts;
+  oidc: IdentOidcFacts;
+  /** Une source extérieure est ce qui authentifie ici. Se lit sur `auth_mode`, jamais sur la
+   *  présence d'une URL. */
   federated: boolean;
+  /** Le délai qu'une appartenance retirée à la source attend. `null` en `oidc` sans API déclarée :
+   *  rien n'y est relu, et ce n'est pas la même chose qu'un délai court. */
+  resync: string | null;
+  /** La valeur du chart où la table se corrige, qui n'est pas la même d'une source à l'autre. */
+  mapping_setting: string;
 }
 
 /**
@@ -1508,7 +1545,7 @@ export interface IdentityPayload {
   sessions_error: string | null;
   controller: { namespace: string; pod: string; container: string } | null;
   delivery: IdentDelivery;
-  directory: IdentDirectory;
+  federation: IdentFederation;
   /** La colonne SOURCE ne se paie que là où un annuaire est en jeu. */
   shows_source: boolean;
   counts: {

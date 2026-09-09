@@ -27,12 +27,18 @@
 //!
 //! # Le mode d'authentification est un second axe
 //!
-//! `authMode: local` ou `ldap` dit qui le portail **reconnaît**, là où `credentialMode` dit ce
-//! qu'il **remet** : les quatre combinaisons sont valides. En `ldap`, les comptes naissent d'une
-//! connexion réussie, portent le label `identity.kdt.sh/source=ldap` et l'annotation qui épingle
-//! leur DN, et leur appartenance est réalignée sur l'annuaire à chaque relecture. Variable absente
-//! ⇒ on n'affirme rien, comme pour la délivrance : c'est aussi ce à quoi ressemble un déploiement
-//! antérieur à 1.2.
+//! `authMode: local`, `ldap` ou `oidc` dit qui le portail **reconnaît**, là où `credentialMode` dit
+//! ce qu'il **remet** : toutes les combinaisons sont valides. Dans les deux modes fédérés, les
+//! comptes naissent d'une connexion réussie, portent le label `identity.kdt.sh/source` de leur
+//! source et l'annotation qui épingle leur identité chez elle — un DN pour un annuaire, le sujet du
+//! jeton pour un fournisseur —, et leur appartenance est réalignée à chaque relecture. Variable
+//! absente ⇒ on n'affirme rien, comme pour la délivrance : c'est aussi ce à quoi ressemble un
+//! déploiement antérieur à 1.2.
+//!
+//! Une différence de fond entre les deux sources voyage avec le reste : en `oidc`, la relecture
+//! n'existe que si l'accès à l'API du fournisseur est déclaré. Sans elle rien n'est relu, aucun
+//! compte n'est désactivé par le contrôleur, et `resync` **est nul** plutôt que court — le front
+//! n'a donc pas à choisir un défaut, il lui suffit de dire ce qui lui arrive.
 //!
 //! # Les deux écritures qui ne passent pas par l'apiserver
 //!
@@ -82,9 +88,9 @@ pub async fn list(
         "sessions_error": inv.sessions_error,
         "controller": inv.controller,
         "delivery": delivery_json(&inv.delivery),
-        "directory": directory_json(&inv.directory),
-        // La colonne SOURCE ne se paie que là où un annuaire est en jeu — soit le cluster
-        // s'authentifie contre lui, soit un objet en porte encore le label.
+        "federation": federation_json(&inv.federation),
+        // La colonne SOURCE ne se paie que là où une source extérieure est en jeu — soit le cluster
+        // s'authentifie contre elle, soit un objet en porte encore le label.
         "shows_source": inv.shows_source(),
         "counts": {
             "users": inv.users.len(),
@@ -128,14 +134,19 @@ fn delivery_json(d: &kdt::identity::Delivery) -> serde_json::Value {
     value
 }
 
-/// Ce que le déploiement déclare de l'annuaire, plus la seule question qu'on lui pose.
+/// Ce que le déploiement déclare de la source d'identité, plus les trois questions qu'on lui pose.
 ///
-/// `federated` est une règle de kdt : le second axe se lit sur `authMode`, jamais sur la présence
-/// d'une URL — un déploiement repassé en `local` garde toute sa configuration LDAP dans son env.
-fn directory_json(d: &kdt::identity::Directory) -> serde_json::Value {
-    let mut value = serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({}));
+/// Ce sont des règles de kdt, pas des champs. `federated` se lit sur `authMode`, jamais sur la
+/// présence d'une URL — un déploiement repassé en `local` garde toute sa configuration dans son
+/// env. `resync` choisit le délai selon la source, et **rend nul** là où rien n'est relu, ce qui
+/// n'est pas un délai court. `mapping_setting` nomme la valeur du chart à corriger, qui n'est pas
+/// la même d'une source à l'autre.
+fn federation_json(f: &kdt::identity::Federation) -> serde_json::Value {
+    let mut value = serde_json::to_value(f).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
-        object.insert("federated".to_string(), d.federated().into());
+        object.insert("federated".to_string(), f.federated().into());
+        object.insert("resync".to_string(), f.resync().into());
+        object.insert("mapping_setting".to_string(), f.mapping_setting().into());
     }
     value
 }
@@ -412,31 +423,36 @@ mod tests {
         assert!(v["bindings_labels"].as_array().unwrap().is_empty());
     }
 
-    // Le second axe voyage entier : le front peint la colonne SOURCE, nomme le DN épinglé et dit
-    // ce qui alimente un group. Aucun de ces trois faits n'est sur l'objet que le navigateur voit.
+    // Le second axe voyage entier : le front peint la colonne SOURCE, nomme la valeur épinglée et
+    // dit ce qui alimente un group. Aucun de ces trois faits n'est sur l'objet que le navigateur
+    // voit.
     #[test]
     fn le_second_axe_voyage_avec_la_regle_qui_le_lit() {
-        use kdt::identity::{AuthMode, Directory, GroupMapping, Source};
+        use kdt::identity::{AuthMode, Federation, GroupMapping, LdapFacts, Source};
 
-        let d = Directory {
+        let f = Federation {
             auth_mode: Some(AuthMode::Ldap),
-            url: Some("ldaps://dc01.example.com:636".into()),
-            resync: Some("15m".into()),
+            ldap: LdapFacts {
+                url: Some("ldaps://dc01.example.com:636".into()),
+                resync: Some("15m".into()),
+                ..LdapFacts::default()
+            },
             mappings: Some(vec![GroupMapping {
-                dn: "CN=K8s-Admins,OU=Groups,DC=example,DC=com".into(),
+                key: "CN=K8s-Admins,OU=Groups,DC=example,DC=com".into(),
                 group: "admins".into(),
             }]),
-            ..Directory::default()
+            ..Federation::default()
         };
-        let v = directory_json(&d);
+        let v = federation_json(&f);
         assert_eq!(v["auth_mode"], "ldap");
         assert_eq!(v["federated"], true);
         assert_eq!(v["resync"], "15m");
+        assert_eq!(v["mapping_setting"], "ldap.groupMappings");
         assert_eq!(v["mappings"][0]["group"], "admins");
 
-        // Mode absent : ni `local` ni `ldap`. C'est aussi ce à quoi ressemble un déploiement
-        // antérieur à 1.2, et le front ne doit pas peindre un axe qui n'a pas été déclaré.
-        let silent = directory_json(&Directory::default());
+        // Mode absent : ni `local`, ni `ldap`, ni `oidc`. C'est aussi ce à quoi ressemble un
+        // déploiement antérieur à 1.2, et le front ne doit pas peindre un axe non déclaré.
+        let silent = federation_json(&Federation::default());
         assert!(silent["auth_mode"].is_null());
         assert_eq!(silent["federated"], false);
         assert!(silent["mappings"].is_null());
@@ -444,25 +460,73 @@ mod tests {
         let u = user_json(
             &IdentUser {
                 source: Source::Ldap,
-                ldap_dn: "CN=Alice,DC=example,DC=com".into(),
+                pin: "CN=Alice,DC=example,DC=com".into(),
                 ..user()
             },
             lang_of("fr"),
         );
         assert_eq!(u["source"], "ldap");
-        assert_eq!(u["ldap_dn"], "CN=Alice,DC=example,DC=com");
+        assert_eq!(u["pin"], "CN=Alice,DC=example,DC=com");
 
         let g = group_json(
             &IdentGroup {
                 name: "admins".into(),
                 source: Source::Ldap,
-                ldap_dns: vec!["CN=K8s-Admins,OU=Groups,DC=example,DC=com".into()],
+                source_keys: vec!["CN=K8s-Admins,OU=Groups,DC=example,DC=com".into()],
                 ..IdentGroup::default()
             },
             lang_of("fr"),
         );
         assert_eq!(g["source"], "ldap");
-        assert_eq!(g["ldap_dns"][0], "CN=K8s-Admins,OU=Groups,DC=example,DC=com");
+        assert_eq!(g["source_keys"][0], "CN=K8s-Admins,OU=Groups,DC=example,DC=com");
+    }
+
+    // La seconde source, et la seule règle qui ne se lit pas comme celle de l'annuaire : sans accès
+    // déclaré à l'API du fournisseur, il n'y a **aucune** relecture. Rendre un délai là serait en
+    // inventer un, et le front peindrait une réconciliation qui n'existe pas.
+    #[test]
+    fn un_fournisseur_sans_api_declaree_ne_rend_aucun_delai_de_relecture() {
+        use kdt::identity::{AuthMode, Federation, GraphFacts, GroupMapping, OidcFacts, Source};
+
+        let provider = |graph: bool| Federation {
+            auth_mode: Some(AuthMode::Oidc),
+            oidc: OidcFacts {
+                issuer: Some("https://login.microsoftonline.com/tenant/v2.0".into()),
+                provider_name: Some("Entra ID".into()),
+                subject_claim: Some("oid".into()),
+                graph: graph.then(|| GraphFacts {
+                    tenant_id: Some("tenant".into()),
+                    resync: Some("15m".into()),
+                    ..GraphFacts::default()
+                }),
+                ..OidcFacts::default()
+            },
+            mappings: Some(vec![GroupMapping {
+                key: "8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11".into(),
+                group: "admins".into(),
+            }]),
+            ..Federation::default()
+        };
+
+        let with = federation_json(&provider(true));
+        assert_eq!(with["auth_mode"], "oidc");
+        assert_eq!(with["federated"], true);
+        assert_eq!(with["oidc"]["provider_name"], "Entra ID");
+        assert_eq!(with["resync"], "15m");
+        assert_eq!(with["mapping_setting"], "oidcAuth.groupMappings");
+
+        let without = federation_json(&provider(false));
+        assert!(without["oidc"]["graph"].is_null());
+        assert!(without["resync"].is_null(), "aucune relecture n'est pas une relecture courte");
+
+        // Le sujet épinglé voyage sous le même champ que le DN : c'est la même question — sur quoi
+        // l'amont revérifie l'identité — et le front nomme la réponse selon la source.
+        let u = user_json(
+            &IdentUser { source: Source::Oidc, pin: "oid-1".into(), ..user() },
+            lang_of("fr"),
+        );
+        assert_eq!(u["source"], "oidc");
+        assert_eq!(u["pin"], "oid-1");
     }
 
     // Le mode absent n'est pas `certificate` : l'amont y défaute, mais l'absence décrit aussi un

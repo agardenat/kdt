@@ -394,7 +394,7 @@ use crate::rancher::{
 
 use crate::identity::{
     apply_identity_write, fetch_identity, install_command, invitation_label, new_identity_state,
-    AuthMode, CredentialMode, Delivery, Directory, IdentGroup, IdentInvite, IdentUser,
+    AuthMode, CredentialMode, Delivery, Federation, IdentGroup, IdentInvite, IdentUser,
     IdentityWrite, Invitation, Phase, SharedIdentity, Source, WriteOutcome, DEFAULT_VALIDITY,
 };
 
@@ -8998,20 +8998,20 @@ impl App {
     // an empty cluster is not a dead end.
     fn open_identity_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
-        let (controller, directory) = {
+        let (controller, federation) = {
             let s = self.ident_state.lock().expect("identity poisoned");
-            (s.controller.clone(), s.directory.clone())
+            (s.controller.clone(), s.federation.clone())
         };
         let row = self.ident_selected().cloned();
 
         let (title, items) = match &row {
             Some(IdentRow::User(u)) => {
                 // Inviting needs a pod to run in, and the account has to be able to act on it. Both
-                // are said in the entry rather than discovered after the confirmation. In `ldap`
-                // mode there is no invitation at all — upstream refuses the command — and saying so
-                // here is cheaper than an exec that comes back with a refusal.
-                let invite_desc = if directory.federated() {
-                    st.ident_invite_ldap.to_string()
+                // are said in the entry rather than discovered after the confirmation. In a
+                // federated mode there is no invitation at all — upstream refuses the command — and
+                // saying so here is cheaper than an exec that comes back with a refusal.
+                let invite_desc = if let Some(mode) = federation.auth_mode.filter(|m| m.source().is_some()) {
+                    lang::fill(st.ident_invite_federated, &[("mode", mode.label())])
                 } else if u.disabled {
                     st.ident_invite_disabled.to_string()
                 } else if controller.is_none() {
@@ -9044,10 +9044,11 @@ impl App {
                     label: if u.disabled { st.k_ident_enable } else { st.k_ident_disable },
                     desc: if !u.disabled {
                         st.desc_ident_disable.to_string()
-                    } else if u.source.federated() {
-                        // Re-enabling holds only as long as the entry is still in the directory:
-                        // the resync disables it again, and it is the same field either way.
-                        format!("{} · {}", st.desc_ident_enable, st.ident_enable_ldap)
+                    } else if u.source.federated() && federation.resync().is_some() {
+                        // Re-enabling holds only as long as the source still recognises the person:
+                        // the next re-read disables it again, and it is the same field either way.
+                        // Said only where a re-read exists — without one, nothing undoes the write.
+                        format!("{} · {}", st.desc_ident_enable, st.ident_enable_federated)
                     } else {
                         st.desc_ident_enable.to_string()
                     },
@@ -9055,8 +9056,8 @@ impl App {
                 });
                 items.push(ActionItem {
                     label: st.k_ident_membership,
-                    desc: if directory.federated() {
-                        format!("{} · {}", st.desc_ident_membership, st.ident_membership_ldap)
+                    desc: if federation.federated() {
+                        format!("{} · {}", st.desc_ident_membership, st.ident_membership_federated)
                     } else {
                         st.desc_ident_membership.to_string()
                     },
@@ -9084,7 +9085,7 @@ impl App {
                     ActionItem {
                         label: st.k_ident_membership,
                         desc: if g.source.federated() {
-                            format!("{} · {}", st.desc_ident_membership, st.ident_membership_ldap)
+                            format!("{} · {}", st.desc_ident_membership, st.ident_membership_federated)
                         } else {
                             st.desc_ident_membership.to_string()
                         },
@@ -19338,7 +19339,7 @@ fn ident_sessions_cell(u: &IdentUser) -> Cell<'static> {
 }
 
 fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, creds_error, sessions_error, totals, operator, delivery, directory, show_source) = {
+    let (loading, error, creds_error, sessions_error, totals, operator, delivery, federation, show_source) = {
         let s = app.ident_state.lock().expect("identity poisoned");
         let totals = IdentTotals {
             users: s.users.len(),
@@ -19361,7 +19362,7 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             totals,
             operator,
             s.delivery.clone(),
-            s.directory.clone(),
+            s.federation.clone(),
             s.shows_source(),
         )
     };
@@ -19396,10 +19397,11 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     }
                 }
                 // The second axis, and only when it is the exception: `local` is what every
-                // deployment was until 1.2, and a badge marks the departure from the norm.
-                if directory.federated() {
+                // deployment was until 1.2, and a badge marks the departure from the norm. It names
+                // the mode itself — `ldap` and `oidc` are not the same news for anyone reading it.
+                if let Some(mode) = federation.auth_mode.filter(|m| m.source().is_some()) {
                     t.push_str(" · ");
-                    t.push_str(AuthMode::Ldap.label());
+                    t.push_str(mode.label());
                 }
                 // Said in the title, once, rather than as a dash on every row: the columns they
                 // silence are the ones nothing else can answer.
@@ -19437,9 +19439,9 @@ fn draw_identity_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // The table itself, split out of the draw so a test can render it at several widths and check that
 // nothing eats the right border.
 ///
-/// `show_source` buys the SOURCE column only where a directory is involved — the cluster
-/// authenticates against one, or some object still carries its label. Everywhere else it would be a
-/// column of dashes taking width from the ones that distinguish.
+/// `show_source` buys the SOURCE column only where a source outside the cluster is involved — the
+/// cluster authenticates against one, or some object still carries its label. Everywhere else it
+/// would be a column of dashes taking width from the ones that distinguish.
 fn ident_table_parts(
     world: IdentWorld,
     src: &[IdentRow],
@@ -19448,10 +19450,12 @@ fn ident_table_parts(
 ) -> (Row<'static>, Vec<Row<'static>>, Vec<Constraint>) {
     let header_style =
         Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
-    // The label's own value, verbatim: a row says `ldap` because the object says `ldap`.
+    // The label's own value, verbatim: a row says `oidc` because the object says `oidc`. The two
+    // federated sources are never merged into one word — which one governs an account decides where
+    // it is fixed, and a shared "federated" would hide exactly that.
     let source_cell = |source: Source| {
         if source.federated() {
-            Cell::from(AuthMode::Ldap.label()).style(Style::default().fg(Color::Cyan))
+            Cell::from(source.label()).style(Style::default().fg(Color::Cyan))
         } else {
             Cell::from("—").style(Style::default().fg(DIM))
         }
@@ -19738,7 +19742,7 @@ fn draw_identity_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         if let Some(c) = &s.controller {
             lines.push(ident_label_line(st.ident_lbl_operator, c.namespace.clone()));
             lines.extend(ident_delivery_lines(&s.delivery, st));
-            lines.extend(ident_directory_lines(&s.directory, st));
+            lines.extend(ident_federation_lines(&s.federation, st));
             // What the table declares and the cluster does not have yet. Never a fault: upstream
             // creates each group at the first sign-in of one of its members.
             let missing = s.missing_mapped_groups();
@@ -19843,55 +19847,101 @@ fn ident_delivery_lines(delivery: &Delivery, st: &'static lang::Strings) -> Vec<
     out
 }
 
-// What the deployment declares about the directory. Stated only where it says something: a `local`
-// deployment has one line, and a pre-1.2 one has the line that names the absence — never a block of
-// empty fields.
-fn ident_directory_lines(
-    directory: &Directory,
+// What the deployment declares about who it authenticates. Stated only where it says something: a
+// `local` deployment has one line, and a pre-1.2 one has the line that names the absence — never a
+// block of empty fields.
+//
+// The two federated modes describe themselves with different facts, and neither is spoken in the
+// other's terms: a directory has a URL, a search base and a re-read delay; a provider has an issuer,
+// the claim its accounts are pinned on, and an API access that may simply not be declared.
+fn ident_federation_lines(
+    federation: &Federation,
     st: &'static lang::Strings,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let Some(mode) = directory.auth_mode else {
+    let Some(mode) = federation.auth_mode else {
         out.push(ident_label_line(st.ident_lbl_auth, st.ident_auth_unknown.to_string()));
         return out;
     };
     out.push(ident_label_line(st.ident_lbl_auth, mode.label().to_string()));
-    if mode == AuthMode::Local {
-        return out;
+    match mode {
+        AuthMode::Local => return out,
+        AuthMode::Ldap => {
+            let ldap = &federation.ldap;
+            if let Some(url) = &ldap.url {
+                // StartTLS is only worth naming when it is what carries the TLS: an `ldaps://` URL
+                // already says it, and upstream refuses to start on anything else.
+                let text = match ldap.start_tls {
+                    Some(true) => format!("{url} (StartTLS)"),
+                    _ => url.clone(),
+                };
+                out.push(ident_label_line(st.ident_lbl_ldap_url, text));
+            }
+            if let Some(profile) = &ldap.profile {
+                out.push(ident_label_line(st.ident_lbl_ldap_profile, profile.clone()));
+            }
+            if let Some(base) = &ldap.search_base {
+                out.push(ident_label_line(st.ident_lbl_ldap_base, base.clone()));
+            }
+            if let Some(resync) = &ldap.resync {
+                out.push(ident_label_line(st.ident_lbl_ldap_resync, resync.clone()));
+            }
+        }
+        AuthMode::Oidc => {
+            let oidc = &federation.oidc;
+            if let Some(issuer) = &oidc.issuer {
+                out.push(ident_label_line(st.ident_lbl_oidc_issuer, issuer.clone()));
+            }
+            if let Some(name) = &oidc.provider_name {
+                out.push(ident_label_line(st.ident_lbl_oidc_provider, name.clone()));
+            }
+            if let Some(client) = &oidc.client_id {
+                out.push(ident_label_line(st.ident_lbl_oidc_client, client.clone()));
+            }
+            // Absent claims are not shown at all: the chart writes one only when it overrides the
+            // upstream default, so naming `sub` here would restate a default as a read fact.
+            if let Some(claim) = &oidc.subject_claim {
+                out.push(ident_label_line(st.ident_lbl_oidc_subject_claim, claim.clone()));
+            }
+            if let Some(claim) = &oidc.groups_claim {
+                out.push(ident_label_line(st.ident_lbl_oidc_groups_claim, claim.clone()));
+            }
+            // The provider's API, and its absence, which is the fact two behaviours hang on rather
+            // than a missing detail — so it is stated, and not left blank.
+            match &oidc.graph {
+                Some(graph) => {
+                    let mut text = graph
+                        .endpoint
+                        .clone()
+                        .or_else(|| graph.tenant_id.clone())
+                        .unwrap_or_default();
+                    if let Some(resync) = &graph.resync {
+                        if !text.is_empty() {
+                            text.push_str(" · ");
+                        }
+                        text.push_str(resync);
+                    }
+                    out.push(ident_label_line(st.ident_lbl_oidc_graph, text));
+                }
+                None => out.push(Line::from(Span::styled(
+                    st.ident_oidc_graph_off,
+                    Style::default().fg(DIM),
+                ))),
+            }
+        }
     }
-    if let Some(url) = &directory.url {
-        // StartTLS is only worth naming when it is what carries the TLS: an `ldaps://` URL already
-        // says it, and upstream refuses to start on anything else.
-        let text = match directory.start_tls {
-            Some(true) => format!("{url} (StartTLS)"),
-            _ => url.clone(),
-        };
-        out.push(ident_label_line(st.ident_lbl_ldap_url, text));
-    }
-    if let Some(profile) = &directory.profile {
-        out.push(ident_label_line(st.ident_lbl_ldap_profile, profile.clone()));
-    }
-    if let Some(base) = &directory.search_base {
-        out.push(ident_label_line(st.ident_lbl_ldap_base, base.clone()));
-    }
-    if let Some(resync) = &directory.resync {
-        out.push(ident_label_line(st.ident_lbl_ldap_resync, resync.clone()));
-    }
-    if let Some(e) = &directory.mappings_error {
+    if let Some(e) = &federation.mappings_error {
         out.push(Line::from(Span::styled(
             lang::fill(st.ident_mappings_unreadable, &[("e", e)]),
             Style::default().fg(Color::Yellow),
         )));
     }
-    if let Some(mappings) = &directory.mappings {
-        out.push(ident_label_line(
-            st.ident_lbl_ldap_mappings,
-            mappings.len().to_string(),
-        ));
+    if let Some(mappings) = &federation.mappings {
+        out.push(ident_label_line(st.ident_lbl_mappings, mappings.len().to_string()));
         for m in mappings {
             out.push(Line::from(vec![
                 Span::styled("  · ".to_string(), Style::default().fg(DIM)),
-                Span::raw(format!("{} → {}", m.dn, m.group)),
+                Span::raw(format!("{} → {}", m.key, m.group)),
             ]));
         }
     }
@@ -19922,13 +19972,17 @@ fn ident_detail_lines(
             if !u.display_name.is_empty() {
                 lines.push(label(st.ident_lbl_display, u.display_name.clone()));
             }
-            // Where the account comes from, and the DN it is pinned to. The pin is the barrier that
-            // keeps two directory logins normalising to the same name from sharing one account, so
-            // it is shown verbatim rather than summarised.
+            // Where the account comes from, and the value it is pinned to. The pin is the barrier
+            // that keeps two logins normalising to the same name from sharing one account, so it is
+            // shown verbatim rather than summarised — under the name its own source gives it.
             if u.source.federated() {
-                lines.push(label(st.ident_lbl_source, AuthMode::Ldap.label().to_string()));
-                if !u.ldap_dn.is_empty() {
-                    lines.push(label(st.ident_lbl_ldap_dn, u.ldap_dn.clone()));
+                lines.push(label(st.ident_lbl_source, u.source.label().to_string()));
+                if !u.pin.is_empty() {
+                    let pin_label = match u.source {
+                        Source::Oidc => st.ident_lbl_oidc_subject,
+                        _ => st.ident_lbl_ldap_dn,
+                    };
+                    lines.push(label(pin_label, u.pin.clone()));
                 }
             }
             // kdt's phase and the controller's are shown side by side whenever they differ, so a
@@ -20029,10 +20083,10 @@ fn ident_detail_lines(
             // A federated group says so even when nothing maps to it any more — that gap is exactly
             // what the hint below is about.
             if g.source.federated() {
-                lines.push(label(st.ident_lbl_source, AuthMode::Ldap.label().to_string()));
+                lines.push(label(st.ident_lbl_source, g.source.label().to_string()));
             }
-            if !g.ldap_dns.is_empty() {
-                lines.push(label(st.ident_lbl_ldap_mappings, g.ldap_dns.join(", ")));
+            if !g.source_keys.is_empty() {
+                lines.push(label(st.ident_lbl_mappings, g.source_keys.join(", ")));
             }
             lines.push(label(
                 st.ident_lbl_members,
@@ -30155,8 +30209,7 @@ mod identity_view_tests {
             uid: "ident|user|alice".to_string(),
             // Federated, with a DN long enough to compete for the width the border needs.
             source: Source::Ldap,
-            ldap_dn: "CN=Alice Martin,OU=Consultants,OU=Users,DC=corp,DC=example,DC=com"
-                .to_string(),
+            pin: "CN=Alice Martin,OU=Consultants,OU=Users,DC=corp,DC=example,DC=com".to_string(),
         }
     }
 
@@ -30181,25 +30234,51 @@ mod identity_view_tests {
             }],
             uid: "ident|group|plateforme".to_string(),
             source: Source::Ldap,
-            ldap_dns: vec![
+            source_keys: vec![
                 "CN=K8s-Plateforme,OU=Groups,DC=corp,DC=example,DC=com".to_string(),
             ],
         }
     }
 
-    fn directory() -> Directory {
-        Directory {
+    fn ldap_federation() -> Federation {
+        Federation {
             auth_mode: Some(AuthMode::Ldap),
-            url: Some("ldaps://dc01.corp.example.com:636".to_string()),
-            profile: Some("activedirectory".to_string()),
-            start_tls: Some(false),
-            search_base: Some("OU=Users,DC=corp,DC=example,DC=com".to_string()),
-            resync: Some("15m".to_string()),
+            ldap: crate::identity::LdapFacts {
+                url: Some("ldaps://dc01.corp.example.com:636".to_string()),
+                profile: Some("activedirectory".to_string()),
+                start_tls: Some(false),
+                search_base: Some("OU=Users,DC=corp,DC=example,DC=com".to_string()),
+                resync: Some("15m".to_string()),
+            },
             mappings: Some(vec![crate::identity::GroupMapping {
-                dn: "CN=K8s-Plateforme,OU=Groups,DC=corp,DC=example,DC=com".to_string(),
+                key: "CN=K8s-Plateforme,OU=Groups,DC=corp,DC=example,DC=com".to_string(),
                 group: "plateforme-astreinte".to_string(),
             }]),
             mappings_error: None,
+            ..Federation::default()
+        }
+    }
+
+    fn oidc_federation(graph: bool) -> Federation {
+        Federation {
+            auth_mode: Some(AuthMode::Oidc),
+            oidc: crate::identity::OidcFacts {
+                issuer: Some("https://login.microsoftonline.com/tenant-id/v2.0".to_string()),
+                provider_name: Some("Entra ID".to_string()),
+                client_id: Some("6f1b0c2a-9e44-4d1b-8f21-0b7c5d3e9a10".to_string()),
+                subject_claim: Some("oid".to_string()),
+                graph: graph.then(|| crate::identity::GraphFacts {
+                    tenant_id: Some("tenant-id".to_string()),
+                    endpoint: Some("https://graph.microsoft.com".to_string()),
+                    resync: Some("15m".to_string()),
+                }),
+                ..crate::identity::OidcFacts::default()
+            },
+            mappings: Some(vec![crate::identity::GroupMapping {
+                key: "8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11".to_string(),
+                group: "plateforme-astreinte".to_string(),
+            }]),
+            ..Federation::default()
         }
     }
 
@@ -30266,6 +30345,40 @@ mod identity_view_tests {
                                     .borders(Borders::ALL)
                                     .title(title.clone()),
                             );
+                        f.render_widget(p, f.area());
+                    })
+                    .expect("draw");
+                let buffer = terminal.backend().buffer().clone();
+                for y in 0..24 {
+                    let cell = buffer.cell((width - 1, y)).expect("right column");
+                    let expected = match y {
+                        0 => border.top_right,
+                        23 => border.bottom_right,
+                        _ => border.vertical_right,
+                    };
+                    assert_eq!(cell.symbol(), expected, "frame eaten at width {width}, row {y}");
+                }
+            }
+        }
+    }
+
+    // The federation block lands in the panel with nothing selected, and it carries the longest
+    // strings of the view: an issuer, a GUID mapping, and the sentence that names an absent
+    // provider API. None of them may reach the right border.
+    #[test]
+    fn the_federation_block_keeps_its_frame_at_every_width() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let border = ratatui::symbols::border::PLAIN;
+        for federation in [ldap_federation(), oidc_federation(true), oidc_federation(false)] {
+            for width in [40_u16, 60, 100, 196] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+                let lines = ident_federation_lines(&federation, st);
+                terminal
+                    .draw(|f| {
+                        let p = Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .block(Block::default().borders(Borders::ALL).title(" identity "));
                         f.render_widget(p, f.area());
                     })
                     .expect("draw");
@@ -30435,7 +30548,7 @@ mod identity_view_tests {
     // The second axis, and the same rule: an undeclared `authMode` is also what every deployment
     // older than 1.2 looks like, so the absence is named rather than read as `local`.
     #[test]
-    fn an_undeclared_auth_mode_states_nothing_about_a_directory() {
+    fn an_undeclared_auth_mode_states_nothing_about_a_federation() {
         let st = lang::t(crate::ai::AiLanguage::Fr);
         let text = |lines: Vec<Line<'static>>| {
             lines
@@ -30445,24 +30558,38 @@ mod identity_view_tests {
                 .join("\n")
         };
 
-        let silent = text(ident_directory_lines(&Directory::default(), st));
+        let silent = text(ident_federation_lines(&Federation::default(), st));
         assert!(silent.contains(st.ident_auth_unknown), "the absence must be named");
         assert!(!silent.contains("ldaps://"));
 
-        // A `local` deployment says so and stops: it has no directory to describe.
-        let local = text(ident_directory_lines(
-            &Directory { auth_mode: Some(AuthMode::Local), ..Directory::default() },
+        // A `local` deployment says so and stops: it has no source outside to describe.
+        let local = text(ident_federation_lines(
+            &Federation { auth_mode: Some(AuthMode::Local), ..Federation::default() },
             st,
         ));
         assert!(local.contains("local"));
         assert!(!local.contains(st.ident_lbl_ldap_url));
 
-        let ldap = text(ident_directory_lines(&directory(), st));
+        let ldap = text(ident_federation_lines(&ldap_federation(), st));
         assert!(ldap.contains("ldaps://dc01.corp.example.com:636"));
         assert!(ldap.contains("15m"), "the re-read delay is what a group removal waits on");
         assert!(ldap.contains("plateforme-astreinte"), "the mapping table is what feeds a group");
         // The URL already carries the TLS: StartTLS is only named when it is what provides it.
         assert!(!ldap.contains("StartTLS"));
+
+        // A provider is described by its own facts, never in the directory's terms — and the one
+        // that matters most is the access to its API, whose absence is a behaviour and not a gap.
+        let provider = text(ident_federation_lines(&oidc_federation(true), st));
+        assert!(provider.contains("https://login.microsoftonline.com/tenant-id/v2.0"));
+        assert!(provider.contains("Entra ID"));
+        assert!(provider.contains("oid"), "the pinning claim decides which identity an account is");
+        assert!(provider.contains("https://graph.microsoft.com"));
+        assert!(!provider.contains(st.ident_lbl_ldap_url), "no directory field on a provider");
+        assert!(!provider.contains(st.ident_oidc_graph_off));
+
+        let no_graph = text(ident_federation_lines(&oidc_federation(false), st));
+        assert!(no_graph.contains(st.ident_oidc_graph_off));
+        assert!(!no_graph.contains("15m"), "no re-read delay may be named where none is re-read");
     }
 
     // `?` and `0` are different answers, and the column that carries the case for revoking must not

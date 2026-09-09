@@ -373,33 +373,46 @@ shows the query and its effect (`/coredns  (3)`).
     revokes nothing. The detail panel adds the session grant (`refreshTtl`) and, in certificate
     mode only, the state of `portal.kubeconfigDownload` — the one access neither `revoke` nor
     `spec.disabled` reaches.
-  - The **authentication mode** is a second axis, independent of the first: `authMode: local` or
-    `ldap`, read from the same controller pod environment (`KDT_IDENTITY_AUTH_MODE`), says who the
-    portal **recognises** where `credentialMode` says what it **hands out**. All four combinations
-    exist. Variable absent ⇒ kdt claims nothing, as for delivery: that is also what a pre-1.2
-    deployment looks like. In `ldap` the title carries it, and the panel adds the directory URL, the
-    profile, the search base, the re-read delay (`ldap.resync`) and the `ldap.groupMappings` table
-    as it is declared, DN by DN.
-  - A **SRC** column appears in both worlds as soon as a directory is involved — the cluster
-    authenticates against one, or some object still carries its label. It reads `ldap` on what the
-    `identity.kdt.sh/source` label marks and `—` elsewhere; nothing else is inferred, neither from
-    the name nor from the shape of the address. The detail of a federated account adds its **pinned
-    DN** (`identity.kdt.sh/ldap-dn`), which upstream re-checks at every sign-in.
-  - The gaps the LDAP mode creates that no object states on its own: a **local** account in an
-    `ldap` deployment (nobody can sign in as it, and `invite` refuses to run), a **federated**
-    account in a `local` deployment (neither password nor TOTP, it must be invited), a group marked
-    `source=ldap` **absent from the table** (nothing feeds it any more), and a group **declared in
-    the table without the label** (the controller leaves its members alone and merely logs it).
-    Groups from the table that do not exist yet are listed without being blamed: each is born at the
-    first sign-in of one of its members. An unreadable table silences those findings rather than
-    reading as an empty one.
+  - The **authentication mode** is a second axis, independent of the first: `authMode: local`,
+    `ldap` or `oidc`, read from the same controller pod environment (`KDT_IDENTITY_AUTH_MODE`), says
+    who the portal **recognises** where `credentialMode` says what it **hands out**. Every
+    combination exists. Variable absent ⇒ kdt claims nothing, as for delivery: that is also what a
+    pre-1.2 deployment looks like. The title carries the mode as soon as it is not `local`, and the
+    panel describes the source with its own facts:
+    - in `ldap`, the directory URL, the profile, the search base, the re-read delay (`ldap.resync`)
+      and the `ldap.groupMappings` table as it is declared, DN by DN;
+    - in `oidc`, the issuer, the provider name, the application id, the overridden claims (pinning,
+      groups) and the `oidcAuth.groupMappings` table, claim by claim. Access to the provider API
+      (`oidcAuth.graph`) is stated **including when it is absent**: without it nothing is re-read,
+      the controller disables no account, and upstream caps `refreshTtl` at 24h. kdt then shows
+      **no** re-read delay rather than a short one.
+  - A **SRC** column appears in both worlds as soon as a source outside the cluster is involved —
+    the cluster authenticates against it, or some object still carries its label. It reads `ldap` or
+    `oidc` on what the `identity.kdt.sh/source` label marks and `—` elsewhere; nothing else is
+    inferred, neither from the name nor from the shape of the address. The two sources are never
+    merged into one shared word: the one that governs an account decides where it is fixed. The
+    detail of a federated account adds the **pinned value** upstream re-checks at every sign-in —
+    the DN (`identity.kdt.sh/ldap-dn`) or the token subject (`identity.kdt.sh/oidc-subject`), read
+    from the annotation of its own source and never from the other's.
+  - The gaps a federated mode creates that no object states on its own: a **local** account in an
+    `ldap` or `oidc` deployment (nobody can sign in as it, and `invite` refuses to run), a
+    **federated** account in a `local` deployment (neither password nor TOTP, it must be invited),
+    an account governed by **the other source** than the one authenticating (upstream refuses the
+    sign-in rather than adopt it), a group marked as federated and **absent from the table**
+    (nothing feeds it any more), and a group **declared in the table without the label** (the
+    controller leaves its members alone and merely logs it). A disabled federated account names the
+    re-read that may have done it — and, in `oidc` without the API access, says that only a hand
+    could have. Groups from the table that do not exist yet are listed without being blamed: each is
+    born at the first sign-in of one of its members. An unreadable table silences those findings
+    rather than reading as an empty one.
   - `o`: **invite** (see below), **close the sessions** (`kdt-identity-server revoke` in the
     controller pod: logs every machine out, the account stays entitled and can open a session
     again — cutting it off is `spec.disabled`), **disable / enable** (`spec.disabled`: the
     controller closes the sessions and the portal refuses the login, access in flight stops at the
     next renewal), **membership** (a picker:
     from an account it ticks its groups, from a group it ticks its accounts; on a group fed from the
-    directory the write lands and the next re-read undoes it, and the menu entry says so),
+    identity source the write lands and the source undoes it at the next re-read or sign-in, and the
+    menu entry says so),
     **create** a user or a
     group, **copy the RBAC subject** as the controller publishes it. Both creations are offered from
     both worlds, and the view moves to the world of the object it just made and lands on it. On a
