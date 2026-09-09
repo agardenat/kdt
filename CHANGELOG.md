@@ -8,6 +8,43 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.1] — 2026-09-09
+
+La vue `:identity` et son portage web suivent kdt-identity 1.2 : l'annuaire d'entreprise peut être
+ce qui authentifie, et la vue le dit — dans les deux clients.
+
+- **feat(identity, web)** — le **mode d'authentification** apparaît comme ce qu'il est chez
+  l'amont : un **second axe**, indépendant du mode de délivrance. `credentialMode` dit ce que le
+  portail remet, `authMode` qui il reconnaît, les quatre combinaisons sont valides, et kdt les lit
+  toutes les deux dans l'environnement du pod contrôleur. Variable absente ⇒ rien n'est affirmé,
+  exactement comme pour la délivrance : c'est aussi ce à quoi ressemble un déploiement antérieur à
+  1.2.
+
+  En `ldap`, la vue porte l'URL de l'annuaire, le profil, la racine de recherche, le délai de
+  relecture et la table `ldap.groupMappings` telle qu'elle est déclarée, DN par DN. Une table
+  illisible n'est pas une table vide : elle **tait** les constats qui en dépendent, au lieu de les
+  rendre tous faux.
+
+  Une colonne **SRC** apparaît dans les deux mondes dès qu'un annuaire est en jeu, et seulement
+  alors — le cluster s'authentifie contre lui, ou un objet en porte encore le label. Elle se lit sur
+  le label `identity.kdt.sh/source`, avec le test de l'amont et rien d'autre : ni le nom du compte,
+  ni la forme de son adresse ne font conclure quoi que ce soit. Le détail d'un compte fédéré ajoute
+  son **DN épinglé**, celui que l'amont revérifie à chaque connexion pour que deux identifiants
+  normalisés vers le même nom ne finissent pas sur le même compte.
+
+  Quatre écarts qu'aucun objet ne dit seul sont désormais nommés, dans les lignes, dans le panneau
+  et dans le diagnostic : un compte **local** dans un déploiement `ldap` — plus personne ne peut s'y
+  connecter, et `invite` refuse de s'exécuter ; un compte **fédéré** dans un déploiement `local` —
+  il n'a ni mot de passe ni TOTP ; un group marqué `source=ldap` **absent de la table** — plus rien
+  ne l'alimente ; un group **déclaré dans la table sans le label** — le contrôleur laisse ses
+  membres intacts et se contente de le journaliser. Les groups de la table qui n'existent pas encore
+  sont listés sans être blâmés : chacun naît à la première connexion d'un de ses membres.
+
+  Les écritures ne changent pas de nature pour autant. L'invitation, que l'amont refuse en `ldap`,
+  est éteinte côté web et expliquée côté TUI plutôt que tentée. L'appartenance d'un group alimenté
+  par l'annuaire reste possible : elle aboutit, et c'est la relecture suivante qui la défait — le
+  menu le dit, sans présenter comme bloquant ce qui ne l'est pas.
+
 ## [2.0.0-beta.6] — 2026-09-08
 
 Trois défauts d'usage de kdt-web, et le même dans le TUI : des colonnes qui ne tombaient pas en
