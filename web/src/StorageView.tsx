@@ -20,7 +20,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { ObjectActions } from "./objects";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   EventRecord,
   Hint,
@@ -208,11 +208,6 @@ export default function StorageView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             detail={
               selectedRow
                 ? { label: st.tabDetail, node: <RowDetail row={selectedRow} st={st} /> }
@@ -263,10 +258,7 @@ export default function StorageView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -279,7 +271,19 @@ export default function StorageView({
         <ClusterBand payload={payload} st={st} />
       )}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={Boolean(selectedRow)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+      >
         {!loaded ? (
           <div className="center" />
         ) : shownCount === 0 ? (
@@ -304,7 +308,7 @@ export default function StorageView({
             onToggle={toggle}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

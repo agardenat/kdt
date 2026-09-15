@@ -16,7 +16,7 @@ import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { visibleRows } from "./tree";
 import type {
@@ -205,7 +205,6 @@ export default function KyvernoView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
             detail={{
               label: st.kyDetail,
               node: selectedRow ? (
@@ -309,10 +308,7 @@ export default function KyvernoView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -324,7 +320,15 @@ export default function KyvernoView({
           onglets et les boutons, elle les repoussait hors du cadre. */}
       {payload && <HealthBand payload={payload} st={st} />}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={Boolean(selectedRow)}
+      >
         {!loaded ? (
           <div className="center" />
         ) : shown.length === 0 ? (
@@ -379,7 +383,7 @@ export default function KyvernoView({
             </div>
           </div>
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

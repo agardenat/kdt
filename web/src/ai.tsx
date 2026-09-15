@@ -2,8 +2,8 @@
 //
 // Dans le TUI c'est une touche et un overlay plein écran ; ici c'est la grammaire du web, celle
 // des quatre autres gestes génériques (mémoire `gui-affordances-not-tui-keys`) : **le bouton vit
-// dans la barre d'actions, la réponse dans le panneau du haut**, et l'onglet n'existe que tant
-// qu'on le regarde.
+// dans la barre d'actions, la réponse prend le panneau du bas** — à la place de la table, comme le
+// fait `y`/`e`/`Ctrl-D` — et l'overlay n'existe que tant qu'on le regarde.
 //
 // # Trois choses vivent ici
 //
@@ -23,6 +23,7 @@ import * as api from "./api";
 import { NeedsAuth } from "./api";
 import { CopyButton } from "./copy";
 import type { Lang, Strings } from "./i18n";
+import { recordIdentity } from "./record";
 import type {
   AiConfigPayload,
   AiPersonalProvider,
@@ -290,9 +291,19 @@ export function useAnalysis(): AnalysisState {
   );
 }
 
-/** Ce qui identifie une analyse : l'objet **et** l'instant de l'évènement, comme la clé de kdt. */
+/**
+ * Ce qui identifie une analyse : l'objet, jamais l'instant.
+ *
+ * Le TUI mêle les deux (`rec.uid-rec.time-nanos`), mais chez lui la clé n'existe que pour une
+ * demande explicite — `i` ou « relancer » — jamais pour décider si une analyse a déjà eu lieu. Ici
+ * `key` sert aussi de mémoire : reste sur la ligne = pas de rappel. Un record synthétique
+ * (`flux::synthetic_record` et pareils) porte `time: Timestamp::now()`, réécrit à chaque
+ * rafraîchissement de la vue — l'y inclure rappelait le modèle toutes les quelques secondes, sans
+ * qu'aucun objet n'ait changé. `recordIdentity` est celle que `record.ts` a déjà pour ce même
+ * problème sur les autres onglets.
+ */
 export function analysisKey(record: EventRecord): string {
-  return `${record.uid}/${record.time}`;
+  return recordIdentity(record);
 }
 
 /**
@@ -418,7 +429,7 @@ export function AiButton({
 // ---------------------------------------------------------------------------
 
 /**
- * L'analyse de la ligne visée, dans le panneau du haut.
+ * L'analyse de la ligne visée, dans le panneau du bas.
  *
  * Elle part toute seule à l'ouverture — c'est ce que fait `i` dans kdt — mais **jamais deux fois
  * pour la même ligne** : revenir sur l'onglet montre ce qui a déjà été écrit plutôt que de

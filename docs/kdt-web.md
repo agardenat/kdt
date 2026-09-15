@@ -170,7 +170,8 @@ sur-le-champ, les phrases calculées suivent au refetch — voir §7.
 ### L'analyse par une IA, et où vit sa configuration
 
 Le `i` de kdt est le cinquième geste générique : un bouton dans la barre d'actions, la réponse en
-flux dans le panneau du haut, et l'onglet qui n'existe que tant qu'on le regarde. Le prompt est
+flux dans le panneau du bas — à la place de la table, comme `y`/`e`/`Ctrl-D` — et l'overlay qui
+n'existe que tant qu'on le regarde. Le prompt est
 celui du TUI — `kdt::ai::build_ai_prompt`, sorti de `ui.rs` pour l'occasion, parce qu'un second
 prompt aurait donné deux réponses différentes du même cluster.
 
@@ -213,7 +214,7 @@ propre onglet.
 Le menu `o` devient un menu de la barre d'actions, avec la convention de toutes les vues. Ce qu'il
 propose dépend de l'état lu : un node cordonné n'offre pas « cordon », il offre « uncordon ».
 
-Le **drain** est un overlay du panneau du haut, comme `Ctrl-D` : garde-fous d'abord, confirmation
+Le **drain** est un overlay du panneau du bas, comme `Ctrl-D` : garde-fous d'abord, confirmation
 ensuite, et la même règle qu'ailleurs — un constat grave exige de retaper le nom du node. Trois
 choses le distinguent :
 

@@ -17,7 +17,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
 
@@ -183,7 +183,6 @@ export default function DataView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
             detail={{
               label: st.secDetail,
               node: selectedSecret ? (
@@ -265,24 +264,29 @@ export default function DataView({
               {st.secOpenChain}
             </button>
           )}
-          {/* Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le
-              TUI. Ils vivent dans la barre, comme toutes les actions, et ouvrent le panneau du
-              haut sur ce qu'ils montrent. */}
+          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
+              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
+              ouvrent remplace la table dans le panneau du bas. */}
           <ObjectActions
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail
+      >
         {!loaded ? (
           <div className="center" />
         ) : rowCount === 0 ? (
@@ -349,7 +353,7 @@ export default function DataView({
             </div>
           </div>
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

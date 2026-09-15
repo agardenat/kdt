@@ -15,7 +15,7 @@ import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { visibleRows } from "./tree";
 import type {
@@ -272,7 +272,6 @@ export default function CertsView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
             detail={{
               label: st.certDetail,
               node: selectedRow ? (
@@ -375,17 +374,22 @@ export default function CertsView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail
+      >
         {!loaded ? (
           <div className="center" />
         ) : shown.length === 0 ? (
@@ -460,7 +464,7 @@ export default function CertsView({
             </div>
           </div>
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

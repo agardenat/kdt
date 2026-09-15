@@ -4,7 +4,8 @@
 // Dans le TUI ce sont cinq touches — `y`, `e`, `h`, `Ctrl-D`, `i` — disponibles dans toutes les vues
 // parce qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici c'est la même chose,
 // dans la grammaire du web (mémoire `gui-affordances-not-tui-keys`) : **les actions vivent dans la
-// barre qui sépare les deux panneaux, et ce qu'elles ouvrent s'affiche dans le panneau du haut.**
+// barre qui sépare les deux panneaux, et ce qu'elles ouvrent remplace la table dans le panneau du
+// bas** (`ViewBody`, dans `panel.tsx`) — sauf `Toucher`, qui n'ouvre rien.
 //
 // `Toucher` est le seul qui écrive sans rien ouvrir, et c'est déjà le cas dans kdt : deux
 // annotations sous `kdt.io/` s'ajoutent, rien n'est retiré, et l'intérêt de la touche est d'être

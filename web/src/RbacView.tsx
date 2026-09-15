@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { visibleRows } from "./tree";
 import type {
@@ -158,7 +158,6 @@ export default function RbacView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
             detail={{
               label: st.rbacDetail,
               node: selectedRow ? (
@@ -228,17 +227,22 @@ export default function RbacView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={Boolean(selectedRow)}
+      >
         {!loaded ? (
           <div className="center" />
         ) : shown.length === 0 ? (
@@ -295,7 +299,7 @@ export default function RbacView({
             </div>
           </div>
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

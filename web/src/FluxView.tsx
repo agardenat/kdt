@@ -10,7 +10,7 @@ import { ApiError, NeedsAuth } from "./api";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
 import type { FluxCounts, FluxRow, InventoryItem, ReconcileScope } from "./types";
@@ -231,7 +231,6 @@ export default function FluxView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
           />
           <Splitter height={panelHeight} onHeight={onPanelHeight} lang={lang} />
         </>
@@ -249,17 +248,14 @@ export default function FluxView({
         {counts && <FluxTally counts={counts} />}
 
         <div className="right">
-          {/* Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le
-              TUI. Ils vivent dans la barre, comme toutes les actions, et ouvrent le panneau du
-              haut sur ce qu'ils montrent. */}
+          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
+              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
+              ouvrent remplace la table dans le panneau du bas. */}
           <ObjectActions
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           {tree && (
@@ -295,7 +291,14 @@ export default function FluxView({
         </div>
       </div>
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+      >
         {!loaded ? (
           <div className="center" />
         ) : display.length === 0 ? (
@@ -361,7 +364,7 @@ export default function FluxView({
             </div>
           </div>
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

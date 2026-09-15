@@ -18,7 +18,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { ObjectActions } from "./objects";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   CapNodeRow,
   CapQuotaRow,
@@ -175,11 +175,6 @@ export default function CapacityView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             detail={detailNode ? { label: st.tabDetail, node: detailNode } : undefined}
           />
           <Splitter height={panelHeight} onHeight={onPanelHeight} lang={lang} />
@@ -231,10 +226,7 @@ export default function CapacityView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -260,7 +252,19 @@ export default function CapacityView({
         </div>
       )}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={Boolean(detailNode)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+      >
         {!loaded ? (
           <div className="center" />
         ) : shownCount === 0 ? (
@@ -280,7 +284,7 @@ export default function CapacityView({
         ) : (
           <QuotaTable rows={quotas} selected={selected} onSelect={select} />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

@@ -256,6 +256,15 @@ button, input { font: inherit; color: inherit; }
 
 .body { flex: 1; min-height: 0; overflow: auto; }
 
+/* Un overlay — YAML, édition, suppression, IA, ou le geste propre d'une vue — pris à la place de
+   la table plutôt que dans une bande de 300 px sous des onglets : il reprend les classes du
+   panneau du haut (`.phd`/`.pid`/`.pclose`/`.pbody`) pour rester la même interface, seulement sur
+   toute la hauteur du corps. */
+.body-overlay {
+  height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--card);
+}
+.body-overlay .ov-label { font-size: 12.5px; font-weight: 600; color: var(--fg); }
+
 /* ---------------------------------------------------------------- tableau */
 .tbl { min-width: 100%; width: max-content; font-size: 12.5px; }
 .tr { display: grid; align-items: center; column-gap: .9rem; padding: 0 .85rem; }
@@ -467,16 +476,6 @@ button, input { font: inherit; color: inherit; }
   background: var(--accent); border-radius: 2px 2px 0 0;
 }
 .ptabs button:disabled { opacity: .38; cursor: default; }
-
-/* Les trois gestes sur un objet sont des overlays, pas des onglets permanents : leur onglet
-   n'apparaît que tant qu'on y est, et porte sa propre croix. Il se distingue des quatre autres —
-   fond marqué, croix à droite — pour qu'on voie qu'il se ferme au lieu de se quitter. */
-.ptabs .ptab-overlay {
-  display: inline-flex; align-items: center; gap: .4rem; margin-left: .3rem;
-  background: var(--row-sel); border-radius: 6px 6px 0 0;
-}
-.ptabs .ptab-overlay .x { color: var(--muted); font-size: 11px; }
-.ptabs .ptab-overlay:hover .x { color: var(--err); }
 
 .pid .dim { color: var(--dim); }
 

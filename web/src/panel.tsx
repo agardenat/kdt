@@ -4,8 +4,14 @@
 // devient un côté serveur (`kdt::flux::synthetic_record`), exactement comme le TUI en fabrique un
 // pour que sa vue Flux réutilise le même panneau. Les trois onglets — Logs, Status, Related — sont
 // donc les mêmes objets sur la même donnée, quelle que soit la vue qui a ouvert la ligne.
+//
+// `yaml`, `edit`, `delete`, `ai` et `custom` n'y vivent plus : ce sont des overlays qui remplacent
+// la table (le panneau du bas), pas un onglet de plus dans le panneau du haut — un YAML de 40
+// lignes ou un éditeur se lisent mal dans une bande de 300 px, et le panneau du haut reste ainsi
+// toujours ce qu'il montre d'habitude, ligne sélectionnée ou pas. `ViewBody` est le point d'entrée
+// que chaque vue pose autour de sa table pour obtenir ce comportement.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode, type RefObject } from "react";
 import * as api from "./api";
 import type { Lang, Strings } from "./i18n";
 import { AiPane } from "./ai";
@@ -21,19 +27,19 @@ import {
 } from "./types";
 
 /**
- * Les onglets, dans l'ordre et sous les noms du TUI.
+ * Les onglets du panneau du haut, plus les cinq overlays qui remplacent la table.
  *
- * `DetailTab { Logs, Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail »
- * en plus n'existerait que sur le web, et les deux interfaces ne se ressembleraient plus.
+ * `detail`, `logs`, `status`, `related` sont les onglets du panneau du haut. `DetailTab { Logs,
+ * Status, Related }` côté Rust : mêmes trois, même ordre. Un onglet « Détail » en plus n'existerait
+ * que sur le web, et les deux interfaces ne se ressembleraient plus.
  *
- * `yaml`, `edit` et `delete` viennent après : dans kdt ce sont trois overlays qu'ouvrent `y`, `e` et
- * `Ctrl-D`, et ils marchent dans toutes les vues. Ici ce sont trois onglets du même panneau — les
- * boutons qui les ouvrent vivent dans la barre, le contenu vit là où va tout contenu.
+ * `yaml`, `edit`, `delete` et `ai` viennent après : dans kdt ce sont quatre overlays qu'ouvrent `y`,
+ * `e`, `Ctrl-D` et `i`, et ils marchent dans toutes les vues. Ici les boutons qui les ouvrent vivent
+ * dans la barre, comme dans le TUI, mais leur contenu remplace la table — c'est `ViewBody` qui
+ * décide, pas `InspectPanel`.
  *
- * Ces trois-là sont des **overlays**, pas des onglets permanents : dans kdt on les ouvre et on les
- * ferme. Leur onglet n'apparaît donc que tant qu'on y est, et disparaît dès qu'on va ailleurs —
- * sinon la barre d'onglets doublerait les boutons de la barre d'actions et on ne saurait plus
- * lequel des deux « YAML » sert à quoi.
+ * Ces quatre-là sont des **overlays**, pas des onglets permanents : dans kdt on les ouvre et on les
+ * ferme. Ils n'apparaissent donc que tant qu'on y est, et disparaissent dès qu'on va ailleurs.
  *
  * `custom` est le même contrat, ouvert aux vues : un overlay que kdt n'a que dans une vue — le
  * panneau de drain d'un node — s'ouvre depuis la barre de cette vue et se referme pareil. Il n'y
@@ -56,6 +62,11 @@ const OVERLAY_TABS: PanelTab[] = ["yaml", "edit", "delete", "ai", "custom"];
 /** L'onglet de repli quand un overlay se ferme, ou quand la ligne visée disparaît. */
 function fallbackTab(hasDetail: boolean): PanelTab {
   return hasDetail ? "detail" : "status";
+}
+
+/** Un onglet qui remplace la table le temps qu'on l'y regarde — jamais le panneau du haut. */
+export function isOverlayTab(tab: PanelTab): boolean {
+  return OVERLAY_TABS.includes(tab);
 }
 
 /**
@@ -107,9 +118,6 @@ export function InspectPanel({
   lang,
   st,
   detail,
-  overlay,
-  onDeleted,
-  onNeedsAuth,
 }: {
   /** `null` quand rien n'est sélectionné : le panneau reste en place et le dit. */
   record: EventRecord | null;
@@ -120,43 +128,17 @@ export function InspectPanel({
   lang: Lang;
   st: Strings;
   detail?: DetailPane;
-  /** Un overlay propre à la vue, ouvert par un bouton de sa barre et refermé par sa croix. */
-  overlay?: DetailPane;
-  /** L'objet vient d'être supprimé : la vue relit, et la ligne disparaîtra d'elle-même. */
-  onDeleted?: (message: string) => void;
-  onNeedsAuth: (message: string) => void;
 }) {
   // Un Pod rend ses propres logs, une ressource Flux ceux de son controller filtrés sur elle.
   // Ailleurs, l'onglet resterait vide : remonter d'un Deployment à ses pods demande de choisir
   // lesquels, et ce choix a des règles qu'on ne réinvente pas ici.
   const logs = record ? hasLogs(record) : false;
-  // `y`, `e` et `Ctrl-D` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en
-  // a pas.
-  const addressable = Boolean(record && record.kind && record.name);
-  // L'onglet réellement affiché. Un overlay dont la cible a disparu — ligne désélectionnée, objet
-  // supprimé — retombe sur ce qui reste lisible plutôt que de laisser un onglet sans contenu.
+  // L'onglet réellement affiché. Un `yaml`/`edit`/`delete`/`ai`/`custom` demandé vit dans le
+  // panneau du bas (`ViewBody`) : ici il retombe sur ce qui reste lisible, exactement comme une
+  // ligne désélectionnée ou un objet supprimé — le panneau du haut ne connaît que ses quatre
+  // onglets propres.
   const shown: PanelTab =
-    (OVERLAY_TABS.includes(tab) && !addressable) ||
-    (tab === "detail" && !detail) ||
-    // La vue a retiré son overlay — le geste est fini, ou la ligne a changé de nature : l'onglet
-    // ne doit pas rester à l'écran sans rien derrière.
-    (tab === "custom" && !overlay)
-      ? fallbackTab(Boolean(detail))
-      : tab;
-
-  // `Échap` referme l'overlay avant de replier le panneau — l'ordre du TUI, où la touche ferme ce
-  // qui est ouvert par-dessus. La capture est nécessaire pour passer devant le handler global de
-  // la coquille, qui replierait le panneau entier.
-  useEffect(() => {
-    if (!OVERLAY_TABS.includes(shown)) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      onTab(fallbackTab(Boolean(detail)));
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [shown, detail, onTab]);
+    isOverlayTab(tab) || (tab === "detail" && !detail) ? fallbackTab(Boolean(detail)) : tab;
 
   return (
     <section className="panel" style={{ height }}>
@@ -188,24 +170,6 @@ export function InspectPanel({
           <button role="tab" aria-selected={shown === "related"} onClick={() => onTab("related")}>
             Related
           </button>
-          {/* Les gestes de kdt sur un objet quelconque sont des overlays : leur onglet n'existe
-              que tant qu'on y est. Les ouvrir se fait depuis la barre d'actions — un second jeu de
-              boutons permanent ici ferait deux « YAML » sans dire lequel fait quoi — et la croix
-              referme l'overlay comme `Échap` referme celui du TUI. */}
-          {OVERLAY_TABS.includes(shown) && (
-            <button className="ptab-overlay" role="tab" aria-selected onClick={() => onTab(fallbackTab(Boolean(detail)))}>
-              {shown === "custom"
-                ? (overlay?.label ?? "")
-                : shown === "yaml"
-                  ? st.actionYaml
-                  : shown === "edit"
-                    ? st.actionEdit
-                    : shown === "ai"
-                      ? st.actionAi
-                      : st.actionDelete}
-              <span className="x">✕</span>
-            </button>
-          )}
         </div>
 
         <div className="pid">
@@ -241,7 +205,6 @@ export function InspectPanel({
           <>
             {/* L'onglet propre à la vue passe devant : quand il existe, c'est lui qu'on vient lire. */}
             {shown === "detail" && (detail?.node ?? null)}
-            {shown === "custom" && (overlay?.node ?? null)}
             {shown === "logs" &&
               (logs ? (
                 <LogsPane record={record} lang={lang} />
@@ -254,45 +217,170 @@ export function InspectPanel({
               ))}
             {shown === "status" && <StatusPane record={record} lang={lang} />}
             {shown === "related" && <RelatedPane record={record} lang={lang} />}
-            {shown === "yaml" && <YamlPane key={record.uid} record={record} lang={lang} st={st} />}
-            {shown === "edit" && (
-              <EditPane
-                key={record.uid}
-                record={record}
-                lang={lang}
-                st={st}
-                onNeedsAuth={onNeedsAuth}
-              />
-            )}
-            {/* L'analyse survit à la fermeture de l'onglet : elle vit dans un état de module, pas
-                dans ce composant. Y revenir relit ce qui a été écrit, sans rappeler le modèle. */}
-            {shown === "ai" && (
-              <AiPane
-                key={record.uid}
-                record={record}
-                lang={lang}
-                st={st}
-                onNeedsAuth={onNeedsAuth}
-              />
-            )}
-            {shown === "delete" && (
-              <DeletePane
-                key={record.uid}
-                record={record}
-                lang={lang}
-                st={st}
-                // Annuler referme l'overlay et rend l'objet à sa vue : replier le panneau ferait
-                // disparaître la ligne qu'on vient de décider de garder, et un demi-recul le
-                // laisserait armé.
-                onCancel={() => onTab(fallbackTab(Boolean(detail)))}
-                onDeleted={onDeleted}
-                onNeedsAuth={onNeedsAuth}
-              />
-            )}
           </>
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * Ce que `y`, `e`, `Ctrl-D`, `i` et l'overlay propre d'une vue ouvrent, **à la place de la table**.
+ *
+ * Un YAML, un éditeur, une confirmation de suppression ou une analyse IA prennent une page entière
+ * dans le TUI ; ici ils prennent le panneau du bas plutôt qu'une bande de 300 px sous des onglets.
+ * La croix referme, comme dans le TUI, et rend la table.
+ */
+function ObjectOverlay({
+  tab,
+  record,
+  lang,
+  st,
+  overlay,
+  onClose,
+  onDeleted,
+  onNeedsAuth,
+}: {
+  tab: PanelTab;
+  record: EventRecord;
+  lang: Lang;
+  st: Strings;
+  /** Le contenu de l'overlay `custom`, propre à la vue (le drain d'un node, par exemple). */
+  overlay?: DetailPane;
+  onClose: () => void;
+  onDeleted?: (message: string) => void;
+  onNeedsAuth: (message: string) => void;
+}) {
+  // `Échap` referme l'overlay avant de replier le panneau — l'ordre du TUI, où la touche ferme ce
+  // qui est ouvert par-dessus. La capture est nécessaire pour passer devant le handler global de
+  // la coquille, qui replierait le panneau du haut.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
+  const label =
+    tab === "custom"
+      ? (overlay?.label ?? "")
+      : tab === "yaml"
+        ? st.actionYaml
+        : tab === "edit"
+          ? st.actionEdit
+          : tab === "ai"
+            ? st.actionAi
+            : st.actionDelete;
+
+  return (
+    <div className="body-overlay">
+      <div className="phd">
+        <div className="pid">
+          <span className={`st ${record.tone}`}>{toneLabel(record.tone)}</span>
+          <span className="mono">
+            {record.kind}{" "}
+            {record.namespace ? `${record.namespace}/${record.name}` : record.name}
+          </span>
+        </div>
+        <span className="ov-label">{label}</span>
+        <button
+          className="pclose"
+          title={lang === "fr" ? "Fermer" : "Close"}
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      </div>
+      <div className="pbody">
+        {tab === "custom" && (overlay?.node ?? null)}
+        {tab === "yaml" && <YamlPane key={record.uid} record={record} lang={lang} st={st} />}
+        {tab === "edit" && (
+          <EditPane key={record.uid} record={record} lang={lang} st={st} onNeedsAuth={onNeedsAuth} />
+        )}
+        {/* L'analyse survit à la fermeture de l'overlay : elle vit dans un état de module, pas
+            dans ce composant. Y revenir relit ce qui a été écrit, sans rappeler le modèle. */}
+        {tab === "ai" && (
+          <AiPane key={record.uid} record={record} lang={lang} st={st} onNeedsAuth={onNeedsAuth} />
+        )}
+        {tab === "delete" && (
+          <DeletePane
+            key={record.uid}
+            record={record}
+            lang={lang}
+            st={st}
+            // Annuler referme l'overlay et rend l'objet à sa vue : replier le panneau ferait
+            // disparaître la ligne qu'on vient de décider de garder, et un demi-recul le
+            // laisserait armé.
+            onCancel={onClose}
+            onDeleted={onDeleted}
+            onNeedsAuth={onNeedsAuth}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * L'enveloppe que chaque vue pose autour de sa table, à la place d'un simple `<div className="body">`.
+ *
+ * Elle ne juge rien de la table elle-même — `children` reste ce que la vue rendait déjà — mais
+ * substitue l'overlay demandé quand `tab` en vise un et que la ligne sélectionnée en a un : la
+ * table disparaît, l'overlay prend sa place, et `Échap` ou sa croix la rendent.
+ */
+export function ViewBody({
+  tab,
+  record,
+  lang,
+  st,
+  onTab,
+  overlay,
+  onDeleted,
+  onNeedsAuth,
+  hasDetail,
+  bodyRef,
+  children,
+}: {
+  tab: PanelTab;
+  record: EventRecord | null;
+  lang: Lang;
+  st: Strings;
+  onTab: (t: PanelTab) => void;
+  overlay?: DetailPane;
+  onDeleted?: (message: string) => void;
+  onNeedsAuth: (message: string) => void;
+  /** La vue pose un onglet `detail` : fermer l'overlay y retombe plutôt que sur `status`. */
+  hasDetail?: boolean;
+  bodyRef?: RefObject<HTMLDivElement | null>;
+  children: ReactNode;
+}) {
+  // `y`, `e` et `Ctrl-D` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en
+  // a pas. L'overlay `custom` vise ce que la vue lui a donné, pas l'objet — un drain garde son
+  // node même si la sélection change entre-temps.
+  const addressable = Boolean(record && record.kind && record.name);
+  const active =
+    tab === "custom" ? (overlay ? tab : null) : isOverlayTab(tab) && addressable ? tab : null;
+
+  return (
+    <div className="body" ref={bodyRef}>
+      {active && record ? (
+        <ObjectOverlay
+          tab={active}
+          record={record}
+          lang={lang}
+          st={st}
+          overlay={overlay}
+          onClose={() => onTab(fallbackTab(Boolean(hasDetail)))}
+          onDeleted={onDeleted}
+          onNeedsAuth={onNeedsAuth}
+        />
+      ) : (
+        children
+      )}
+    </div>
   );
 }
 

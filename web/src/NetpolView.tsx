@@ -13,7 +13,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { ObjectActions } from "./objects";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type { EventRecord, NetPolRow, NetpolPayload } from "./types";
 
 /** `NAMESPACE NAME ENGINE TARGET TYPES INGRESS EGRESS AGE`, dans l'ordre du TUI. */
@@ -102,11 +102,6 @@ export default function NetpolView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             detail={
               selectedRow
                 ? { label: st.tabDetail, node: <PolicyDetail policy={selectedRow} st={st} /> }
@@ -139,17 +134,26 @@ export default function NetpolView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={Boolean(selectedRow)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+      >
         {!loaded ? (
           <div className="center" />
         ) : rows.length === 0 ? (
@@ -174,7 +178,7 @@ export default function NetpolView({
             }}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

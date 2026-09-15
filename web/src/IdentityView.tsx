@@ -20,7 +20,7 @@ import { CopyButton } from "./copy";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type {
   EventRecord,
@@ -239,11 +239,6 @@ export default function IdentityView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             detail={{
               label: st.identDetail,
               node: selectedUser ? (
@@ -355,10 +350,7 @@ export default function IdentityView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -367,7 +359,19 @@ export default function IdentityView({
 
       {invite && <InvitePanel invite={invite} st={st} onClose={() => setInvite(null)} />}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+      >
         {!loaded ? (
           <div className="center" />
         ) : (world === "users" ? shownUsers : shownGroups).length === 0 ? (
@@ -409,7 +413,7 @@ export default function IdentityView({
             }}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

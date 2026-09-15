@@ -662,7 +662,7 @@ helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
 
 **L'analyse par une IA** — le `i` de kdt — est offerte dans toutes les vues, sur la ligne
 sélectionnée : le bouton est dans la barre d'actions, à côté des quatre autres gestes, et la réponse
-s'écrit au fil de l'eau dans le panneau du haut. Le prompt est le même que celui du TUI, assemblé
+s'écrit au fil de l'eau dans le panneau du bas, à la place de la table. Le prompt est le même que celui du TUI, assemblé
 côté serveur à partir de ce que **votre** credential a pu lire — status, logs, évènements de
 l'objet, objets liés.
 

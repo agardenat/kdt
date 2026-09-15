@@ -21,7 +21,7 @@ import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { ObjectActions } from "./objects";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   DrainPreflight,
   DrainProgress,
@@ -219,36 +219,11 @@ export default function NodesView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             // Le monde Usage montre le node autrement : les cumuls sont un contenu de l'objet, pas
             // une ligne de la table, et c'est ce que le TUI met sous sa table.
             detail={
               world === "usage" && usage
                 ? { label: st.ndDiagnostic, node: <Diagnostic usage={usage} st={st} /> }
-                : undefined
-            }
-            // Le drain est un overlay, comme dans kdt : il s'ouvre, il se ferme, et son onglet
-            // n'existe que tant qu'on y est.
-            overlay={
-              draining
-                ? {
-                    label: `${st.ndDrainTitle} · ${draining}`,
-                    node: (
-                      <DrainPane
-                        key={draining}
-                        node={draining}
-                        lang={lang}
-                        st={st}
-                        onCancel={() => setDraining(null)}
-                        onFinished={() => void load()}
-                        onNeedsAuth={onNeedsAuth}
-                      />
-                    ),
-                  }
                 : undefined
             }
           />
@@ -300,10 +275,7 @@ export default function NodesView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           {busy && <span className="dim">{st.objWorking}</span>}
@@ -328,7 +300,6 @@ export default function NodesView({
                   setMenuOpen(false);
                   setDraining(selectedNode.name);
                   setTab("custom");
-                  onPanelOpen(true);
                 }}
               />
             )}
@@ -345,7 +316,39 @@ export default function NodesView({
         </div>
       )}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail={world === "usage" && Boolean(usage)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+        // Le drain est l'overlay `custom` de cette vue, comme dans kdt : il s'ouvre, il se ferme,
+        // et son contenu n'existe que tant qu'on y est.
+        overlay={
+          draining
+            ? {
+                label: `${st.ndDrainTitle} · ${draining}`,
+                node: (
+                  <DrainPane
+                    key={draining}
+                    node={draining}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setDraining(null)}
+                    onFinished={() => void load()}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : undefined
+        }
+      >
         {world === "usage" ? (
           !selectedNode ? (
             <div className="center">
@@ -376,7 +379,7 @@ export default function NodesView({
             }}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

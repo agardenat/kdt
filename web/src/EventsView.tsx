@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import { age, toneLabel, type EventRecord } from "./types";
 
@@ -118,7 +118,6 @@ export default function EventsView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
           />
           <Splitter height={panelHeight} onHeight={onPanelHeight} lang={lang} />
         </>
@@ -138,17 +137,14 @@ export default function EventsView({
           <span className="count">{warnings}</span>
         </button>
         <div className="right">
-          {/* Les trois gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h` dans le
-              TUI. Ils vivent dans la barre, comme toutes les actions, et ouvrent le panneau du
-              haut sur ce qu'ils montrent. */}
+          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
+              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
+              ouvrent remplace la table dans le panneau du bas. */}
           <ObjectActions
             record={selected}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -156,7 +152,15 @@ export default function EventsView({
         </div>
       </div>
 
-      <div className="body" ref={bodyRef}>
+      <ViewBody
+        tab={tab}
+        record={selected}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        bodyRef={bodyRef}
+      >
         {visible.length === 0 ? (
           <div className="center">
             <div className="box">
@@ -177,7 +181,7 @@ export default function EventsView({
             }}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>

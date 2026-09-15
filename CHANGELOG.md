@@ -8,6 +8,21 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.3] — 2026-09-15
+
+- **fix(web)** — les overlays des cinq gestes génériques (`y`, `e`, `Ctrl-D`, `i`, et l'overlay
+  propre d'une vue comme le drain d'un node) ne s'affichent plus comme un onglet de plus dans le
+  panneau du haut : ils remplacent la table, dans le panneau du bas — un YAML ou un éditeur se
+  lisaient mal dans une bande de 300 px. `InspectPanel` ne garde que ses quatre onglets propres
+  (`Detail`, `Logs`, `Status`, `Related`) ; `ViewBody`, posé autour de la table de chaque vue,
+  décide seul de la substitution et referme sur `Échap` ou sa croix, comme avant.
+
+  Corrige au passage le rappel automatique de l'analyse IA à chaque rafraîchissement de la vue :
+  sa clé de mémoïsation incluait l'horodatage du `EventRecord`, qui vaut `Timestamp::now()` côté
+  serveur pour tout objet synthétique (Flux, RBAC, Velero, Kyverno, Storage, certs, nodes…) — donc
+  réécrit à chaque poll même quand rien n'avait changé côté cluster. La clé retient désormais
+  l'identité de l'objet seule, comme le fait déjà `record.ts` pour les autres onglets du panneau.
+
 ## [2.0.0-rc.2] — 2026-09-09
 
 - **feat(identity, web)** — les vues `:identity` et sa jumelle web suivent kdt-identity 1.3 : un

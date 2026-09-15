@@ -20,7 +20,7 @@ import { CopyButton } from "./copy";
 import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { InspectPanel, PanelToggle, Splitter, type PanelTab } from "./panel";
+import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { ObjectActions } from "./objects";
 import type {
   EventRecord,
@@ -247,11 +247,6 @@ export default function RancherView({
             height={panelHeight}
             lang={lang}
             st={st}
-            onNeedsAuth={onNeedsAuth}
-            onDeleted={() => {
-              setSelected(null);
-              void load();
-            }}
             detail={{
               label: st.ranchDetail,
               node: selectedUser ? (
@@ -364,10 +359,7 @@ export default function RancherView({
             record={selectedRecord}
             lang={lang}
             st={st}
-            onOpen={(t) => {
-              setTab(t);
-              onPanelOpen(true);
-            }}
+            onOpen={(t) => setTab(t)}
             onNeedsAuth={onNeedsAuth}
           />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
@@ -376,7 +368,19 @@ export default function RancherView({
 
       {issued && <IssuedPanel token={issued} st={st} onClose={() => setIssued(null)} />}
 
-      <div className="body">
+      <ViewBody
+        tab={tab}
+        record={selectedRecord}
+        lang={lang}
+        st={st}
+        onTab={setTab}
+        onNeedsAuth={onNeedsAuth}
+        hasDetail
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+      >
         {!loaded ? (
           <div className="center" />
         ) : shownCount === 0 ? (
@@ -405,7 +409,7 @@ export default function RancherView({
             onSelect={select}
           />
         )}
-      </div>
+      </ViewBody>
 
       <div className="statusbar">
         <span>
