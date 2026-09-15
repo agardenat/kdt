@@ -17,10 +17,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
-import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   DrainPreflight,
@@ -34,9 +34,10 @@ import type {
   UsageRatio,
 } from "./types";
 
-/** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. */
+/** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`44px`) porte la
+ * case de sélection multiple. */
 const NODE_COLUMNS =
-  "minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px minmax(180px,1.2fr)";
+  "44px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px minmax(180px,1.2fr)";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -85,9 +86,10 @@ export default function NodesView({
   const [world, setWorld] = useState<World>("nodes");
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
-  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   // L'usage du node sélectionné. Il ne se lit que dans son monde : c'est une liste de tous les pods
   // du node plus les métriques du cluster, et la payer pendant qu'on lit l'inventaire serait la
@@ -153,9 +155,6 @@ export default function NodesView({
 
   useToastTimeout(toast, setToast);
 
-  const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
-
   const needle = query.trim().toLowerCase();
   const shown = useMemo(
     () =>
@@ -186,12 +185,10 @@ export default function NodesView({
   const selectedRecord: EventRecord | null = selectedNode?.record ?? null;
 
   const cordon = useCallback(
-    async (unschedulable: boolean) => {
-      if (!selectedName) return;
-      setMenuOpen(false);
+    async (name: string, unschedulable: boolean) => {
       setBusy(true);
       try {
-        const { message } = await api.nodeCordon(selectedName, unschedulable, lang);
+        const { message } = await api.nodeCordon(name, unschedulable, lang);
         setToast({ tone: "ok", text: message });
         void load();
       } catch (e) {
@@ -201,8 +198,16 @@ export default function NodesView({
         setBusy(false);
       }
     },
-    [selectedName, lang, load, onNeedsAuth],
+    [lang, load, onNeedsAuth],
   );
+
+  // Le drain d'une ligne vise **son** node, pas forcément celui qu'on inspecte déjà : ouvrir le
+  // hamburger d'une autre ligne doit pouvoir drainer celle-là sans passer par la sélection.
+  const drainRow = useCallback((n: NodeRow) => {
+    setSelected(n.uid);
+    setDraining(n.name);
+    setTab("custom");
+  }, []);
 
   const ready = nodes.filter((n) => n.ready === "True").length;
   const alerting = nodes.filter((n) => n.alerts.length > 0).length;
@@ -271,39 +276,7 @@ export default function NodesView({
         )}
 
         <div className="right">
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           {busy && <span className="dim">{st.objWorking}</span>}
-          {/* Les actions vivent dans la barre et portent sur la ligne sélectionnée, comme partout
-              ailleurs. Ce qui est attaché à l'objet, ce sont les plis — et un node n'en a pas. */}
-          <div className="menu-anchor" ref={menuRef}>
-            <button
-              className="panel-toggle action"
-              disabled={!selectedNode}
-              title={selectedNode ? undefined : st.ndSelectNode}
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((v) => !v)}
-            >
-              {st.ndActions} ▾
-            </button>
-            {menuOpen && selectedNode && (
-              <NodeMenu
-                node={selectedNode}
-                st={st}
-                onCordon={cordon}
-                onDrain={() => {
-                  setMenuOpen(false);
-                  setDraining(selectedNode.name);
-                  setTab("custom");
-                }}
-              />
-            )}
-          </div>
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -348,6 +321,30 @@ export default function NodesView({
               }
             : undefined
         }
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={nodes.filter((n) => checked.has(n.uid)).map((n) => n.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {world === "usage" ? (
           !selectedNode ? (
@@ -374,9 +371,23 @@ export default function NodesView({
           <NodeTable
             rows={shown}
             selected={selected}
+            lang={lang}
+            st={st}
             onSelect={(uid) => {
               setSelected(uid);
             }}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            onCordon={cordon}
+            onDrain={drainRow}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -409,16 +420,46 @@ export default function NodesView({
 function NodeTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  onCordon,
+  onDrain,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: NodeRow[];
   selected: string | null;
+  lang: Lang;
+  st: Strings;
   onSelect: (uid: string) => void;
+  onOpenTab: (uid: string, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  onCordon: (name: string, unschedulable: boolean) => void;
+  onDrain: (n: NodeRow) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((n) => n.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAME</div>
           <div className="cell">READY</div>
           <div className="cell">ROLES</div>
@@ -440,7 +481,36 @@ function NodeTable({
               if (e.key === "Enter") onSelect(n.uid);
             }}
           >
-            <div className="cell id">{n.name}</div>
+            <RowCheckbox
+              checked={checked.has(n.uid)}
+              onToggle={() => onToggleCheck(n.uid)}
+              label={st.selectRow}
+            />
+            <div className="cell id">
+              <RowMenu
+                record={n.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(n.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {({ close }) => (
+                  <NodeMenu
+                    node={n}
+                    st={st}
+                    onCordon={(unschedulable) => {
+                      close();
+                      onCordon(n.name, unschedulable);
+                    }}
+                    onDrain={() => {
+                      close();
+                      onDrain(n);
+                    }}
+                  />
+                )}
+              </RowMenu>
+              {n.name}
+            </div>
             <div className={`cell mono tone-${n.ready_tone}`}>{n.ready}</div>
             <div className="cell mono">{n.roles}</div>
             <div className="cell mono dim">{n.version}</div>
@@ -478,30 +548,25 @@ function NodeMenu({
   onCordon: (unschedulable: boolean) => void;
   onDrain: () => void;
 }) {
+  // Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui.
   return (
-    <div className="pop menu" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.ndActions}</span>
-      </div>
-      <div className="menu-target mono">Node {node.name}</div>
-      <div className="menu-list">
-        {node.schedulable ? (
-          <button className="menu-item" onClick={() => onCordon(true)}>
-            <span className="lbl">{st.ndCordon}</span>
-            <span className="desc">{st.ndDescCordon}</span>
-          </button>
-        ) : (
-          <button className="menu-item" onClick={() => onCordon(false)}>
-            <span className="lbl">{st.ndUncordon}</span>
-            <span className="desc">{st.ndDescUncordon}</span>
-          </button>
-        )}
-        <button className="menu-item" onClick={onDrain}>
-          <span className="lbl">{st.ndDrain}</span>
-          <span className="desc">{st.ndDescDrain}</span>
+    <>
+      {node.schedulable ? (
+        <button className="menu-item" onClick={() => onCordon(true)}>
+          <span className="lbl">{st.ndCordon}</span>
+          <span className="desc">{st.ndDescCordon}</span>
         </button>
-      </div>
-    </div>
+      ) : (
+        <button className="menu-item" onClick={() => onCordon(false)}>
+          <span className="lbl">{st.ndUncordon}</span>
+          <span className="desc">{st.ndDescUncordon}</span>
+        </button>
+      )}
+      <button className="menu-item" onClick={onDrain}>
+        <span className="lbl">{st.ndDrain}</span>
+        <span className="desc">{st.ndDescDrain}</span>
+      </button>
+    </>
   );
 }
 

@@ -11,11 +11,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
-import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   VelBackupRow,
@@ -29,10 +29,17 @@ import type {
   VelWorld,
 } from "./types";
 
-/** Les colonnes du TUI : `NAMESPACE NAME KIND STATE INFO EXPIRE AGE ALERT`, dans le même ordre. */
+/** Les colonnes du TUI : `NAMESPACE NAME KIND STATE INFO EXPIRE AGE ALERT`, dans le même ordre. La
+ * première piste (`44px`) porte la case de sélection multiple. */
 const COLUMNS =
-  "minmax(110px,16ch) minmax(240px,1.1fr) 76px minmax(120px,16ch) minmax(180px,24ch)" +
+  "44px minmax(110px,16ch) minmax(240px,1.1fr) 76px minmax(120px,16ch) minmax(180px,24ch)" +
   " 76px 56px minmax(200px,1.4fr)";
+
+/** Une ligne sans objet à elle (un `orphans` synthétique, une feuille de contenu sans
+ * enregistrement) n'a pas de case ni de hamburger. */
+function usable(record: EventRecord | null): boolean {
+  return Boolean(record && record.kind && record.name);
+}
 
 export default function VeleroView({
   lang,
@@ -64,14 +71,19 @@ export default function VeleroView({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
-  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
   // Le contenu d'un backup, téléchargé à la demande : uid du backup → son inventaire.
   const [contents, setContents] = useState<Record<string, VelContentsPayload | "loading">>({});
   const [ctExpanded, setCtExpanded] = useState<Set<string>>(new Set());
   // Le log du run affiché, s'il y en a un. Il appartient à la ligne pour laquelle il a été demandé.
   const [log, setLog] = useState<{ uid: string; payload: VelLogPayload } | null>(null);
+  // La restauration à la carte est un formulaire trop large pour un hamburger : elle prend
+  // l'overlay `custom` du panneau du bas, comme le drain d'un node. Elle porte le backup visé,
+  // pas la sélection — changer de ligne pendant qu'on la remplit ne doit pas la faire disparaître.
+  const [restoring, setRestoring] = useState<VelBackupRow | null>(null);
 
   const namespace = namespaces[0] ?? "";
 
@@ -97,9 +109,6 @@ export default function VeleroView({
   }, [load]);
 
   useToastTimeout(toast, setToast);
-
-  const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   const rows = payload?.rows ?? [];
   const needle = query.trim().toLowerCase();
@@ -147,6 +156,26 @@ export default function VeleroView({
     }
     return null;
   }, [selectedRow, display, selected]);
+
+  // La sélection multiple retrouve son `EventRecord` ici : les lignes principales, et les feuilles
+  // de contenu actuellement téléchargées — celles qui n'ont pas encore d'enregistrement en sont
+  // exclues, comme le hamburger de ligne les exclut déjà.
+  const allRecords = useMemo<{ uid: string; record: EventRecord }[]>(() => {
+    const out: { uid: string; record: EventRecord }[] = rows.map((r) => ({
+      uid: r.uid,
+      record: r.record,
+    }));
+    for (const entry of display) {
+      if ("item" in entry && entry.record) out.push({ uid: entry.uid, record: entry.record });
+    }
+    return out;
+  }, [rows, display]);
+
+  const openRestoreForm = useCallback((row: VelBackupRow) => {
+    setSelected(row.uid);
+    setRestoring(row);
+    setTab("custom");
+  }, []);
 
   const toggleFold = useCallback((uid: string) => {
     setCollapsed((prev) => {
@@ -213,7 +242,6 @@ export default function VeleroView({
 
   const run = useCallback(
     async (request: Parameters<typeof api.veleroWrite>[0]) => {
-      setMenuOpen(false);
       setBusy(true);
       try {
         const { message } = await api.veleroWrite(request, lang);
@@ -232,8 +260,6 @@ export default function VeleroView({
   );
 
   const counts = payload?.counts;
-  const actionable =
-    selectedRow?.row === "schedule" || selectedRow?.row === "backup" ? selectedRow : null;
 
   return (
     <>
@@ -308,32 +334,6 @@ export default function VeleroView({
           >
             {st.velLogs}
           </button>
-          <div className="menu-anchor" ref={menuRef}>
-            <button
-              className="panel-toggle action"
-              disabled={!actionable}
-              title={actionable ? undefined : st.velNoAction}
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((v) => !v)}
-            >
-              {st.velActions} ▾
-            </button>
-            {menuOpen && actionable && (
-              <ActionMenu
-                st={st}
-                row={actionable}
-                contents={contents[actionable.uid]}
-                onRun={(r) => void run(r)}
-              />
-            )}
-          </div>
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -354,6 +354,62 @@ export default function VeleroView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         hasDetail={Boolean(payload)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+        overlay={
+          restoring
+            ? {
+                label: `${st.velRestoreOpts} · ${restoring.namespace}/${restoring.name}`,
+                node: (
+                  <RestoreForm
+                    st={st}
+                    row={restoring}
+                    contents={
+                      typeof contents[restoring.uid] === "object"
+                        ? (contents[restoring.uid] as VelContentsPayload)
+                        : null
+                    }
+                    onCancel={() => setRestoring(null)}
+                    onSubmit={(restore) => {
+                      setRestoring(null);
+                      void run({
+                        action: "restore",
+                        namespace: restoring.namespace,
+                        name: restoring.name,
+                        restore,
+                      });
+                    }}
+                  />
+                ),
+              }
+            : undefined
+        }
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={allRecords.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -378,6 +434,16 @@ export default function VeleroView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+                <SelectionHeaderCell
+                  keys={display
+                    .filter((e) => ("item" in e ? usable(e.record) : usable(e.row.record)))
+                    .map((e) => ("item" in e ? e.uid : e.row.uid))}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">KIND</div>
@@ -394,10 +460,16 @@ export default function VeleroView({
                   <ContentsRow
                     key={entry.uid}
                     entry={entry}
+                    lang={lang}
                     st={st}
                     expanded={ctExpanded.has(entry.key)}
                     selected={selected === entry.uid}
                     onSelect={() => setSelected(entry.uid)}
+                    onOpenTab={(t) => {
+                      setSelected(entry.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
                     onFold={() =>
                       setCtExpanded((prev) => {
                         const next = new Set(prev);
@@ -406,11 +478,14 @@ export default function VeleroView({
                         return next;
                       })
                     }
+                    checked={checked.has(entry.uid)}
+                    onToggleCheck={() => toggle(entry.uid)}
                   />
                 ) : (
                   <Line
                     key={entry.row.uid}
                     row={entry.row}
+                    lang={lang}
                     st={st}
                     grouped={group && world === "backups"}
                     collapsed={collapsed.has(entry.row.uid)}
@@ -424,10 +499,19 @@ export default function VeleroView({
                     }
                     selected={selected === entry.row.uid}
                     onSelect={() => setSelected(entry.row.uid)}
+                    onOpenTab={(t) => {
+                      setSelected(entry.row.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
                     onFold={() => toggleFold(entry.row.uid)}
                     onContents={() =>
                       entry.row.row === "backup" && void toggleContents(entry.row)
                     }
+                    onRun={run}
+                    onOpenRestoreForm={openRestoreForm}
+                    checked={checked.has(entry.row.uid)}
+                    onToggleCheck={() => toggle(entry.row.uid)}
                   />
                 ),
               )}
@@ -501,6 +585,7 @@ function ServerLine({ server, st }: { server: VeleroPayload["server"]; st: Strin
 
 function Line({
   row,
+  lang,
   st,
   grouped,
   collapsed,
@@ -508,10 +593,17 @@ function Line({
   contentsCount,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onFold,
   onContents,
+  onRun,
+  onOpenRestoreForm,
+  checked,
+  onToggleCheck,
 }: {
   row: VelRow;
+  lang: Lang;
   st: Strings;
   grouped: boolean;
   collapsed: boolean;
@@ -519,11 +611,35 @@ function Line({
   contentsCount: number | null;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onFold: () => void;
   onContents: () => void;
+  onRun: (request: Parameters<typeof api.veleroWrite>[0]) => void;
+  onOpenRestoreForm: (row: VelBackupRow) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   const foldable = grouped && (row.row === "schedule" || row.row === "orphans");
   const indent = grouped && row.row === "backup" ? 1.15 : 0;
+  const rowUsable = usable(row.record);
+  const actionMenu =
+    row.row === "schedule" || row.row === "backup"
+      ? ({ close }: { close: () => void }) => (
+          <ActionMenu
+            st={st}
+            row={row}
+            onRun={(r) => {
+              close();
+              onRun(r);
+            }}
+            onOpenRestoreForm={() => {
+              close();
+              if (row.row === "backup") onOpenRestoreForm(row);
+            }}
+          />
+        )
+      : undefined;
 
   return (
     <div
@@ -540,6 +656,11 @@ function Line({
         }
       }}
     >
+      {rowUsable ? (
+        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      ) : (
+        <div className="cell sel" />
+      )}
       <div className="cell mono dim">{"namespace" in row ? row.namespace : ""}</div>
       <div className="cell id" style={{ paddingLeft: `${indent}rem` }}>
         {foldable ? (
@@ -556,6 +677,11 @@ function Line({
           </button>
         ) : (
           <span className="fold-gap" />
+        )}
+        {rowUsable && (
+          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+            {actionMenu}
+          </RowMenu>
         )}
         {row.name}
         {/* L'équivalent des touches `+`/`-` du TUI. Le contenu se télécharge depuis le stockage
@@ -627,19 +753,30 @@ interface ContentsLine {
 
 function ContentsRow({
   entry,
+  lang,
   st,
   expanded,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onFold,
+  checked,
+  onToggleCheck,
 }: {
   entry: ContentsLine;
+  lang: Lang;
   st: Strings;
   expanded: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onFold: () => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
+  const rowUsable = usable(entry.record);
   return (
     <div
       className="tr vel-contents"
@@ -655,6 +792,11 @@ function ContentsRow({
         }
       }}
     >
+      {rowUsable ? (
+        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      ) : (
+        <div className="cell sel" />
+      )}
       {/* La colonne NAMESPACE reste vide : ailleurs dans cette table elle nomme le namespace de
           l'objet velero, et un namespace capturé posé là se lirait comme la même chose. */}
       <div className="cell" />
@@ -673,6 +815,15 @@ function ContentsRow({
           </button>
         ) : (
           <span className="fold-gap" />
+        )}
+        {rowUsable && entry.record && (
+          <RowMenu
+            record={entry.record}
+            lang={lang}
+            st={st}
+            onOpen={onOpenTab}
+            onNeedsAuth={onNeedsAuth}
+          />
         )}
         {entry.label}
       </div>
@@ -759,32 +910,17 @@ function contentsLines(
 function ActionMenu({
   st,
   row,
-  contents,
   onRun,
+  onOpenRestoreForm,
 }: {
   st: Strings;
   row: VelScheduleRow | VelBackupRow;
-  contents: VelContentsPayload | "loading" | undefined;
   onRun: (r: Parameters<typeof api.veleroWrite>[0]) => void;
+  onOpenRestoreForm: () => void;
 }) {
   const [arming, setArming] = useState<{ label: string; desc: string; run: () => void } | null>(
     null,
   );
-  const [form, setForm] = useState(false);
-
-  if (form && row.row === "backup") {
-    return (
-      <RestoreForm
-        st={st}
-        row={row}
-        contents={typeof contents === "object" ? contents : null}
-        onCancel={() => setForm(false)}
-        onSubmit={(restore) =>
-          onRun({ action: "restore", namespace: row.namespace, name: row.name, restore })
-        }
-      />
-    );
-  }
 
   const items: Array<{ label: string; desc: string; run: () => void }> = [];
   if (row.row === "schedule") {
@@ -831,48 +967,38 @@ function ActionMenu({
     }
   }
 
-  return (
-    <div className="pop menu" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.velActions}</span>
+  // Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui.
+  return arming ? (
+    <div className="menu-confirm">
+      <p>{arming.desc}</p>
+      <div className="menu-buttons">
+        {/* Annuler d'abord et autofocus : la sortie par défaut est celle qui n'écrit rien. */}
+        <button autoFocus onClick={() => setArming(null)}>
+          {st.fluxCancel}
+        </button>
+        <button className="cta" onClick={arming.run}>
+          {st.fluxConfirm} · {arming.label}
+        </button>
       </div>
-      <div className="menu-target mono">
-        {row.namespace}/{row.name}
-      </div>
-
-      {arming ? (
-        <div className="menu-confirm">
-          <p>{arming.desc}</p>
-          <div className="menu-buttons">
-            {/* Annuler d'abord et autofocus : la sortie par défaut est celle qui n'écrit rien. */}
-            <button autoFocus onClick={() => setArming(null)}>
-              {st.fluxCancel}
-            </button>
-            <button className="cta" onClick={arming.run}>
-              {st.fluxConfirm} · {arming.label}
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="menu-list">
-          {items.map((a) => (
-            <button key={a.label} className="menu-item" onClick={() => setArming(a)}>
-              <span className="lbl">{a.label}</span>
-              <span className="desc">{a.desc}</span>
-            </button>
-          ))}
-          {/* La restauration à la carte n'est pas une confirmation mais un formulaire : elle ouvre
-              son propre écran plutôt que d'armer. */}
-          {row.row === "backup" && (row.usable || row.partially_failed) && (
-            <button className="menu-item" onClick={() => setForm(true)}>
-              <span className="lbl">{st.velRestoreOpts}</span>
-              <span className="desc">{st.velRestoreOptsHelp}</span>
-            </button>
-          )}
-          {items.length === 0 && <p className="menu-note">{st.velNoAction}</p>}
-        </div>
-      )}
     </div>
+  ) : (
+    <>
+      {items.map((a) => (
+        <button key={a.label} className="menu-item" onClick={() => setArming(a)}>
+          <span className="lbl">{a.label}</span>
+          <span className="desc">{a.desc}</span>
+        </button>
+      ))}
+      {/* La restauration à la carte n'est pas une confirmation mais un formulaire : elle ouvre
+          l'overlay `custom` du panneau du bas plutôt que d'armer dans le hamburger. */}
+      {row.row === "backup" && (row.usable || row.partially_failed) && (
+        <button className="menu-item" onClick={onOpenRestoreForm}>
+          <span className="lbl">{st.velRestoreOpts}</span>
+          <span className="desc">{st.velRestoreOptsHelp}</span>
+        </button>
+      )}
+      {items.length === 0 && <p className="menu-note">{st.velNoAction}</p>}
+    </>
   );
 }
 
@@ -937,15 +1063,10 @@ function RestoreForm({
 
   const ready = namespaces.length > 0 && (!overwrite || typed === row.name);
 
+  // Posé dans l'overlay `custom` du panneau du bas — trop large pour le hamburger de ligne —
+  // l'identité du backup et le titre sont déjà portés par le bandeau de l'overlay.
   return (
-    <div className="pop menu wide" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.velRestoreOpts}</span>
-      </div>
-      <div className="menu-target mono">
-        {row.namespace}/{row.name}
-      </div>
-
+    <div className="editor">
       <div className="vel-form">
         <div className="sect">{manual ? st.velRoNsManual : st.velRoNamespaces}</div>
         {manual ? (

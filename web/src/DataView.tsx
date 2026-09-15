@@ -18,12 +18,15 @@ import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
 
+/** La première piste (`44px`) porte la case de sélection multiple. */
 const SECRET_COLUMNS =
-  "minmax(220px,1.4fr) minmax(120px,18ch) minmax(140px,20ch) 72px minmax(150px,1fr) 56px";
-const CM_COLUMNS = "minmax(240px,1.6fr) minmax(120px,18ch) 64px 80px minmax(150px,1fr) 56px";
+  "44px minmax(220px,1.4fr) minmax(120px,18ch) minmax(140px,20ch) 72px minmax(150px,1fr) 56px";
+const CM_COLUMNS =
+  "44px minmax(240px,1.6fr) minmax(120px,18ch) 64px 80px minmax(150px,1fr) 56px";
 
 type World = "secrets" | "configmaps";
 
@@ -73,6 +76,8 @@ export default function DataView({
   // Le filtre `f` du TUI, qui y cycle sur une touche. Ici les trois états tiennent côte à côte :
   // on voit lequel est actif sans avoir à appuyer pour le découvrir.
   const [filter, setFilter] = useState<SecretFilter>("all");
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const namespace = namespaces[0] ?? "";
 
@@ -106,6 +111,7 @@ export default function DataView({
   }, [load]);
 
   useEffect(() => setSelected(null), [world]);
+  useEffect(() => clear(), [world, clear]);
 
   // Le saut d'une autre vue atterrit dès que sa cible apparaît dans la liste : la lecture peut ne
   // pas être finie quand le geste est fait. Il ne change pas la portée — comme dans kdt, où `s`
@@ -264,16 +270,6 @@ export default function DataView({
               {st.secOpenChain}
             </button>
           )}
-          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
-              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
-              ouvrent remplace la table dans le panneau du bas. */}
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -286,6 +282,32 @@ export default function DataView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         hasDetail
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={(world === "secrets" ? visibleSecrets : visibleConfigmaps)
+                      .filter((r) => checked.has(r.uid))
+                      .map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -303,6 +325,14 @@ export default function DataView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: SECRET_COLUMNS }}>
+                <SelectionHeaderCell
+                  keys={visibleSecrets.map((s) => s.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">TYPE</div>
@@ -316,12 +346,20 @@ export default function DataView({
                 <SecretLine
                   key={s.uid}
                   s={s}
+                  lang={lang}
                   st={st}
                   selected={selected === s.uid}
                   onSelect={() => {
                     setSelected(s.uid);
                     setTab("detail");
                   }}
+                  onOpenTab={(t) => {
+                    setSelected(s.uid);
+                    setTab(t);
+                  }}
+                  onNeedsAuth={onNeedsAuth}
+                  checked={checked.has(s.uid)}
+                  onToggleCheck={() => toggle(s.uid)}
                 />
               ))}
             </div>
@@ -330,6 +368,14 @@ export default function DataView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: CM_COLUMNS }}>
+                <SelectionHeaderCell
+                  keys={visibleConfigmaps.map((c) => c.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
                 <div className="cell num">KEYS</div>
@@ -343,11 +389,20 @@ export default function DataView({
                 <ConfigMapLine
                   key={c.uid}
                   c={c}
+                  lang={lang}
+                  st={st}
                   selected={selected === c.uid}
                   onSelect={() => {
                     setSelected(c.uid);
                     setTab("detail");
                   }}
+                  onOpenTab={(t) => {
+                    setSelected(c.uid);
+                    setTab(t);
+                  }}
+                  onNeedsAuth={onNeedsAuth}
+                  checked={checked.has(c.uid)}
+                  onToggleCheck={() => toggle(c.uid)}
                 />
               ))}
             </div>
@@ -374,14 +429,24 @@ export default function DataView({
 
 function SecretLine({
   s,
+  lang,
   st,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
 }: {
   s: SecretRow;
+  lang: Lang;
   st: Strings;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   return (
     <div
@@ -394,7 +459,11 @@ function SecretLine({
         if (e.key === "Enter") onSelect();
       }}
     >
-      <div className="cell id">{s.name}</div>
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      <div className="cell id">
+        <RowMenu record={s.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+        {s.name}
+      </div>
       <div className="cell mono dim">{s.namespace}</div>
       <div className="cell mono dim" title={s.type_}>
         {s.type_.replace("kubernetes.io/", "")}
@@ -420,12 +489,24 @@ function SecretLine({
 
 function ConfigMapLine({
   c,
+  lang,
+  st,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
 }: {
   c: ConfigMapRow;
+  lang: Lang;
+  st: Strings;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   return (
     <div
@@ -438,7 +519,11 @@ function ConfigMapLine({
         if (e.key === "Enter") onSelect();
       }}
     >
-      <div className="cell id">{c.name}</div>
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      <div className="cell id">
+        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+        {c.name}
+      </div>
       <div className="cell mono dim">{c.namespace}</div>
       <div className="cell num dim">{c.keys.length}</div>
       <div className="cell num dim">{size(c.total_bytes)}</div>

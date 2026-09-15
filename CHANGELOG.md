@@ -8,6 +8,27 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.4] — 2026-09-15
+
+- **feat(web)** — les gestes qui visent une ligne sont **sur la ligne** : un menu `☰` en tête de
+  chaque ligne porte les cinq gestes génériques de kdt (`y`, `e`, `h`, `Ctrl-D`, `i`) et ce que la
+  vue ajoute pour ce kind — scale, cordon, réconciliation, restauration. La barre au-dessus de la
+  table ne garde que ce qui ne vise aucune ligne, et il n'y a plus à sélectionner d'abord pour
+  agir ensuite. Le menu est rendu hors de la table : une cellule découpe ce qui dépasse, c'est ce
+  qui élide les noms trop longs, et un menu posé dedans ne se verrait pas.
+
+- **feat(web)** — une **colonne de cases** ouvre la sélection multiple, et son en-tête porte le
+  menu des actions groupées : aujourd'hui la suppression. Chaque objet garde son propre préflight
+  et son propre garde-fou — un constat grave exige toujours de retaper le nom de l'objet concerné,
+  pas un compte global — et l'écriture se fait objet par objet, chaque ligne montrant où elle en
+  est. Un échec laisse le panneau ouvert sur son erreur et se relance sans resupprimer ce qui est
+  déjà passé. Les lignes de container n'ont pas de case : un container n'est pas un objet de
+  l'API, et le supprimer reviendrait à supprimer son pod sans le dire.
+
+  Corrige au passage un décalage qui précédait ce changement : les lignes de pod de la vue
+  Workloads n'émettaient pas de cellule pour la colonne `NAMESPACE`, et toute la ligne était
+  décalée d'une colonne par rapport à son en-tête.
+
 ## [2.0.0-rc.3] — 2026-09-15
 
 - **fix(web)** — les overlays des cinq gestes génériques (`y`, `e`, `Ctrl-D`, `i`, et l'overlay

@@ -17,11 +17,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import { CopyButton } from "./copy";
-import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   Hint,
@@ -34,22 +34,23 @@ import type {
   RanchUserRow,
 } from "./types";
 
-/** `RANCHER ID IDENTITY LOGIN PROVIDER GLOBAL ROLE GRP ACC TOK REFRESH STATE AGE`. */
+/** `RANCHER ID IDENTITY LOGIN PROVIDER GLOBAL ROLE GRP ACC TOK REFRESH STATE AGE`. La première
+ * piste (`44px`) porte la case de sélection multiple. */
 const USER_COLUMNS =
-  "minmax(110px,16ch) minmax(180px,26ch) minmax(90px,16ch) 104px minmax(140px,1fr)" +
+  "44px minmax(110px,16ch) minmax(180px,26ch) minmax(90px,16ch) 104px minmax(140px,1fr)" +
   " 40px 40px 40px 64px 76px 48px";
 
 /** `SCOPE TARGET SUBJECT TYPE PROVIDER ROLE AGE`. */
 const BINDING_COLUMNS =
-  "72px minmax(90px,16ch) minmax(180px,28ch) 56px 116px minmax(160px,1fr) 48px";
+  "44px 72px minmax(90px,16ch) minmax(180px,28ch) 56px 116px minmax(160px,1fr) 48px";
 
 /** `PROJECT ID CLUSTER NS MEMBERS OWNERS QUOTA AGE`. */
 const PROJECT_COLUMNS =
-  "minmax(130px,20ch) 88px 96px 44px 68px minmax(160px,1fr) minmax(140px,26ch) 48px";
+  "44px minmax(130px,20ch) 88px 96px 44px 68px minmax(160px,1fr) minmax(140px,26ch) 48px";
 
 /** `TOKEN USER PROVIDER KIND SCOPE TTL STATE AGE`. */
 const TOKEN_COLUMNS =
-  "minmax(180px,32ch) minmax(160px,1fr) 116px 104px 96px 76px 76px 48px";
+  "44px minmax(180px,32ch) minmax(160px,1fr) 116px 104px 96px 76px 76px 48px";
 
 type World = "users" | "access" | "projects" | "tokens";
 type Filter = "all" | "problems";
@@ -82,13 +83,13 @@ export default function RancherView({
   const [filter, setFilter] = useState<Filter>("all");
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [form, setForm] = useState<Form>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
   // Le credential d'un token émis n'existe que là, le temps qu'on le copie. Il n'est écrit ni dans
   // l'état de la liste, ni dans un log, ni sur disque.
   const [issued, setIssued] = useState<IssuedToken | null>(null);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -112,16 +113,6 @@ export default function RancherView({
   }, [load]);
 
   useToastTimeout(toast, setToast);
-
-  // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
-  // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
-  // rouvrirait dans le même geste. Le formulaire en cours part avec le menu : rouvrir sur une
-  // saisie à moitié faite ferait agir sur un état qu'on ne relit pas.
-  const closeMenu = useCallback(() => {
-    setMenuOpen(false);
-    setForm(null);
-  }, []);
-  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   const needle = query.trim().toLowerCase();
   const worse = (hints: Hint[]) => hints.some((h) => h.level !== "info");
@@ -190,8 +181,6 @@ export default function RancherView({
 
   const run = useCallback(
     async (request: Record<string, unknown>) => {
-      setMenuOpen(false);
-      setForm(null);
       setBusy(true);
       try {
         const { message, token } = await api.rancherWrite(request, lang);
@@ -282,6 +271,7 @@ export default function RancherView({
             onClick={() => {
               setWorld(id);
               setSelected(null);
+              clear();
             }}
           >
             {label}
@@ -327,41 +317,6 @@ export default function RancherView({
         <div className="right">
           {busy && <span>{st.objWorking}</span>}
           <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
-          <div className="menu-anchor" ref={menuRef}>
-            <button
-              className="panel-toggle action"
-              // Un downstream n'a que des répliques : le menu ne s'ouvre pas, et l'infobulle dit
-              // pourquoi plutôt que de laisser découvrir le refus après la confirmation.
-              disabled={!writable}
-              title={writable ? undefined : readOnlyReason}
-              aria-expanded={menuOpen}
-              onClick={() => {
-                setMenuOpen((v) => !v);
-                setForm(null);
-              }}
-            >
-              {st.ranchActions} ▾
-            </button>
-            {menuOpen && writable && (
-              <RancherMenu
-                st={st}
-                user={selectedUser}
-                token={selectedToken}
-                setting={selectedSetting}
-                hashing={payload?.token_hashing ?? false}
-                form={form}
-                onForm={setForm}
-                onRun={run}
-              />
-            )}
-          </div>
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -380,6 +335,32 @@ export default function RancherView({
           setSelected(null);
           void load();
         }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={[...users, ...bindings, ...projects, ...settings, ...tokens]
+                      .filter((r) => checked.has(r.uid))
+                      .map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -395,18 +376,82 @@ export default function RancherView({
             </div>
           </div>
         ) : world === "users" ? (
-          <UserTable rows={users} selected={selected} onSelect={select} />
+          <UserTable
+            rows={users}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            writable={writable}
+            hashing={payload?.token_hashing ?? false}
+            onRun={run}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : world === "access" ? (
-          <BindingTable rows={bindings} selected={selected} onSelect={select} />
+          <BindingTable
+            rows={bindings}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : world === "projects" ? (
-          <ProjectTable rows={projects} selected={selected} onSelect={select} />
+          <ProjectTable
+            rows={projects}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : (
           <TokenTable
             settings={settings}
             tokens={tokens}
             selected={selected}
+            lang={lang}
             st={st}
             onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            writable={writable}
+            onRun={run}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -435,19 +480,54 @@ export default function RancherView({
   );
 }
 
+interface WorldTableProps {
+  lang: Lang;
+  st: Strings;
+  onOpenTab: (uid: string, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
+}
+
 function UserTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  writable,
+  hashing,
+  onRun,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: RanchUserRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+  writable: boolean;
+  hashing: boolean;
+  onRun: (request: Record<string, unknown>) => void;
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: USER_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((u) => u.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">RANCHER ID</div>
           <div className="cell">IDENTITY</div>
           <div className="cell">LOGIN</div>
@@ -463,10 +543,45 @@ function UserTable({
       </div>
       <div className="tbody">
         {rows.map((u) => (
-          <Row key={u.uid} uid={u.uid} tone={u.record.tone} selected={selected} columns={USER_COLUMNS} onSelect={onSelect}>
+          <Row
+            key={u.uid}
+            uid={u.uid}
+            tone={u.record.tone}
+            selected={selected}
+            columns={USER_COLUMNS}
+            onSelect={onSelect}
+            checked={checked.has(u.uid)}
+            onToggleCheck={() => onToggleCheck(u.uid)}
+            st={st}
+          >
             <div className="cell mono dim">{u.id}</div>
             {/* Un principal opaque — un GUID — est montré tel quel plutôt que déguisé en nom. */}
-            <div className={`cell id ${u.identity_opaque ? "dim" : ""}`}>{u.identity_cell}</div>
+            <div className={`cell id ${u.identity_opaque ? "dim" : ""}`}>
+              <RowMenu
+                record={u.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(u.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {writable
+                  ? ({ close }) => (
+                      <RancherMenu
+                        st={st}
+                        user={u}
+                        token={null}
+                        setting={null}
+                        hashing={hashing}
+                        onRun={(request) => {
+                          close();
+                          onRun(request);
+                        }}
+                      />
+                    )
+                  : undefined}
+              </RowMenu>
+              {u.identity_cell}
+            </div>
             <div className="cell mono">{u.username}</div>
             <div className={`cell ${u.provider_tone}`}>{u.provider}</div>
             <div className={`cell ${u.is_admin ? "" : "dim"}`}>
@@ -489,16 +604,33 @@ function UserTable({
 function BindingTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: RanchBindingRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: BINDING_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((b) => b.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">SCOPE</div>
           <div className="cell">TARGET</div>
           <div className="cell">SUBJECT</div>
@@ -517,6 +649,9 @@ function BindingTable({
             selected={selected}
             columns={BINDING_COLUMNS}
             onSelect={onSelect}
+            checked={checked.has(b.uid)}
+            onToggleCheck={() => onToggleCheck(b.uid)}
+            st={st}
             // Le rôle que Rancher pose sur tout compte se lit comme de l'arrière-plan : il est là
             // parce qu'il existe, pas parce que quelqu'un l'a décidé.
             className={b.automatic ? "automatic" : undefined}
@@ -524,6 +659,13 @@ function BindingTable({
             <div className="cell mono">{b.scope_kind}</div>
             <div className="cell mono">{b.scope_label}</div>
             <div className="cell id">
+              <RowMenu
+                record={b.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(b.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
               {b.subject_label}
               {!b.authoritative && <span className="badge-projected">projeté</span>}
             </div>
@@ -541,16 +683,33 @@ function BindingTable({
 function ProjectTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: RanchProjectRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: PROJECT_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((p) => p.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">PROJECT</div>
           <div className="cell">ID</div>
           <div className="cell">CLUSTER</div>
@@ -563,8 +722,27 @@ function ProjectTable({
       </div>
       <div className="tbody">
         {rows.map((p) => (
-          <Row key={p.uid} uid={p.uid} tone={p.record.tone} selected={selected} columns={PROJECT_COLUMNS} onSelect={onSelect}>
-            <div className="cell id">{p.display_name}</div>
+          <Row
+            key={p.uid}
+            uid={p.uid}
+            tone={p.record.tone}
+            selected={selected}
+            columns={PROJECT_COLUMNS}
+            onSelect={onSelect}
+            checked={checked.has(p.uid)}
+            onToggleCheck={() => onToggleCheck(p.uid)}
+            st={st}
+          >
+            <div className="cell id">
+              <RowMenu
+                record={p.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(p.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
+              {p.display_name}
+            </div>
             <div className="cell mono dim">{p.id}</div>
             <div className="cell mono dim">{p.cluster}</div>
             <div className="cell num">{p.namespaces.length || "·"}</div>
@@ -590,19 +768,38 @@ function TokenTable({
   settings,
   tokens,
   selected,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  writable,
+  onRun,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   settings: RanchSettingRow[];
   tokens: RanchTokenRow[];
   selected: string | null;
-  st: Strings;
   onSelect: (uid: string) => void;
-}) {
+  writable: boolean;
+  onRun: (request: Record<string, unknown>) => void;
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: TOKEN_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={[...settings.map((s) => s.uid), ...tokens.map((t) => t.uid)]}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">TOKEN</div>
           <div className="cell">USER</div>
           <div className="cell">PROVIDER</div>
@@ -615,10 +812,45 @@ function TokenTable({
       </div>
       <div className="tbody">
         {settings.map((s) => (
-          <Row key={s.uid} uid={s.uid} tone={s.record.tone} selected={selected} columns={TOKEN_COLUMNS} onSelect={onSelect}>
+          <Row
+            key={s.uid}
+            uid={s.uid}
+            tone={s.record.tone}
+            selected={selected}
+            columns={TOKEN_COLUMNS}
+            onSelect={onSelect}
+            checked={checked.has(s.uid)}
+            onToggleCheck={() => onToggleCheck(s.uid)}
+            st={st}
+          >
             {/* Un réglage qu'un opérateur a changé mérite de se voir comme changé : le défaut est
                 de l'arrière-plan, une valeur délibérée non. */}
-            <div className={`cell ${s.is_default ? "dim" : "id"}`}>{s.name}</div>
+            <div className={`cell ${s.is_default ? "dim" : "id"}`}>
+              <RowMenu
+                record={s.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(s.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {writable
+                  ? ({ close }) => (
+                      <RancherMenu
+                        st={st}
+                        user={null}
+                        token={null}
+                        setting={s}
+                        hashing={false}
+                        onRun={(request) => {
+                          close();
+                          onRun(request);
+                        }}
+                      />
+                    )
+                  : undefined}
+              </RowMenu>
+              {s.name}
+            </div>
             <div className="cell" />
             <div className="cell" />
             <div className="cell info">setting</div>
@@ -629,9 +861,42 @@ function TokenTable({
           </Row>
         ))}
         {tokens.map((t) => (
-          <Row key={t.uid} uid={t.uid} tone={t.record.tone} selected={selected} columns={TOKEN_COLUMNS} onSelect={onSelect}>
+          <Row
+            key={t.uid}
+            uid={t.uid}
+            tone={t.record.tone}
+            selected={selected}
+            columns={TOKEN_COLUMNS}
+            onSelect={onSelect}
+            checked={checked.has(t.uid)}
+            onToggleCheck={() => onToggleCheck(t.uid)}
+            st={st}
+          >
             <div className="cell mono">{t.name}</div>
             <div className="cell id" title={t.user_id}>
+              <RowMenu
+                record={t.record}
+                lang={lang}
+                st={st}
+                onOpen={(tab) => onOpenTab(t.uid, tab)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {writable
+                  ? ({ close }) => (
+                      <RancherMenu
+                        st={st}
+                        user={null}
+                        token={t}
+                        setting={null}
+                        hashing={false}
+                        onRun={(request) => {
+                          close();
+                          onRun(request);
+                        }}
+                      />
+                    )
+                  : undefined}
+              </RowMenu>
               {t.owner_label}
             </div>
             <div className={`cell ${t.provider_tone}`}>{t.provider}</div>
@@ -656,6 +921,9 @@ function Row({
   columns,
   className,
   onSelect,
+  checked,
+  onToggleCheck,
+  st,
   children,
 }: {
   uid: string;
@@ -664,6 +932,9 @@ function Row({
   columns: string;
   className?: string;
   onSelect: (uid: string) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
+  st: Strings;
   children: React.ReactNode;
 }) {
   return (
@@ -677,6 +948,7 @@ function Row({
         if (e.key === "Enter") onSelect(uid);
       }}
     >
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       {children}
     </div>
   );
@@ -925,8 +1197,6 @@ function RancherMenu({
   token,
   setting,
   hashing,
-  form,
-  onForm,
   onRun,
 }: {
   st: Strings;
@@ -934,141 +1204,127 @@ function RancherMenu({
   token: RanchTokenRow | null;
   setting: RanchSettingRow | null;
   hashing: boolean;
-  form: Form;
-  onForm: (f: Form) => void;
   onRun: (request: Record<string, unknown>) => void;
 }) {
+  const [form, setForm] = useState<Form>(null);
   const [ttl, setTtl] = useState("0");
   const [value, setValue] = useState("");
 
-  const target = user?.label ?? token?.name ?? setting?.name ?? null;
+  // Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui.
+  if (form === null) {
+    return (
+      <>
+        {user && (
+          <MenuItem
+            label={st.ranchIssue}
+            desc={hashing ? `${st.ranchIssueHelp} ${st.ranchIssueHashing}` : st.ranchIssueHelp}
+            onClick={() => {
+              setTtl("0");
+              setForm({ kind: "issue" });
+            }}
+          />
+        )}
+        {token && (
+          <>
+            <MenuItem
+              label={st.ranchSetTtl}
+              desc={`${st.ranchSetTtlHelp} (${token.ttl_label})`}
+              onClick={() => {
+                setTtl(String(Math.round(token.ttl_ms / 60000)));
+                setForm({ kind: "ttl" });
+              }}
+            />
+            <MenuItem
+              label={st.ranchRevoke}
+              // Révoquer une session de connexion est une déconnexion, pas la suppression d'une
+              // clé : la description dit laquelle des deux avant la confirmation.
+              desc={
+                token.derived ? st.ranchRevokeHelp : `${st.ranchRevokeHelp} ${st.ranchRevokeSession}`
+              }
+              onClick={() => setForm({ kind: "revoke" })}
+            />
+          </>
+        )}
+        {setting && (
+          <MenuItem
+            label={st.ranchSetSetting}
+            desc={`${st.ranchSetSettingHelp} (${setting.value_text})`}
+            onClick={() => {
+              setValue(setting.effective);
+              setForm({ kind: "setting" });
+            }}
+          />
+        )}
+      </>
+    );
+  }
 
   return (
-    <div className="pop menu" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.ranchActions}</span>
-      </div>
-      {target && <div className="menu-target mono">{target}</div>}
+    <div className="menu-confirm">
+      {form.kind === "issue" && user && (
+        <>
+          <p>{st.ranchIssueHelp}</p>
+          {hashing && <p className="warn">{st.ranchIssueHashing}</p>}
+          <div className="form-row">
+            <label htmlFor="ranch-ttl">{st.ranchIssueTtl}</label>
+            <input id="ranch-ttl" value={ttl} onChange={(e) => setTtl(e.target.value)} />
+          </div>
+          <Buttons
+            st={st}
+            disabled={!Number.isFinite(Number(ttl))}
+            onCancel={() => setForm(null)}
+            onConfirm={() =>
+              onRun({ action: "issue_token", user_id: user.id, ttl_minutes: Number(ttl) })
+            }
+          />
+        </>
+      )}
 
-      {form === null ? (
-        <div className="menu-list">
-          {user && (
-            <MenuItem
-              label={st.ranchIssue}
-              desc={hashing ? `${st.ranchIssueHelp} ${st.ranchIssueHashing}` : st.ranchIssueHelp}
-              onClick={() => {
-                setTtl("0");
-                onForm({ kind: "issue" });
-              }}
-            />
-          )}
-          {token && (
-            <>
-              <MenuItem
-                label={st.ranchSetTtl}
-                desc={`${st.ranchSetTtlHelp} (${token.ttl_label})`}
-                onClick={() => {
-                  setTtl(String(Math.round(token.ttl_ms / 60000)));
-                  onForm({ kind: "ttl" });
-                }}
-              />
-              <MenuItem
-                label={st.ranchRevoke}
-                // Révoquer une session de connexion est une déconnexion, pas la suppression d'une
-                // clé : la description dit laquelle des deux avant la confirmation.
-                desc={
-                  token.derived
-                    ? st.ranchRevokeHelp
-                    : `${st.ranchRevokeHelp} ${st.ranchRevokeSession}`
-                }
-                onClick={() => onForm({ kind: "revoke" })}
-              />
-            </>
-          )}
-          {setting && (
-            <MenuItem
-              label={st.ranchSetSetting}
-              desc={`${st.ranchSetSettingHelp} (${setting.value_text})`}
-              onClick={() => {
-                setValue(setting.effective);
-                onForm({ kind: "setting" });
-              }}
-            />
-          )}
-          {!user && !token && !setting && <p className="menu-note">{st.ranchSelectRow}</p>}
-        </div>
-      ) : (
-        <div className="menu-confirm">
-          {form.kind === "issue" && user && (
-            <>
-              <p>{st.ranchIssueHelp}</p>
-              {hashing && <p className="warn">{st.ranchIssueHashing}</p>}
-              <div className="form-row">
-                <label htmlFor="ranch-ttl">{st.ranchIssueTtl}</label>
-                <input id="ranch-ttl" value={ttl} onChange={(e) => setTtl(e.target.value)} />
-              </div>
-              <Buttons
-                st={st}
-                disabled={!Number.isFinite(Number(ttl))}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun({ action: "issue_token", user_id: user.id, ttl_minutes: Number(ttl) })
-                }
-              />
-            </>
-          )}
+      {form.kind === "ttl" && token && (
+        <>
+          <p>{st.ranchSetTtlHelp}</p>
+          <div className="form-row">
+            <label htmlFor="ranch-ttl2">{st.ranchIssueTtl}</label>
+            <input id="ranch-ttl2" value={ttl} onChange={(e) => setTtl(e.target.value)} />
+          </div>
+          <Buttons
+            st={st}
+            disabled={!Number.isFinite(Number(ttl))}
+            onCancel={() => setForm(null)}
+            onConfirm={() =>
+              onRun({ action: "set_token_ttl", name: token.name, ttl_minutes: Number(ttl) })
+            }
+          />
+        </>
+      )}
 
-          {form.kind === "ttl" && token && (
-            <>
-              <p>{st.ranchSetTtlHelp}</p>
-              <div className="form-row">
-                <label htmlFor="ranch-ttl2">{st.ranchIssueTtl}</label>
-                <input id="ranch-ttl2" value={ttl} onChange={(e) => setTtl(e.target.value)} />
-              </div>
-              <Buttons
-                st={st}
-                disabled={!Number.isFinite(Number(ttl))}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun({ action: "set_token_ttl", name: token.name, ttl_minutes: Number(ttl) })
-                }
-              />
-            </>
-          )}
+      {form.kind === "revoke" && token && (
+        <>
+          <p>{st.ranchRevokeHelp}</p>
+          {!token.derived && <p className="warn">{st.ranchRevokeSession}</p>}
+          <Buttons
+            st={st}
+            confirmLabel={st.ranchRevoke}
+            danger
+            onCancel={() => setForm(null)}
+            onConfirm={() => onRun({ action: "revoke_token", name: token.name })}
+          />
+        </>
+      )}
 
-          {form.kind === "revoke" && token && (
-            <>
-              <p>{st.ranchRevokeHelp}</p>
-              {!token.derived && <p className="warn">{st.ranchRevokeSession}</p>}
-              <Buttons
-                st={st}
-                confirmLabel={st.ranchRevoke}
-                danger
-                onCancel={() => onForm(null)}
-                onConfirm={() => onRun({ action: "revoke_token", name: token.name })}
-              />
-            </>
-          )}
-
-          {form.kind === "setting" && setting && (
-            <>
-              <p>{st.ranchSetSettingHelp}</p>
-              <div className="form-row">
-                <label htmlFor="ranch-setting">{setting.name}</label>
-                <input
-                  id="ranch-setting"
-                  value={value}
-                  onChange={(e) => setValue(e.target.value)}
-                />
-              </div>
-              <Buttons
-                st={st}
-                onCancel={() => onForm(null)}
-                onConfirm={() => onRun({ action: "set_setting", name: setting.name, value })}
-              />
-            </>
-          )}
-        </div>
+      {form.kind === "setting" && setting && (
+        <>
+          <p>{st.ranchSetSettingHelp}</p>
+          <div className="form-row">
+            <label htmlFor="ranch-setting">{setting.name}</label>
+            <input id="ranch-setting" value={value} onChange={(e) => setValue(e.target.value)} />
+          </div>
+          <Buttons
+            st={st}
+            onCancel={() => setForm(null)}
+            onConfirm={() => onRun({ action: "set_setting", name: setting.name, value })}
+          />
+        </>
       )}
     </div>
   );

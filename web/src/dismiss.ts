@@ -8,8 +8,12 @@
 // L'ancre est le conteneur qui porte **le bouton et le menu**, pas le menu seul : sans le bouton
 // dedans, un clic sur lui fermerait ici puis rouvrirait au `onClick`, et le menu ne se fermerait
 // jamais par son propre bouton.
+//
+// Quand le menu est rendu ailleurs dans le document (`MenuAnchor`, `menu.tsx`, le sort dans
+// `document.body` pour échapper au découpage des cellules), il n'est plus dans l'ancre : il se
+// déclare alors en second, sans quoi un clic dans le menu passerait pour un clic à côté.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 /**
  * Ferme au clic hors de l'ancre et à `Échap`, tant que `open` est vrai.
@@ -17,7 +21,11 @@ import { useEffect, useRef } from "react";
  * Rend la ref à poser sur l'ancre. `onClose` est appelé une fois par geste ; le stabiliser avec
  * `useCallback` évite de réabonner l'écouteur à chaque rendu.
  */
-export function useDismiss<T extends HTMLElement>(open: boolean, onClose: () => void) {
+export function useDismiss<T extends HTMLElement>(
+  open: boolean,
+  onClose: () => void,
+  detached?: RefObject<HTMLElement | null>,
+) {
   const ref = useRef<T | null>(null);
 
   useEffect(() => {
@@ -26,8 +34,9 @@ export function useDismiss<T extends HTMLElement>(open: boolean, onClose: () => 
     // `pointerdown` et non `click` : le geste se juge où il commence. Un `click` se déclenche à
     // la fin, et un glissement qui part du menu pour finir dehors le refermerait.
     const onPointerDown = (e: PointerEvent) => {
-      const el = ref.current;
-      if (el && e.target instanceof Node && el.contains(e.target)) return;
+      if (!(e.target instanceof Node)) return onClose();
+      if (ref.current?.contains(e.target)) return;
+      if (detached?.current?.contains(e.target)) return;
       onClose();
     };
 
@@ -45,7 +54,7 @@ export function useDismiss<T extends HTMLElement>(open: boolean, onClose: () => 
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("keydown", onKeyDown, true);
     };
-  }, [open, onClose]);
+  }, [open, onClose, detached]);
 
   return ref;
 }

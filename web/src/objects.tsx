@@ -2,27 +2,29 @@
 // toucher, le supprimer, et l'envoyer à l'IA.
 //
 // Dans le TUI ce sont cinq touches — `y`, `e`, `h`, `Ctrl-D`, `i` — disponibles dans toutes les vues
-// parce qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici c'est la même chose,
-// dans la grammaire du web (mémoire `gui-affordances-not-tui-keys`) : **les actions vivent dans la
-// barre qui sépare les deux panneaux, et ce qu'elles ouvrent remplace la table dans le panneau du
-// bas** (`ViewBody`, dans `panel.tsx`) — sauf `Toucher`, qui n'ouvre rien.
+// parce qu'elles visent l'objet Kubernetes derrière la ligne, pas la ligne. Ici, depuis le hamburger
+// de ligne, c'est un menu posé **sur la ligne qui le porte** plutôt que dans la barre : ce qu'ils
+// ouvrent remplace toujours la table dans le panneau du bas (`ViewBody`, dans `panel.tsx`) — sauf
+// `Toucher`, qui n'ouvre rien.
 //
 // `Toucher` est le seul qui écrive sans rien ouvrir, et c'est déjà le cas dans kdt : deux
 // annotations sous `kdt.io/` s'ajoutent, rien n'est retiré, et l'intérêt de la touche est d'être
-// assez rapide pour parcourir une liste avec. L'accusé se lit à côté du bouton.
+// assez rapide pour parcourir une liste avec. L'accusé se lit dans le menu, le temps qu'il reste
+// ouvert.
 //
 // `Supprimer` fait l'inverse et ouvre tout : les garde-fous d'abord, la confirmation ensuite. La
 // sortie par défaut est celle qui ne supprime rien — dans le TUI `Entrée` annule et c'est `Ctrl-D`
 // qui affirme ; ici c'est le bouton d'annulation qui prend le focus, et celui qui supprime est une
 // cible distincte qu'il faut aller chercher.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "./api";
 import { NeedsAuth } from "./api";
 import { AiButton } from "./ai";
 import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
-import { useTarget } from "./record";
+import { MenuAnchor } from "./menu";
+import { recordIdentity, useTarget } from "./record";
 import type {
   DeletePreflight,
   DeleteReason,
@@ -33,47 +35,47 @@ import type {
   ObjectYaml,
 } from "./types";
 
-/** L'onglet du panneau qu'un bouton de la barre ouvre. */
+/** L'onglet du panneau qu'un item du menu ouvre. */
 export type ObjectTab = "yaml" | "edit" | "delete" | "ai";
 
 /**
- * Les boutons, posés dans la barre des onglets de la vue.
+ * Le hamburger posé en début de ligne : YAML, Éditer, Toucher, ce que la vue ajoute pour cette
+ * ligne, Supprimer, puis IA — dans cet ordre, celui que portait la barre.
  *
- * Ils portent sur la ligne sélectionnée. Sans sélection ils sont éteints et le disent : proposer un
- * geste qui n'a pas de cible ferait chercher pourquoi il ne se passe rien.
+ * `record` n'est plus nullable : contrairement à l'ancienne barre, un menu de ligne n'existe que
+ * sur une ligne qui a déjà un objet à viser — c'est à l'appelant de ne pas le poser sur une ligne
+ * de regroupement (même garde que l'ancien `usable`).
+ *
+ * Le déroulé lui-même est celui de `MenuAnchor` (`menu.tsx`), rendu hors de la table : une cellule
+ * découpe ce qui dépasse, et un menu posé dedans ne se verrait pas.
  */
-export function ObjectActions({
+export function RowMenu({
   record,
   lang,
   st,
   onOpen,
   onNeedsAuth,
+  children,
 }: {
-  record: EventRecord | null;
+  record: EventRecord;
   lang: Lang;
   st: Strings;
   onOpen: (tab: ObjectTab) => void;
   onNeedsAuth: (message: string) => void;
+  /** Les items propres à la vue (menu de kind), insérés entre `Toucher` et `Supprimer`. Une
+   * fonction et non un nœud tout fait : le menu contextuel d'une vue a souvent son propre geste à
+   * confirmer (`scale`, `cordon`…), et doit pouvoir refermer le hamburger une fois l'action lancée. */
+  children?: (ctl: { close: () => void }) => ReactNode;
 }) {
   const [ack, setAck] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // L'accusé s'efface tout seul : c'est un accusé de réception, pas un état de l'objet.
-  useEffect(() => {
-    if (!ack) return;
-    const timer = window.setTimeout(() => setAck(null), 8000);
-    return () => window.clearTimeout(timer);
-  }, [ack]);
-
-  // La cible change : l'accusé précédent ne parle plus de ce qui est sous les yeux.
-  useEffect(() => setAck(null), [record?.uid]);
-
-  // Un enregistrement sans kind ni nom ne désigne aucun objet — une ligne de regroupement, par
-  // exemple. Les trois gestes n'ont alors rien à viser.
-  const usable = Boolean(record && record.kind && record.name);
+  // Le menu se referme : l'accusé du geste précédent ne vaut plus la peine d'être gardé.
+  const onOpenChange = useCallback((open: boolean) => {
+    if (!open) setAck(null);
+  }, []);
 
   const touch = useCallback(async () => {
-    if (!record) return;
     setBusy(true);
     try {
       const { message } = await api.objectTouch(record, lang);
@@ -87,48 +89,47 @@ export function ObjectActions({
   }, [record, lang, onNeedsAuth]);
 
   return (
-    <div className="obj-actions" role="group" aria-label={st.objActions}>
-      <button
-        className="panel-toggle"
-        disabled={!usable}
-        title={usable ? undefined : st.objSelectRow}
-        onClick={() => onOpen("yaml")}
-      >
-        {st.actionYaml}
-      </button>
-      <button
-        className="panel-toggle"
-        disabled={!usable}
-        title={usable ? undefined : st.objSelectRow}
-        onClick={() => onOpen("edit")}
-      >
-        {st.actionEdit}
-      </button>
-      <button
-        className="panel-toggle"
-        disabled={!usable || busy}
-        title={usable ? st.objTouchHelp : st.objSelectRow}
-        onClick={() => void touch()}
-      >
-        {st.actionTouch}
-      </button>
-      {/* Il n'écrit rien tout seul : il ouvre les garde-fous dans le panneau du haut, et c'est là
-          que la confirmation se donne. Le bouton porte quand même le ton d'une action sur le
-          cluster — une commande éteinte se cherche. */}
-      <button
-        className="panel-toggle action"
-        disabled={!usable}
-        title={usable ? undefined : st.objSelectRow}
-        onClick={() => onOpen("delete")}
-      >
-        {st.actionDelete}
-      </button>
-      {/* Le geste `i` de kdt. Dernier de la barre et non premier : c'est celui qui fait sortir de
-          la donnée du cluster, et il se prend délibérément. */}
-      <AiButton usable={usable} st={st} onOpen={() => onOpen("ai")} />
-      {busy && <span className="dim">{st.objWorking}</span>}
-      {ack && <span className={ack.tone === "err" ? "err" : "ok"}>{ack.text}</span>}
-    </div>
+    <MenuAnchor label={st.rowMenu} onOpenChange={onOpenChange}>
+      {({ close }) => {
+        // Les quatre gestes qui ouvrent quelque chose referment le menu : ce qu'ils ouvrent prend
+        // la place de la table, et un menu resté ouvert par-dessus flotterait sur autre chose.
+        const act = (tab: ObjectTab) => {
+          close();
+          onOpen(tab);
+        };
+        return (
+          <>
+            <div className="pop-hd">
+              <span>{st.rowMenu}</span>
+            </div>
+            <div className="menu-target mono">
+              {record.kind} {record.namespace ? `${record.namespace}/${record.name}` : record.name}
+            </div>
+            <div className="menu-list">
+              <button className="menu-item" onClick={() => act("yaml")}>
+                <span className="lbl">{st.actionYaml}</span>
+              </button>
+              <button className="menu-item" onClick={() => act("edit")}>
+                <span className="lbl">{st.actionEdit}</span>
+              </button>
+              <button className="menu-item" disabled={busy} onClick={() => void touch()}>
+                <span className="lbl">{st.actionTouch}</span>
+                <span className="desc">{st.objTouchHelp}</span>
+              </button>
+              {children?.({ close })}
+              <button className="menu-item danger" onClick={() => act("delete")}>
+                <span className="lbl">{st.actionDelete}</span>
+              </button>
+              {/* Le geste `i` de kdt. Dernier du menu et non premier : c'est celui qui fait sortir
+                  de la donnée du cluster, et il se prend délibérément. */}
+              <AiButton usable className="menu-item" st={st} onOpen={() => act("ai")} />
+            </div>
+            {busy && <p className="menu-note dim">{st.objWorking}</p>}
+            {ack && <p className={`menu-note ${ack.tone === "err" ? "err" : "ok"}`}>{ack.text}</p>}
+          </>
+        );
+      }}
+    </MenuAnchor>
   );
 }
 
@@ -526,5 +527,201 @@ function Finding({ reason }: { reason: DeleteReason }) {
     <p className={`guard ${reason.level}`}>
       <span className="gl">{glyph}</span> {reason.text}
     </p>
+  );
+}
+
+type BulkItemState = "checking" | "ready" | "running" | "done" | "error";
+
+interface BulkItem {
+  record: EventRecord;
+  key: string;
+  state: BulkItemState;
+  preflight: DeletePreflight | null;
+  typed: string;
+  message: string | null;
+}
+
+/**
+ * La suppression groupée, ouverte depuis le hamburger de masse.
+ *
+ * kdt-web n'a pas de route de suppression en lot : chaque objet garde son propre préflight et son
+ * propre garde-fou, comme `DeletePane`. Un objet `strict` exige son nom retapé — le sien, pas un
+ * compte global — les autres n'en demandent pas plus qu'une suppression individuelle non stricte.
+ * L'écriture est ensuite séquentielle, objet par objet, avec l'état de chaque ligne mis à jour au
+ * fur et à mesure : ce sont des requêtes courtes indépendantes, pas une seule écriture longue à
+ * suivre en flux.
+ */
+export function BulkDeletePane({
+  records,
+  lang,
+  st,
+  onCancel,
+  onDone,
+  onNeedsAuth,
+}: {
+  records: EventRecord[];
+  lang: Lang;
+  st: Strings;
+  onCancel: () => void;
+  onDone?: (message: string) => void;
+  onNeedsAuth: (message: string) => void;
+}) {
+  const [items, setItems] = useState<BulkItem[]>(() =>
+    records.map((record) => ({
+      record,
+      key: recordIdentity(record),
+      state: "checking",
+      preflight: null,
+      typed: "",
+      message: null,
+    })),
+  );
+  const [running, setRunning] = useState(false);
+
+  // Une session expirée expire pour tout le lot : le dire une fois plutôt qu'une fois par objet,
+  // sans quoi cinquante lignes en échec ouvriraient cinquante fois la même demande.
+  const authAsked = useRef(false);
+  const askAuth = useCallback(
+    (e: unknown) => {
+      if (!(e instanceof NeedsAuth) || authAsked.current) return;
+      authAsked.current = true;
+      onNeedsAuth(e.message);
+    },
+    [onNeedsAuth],
+  );
+
+  // La liste sélectionnée ne bouge plus une fois le panneau ouvert : une lecture par objet, une
+  // seule fois, comme `DeletePane` ne recharge pas le nom retapé à chaque passe de la vue.
+  useEffect(() => {
+    let live = true;
+    for (const record of records) {
+      const key = recordIdentity(record);
+      api
+        .objectDeletePreflight(record, lang)
+        .then((preflight) => {
+          if (live) setItems((prev) => prev.map((it) => (it.key === key ? { ...it, state: "ready", preflight } : it)));
+        })
+        .catch((e) => {
+          if (!live) return;
+          askAuth(e);
+          const preflight: DeletePreflight = {
+            reasons: [],
+            strict: true,
+            error: String((e as Error).message ?? e),
+          };
+          setItems((prev) => prev.map((it) => (it.key === key ? { ...it, state: "ready", preflight } : it)));
+        });
+    }
+    return () => {
+      live = false;
+    };
+    // Une seule lecture, à l'ouverture : `records` ne change pas en place.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const setTyped = (key: string, typed: string) =>
+    setItems((prev) => prev.map((it) => (it.key === key ? { ...it, typed } : it)));
+
+  const loading = items.some((it) => it.state === "checking");
+  // Ce qui reste à faire : un objet déjà supprimé n'attend plus rien, et ne bloque donc plus sur
+  // son nom à retaper. Le lot se relance tant qu'il reste une ligne en échec.
+  const pending = useMemo(() => items.filter((it) => it.state !== "done"), [items]);
+  const blocked = pending.some((it) => it.preflight?.strict && it.typed.trim() !== it.record.name);
+
+  const remove = useCallback(async () => {
+    setRunning(true);
+    let ok = 0;
+    let failed = 0;
+    for (const it of items) {
+      // Un objet déjà supprimé n'est pas resupprimé au deuxième essai : la requête échouerait en
+      // `NotFound` et transformerait une réussite en erreur.
+      if (it.state === "done") continue;
+      setItems((prev) => prev.map((x) => (x.key === it.key ? { ...x, state: "running" } : x)));
+      try {
+        const { message } = await api.objectDelete(it.record, it.typed, lang);
+        ok += 1;
+        setItems((prev) => prev.map((x) => (x.key === it.key ? { ...x, state: "done", message } : x)));
+      } catch (e) {
+        failed += 1;
+        askAuth(e);
+        const message = String((e as Error).message ?? e);
+        setItems((prev) => prev.map((x) => (x.key === it.key ? { ...x, state: "error", message } : x)));
+      }
+    }
+    setRunning(false);
+    // Le panneau ne se referme que quand il n'y a plus rien à lire dedans. Avec un échec, il reste
+    // ouvert sur ses lignes rouges : `onDone` rend la main à la vue, qui recharge et efface la
+    // sélection — l'erreur disparaîtrait avant d'avoir été lue.
+    if (failed === 0 && ok > 0) {
+      onDone?.(lang === "fr" ? `${ok} objet(s) supprimé(s)` : `${ok} object(s) deleted`);
+    }
+  }, [items, lang, onDone, askAuth]);
+
+  const done = items.length - pending.length;
+
+  // Fermer après un lot partiel n'est pas annuler : ce qui est supprimé l'est, et la vue doit le
+  // relire. C'est `onDone` qui le lui dit — le compte porte les deux moitiés.
+  const leave = useCallback(() => {
+    if (done === 0) return onCancel();
+    const failed = items.length - done;
+    onDone?.(
+      lang === "fr"
+        ? `${done} objet(s) supprimé(s)${failed ? `, ${failed} en échec` : ""}`
+        : `${done} object(s) deleted${failed ? `, ${failed} failed` : ""}`,
+    );
+  }, [done, items.length, lang, onCancel, onDone]);
+
+  return (
+    <div className="editor">
+      <div className="bulk-list">
+        {items.map((it) => (
+          <div key={it.key} className="bulk-item">
+            <p className="mono">
+              {it.record.kind}{" "}
+              {it.record.namespace ? `${it.record.namespace}/${it.record.name}` : it.record.name}
+              {it.state === "checking" && <span className="dim"> · {st.delChecking}</span>}
+              {it.state === "running" && <span className="dim"> · {st.objWorking}</span>}
+              {it.state === "done" && <span className="ok"> · {it.message}</span>}
+              {it.state === "error" && <span className="err"> · {it.message}</span>}
+            </p>
+            {it.preflight?.error && <p className="guard danger">{it.preflight.error}</p>}
+            {it.preflight?.clear && <p className="guard info">{it.preflight.clear}</p>}
+            {it.preflight?.reasons.map((r) => (
+              <Finding key={r.text} reason={r} />
+            ))}
+            {it.preflight?.strict && (it.state === "ready" || it.state === "error") && (
+              <input
+                className="ns-add"
+                value={it.typed}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder={st.delStrictPlaceholder}
+                disabled={running}
+                onChange={(e) => setTyped(it.key, e.target.value)}
+              />
+            )}
+          </div>
+        ))}
+      </div>
+
+      {!loading && pending.some((it) => it.preflight?.strict) && (
+        <p className="warn">{st.bulkDeleteHelp}</p>
+      )}
+
+      <div className="menu-buttons">
+        {/* La sortie par défaut est celle qui ne supprime rien. Une fois qu'une ligne est passée,
+            elle ne ferme plus seulement le panneau : la vue a des objets en moins à relire. */}
+        <button autoFocus onClick={leave} disabled={running}>
+          {done === 0 ? st.delCancel : st.bulkDeleteClose}
+        </button>
+        <button
+          className="cta danger"
+          disabled={loading || blocked || running || pending.length === 0}
+          onClick={() => void remove()}
+        >
+          {st.bulkDeleteConfirm.replace("{n}", String(pending.length))}
+        </button>
+      </div>
+    </div>
   );
 }

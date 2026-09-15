@@ -652,9 +652,9 @@ helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
     --set ingress.enabled=true --set ingress.host=kdt.example.com
 ```
 
-**AI analysis** — kdt's `i` — is offered in every view, on the selected row: the button sits in the
-action bar next to the other four gestures, and the answer streams into the bottom panel, in place
-of the table. The prompt is
+**AI analysis** — kdt's `i` — is offered in every view, on the row it targets: it sits in that
+row's `☰` menu next to the other four gestures, and the answer streams into the bottom panel, in
+place of the table. The prompt is
 the TUI's, assembled server-side from what **your** credential could read — the object's status,
 logs and events, and related objects.
 

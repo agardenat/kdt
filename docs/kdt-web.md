@@ -147,6 +147,16 @@ Arrêtée sur maquette le 2026-09-06. Front en React + Vite + TypeScript, dans `
   pour capacity, Backups / Schedules / Restaurations / Locations pour velero. Le mapping est exact.
 - **Drawer à droite** pour le détail d'une ligne, avec les onglets Logs / Status / Related / YAML.
   La liste reste visible, on enchaîne les sélections.
+- **Les gestes d'une ligne vivent dans son menu `☰`**, en tête de ligne : les cinq gestes
+  génériques de kdt (`y`, `e`, `h`, `Ctrl-D`, `i`) et ce que la vue ajoute pour ce kind — scale,
+  cordon, réconciliation. Le clavier du TUI devient une cible visible sur la ligne qu'il vise, et
+  la barre ne garde que ce qui ne vise aucune ligne. Le menu est rendu hors de la table
+  (`MenuAnchor`, `web/src/menu.tsx`) : posé dans la cellule, il serait découpé par le
+  `overflow: hidden` qui élide les noms trop longs.
+- **Une colonne de cases** ouvre la sélection multiple, et son en-tête porte le menu des actions
+  groupées — aujourd'hui la suppression. Il n'y a pas de route de suppression en lot : chaque
+  objet garde son préflight et son garde-fou, l'écriture est séquentielle, et un objet qui échoue
+  laisse le panneau ouvert sur son erreur.
 - **Les arbres passent en graphique** : arbre Flux, workloads → pods → containers, chaîne
   cert-manager. Le travail est fait côté données — `build_flux_tree` rend un `Vec<FlatTreeNode>`
   avec `depth` et `last_sibling`, le TUI ne choisit que les caractères `├─` / `└─`. Les badges
@@ -169,7 +179,7 @@ sur-le-champ, les phrases calculées suivent au refetch — voir §7.
 
 ### L'analyse par une IA, et où vit sa configuration
 
-Le `i` de kdt est le cinquième geste générique : un bouton dans la barre d'actions, la réponse en
+Le `i` de kdt est le cinquième geste générique : une entrée du menu `☰` de la ligne, la réponse en
 flux dans le panneau du bas — à la place de la table, comme `y`/`e`/`Ctrl-D` — et l'overlay qui
 n'existe que tant qu'on le regarde. Le prompt est
 celui du TUI — `kdt::ai::build_ai_prompt`, sorti de `ui.rs` pour l'occasion, parce qu'un second
@@ -211,8 +221,8 @@ comme dans le TUI où `i` sur cet écran analyse le node et non un container. Le
 user / système / total, lui, est bien un contenu de l'objet : il est dans le panneau, sous son
 propre onglet.
 
-Le menu `o` devient un menu de la barre d'actions, avec la convention de toutes les vues. Ce qu'il
-propose dépend de l'état lu : un node cordonné n'offre pas « cordon », il offre « uncordon ».
+Le menu `o` devient une section du menu `☰` de la ligne, avec la convention de toutes les vues. Ce
+qu'il propose dépend de l'état lu : un node cordonné n'offre pas « cordon », il offre « uncordon ».
 
 Le **drain** est un overlay du panneau du bas, comme `Ctrl-D` : garde-fous d'abord, confirmation
 ensuite, et la même règle qu'ailleurs — un constat grave exige de retaper le nom du node. Trois

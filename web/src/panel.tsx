@@ -225,6 +225,22 @@ export function InspectPanel({
 }
 
 /**
+ * `Échap` referme ce qui est ouvert par-dessus la table, avant de replier le panneau du haut —
+ * l'ordre du TUI. La capture est nécessaire pour passer devant le handler global de la coquille.
+ */
+function useEscapeCloses(onClose: () => void) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+}
+
+/**
  * Ce que `y`, `e`, `Ctrl-D`, `i` et l'overlay propre d'une vue ouvrent, **à la place de la table**.
  *
  * Un YAML, un éditeur, une confirmation de suppression ou une analyse IA prennent une page entière
@@ -251,18 +267,7 @@ function ObjectOverlay({
   onDeleted?: (message: string) => void;
   onNeedsAuth: (message: string) => void;
 }) {
-  // `Échap` referme l'overlay avant de replier le panneau — l'ordre du TUI, où la touche ferme ce
-  // qui est ouvert par-dessus. La capture est nécessaire pour passer devant le handler global de
-  // la coquille, qui replierait le panneau du haut.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      onClose();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  useEscapeCloses(onClose);
 
   const label =
     tab === "custom"
@@ -325,11 +330,55 @@ function ObjectOverlay({
 }
 
 /**
+ * L'overlay d'une action de masse — pour l'instant, `BulkDeletePane` seul — sur le même patron que
+ * `ObjectOverlay` : même chrome (`.phd`/`.pid`/`.pbody`/`.pclose`), même `Échap`, mais l'en-tête
+ * nomme un compte plutôt qu'un objet puisqu'il n'y en a pas un seul.
+ */
+function BulkOverlay({
+  label,
+  count,
+  lang,
+  onClose,
+  children,
+}: {
+  label: string;
+  count: number;
+  lang: Lang;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  useEscapeCloses(onClose);
+
+  return (
+    <div className="body-overlay">
+      <div className="phd">
+        <div className="pid">
+          <span className="mono">{count}</span>
+        </div>
+        <span className="ov-label">{label}</span>
+        <button
+          className="pclose"
+          title={lang === "fr" ? "Fermer" : "Close"}
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      </div>
+      <div className="pbody">{children}</div>
+    </div>
+  );
+}
+
+/**
  * L'enveloppe que chaque vue pose autour de sa table, à la place d'un simple `<div className="body">`.
  *
  * Elle ne juge rien de la table elle-même — `children` reste ce que la vue rendait déjà — mais
  * substitue l'overlay demandé quand `tab` en vise un et que la ligne sélectionnée en a un : la
  * table disparaît, l'overlay prend sa place, et `Échap` ou sa croix la rendent.
+ *
+ * `bulk` est un second canal, indépendant de `tab`/`record` : la sélection multiple d'une vue n'est
+ * pas un objet mais un ensemble, et quand elle est posée elle prend le pas sur l'overlay par-objet
+ * comme sur la table — une vue n'a jamais les deux ouverts à la fois.
  */
 export function ViewBody({
   tab,
@@ -342,6 +391,8 @@ export function ViewBody({
   onNeedsAuth,
   hasDetail,
   bodyRef,
+  bulk,
+  onBulkClose,
   children,
 }: {
   tab: PanelTab;
@@ -355,6 +406,9 @@ export function ViewBody({
   /** La vue pose un onglet `detail` : fermer l'overlay y retombe plutôt que sur `status`. */
   hasDetail?: boolean;
   bodyRef?: RefObject<HTMLDivElement | null>;
+  /** Le hamburger de masse a ouvert une action groupée (`BulkDeletePane` aujourd'hui). */
+  bulk?: { label: string; count: number; node: ReactNode } | null;
+  onBulkClose?: () => void;
   children: ReactNode;
 }) {
   // `y`, `e` et `Ctrl-D` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en
@@ -366,7 +420,11 @@ export function ViewBody({
 
   return (
     <div className="body" ref={bodyRef}>
-      {active && record ? (
+      {bulk ? (
+        <BulkOverlay label={bulk.label} count={bulk.count} lang={lang} onClose={() => onBulkClose?.()}>
+          {bulk.node}
+        </BulkOverlay>
+      ) : active && record ? (
         <ObjectOverlay
           tab={active}
           record={record}

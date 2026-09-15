@@ -12,11 +12,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
-import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   CertActionTarget,
@@ -35,14 +35,15 @@ import type {
  *
  * Côté Rust : RESOURCE dimensionnée sur son contenu (28 à 72 caractères), puis 10, 28, 8, 6, et le
  * reste au message. RESOURCE est en `fr` parce que c'est elle qui porte l'indentation de la lignée,
- * et MESSAGE en second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge.
+ * et MESSAGE en second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge. La première
+ * piste (`44px`) porte la case de sélection multiple.
  */
 const TREE_COLUMNS =
-  "minmax(280px,1.3fr) 104px minmax(180px,28ch) 76px 52px minmax(200px,1.4fr)";
+  "44px minmax(280px,1.3fr) 104px minmax(180px,28ch) 76px 52px minmax(200px,1.4fr)";
 
 /** Les colonnes de la vue à plat : `KIND NAMESPACE NAME READY TARGET EXPIRE AGE MESSAGE`. */
 const LIST_COLUMNS =
-  "minmax(110px,14ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(180px,28ch) 76px 52px" +
+  "44px minmax(110px,14ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(180px,28ch) 76px 52px" +
   " minmax(200px,1.4fr)";
 
 export default function CertsView({
@@ -84,9 +85,10 @@ export default function CertsView({
   const [tab, setTab] = useState<PanelTab>("detail");
   // Les plis posés à la main. Ils gagnent toujours sur le pliage automatique — voir `collapsed`.
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
-  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   // La portée est un namespace, comme pour les autres vues qui listent. Elle ne coupe pas la
   // chaîne : le serveur garde les kinds cluster — un ClusterIssuer n'a pas de namespace et c'est
@@ -115,12 +117,6 @@ export default function CertsView({
   }, [load]);
 
   useToastTimeout(toast, setToast);
-
-  // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
-  // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
-  // rouvrirait dans le même geste.
-  const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   const rows = payload?.rows ?? [];
   const needle = query.trim().toLowerCase();
@@ -228,7 +224,6 @@ export default function CertsView({
 
   const run = useCallback(
     async (action: () => Promise<{ message: string }>) => {
-      setMenuOpen(false);
       setBusy(true);
       try {
         const { message } = await action();
@@ -356,27 +351,6 @@ export default function CertsView({
           >
             {st.certOpenSecret}
           </button>
-          <div className="menu-anchor" ref={menuRef}>
-            <button
-              className="panel-toggle action"
-              disabled={!owningCert}
-              title={owningCert ? undefined : st.certSelectRow}
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((v) => !v)}
-            >
-              {st.certActions} ▾
-            </button>
-            {menuOpen && owningCert && (
-              <CertMenu cert={owningCert} st={st} lang={lang} onRun={run} />
-            )}
-          </div>
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -389,6 +363,30 @@ export default function CertsView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         hasDetail
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={rows.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -416,6 +414,14 @@ export default function CertsView({
                 className="tr"
                 style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
               >
+                <SelectionHeaderCell
+                  keys={shown.map((r) => r.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 {tree ? (
                   <div className="cell">RESOURCE</div>
                 ) : (
@@ -439,6 +445,7 @@ export default function CertsView({
                     key={row.uid}
                     row={row}
                     tree={tree}
+                    lang={lang}
                     st={st}
                     collapsed={collapsed.has(row.uid)}
                     selected={selected === row.uid}
@@ -446,18 +453,34 @@ export default function CertsView({
                       setSelected(row.uid);
                       setTab("detail");
                     }}
+                    onOpenTab={(t) => {
+                      setSelected(row.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
                     onFold={() => setToggled((p) => ({ ...p, [row.uid]: !collapsed.has(row.uid) }))}
+                    onRun={run}
+                    checked={checked.has(row.uid)}
+                    onToggleCheck={() => toggle(row.uid)}
                   />
                 ) : (
                   <SecretLine
                     key={row.uid}
                     row={row}
+                    lang={lang}
                     st={st}
                     selected={selected === row.uid}
                     onSelect={() => {
                       setSelected(row.uid);
                       setTab("detail");
                     }}
+                    onOpenTab={(t) => {
+                      setSelected(row.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                    checked={checked.has(row.uid)}
+                    onToggleCheck={() => toggle(row.uid)}
                   />
                 ),
               )}
@@ -510,20 +533,49 @@ function matches(row: CertRow, needle: string): boolean {
 function ResourceLine({
   row,
   tree,
+  lang,
   st,
   collapsed,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onFold,
+  onRun,
+  checked,
+  onToggleCheck,
 }: {
   row: CertResourceRow;
   tree: boolean;
+  lang: Lang;
   st: Strings;
   collapsed: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onFold: () => void;
+  onRun: (action: () => Promise<{ message: string }>) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
+  // La relance n'a de sens que sur le Certificate lui-même : proposer « renouveler » depuis un
+  // Issuer ou une Order agirait sur un objet différent de celui que le hamburger porte.
+  const certMenu =
+    row.kind === "Certificate"
+      ? ({ close }: { close: () => void }) => (
+          <CertMenu
+            cert={row}
+            st={st}
+            lang={lang}
+            onRun={(action) => {
+              close();
+              onRun(action);
+            }}
+          />
+        )
+      : undefined;
+
   return (
     <div
       className={`tr cert-${row.ready}`}
@@ -539,6 +591,7 @@ function ResourceLine({
         }
       }}
     >
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       {tree ? (
         <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
           {row.has_children ? (
@@ -556,6 +609,9 @@ function ResourceLine({
           ) : (
             <span className="fold-gap" />
           )}
+          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+            {certMenu}
+          </RowMenu>
           <span className="kind">{row.kind_short}</span> {row.name}
           <Keystores formats={row.keystore_formats} />
         </div>
@@ -564,6 +620,15 @@ function ResourceLine({
           <div className="cell kind">{row.kind_short}</div>
           <div className="cell mono dim">{row.namespace}</div>
           <div className="cell id">
+            <RowMenu
+              record={row.record}
+              lang={lang}
+              st={st}
+              onOpen={onOpenTab}
+              onNeedsAuth={onNeedsAuth}
+            >
+              {certMenu}
+            </RowMenu>
             {row.name}
             <Keystores formats={row.keystore_formats} />
           </div>
@@ -589,14 +654,24 @@ function ResourceLine({
 /** La feuille TLS : le Secret produit, joint depuis la vue Secrets et jamais relu deux fois. */
 function SecretLine({
   row,
+  lang,
   st,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
 }: {
   row: Extract<CertRow, { row: "secret" }>;
+  lang: Lang;
   st: Strings;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   const consumers =
     row.ingress_refs === 0
@@ -616,8 +691,10 @@ function SecretLine({
         if (e.key === "Enter") onSelect();
       }}
     >
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         <span className="fold-gap">→</span>
+        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         <span className="kind">Secret</span> {row.name}
       </div>
       <div className="cell">
@@ -901,53 +978,43 @@ function CertMenu({
     name: cert.name,
   };
 
-  return (
-    <div className="pop menu" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.certActions}</span>
+  // Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui.
+  return arming ? (
+    <div className="menu-confirm">
+      <p>{arming === "renew" ? st.certDescRenew : st.certDescAcmeRetry}</p>
+      <div className="menu-buttons">
+        <button autoFocus onClick={() => setArming(null)}>
+          {st.fluxCancel}
+        </button>
+        <button
+          className="cta"
+          onClick={() =>
+            onRun(() =>
+              arming === "renew"
+                ? api.certRenew(renewTarget, lang)
+                : api.certAcmeRetry(actions!.acme_retry!, lang),
+            )
+          }
+        >
+          {st.fluxConfirm}
+        </button>
       </div>
-      <div className="menu-target mono">
-        Certificate {cert.namespace}/{cert.name}
-      </div>
-
-      {arming ? (
-        <div className="menu-confirm">
-          <p>{arming === "renew" ? st.certDescRenew : st.certDescAcmeRetry}</p>
-          <div className="menu-buttons">
-            <button autoFocus onClick={() => setArming(null)}>
-              {st.fluxCancel}
-            </button>
-            <button
-              className="cta"
-              onClick={() =>
-                onRun(() =>
-                  arming === "renew"
-                    ? api.certRenew(renewTarget, lang)
-                    : api.certAcmeRetry(actions!.acme_retry!, lang),
-                )
-              }
-            >
-              {st.fluxConfirm}
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="menu-list">
-          <button className="menu-item" onClick={() => setArming("renew")}>
-            <span className="lbl">{st.certRenew}</span>
-            <span className="desc">{st.certDescRenew}</span>
-          </button>
-          {/* La relance n'est offerte que s'il y a une demande vivante à relancer — et jamais sous
-              quota ACME, où réessayer ne fait que brûler ce qui reste. C'est kdt qui tranche. */}
-          {actions?.acme_retry && (
-            <button className="menu-item" onClick={() => setArming("retry")}>
-              <span className="lbl">{st.certAcmeRetry}</span>
-              <span className="desc">{st.certDescAcmeRetry}</span>
-            </button>
-          )}
-          {actions?.rate_limited && <p className="menu-note err">{st.certRateLimited}</p>}
-        </div>
-      )}
     </div>
+  ) : (
+    <>
+      <button className="menu-item" onClick={() => setArming("renew")}>
+        <span className="lbl">{st.certRenew}</span>
+        <span className="desc">{st.certDescRenew}</span>
+      </button>
+      {/* La relance n'est offerte que s'il y a une demande vivante à relancer — et jamais sous
+          quota ACME, où réessayer ne fait que brûler ce qui reste. C'est kdt qui tranche. */}
+      {actions?.acme_retry && (
+        <button className="menu-item" onClick={() => setArming("retry")}>
+          <span className="lbl">{st.certAcmeRetry}</span>
+          <span className="desc">{st.certDescAcmeRetry}</span>
+        </button>
+      )}
+      {actions?.rate_limited && <p className="menu-note err">{st.certRateLimited}</p>}
+    </>
   );
 }

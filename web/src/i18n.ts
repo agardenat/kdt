@@ -121,7 +121,6 @@ export interface Strings {
   wlWorking: string;
   wlEmpty: string;
   wlContainers: string;
-  wlActions: string;
   wlScale: string;
   wlRestart: string;
   wlRecycle: string;
@@ -132,7 +131,6 @@ export interface Strings {
   wlMissing: string;
   wlMissingHelp: string;
   wlRestarts: string;
-  wlSelectWorkload: string;
   wlCpuReq: string;
   wlCpuLim: string;
   wlMemReq: string;
@@ -222,7 +220,6 @@ export interface Strings {
   certDays: string;
 
   // --- Gestes sur un objet quelconque : `y`, `e`, `h` dans le TUI.
-  objActions: string;
   objSelectRow: string;
   objYamlRaw: string;
   objYamlNeat: string;
@@ -253,6 +250,18 @@ export interface Strings {
   delStrictPlaceholder: string;
   delStrictMismatch: string;
   delReload: string;
+
+  // --- Menu de ligne (hamburger, remplace la barre d'actions) et sélection multiple.
+  rowMenu: string;
+  selectRow: string;
+  selectAll: string;
+  bulkCount: string;
+  bulkClear: string;
+  bulkActions: string;
+  bulkDeleteTitle: string;
+  bulkDeleteConfirm: string;
+  bulkDeleteHelp: string;
+  bulkDeleteClose: string;
 
   // --- Vue identity. Le jargon reste en anglais des deux côtés (`KdtUser`, `KdtGroup`, `subject`),
   // et les phases, invitations et constats arrivent déjà rédigés du serveur.
@@ -774,7 +783,6 @@ const FR: Strings = {
   wlWorking: "en cours…",
   wlEmpty: "Aucun workload ni pod dans cette portée.",
   wlContainers: "Containers du pod",
-  wlActions: "Actions sur le workload",
   wlScale: "scale",
   wlRestart: "restart",
   wlRecycle: "recycle",
@@ -787,7 +795,6 @@ const FR: Strings = {
   wlMissingHelp:
     "Ces kinds n'ont pas pu être listés : la vue en est incomplète, ce n'est pas qu'il n'y en a aucun.",
   wlRestarts: "redémarrages",
-  wlSelectWorkload: "Choisissez un workload : un pod et un container ne se scalent pas.",
   wlCpuReq: "CPU consommé, en % de la requête. Au-dessus de 100 %, le pod prend plus qu'il n'a réservé — c'est permis.",
   wlCpuLim: "CPU consommé, en % de la limite. Au-dessus de 100 %, le container est throttlé.",
   wlMemReq: "Mémoire consommée, en % de la requête.",
@@ -880,7 +887,6 @@ const FR: Strings = {
   certFold: "Plier / déplier la chaîne",
   certDays: "{n} j",
 
-  objActions: "Objet",
   objSelectRow: "Sélectionnez une ligne",
   objYamlRaw: "brut",
   objYamlNeat: "net",
@@ -913,6 +919,17 @@ const FR: Strings = {
   delStrictPlaceholder: "nom de l'objet",
   delStrictMismatch: "attendu : {name}",
   delReload: "Revérifier",
+
+  rowMenu: "Actions",
+  selectRow: "Sélectionner",
+  selectAll: "Tout sélectionner",
+  bulkCount: "{n} sélectionné(s)",
+  bulkClear: "Effacer la sélection",
+  bulkActions: "Actions groupées",
+  bulkDeleteTitle: "Suppression groupée",
+  bulkDeleteConfirm: "Supprimer {n} objets",
+  bulkDeleteHelp: "Les objets signalés doivent être confirmés un par un.",
+  bulkDeleteClose: "Fermer",
 
   identUsers: "Comptes",
   identGroups: "Groupes",
@@ -1468,7 +1485,6 @@ const EN: Strings = {
   wlWorking: "working…",
   wlEmpty: "No workload or pod in this scope.",
   wlContainers: "Pod containers",
-  wlActions: "Workload actions",
   wlScale: "scale",
   wlRestart: "restart",
   wlRecycle: "recycle",
@@ -1481,7 +1497,6 @@ const EN: Strings = {
   wlMissingHelp:
     "These kinds could not be listed: the view is incomplete, it does not mean there are none.",
   wlRestarts: "restarts",
-  wlSelectWorkload: "Pick a workload: a pod or a container cannot be scaled.",
   wlCpuReq: "CPU used, as % of the request. Above 100% the pod takes more than it reserved — which is allowed.",
   wlCpuLim: "CPU used, as % of the limit. Above 100% the container is throttled.",
   wlMemReq: "Memory used, as % of the request.",
@@ -1573,7 +1588,6 @@ const EN: Strings = {
   certFold: "Fold / unfold the chain",
   certDays: "{n} d",
 
-  objActions: "Object",
   objSelectRow: "Select a row",
   objYamlRaw: "raw",
   objYamlNeat: "neat",
@@ -1606,6 +1620,17 @@ const EN: Strings = {
   delStrictPlaceholder: "object name",
   delStrictMismatch: "expected: {name}",
   delReload: "Check again",
+
+  rowMenu: "Actions",
+  selectRow: "Select",
+  selectAll: "Select all",
+  bulkCount: "{n} selected",
+  bulkClear: "Clear selection",
+  bulkActions: "Bulk actions",
+  bulkDeleteTitle: "Bulk delete",
+  bulkDeleteConfirm: "Delete {n} objects",
+  bulkDeleteHelp: "Flagged objects must be confirmed individually.",
+  bulkDeleteClose: "Close",
 
   identUsers: "Accounts",
   identGroups: "Groups",

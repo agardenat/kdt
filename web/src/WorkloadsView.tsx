@@ -11,11 +11,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
-import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
 
 /**
@@ -28,9 +28,11 @@ import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from ".
  *
  * La table déborde horizontalement sur un écran étroit ; `.tbl` est déjà en `width: max-content`
  * dans un conteneur qui défile, donc rien ne s'écrase.
+ *
+ * La première piste (`44px`) porte la case de sélection multiple, jamais mesurée sur le contenu.
  */
 const COLUMNS =
-  "minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
+  "44px minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
   " 60px 60px 60px 60px minmax(110px,14ch) minmax(120px,16ch) 52px";
 
 /**
@@ -88,9 +90,10 @@ export default function WorkloadsView({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
-  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
+  const { checked, toggle: toggleChecked, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   // La vue est dans la portée, contrairement à l'arbre Flux : elle liste des objets indépendants,
   // pas un graphe qu'un filtre amputerait de ses arêtes. Un seul namespace — la hiérarchie se lit
@@ -122,12 +125,6 @@ export default function WorkloadsView({
   }, [load]);
 
   useToastTimeout(toast, setToast);
-
-  // `Échap` ferme le menu avant tout le reste, et un clic à côté aussi : c'est ce qui est ouvert
-  // par-dessus. La ref va sur l'ancre — bouton **et** menu — sinon le bouton refermerait puis
-  // rouvrirait dans le même geste.
-  const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const menuRef = useDismiss<HTMLDivElement>(menuOpen, closeMenu);
 
   const needle = query.trim().toLowerCase();
 
@@ -171,17 +168,24 @@ export default function WorkloadsView({
     return out;
   }, [grouped, workloads, pods, expanded, needle]);
 
-  // Un pod ou un container n'a ni `scale` ni `restart` : le menu ne s'ouvre que sur un workload,
-  // et le dit plutôt que de proposer des entrées qui échoueraient.
-  const selectedWorkload = useMemo(
-    () => workloads.find((w) => w.uid === selected) ?? null,
-    [workloads, selected],
-  );
-
   const selectedRecord = useMemo<EventRecord | null>(() => {
     for (const entry of rows) if (entry.row.uid === selected) return entry.row.record;
     return null;
   }, [rows, selected]);
+
+  // La sélection multiple survit à un changement de filtre ou de groupement : une ligne cochée
+  // puis sortie de `rows` par le filtre garde son objet, cherché ici plutôt que dans `rows`.
+  //
+  // Les containers en sont absents, et n'ont pas de case : un container n'est pas un objet de
+  // l'API, et son `record` est celui de **son pod** (`synthetic_container_record`). Le cocher
+  // reviendrait à cocher le pod sous un autre nom — supprimant le pod entier en croyant viser un
+  // container, et deux fois si le pod était coché lui aussi.
+  const allRecords = useMemo<{ uid: string; record: EventRecord }[]>(() => {
+    const out: { uid: string; record: EventRecord }[] = [];
+    for (const w of workloads) out.push({ uid: w.uid, record: w.record });
+    for (const p of pods) out.push({ uid: p.uid, record: p.record });
+    return out;
+  }, [workloads, pods]);
 
   const toggle = useCallback((uid: string) => {
     setExpanded((prev) => {
@@ -194,7 +198,6 @@ export default function WorkloadsView({
 
   const run = useCallback(
     async (action: () => Promise<{ message: string }>) => {
-      setMenuOpen(false);
       setBusy(true);
       try {
         const { message } = await action();
@@ -255,33 +258,7 @@ export default function WorkloadsView({
         </div>
 
         <div className="right">
-          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
-              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
-              ouvrent remplace la table dans le panneau du bas. */}
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           {busy && <span>{st.wlWorking}</span>}
-          {/* Les actions vivent dans la barre et portent sur la ligne sélectionnée — la même
-              convention que la vue Flux. Ce qui est attaché à l'objet, ce sont les plis. */}
-          <div className="menu-anchor" ref={menuRef}>
-            <button
-              className="panel-toggle action"
-              disabled={!selectedWorkload}
-              title={selectedWorkload ? undefined : st.wlSelectWorkload}
-              aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((v) => !v)}
-            >
-              {st.wlActions} ▾
-            </button>
-            {menuOpen && selectedWorkload && (
-              <WorkloadMenu w={selectedWorkload} st={st} onRun={run} />
-            )}
-          </div>
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -293,6 +270,30 @@ export default function WorkloadsView({
         st={st}
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={allRecords.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={(message) => {
+                      setBulkOpen(false);
+                      clear();
+                      setToast({ tone: "ok", text: message });
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -310,6 +311,16 @@ export default function WorkloadsView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+                <SelectionHeaderCell
+                  keys={rows
+                    .filter((entry) => entry.level !== "container")
+                    .map((entry) => entry.row.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">READY</div>
@@ -343,32 +354,57 @@ export default function WorkloadsView({
                     key={entry.row.uid}
                     w={entry.row}
                     agg={entry.agg}
+                    lang={lang}
+                    st={st}
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
                     }}
+                    onOpenTab={(t) => {
+                      setSelected(entry.row.uid);
+                      setTab(t);
+                    }}
+                    onRun={run}
+                    onNeedsAuth={onNeedsAuth}
+                    checked={checked.has(entry.row.uid)}
+                    onToggleCheck={() => toggleChecked(entry.row.uid)}
                   />
                 ) : entry.level === "pod" ? (
                   <PodLine
                     key={entry.row.uid}
                     p={entry.row}
                     st={st}
+                    lang={lang}
                     indent={entry.indent}
                     expanded={expanded.has(entry.row.uid)}
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
                     }}
+                    onOpenTab={(t) => {
+                      setSelected(entry.row.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
                     onToggle={() => toggle(entry.row.uid)}
+                    checked={checked.has(entry.row.uid)}
+                    onToggleCheck={() => toggleChecked(entry.row.uid)}
                   />
                 ) : (
                   <ContainerLine
                     key={entry.row.uid}
                     c={entry.row}
+                    lang={lang}
+                    st={st}
                     selected={selected === entry.row.uid}
                     onSelect={() => {
                       setSelected(entry.row.uid);
                     }}
+                    onOpenTab={(t) => {
+                      setSelected(entry.row.uid);
+                      setTab(t);
+                    }}
+                    onNeedsAuth={onNeedsAuth}
                   />
                 ),
               )}
@@ -404,13 +440,27 @@ export default function WorkloadsView({
 function WorkloadLine({
   w,
   agg,
+  lang,
+  st,
   selected,
   onSelect,
+  onOpenTab,
+  onRun,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
 }: {
   w: WorkloadRow;
   agg: Agg;
+  lang: Lang;
+  st: Strings;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onRun: (action: () => Promise<{ message: string }>) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   return (
     <div
@@ -423,12 +473,22 @@ function WorkloadLine({
         if (e.key === "Enter") onSelect();
       }}
     >
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell mono dim">{w.namespace}</div>
       <div className="cell id">
+        <RowMenu record={w.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+          {({ close }) => (
+            <WorkloadMenu
+              w={w}
+              st={st}
+              onRun={(action) => {
+                close();
+                onRun(action);
+              }}
+            />
+          )}
+        </RowMenu>
         <span className="kind">{w.kind}</span> {w.name}
-        {/* Les actions vivent sur la ligne qu'elles visent, et non dans une barre où il faudrait
-            d'abord sélectionner puis chercher : c'est là que la souris est déjà. */}
-
       </div>
       <div className="cell mono">{w.ready_label}</div>
       <div className="cell">
@@ -477,91 +537,92 @@ function WorkloadMenu({
         ? st.wlDescRestart
         : st.wlDescRecycle;
 
-  return (
-    <div className="pop menu" onClick={(e) => e.stopPropagation()}>
-      <div className="pop-hd">
-        <span>{st.wlActions}</span>
-      </div>
-      <div className="menu-target mono">
-        {w.kind} {w.namespace}/{w.name}
-      </div>
-
-      {arming ? (
-        <div className="menu-confirm">
-          <p>{desc}</p>
-          {arming !== "restart" && (
-            <label className="opt">
-              {st.wlReplicas}
-              <input
-                type="number"
-                min={arming === "recycle" ? 1 : 0}
-                value={replicas}
-                autoFocus
-                onChange={(e) => setReplicas(Number(e.target.value))}
-              />
-            </label>
-          )}
-          <div className="menu-buttons">
-            {/* La sortie par défaut est celle qui n'écrit rien. */}
-            <button onClick={() => setArming(null)}>{st.fluxCancel}</button>
-            <button
-              className="cta"
-              onClick={() =>
-                onRun(() =>
-                  arming === "scale"
-                    ? api.scale(w, replicas)
-                    : arming === "restart"
-                      ? api.restart(w)
-                      : api.recycle(w, replicas),
-                )
-              }
-            >
-              {st.fluxConfirm}
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="menu-list">
-          {w.scalable && (
-            <button className="menu-item" onClick={() => setArming("scale")}>
-              <span className="lbl">{st.wlScale}</span>
-              <span className="desc">{st.wlDescScale}</span>
-            </button>
-          )}
-          {w.restartable && (
-            <button className="menu-item" onClick={() => setArming("restart")}>
-              <span className="lbl">{st.wlRestart}</span>
-              <span className="desc">{st.wlDescRestart}</span>
-            </button>
-          )}
-          {w.scalable && (
-            <button className="menu-item" onClick={() => setArming("recycle")}>
-              <span className="lbl">{st.wlRecycle}</span>
-              <span className="desc">{st.wlDescRecycle}</span>
-            </button>
-          )}
-        </div>
+  // Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui, le
+  // hamburger de ligne les porte déjà pour l'objet entier.
+  return arming ? (
+    <div className="menu-confirm">
+      <p>{desc}</p>
+      {arming !== "restart" && (
+        <label className="opt">
+          {st.wlReplicas}
+          <input
+            type="number"
+            min={arming === "recycle" ? 1 : 0}
+            value={replicas}
+            autoFocus
+            onChange={(e) => setReplicas(Number(e.target.value))}
+          />
+        </label>
       )}
+      <div className="menu-buttons">
+        {/* La sortie par défaut est celle qui n'écrit rien. */}
+        <button onClick={() => setArming(null)}>{st.fluxCancel}</button>
+        <button
+          className="cta"
+          onClick={() =>
+            onRun(() =>
+              arming === "scale"
+                ? api.scale(w, replicas)
+                : arming === "restart"
+                  ? api.restart(w)
+                  : api.recycle(w, replicas),
+            )
+          }
+        >
+          {st.fluxConfirm}
+        </button>
+      </div>
     </div>
+  ) : (
+    <>
+      {w.scalable && (
+        <button className="menu-item" onClick={() => setArming("scale")}>
+          <span className="lbl">{st.wlScale}</span>
+          <span className="desc">{st.wlDescScale}</span>
+        </button>
+      )}
+      {w.restartable && (
+        <button className="menu-item" onClick={() => setArming("restart")}>
+          <span className="lbl">{st.wlRestart}</span>
+          <span className="desc">{st.wlDescRestart}</span>
+        </button>
+      )}
+      {w.scalable && (
+        <button className="menu-item" onClick={() => setArming("recycle")}>
+          <span className="lbl">{st.wlRecycle}</span>
+          <span className="desc">{st.wlDescRecycle}</span>
+        </button>
+      )}
+    </>
   );
 }
 
 function PodLine({
   p,
+  lang,
   st,
   indent,
   expanded,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onToggle,
+  checked,
+  onToggleCheck,
 }: {
   p: PodRow;
+  lang: Lang;
   st: Strings;
   indent: boolean;
   expanded: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onToggle: () => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   return (
     <div
@@ -578,6 +639,12 @@ function PodLine({
         }
       }}
     >
+      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      {/* Un pod n'a pas sa propre colonne NAMESPACE — celle de son workload au-dessus suffit —
+          mais la piste existe dans `COLUMNS` : sans cellule vide ici, toute la ligne se décale
+          d'une colonne vers la gauche (préexistant à ce changement, remarqué en y posant la case
+          à cocher). */}
+      <div className="cell" />
       <div className="cell id" style={{ paddingLeft: indent ? "1.15rem" : undefined }}>
         {p.containers.length > 0 ? (
           <button
@@ -594,6 +661,7 @@ function PodLine({
         ) : (
           <span className="fold-gap" />
         )}
+        <RowMenu record={p.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         {p.name}
       </div>
       <div className="cell mono">{p.ready}</div>
@@ -618,12 +686,20 @@ function PodLine({
 
 function ContainerLine({
   c,
+  lang,
+  st,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
 }: {
   c: ContainerRow;
+  lang: Lang;
+  st: Strings;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
 }) {
   return (
     <div
@@ -636,8 +712,12 @@ function ContainerLine({
         if (e.key === "Enter") onSelect();
       }}
     >
+      {/* Pas de case : un container n'est pas un objet à supprimer, son `record` est celui de son
+          pod. Le menu, lui, reste — il nomme le pod qu'il vise dans son en-tête. */}
+      <div className="cell sel" />
       <div className="cell" />
       <div className="cell id" style={{ paddingLeft: "2.6rem" }}>
+        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         <span className={`gl ${c.tone}`}>{c.ready ? "✓" : "✗"}</span>
         {c.display_name}
       </div>

@@ -13,7 +13,8 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   RbacBindingRow,
@@ -27,14 +28,21 @@ import type {
   RbacSubjectRow,
 } from "./types";
 
-/** Les colonnes de la liste d'audit : `SEV SCOPE SUBJECT ROLE SOURCE RISK AGE`, celles du TUI. */
+/** Les colonnes de la liste d'audit : `SEV SCOPE SUBJECT ROLE SOURCE RISK AGE`, celles du TUI. La
+ * première piste (`44px`) porte la case de sélection multiple. */
 const FLAT_COLUMNS =
-  "84px minmax(140px,22ch) minmax(200px,1.2fr) minmax(200px,32ch) minmax(180px,30ch)" +
+  "44px 84px minmax(140px,22ch) minmax(200px,1.2fr) minmax(200px,32ch) minmax(180px,30ch)" +
   " minmax(120px,20ch) 56px";
 
 /** Les colonnes des trois lectures en arbre : `NODE SEV SCOPE ORIGIN DETAIL AGE`. */
 const TREE_COLUMNS =
-  "minmax(300px,1.3fr) 84px minmax(120px,18ch) minmax(180px,28ch) minmax(200px,1.2fr) 56px";
+  "44px minmax(300px,1.3fr) 84px minmax(120px,18ch) minmax(180px,28ch) minmax(200px,1.2fr) 56px";
+
+/** Un `nsgroup`/`rule`/`subject-leaf` n'a pas d'objet à lui : son `record` porte un kind/name vides,
+ * même garde que partout ailleurs pour décider d'une case et d'un hamburger. */
+function usable(row: RbacRow): boolean {
+  return Boolean(row.record.kind && row.record.name);
+}
 
 const SEVERITIES: RbacSeverity[] = ["info", "low", "medium", "high", "critical"];
 
@@ -67,6 +75,8 @@ export default function RbacView({
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   // Une seule portée : « la RBAC d'un namespace » est une question sur un namespace, pas sur trois.
   const namespace = namespaces[0] ?? "";
@@ -176,7 +186,11 @@ export default function RbacView({
             role="tab"
             aria-selected={orient === o}
             title={st.rbacOrientHelp}
-            onClick={() => setOrient(o)}
+            onClick={() => {
+              setOrient(o);
+              setSelected(null);
+              clear();
+            }}
           >
             {o === "flat"
               ? st.rbacFlat
@@ -223,13 +237,6 @@ export default function RbacView({
         )}
 
         <div className="right">
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -242,6 +249,34 @@ export default function RbacView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         hasDetail={Boolean(selectedRow)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={rows.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -260,6 +295,14 @@ export default function RbacView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: columns }}>
+                <SelectionHeaderCell
+                  keys={shown.filter(usable).map((r) => r.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 {orient === "flat" ? (
                   <>
                     <div className="cell">SEV</div>
@@ -289,11 +332,19 @@ export default function RbacView({
                   row={row}
                   orient={orient}
                   columns={columns}
+                  lang={lang}
                   st={st}
                   collapsed={collapsed.has(row.uid)}
                   selected={selected === row.uid}
                   onSelect={() => setSelected(row.uid)}
+                  onOpenTab={(t) => {
+                    setSelected(row.uid);
+                    setTab(t);
+                  }}
+                  onNeedsAuth={onNeedsAuth}
                   onFold={() => toggleFold(row, collapsed.has(row.uid))}
+                  checked={checked.has(row.uid)}
+                  onToggleCheck={() => toggle(row.uid)}
                 />
               ))}
             </div>
@@ -323,20 +374,30 @@ function Line({
   row,
   orient,
   columns,
+  lang,
   st,
   collapsed,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onFold,
+  checked,
+  onToggleCheck,
 }: {
   row: RbacRow;
   orient: RbacOrient;
   columns: string;
+  lang: Lang;
   st: Strings;
   collapsed: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onFold: () => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
   const common = {
     className: `tr ${rowClass(row)}`,
@@ -352,12 +413,22 @@ function Line({
       }
     },
   };
+  const rowUsable = usable(row);
+  const checkbox = rowUsable ? (
+    <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+  ) : (
+    <div className="cell sel" />
+  );
+  const menu = rowUsable ? (
+    <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+  ) : null;
 
   if (orient === "flat") {
     // La liste d'audit ne montre que des liaisons : c'est la lecture pour laquelle `:rbac` existe.
     if (row.row !== "binding") return null;
     return (
       <div {...common}>
+        {checkbox}
         <div className={`cell sev-${row.severity}`}>
           {row.sev_icon} {row.sev_label}
         </div>
@@ -365,6 +436,7 @@ function Line({
           {row.scope_label}
         </div>
         <div className="cell id" title={row.subject_rows.map((s) => s.label).join(", ")}>
+          {menu}
           {row.subject_label}
         </div>
         <div className="cell info" title={row.role_label}>
@@ -383,6 +455,7 @@ function Line({
 
   return (
     <div {...common}>
+      {checkbox}
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         {row.has_children ? (
           <button
@@ -399,6 +472,7 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
+        {menu}
         <Label row={row} st={st} />
       </div>
       <TreeCells row={row} st={st} />

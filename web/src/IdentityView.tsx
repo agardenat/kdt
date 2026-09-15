@@ -21,7 +21,8 @@ import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   Hint,
@@ -34,9 +35,10 @@ import type {
   IdentityPayload,
 } from "./types";
 
-/** `NAME EMAIL PHASE GROUPS INVITE SESS AGE` — les colonnes du TUI, dans le même ordre. */
+/** `NAME EMAIL PHASE GROUPS INVITE SESS AGE` — les colonnes du TUI, dans le même ordre. La
+ * première piste (`44px`) porte la case de sélection multiple. */
 const USER_COLUMNS =
-  "minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px";
+  "44px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px";
 
 /**
  * Les mêmes, plus SRC avant l'âge.
@@ -45,27 +47,27 @@ const USER_COLUMNS =
  * que le TUI. Ailleurs ce serait une colonne de tirets prise sur celles qui distinguent.
  */
 const USER_COLUMNS_SOURCE =
-  "minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px";
+  "44px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px";
 
 /** `NAME MEM UNKNOWN RIGHTS DESCRIPTION AGE`. */
 const GROUP_COLUMNS =
-  "minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px";
+  "44px minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px";
 
 const GROUP_COLUMNS_SOURCE =
-  "minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px";
+  "44px minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px";
 
 type World = "users" | "groups";
 type Filter = "all" | "problems";
-/** Le formulaire ouvert dans le menu de la barre. `null` = la liste des actions. */
-type Form =
+/** Le formulaire de la barre : ce qui ne vise aucune ligne, la création. */
+type Form = null | { kind: "create-user" } | { kind: "create-group" };
+/** Le formulaire d'un hamburger de ligne : ce qui vise **cette** ligne. */
+type RowForm =
   | null
   | { kind: "invite" }
   | { kind: "revoke" }
   | { kind: "disabled"; next: boolean }
   | { kind: "add-member" }
-  | { kind: "remove-member" }
-  | { kind: "create-user" }
-  | { kind: "create-group" };
+  | { kind: "remove-member" };
 
 export default function IdentityView({
   lang,
@@ -103,6 +105,8 @@ export default function IdentityView({
   // Une création vise une ligne qui n'existe pas encore : son uid non plus, donc l'atterrissage se
   // retient par le **nom**, comme `ident_pending` dans le TUI.
   const [pending, setPending] = useState<{ world: World; name: string } | null>(null);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -265,6 +269,7 @@ export default function IdentityView({
           onClick={() => {
             setWorld("users");
             setSelected(null);
+            clear();
           }}
         >
           {st.identUsers}
@@ -276,6 +281,7 @@ export default function IdentityView({
           onClick={() => {
             setWorld("groups");
             setSelected(null);
+            clear();
           }}
         >
           {st.identGroups}
@@ -318,6 +324,8 @@ export default function IdentityView({
         <div className="right">
           {busy && <span>{st.objWorking}</span>}
           <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
+          {/* Ce qui ne vise aucune ligne — créer un compte, créer un groupe — reste dans la barre :
+              inviter, révoquer, (dés)activer et l'appartenance viennent d'un hamburger de ligne. */}
           <div className="menu-anchor" ref={menuRef}>
             <button
               className="panel-toggle action"
@@ -330,13 +338,8 @@ export default function IdentityView({
               {st.identActions} ▾
             </button>
             {menuOpen && (
-              <IdentityMenu
+              <IdentityCreateMenu
                 st={st}
-                user={world === "users" ? selectedUser : null}
-                group={world === "groups" ? selectedGroup : null}
-                groups={groups}
-                controller={controller}
-                federation={payload?.federation ?? null}
                 installed={payload?.installed ?? false}
                 installCommand={payload?.install_command ?? ""}
                 form={form}
@@ -346,13 +349,6 @@ export default function IdentityView({
               />
             )}
           </div>
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -371,6 +367,32 @@ export default function IdentityView({
           setSelected(null);
           void load();
         }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={[...users, ...groups]
+                      .filter((r) => checked.has(r.uid))
+                      .map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -393,24 +415,51 @@ export default function IdentityView({
         ) : world === "users" ? (
           <UserTable
             rows={shownUsers}
+            groups={groups}
+            controller={controller}
+            federation={payload?.federation ?? null}
             selected={selected}
             showSource={payload?.shows_source ?? false}
+            lang={lang}
             st={st}
             onSelect={(u) => {
               setSelected(u.uid);
               setTab("detail");
             }}
+            onOpenTab={(u, t) => {
+              setSelected(u.uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            onRun={run}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : (
           <GroupTable
             rows={shownGroups}
             selected={selected}
             showSource={payload?.shows_source ?? false}
+            lang={lang}
             st={st}
             onSelect={(g) => {
               setSelected(g.uid);
               setTab("detail");
             }}
+            onOpenTab={(g, t) => {
+              setSelected(g.uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            onRun={run}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -496,16 +545,40 @@ function FederationStatus({ federation, st }: { federation: IdentFederation; st:
 
 function UserTable({
   rows,
+  groups,
+  controller,
+  federation,
   selected,
   showSource,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  onRun,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: IdentUserRow[];
+  groups: IdentGroupRow[];
+  controller: { namespace: string; pod: string; container: string } | null;
+  federation: IdentFederation | null;
   selected: string | null;
   showSource: boolean;
+  lang: Lang;
   st: Strings;
   onSelect: (u: IdentUserRow) => void;
+  onOpenTab: (u: IdentUserRow, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  onRun: (request: Record<string, unknown>) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
@@ -514,6 +587,14 @@ function UserTable({
           className="tr"
           style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
         >
+          <SelectionHeaderCell
+            keys={rows.map((u) => u.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAME</div>
           <div className="cell">EMAIL</div>
           <div className="cell">PHASE</div>
@@ -537,7 +618,36 @@ function UserTable({
               if (e.key === "Enter") onSelect(u);
             }}
           >
-            <div className="cell id">{u.name}</div>
+            <RowCheckbox
+              checked={checked.has(u.uid)}
+              onToggle={() => onToggleCheck(u.uid)}
+              label={st.selectRow}
+            />
+            <div className="cell id">
+              <RowMenu
+                record={u.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(u, t)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {({ close }) => (
+                  <IdentityRowMenu
+                    st={st}
+                    user={u}
+                    group={null}
+                    groups={groups}
+                    controller={controller}
+                    federation={federation}
+                    onRun={(request) => {
+                      close();
+                      onRun(request);
+                    }}
+                  />
+                )}
+              </RowMenu>
+              {u.name}
+            </div>
             <div className="cell dim">{u.email}</div>
             <div className={`cell ${u.phase_tone}`}>{u.phase_label}</div>
             {/* Les groupes décident de ce que le compte peut faire : la colonne prend le mou. */}
@@ -573,14 +683,32 @@ function GroupTable({
   rows,
   selected,
   showSource,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  onRun,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: IdentGroupRow[];
   selected: string | null;
   showSource: boolean;
+  lang: Lang;
   st: Strings;
   onSelect: (g: IdentGroupRow) => void;
+  onOpenTab: (g: IdentGroupRow, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  onRun: (request: Record<string, unknown>) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
@@ -589,6 +717,14 @@ function GroupTable({
           className="tr"
           style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
         >
+          <SelectionHeaderCell
+            keys={rows.map((g) => g.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAME</div>
           <div className="cell num">MEM</div>
           <div className="cell">UNKNOWN</div>
@@ -611,7 +747,36 @@ function GroupTable({
               if (e.key === "Enter") onSelect(g);
             }}
           >
-            <div className="cell id">{g.name}</div>
+            <RowCheckbox
+              checked={checked.has(g.uid)}
+              onToggle={() => onToggleCheck(g.uid)}
+              label={st.selectRow}
+            />
+            <div className="cell id">
+              <RowMenu
+                record={g.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(g, t)}
+                onNeedsAuth={onNeedsAuth}
+              >
+                {({ close }) => (
+                  <IdentityRowMenu
+                    st={st}
+                    user={null}
+                    group={g}
+                    groups={[]}
+                    controller={null}
+                    federation={null}
+                    onRun={(request) => {
+                      close();
+                      onRun(request);
+                    }}
+                  />
+                )}
+              </RowMenu>
+              {g.name}
+            </div>
             {/* Un zéro se lit comme rien plutôt que comme « 0 » : dans une colonne de comptes, ce
                 qui compte est les lignes qui en ont. */}
             <div className="cell num">{g.resolved.length || "·"}</div>
@@ -989,13 +1154,238 @@ function memberHelp(st: Strings, federated: boolean): string {
   return federated ? `${st.identMemberHelp} · ${st.identMembershipFederated}` : st.identMemberHelp;
 }
 
-function IdentityMenu({
+/**
+ * Le menu de ligne : ce que kdt offre sur `o` pour **ce** compte ou **ce** groupe.
+ *
+ * Posé comme `children` de `RowMenu` : pas de `.pop.menu`/`.pop-hd`/`.menu-target` à lui, il rend
+ * directement sa liste d'items (ou son formulaire). `user` et `group` sont mutuellement exclusifs —
+ * chaque appelant (une ligne de `UserTable`, une ligne de `GroupTable`) n'en fournit qu'un.
+ */
+function IdentityRowMenu({
   st,
   user,
   group,
   groups,
   controller,
   federation,
+  onRun,
+}: {
+  st: Strings;
+  user: IdentUserRow | null;
+  group: IdentGroupRow | null;
+  groups: IdentGroupRow[];
+  controller: { namespace: string; pod: string; container: string } | null;
+  federation: IdentFederation | null;
+  onRun: (request: Record<string, unknown>) => void;
+}) {
+  const [form, setForm] = useState<RowForm>(null);
+  const [validity, setValidity] = useState("72h");
+  const [target, setTarget] = useState("");
+
+  if (form === null) {
+    return (
+      <>
+        {user && (
+          <>
+            {/* Dans un mode fédéré l'invitation n'existe pas : les comptes naissent d'une
+                connexion réussie, et la commande amont refuse de s'exécuter. Ce qui ne peut pas
+                aboutir est éteint ici plutôt que découvert après la confirmation. */}
+            <MenuItem
+              label={st.identInvite}
+              desc={
+                federation?.federated
+                  ? st.identInviteFederated
+                  : controller
+                    ? st.identInviteHelp
+                    : st.identNoController
+              }
+              disabled={!controller || user.disabled || !!federation?.federated}
+              onClick={() => setForm({ kind: "invite" })}
+            />
+            {/* À côté d'inviter, parce que les deux tournent dans le pod et parlent d'accès. Le
+                libellé dit ce que ça fait — déconnecter toutes les machines — jamais « révoquer
+                le compte », qui est l'autre geste. */}
+            <MenuItem
+              label={st.identRevoke}
+              desc={controller ? st.identRevokeHelp : st.identNoController}
+              disabled={!controller}
+              onClick={() => setForm({ kind: "revoke" })}
+            />
+            <MenuItem
+              label={user.disabled ? st.identEnable : st.identDisable}
+              desc={
+                !user.disabled
+                  ? st.identDisableHelp
+                  : /* Réactiver ne tient que tant que la source reconnaît la personne — et
+                       seulement là où il y a une relecture pour le défaire. */
+                    user.source !== "local" && federation?.resync
+                    ? `${st.identEnableHelp} · ${st.identEnableFederated}`
+                    : st.identEnableHelp
+              }
+              onClick={() => setForm({ kind: "disabled", next: !user.disabled })}
+            />
+            <MenuItem
+              label={st.identAddMember}
+              desc={memberHelp(st, federation?.federated ?? false)}
+              disabled={groups.length === 0}
+              onClick={() => {
+                setTarget(groups[0]?.name ?? "");
+                setForm({ kind: "add-member" });
+              }}
+            />
+            {/* Retirer se fait depuis le compte, en nommant le groupe : c'est là qu'on voit à
+                quoi il appartient, et l'écriture porte de toute façon sur le groupe. */}
+            <MenuItem
+              label={st.identRemoveMember}
+              desc={memberHelp(st, federation?.federated ?? false)}
+              disabled={user.member_of.length === 0}
+              onClick={() => {
+                setTarget(user.member_of[0] ?? "");
+                setForm({ kind: "remove-member" });
+              }}
+            />
+          </>
+        )}
+        {group && (
+          <MenuItem
+            label={st.identAddMember}
+            desc={memberHelp(st, group.source !== "local")}
+            onClick={() => {
+              setTarget("");
+              setForm({ kind: "add-member" });
+            }}
+          />
+        )}
+      </>
+    );
+  }
+
+  return (
+    <div className="menu-confirm">
+      {form.kind === "invite" && (
+        <>
+          <p>{st.identInviteHelp}</p>
+          <div className="form-row">
+            <label htmlFor="ident-validity">{st.identInviteValidity}</label>
+            <input
+              id="ident-validity"
+              value={validity}
+              onChange={(e) => setValidity(e.target.value)}
+            />
+          </div>
+          <Buttons
+            st={st}
+            onCancel={() => setForm(null)}
+            onConfirm={() => onRun({ action: "invite", user: user!.name, validity })}
+          />
+        </>
+      )}
+
+      {form.kind === "revoke" && (
+        <>
+          <p>{st.identRevokeHelp}</p>
+          <Buttons
+            st={st}
+            onCancel={() => setForm(null)}
+            onConfirm={() => onRun({ action: "revoke", user: user!.name })}
+          />
+        </>
+      )}
+
+      {form.kind === "disabled" && (
+        <>
+          <p>{form.next ? st.identDisableHelp : st.identEnableHelp}</p>
+          <Buttons
+            st={st}
+            onCancel={() => setForm(null)}
+            onConfirm={() =>
+              onRun({ action: "set_disabled", user: user!.name, disabled: form.next })
+            }
+          />
+        </>
+      )}
+
+      {form.kind === "add-member" && (
+        <>
+          <p>{st.identMemberHelp}</p>
+          <div className="form-row">
+            {/* Depuis un compte, on choisit le groupe ; depuis un groupe, on saisit le compte.
+                Dans les deux cas l'écriture porte sur `spec.members` du groupe. */}
+            <label htmlFor="ident-target">{user ? st.identGroups : st.identMembers}</label>
+            <input
+              id="ident-target"
+              list={user ? "ident-group-list" : undefined}
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+            />
+            {user && (
+              <datalist id="ident-group-list">
+                {groups.map((g) => (
+                  <option key={g.uid} value={g.name} />
+                ))}
+              </datalist>
+            )}
+          </div>
+          <Buttons
+            st={st}
+            disabled={!target.trim()}
+            onCancel={() => setForm(null)}
+            onConfirm={() =>
+              onRun(
+                user
+                  ? { action: "add_member", group: target.trim(), user: user.name }
+                  : { action: "add_member", group: group!.name, user: target.trim() },
+              )
+            }
+          />
+        </>
+      )}
+
+      {form.kind === "remove-member" && user && (
+        <>
+          <p>{st.identMemberHelp}</p>
+          <div className="form-row">
+            <label htmlFor="ident-remove">{st.identGroups}</label>
+            <input
+              id="ident-remove"
+              list="ident-member-of"
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+            />
+            <datalist id="ident-member-of">
+              {user.member_of.map((g) => (
+                <option key={g} value={g} />
+              ))}
+            </datalist>
+          </div>
+          <Buttons
+            st={st}
+            disabled={memberIndex(groups, target, user.name) < 0}
+            onCancel={() => setForm(null)}
+            onConfirm={() =>
+              onRun({
+                action: "remove_member",
+                group: target.trim(),
+                user: user.name,
+                // L'index dans `spec.members`, lu sur le groupe affiché. Un index périmé ne
+                // retire pas le mauvais membre : le patch porte un `test` sur le nom, et
+                // l'apiserver refuse plutôt que d'obéir.
+                index: memberIndex(groups, target, user.name),
+              })
+            }
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Le menu de la barre : ce qui ne vise aucune ligne. Sur un cluster sans kdt-identity, créer un
+ * `KdtUser` n'est pas le geste suivant : la commande qui l'installerait, si.
+ */
+function IdentityCreateMenu({
+  st,
   installed,
   installCommand,
   form,
@@ -1004,11 +1394,6 @@ function IdentityMenu({
   onCreated,
 }: {
   st: Strings;
-  user: IdentUserRow | null;
-  group: IdentGroupRow | null;
-  groups: IdentGroupRow[];
-  controller: { namespace: string; pod: string; container: string } | null;
-  federation: IdentFederation | null;
   installed: boolean;
   installCommand: string;
   form: Form;
@@ -1020,91 +1405,15 @@ function IdentityMenu({
   const [email, setEmail] = useState("");
   const [display, setDisplay] = useState("");
   const [description, setDescription] = useState("");
-  const [validity, setValidity] = useState("72h");
-  const [target, setTarget] = useState("");
 
   return (
     <div className="pop menu" onClick={(e) => e.stopPropagation()}>
       <div className="pop-hd">
         <span>{st.identActions}</span>
       </div>
-      {(user || group) && (
-        <div className="menu-target mono">{user ? user.name : group?.name}</div>
-      )}
 
       {form === null ? (
         <div className="menu-list">
-          {user && (
-            <>
-              {/* Dans un mode fédéré l'invitation n'existe pas : les comptes naissent d'une
-                  connexion réussie, et la commande amont refuse de s'exécuter. Ce qui ne peut pas
-                  aboutir est éteint ici plutôt que découvert après la confirmation. */}
-              <MenuItem
-                label={st.identInvite}
-                desc={
-                  federation?.federated
-                    ? st.identInviteFederated
-                    : controller
-                      ? st.identInviteHelp
-                      : st.identNoController
-                }
-                disabled={!controller || user.disabled || !!federation?.federated}
-                onClick={() => onForm({ kind: "invite" })}
-              />
-              {/* À côté d'inviter, parce que les deux tournent dans le pod et parlent d'accès. Le
-                  libellé dit ce que ça fait — déconnecter toutes les machines — jamais « révoquer
-                  le compte », qui est l'autre geste. */}
-              <MenuItem
-                label={st.identRevoke}
-                desc={controller ? st.identRevokeHelp : st.identNoController}
-                disabled={!controller}
-                onClick={() => onForm({ kind: "revoke" })}
-              />
-              <MenuItem
-                label={user.disabled ? st.identEnable : st.identDisable}
-                desc={
-                  !user.disabled
-                    ? st.identDisableHelp
-                    : /* Réactiver ne tient que tant que la source reconnaît la personne — et
-                         seulement là où il y a une relecture pour le défaire. */
-                      user.source !== "local" && federation?.resync
-                      ? `${st.identEnableHelp} · ${st.identEnableFederated}`
-                      : st.identEnableHelp
-                }
-                onClick={() => onForm({ kind: "disabled", next: !user.disabled })}
-              />
-              <MenuItem
-                label={st.identAddMember}
-                desc={memberHelp(st, federation?.federated ?? false)}
-                disabled={groups.length === 0}
-                onClick={() => {
-                  setTarget(groups[0]?.name ?? "");
-                  onForm({ kind: "add-member" });
-                }}
-              />
-              {/* Retirer se fait depuis le compte, en nommant le groupe : c'est là qu'on voit à
-                  quoi il appartient, et l'écriture porte de toute façon sur le groupe. */}
-              <MenuItem
-                label={st.identRemoveMember}
-                desc={memberHelp(st, federation?.federated ?? false)}
-                disabled={user.member_of.length === 0}
-                onClick={() => {
-                  setTarget(user.member_of[0] ?? "");
-                  onForm({ kind: "remove-member" });
-                }}
-              />
-            </>
-          )}
-          {group && (
-            <MenuItem
-              label={st.identAddMember}
-              desc={memberHelp(st, group.source !== "local")}
-              onClick={() => {
-                setTarget("");
-                onForm({ kind: "add-member" });
-              }}
-            />
-          )}
           <MenuItem
             label={st.identCreateUser}
             desc={st.identMemberHelp}
@@ -1124,8 +1433,6 @@ function IdentityMenu({
               onForm({ kind: "create-group" });
             }}
           />
-          {/* Sur un cluster sans kdt-identity, créer un KdtUser n'est pas le geste suivant : la
-              commande qui l'installerait, si. */}
           {!installed && (
             <div className="menu-confirm">
               <p>{st.identInstallHelp}</p>
@@ -1135,125 +1442,6 @@ function IdentityMenu({
         </div>
       ) : (
         <div className="menu-confirm">
-          {form.kind === "invite" && (
-            <>
-              <p>{st.identInviteHelp}</p>
-              <div className="form-row">
-                <label htmlFor="ident-validity">{st.identInviteValidity}</label>
-                <input
-                  id="ident-validity"
-                  value={validity}
-                  onChange={(e) => setValidity(e.target.value)}
-                />
-              </div>
-              <Buttons
-                st={st}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun({ action: "invite", user: user!.name, validity })
-                }
-              />
-            </>
-          )}
-
-          {form.kind === "revoke" && (
-            <>
-              <p>{st.identRevokeHelp}</p>
-              <Buttons
-                st={st}
-                onCancel={() => onForm(null)}
-                onConfirm={() => onRun({ action: "revoke", user: user!.name })}
-              />
-            </>
-          )}
-
-          {form.kind === "disabled" && (
-            <>
-              <p>{form.next ? st.identDisableHelp : st.identEnableHelp}</p>
-              <Buttons
-                st={st}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun({ action: "set_disabled", user: user!.name, disabled: form.next })
-                }
-              />
-            </>
-          )}
-
-          {form.kind === "add-member" && (
-            <>
-              <p>{st.identMemberHelp}</p>
-              <div className="form-row">
-                {/* Depuis un compte, on choisit le groupe ; depuis un groupe, on saisit le compte.
-                    Dans les deux cas l'écriture porte sur `spec.members` du groupe. */}
-                <label htmlFor="ident-target">
-                  {user ? st.identGroups : st.identMembers}
-                </label>
-                <input
-                  id="ident-target"
-                  list={user ? "ident-group-list" : undefined}
-                  value={target}
-                  onChange={(e) => setTarget(e.target.value)}
-                />
-                {user && (
-                  <datalist id="ident-group-list">
-                    {groups.map((g) => (
-                      <option key={g.uid} value={g.name} />
-                    ))}
-                  </datalist>
-                )}
-              </div>
-              <Buttons
-                st={st}
-                disabled={!target.trim()}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun(
-                    user
-                      ? { action: "add_member", group: target.trim(), user: user.name }
-                      : { action: "add_member", group: group!.name, user: target.trim() },
-                  )
-                }
-              />
-            </>
-          )}
-
-          {form.kind === "remove-member" && user && (
-            <>
-              <p>{st.identMemberHelp}</p>
-              <div className="form-row">
-                <label htmlFor="ident-remove">{st.identGroups}</label>
-                <input
-                  id="ident-remove"
-                  list="ident-member-of"
-                  value={target}
-                  onChange={(e) => setTarget(e.target.value)}
-                />
-                <datalist id="ident-member-of">
-                  {user.member_of.map((g) => (
-                    <option key={g} value={g} />
-                  ))}
-                </datalist>
-              </div>
-              <Buttons
-                st={st}
-                disabled={memberIndex(groups, target, user.name) < 0}
-                onCancel={() => onForm(null)}
-                onConfirm={() =>
-                  onRun({
-                    action: "remove_member",
-                    group: target.trim(),
-                    user: user.name,
-                    // L'index dans `spec.members`, lu sur le groupe affiché. Un index périmé ne
-                    // retire pas le mauvais membre : le patch porte un `test` sur le nom, et
-                    // l'apiserver refuse plutôt que d'obéir.
-                    index: memberIndex(groups, target, user.name),
-                  })
-                }
-              />
-            </>
-          )}
-
           {form.kind === "create-user" && (
             <>
               <Field id="cu-name" label={st.identName} value={name} onChange={setName} />

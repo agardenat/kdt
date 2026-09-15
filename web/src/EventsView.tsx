@@ -9,7 +9,9 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { recordIdentity } from "./record";
 import { age, toneLabel, type EventRecord } from "./types";
 
 /**
@@ -17,10 +19,16 @@ import { age, toneLabel, type EventRecord } from "./types";
  *
  * Côté Rust les largeurs sont en caractères — 5, 4, 20, 14, 40, 22, 4, puis le reste pour le
  * message. Transposées ici en pistes de grille, avec un minimum pour que rien ne s'écrase et un
- * `fr` sur les deux colonnes qui méritent la place restante.
+ * `fr` sur les deux colonnes qui méritent la place restante. La première (`44px`) porte la case de
+ * sélection multiple.
  */
 const COLUMNS =
-  "52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch) 40px minmax(240px,2fr)";
+  "44px 52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch) 40px minmax(240px,2fr)";
+
+/** Un évènement sans objet visé (kind/name vides) n'a rien pour `RowMenu`/la case à cocher. */
+function usable(r: EventRecord): boolean {
+  return Boolean(r.kind && r.name);
+}
 
 type Filter = "all" | "warnings";
 
@@ -52,6 +60,8 @@ export default function EventsView({
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
   const [tab, setTab] = useState<PanelTab>("status");
   const bodyRef = useRef<HTMLDivElement>(null);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -137,16 +147,6 @@ export default function EventsView({
           <span className="count">{warnings}</span>
         </button>
         <div className="right">
-          {/* Les cinq gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`,
-              `i` dans le TUI. Ils vivent dans la barre, comme toutes les actions, et ce qu'ils
-              ouvrent remplace la table dans le panneau du bas. */}
-          <ObjectActions
-            record={selected}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
           {refreshedAt && <span>{st.refreshed.replace("{age}", age(new Date(refreshedAt).toISOString()))}</span>}
         </div>
@@ -160,6 +160,29 @@ export default function EventsView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         bodyRef={bodyRef}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={rows.filter((r) => checked.has(recordIdentity(r)))}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {visible.length === 0 ? (
           <div className="center">
@@ -175,10 +198,22 @@ export default function EventsView({
         ) : (
           <EventTable
             rows={visible}
+            lang={lang}
+            st={st}
             selected={selected}
             onSelect={(r) => {
               setSelected(r);
             }}
+            onOpenTab={(r, t) => {
+              setSelected(r);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -202,17 +237,43 @@ export default function EventsView({
 
 function EventTable({
   rows,
+  lang,
+  st,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: EventRecord[];
+  lang: Lang;
+  st: Strings;
   selected: EventRecord | null;
   onSelect: (r: EventRecord) => void;
+  onOpenTab: (r: EventRecord, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.filter(usable).map(recordIdentity)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell num">AGE</div>
           <div className="cell">SEV</div>
           <div className="cell">NS</div>
@@ -224,30 +285,53 @@ function EventTable({
         </div>
       </div>
       <div className="tbody">
-        {rows.map((r) => (
-          <div
-            key={r.uid || `${r.namespace}/${r.name}/${r.time}`}
-            className={`tr sev-${r.tone}`}
-            style={{ gridTemplateColumns: COLUMNS }}
-            aria-selected={selected?.uid === r.uid}
-            tabIndex={0}
-            onClick={() => onSelect(r)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") onSelect(r);
-            }}
-          >
-            <div className="cell num">{age(r.time)}</div>
-            <div className="cell">
-              <span className={`st ${r.tone}`}>{toneLabel(r.tone)}</span>
+        {rows.map((r) => {
+          const key = recordIdentity(r);
+          return (
+            <div
+              key={key}
+              className={`tr sev-${r.tone}`}
+              style={{ gridTemplateColumns: COLUMNS }}
+              aria-selected={selected?.uid === r.uid}
+              tabIndex={0}
+              onClick={() => onSelect(r)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onSelect(r);
+              }}
+            >
+              {usable(r) ? (
+                <RowCheckbox
+                  checked={checked.has(key)}
+                  onToggle={() => onToggleCheck(key)}
+                  label={st.selectRow}
+                />
+              ) : (
+                <div className="cell sel" />
+              )}
+              <div className="cell num">{age(r.time)}</div>
+              <div className="cell">
+                <span className={`st ${r.tone}`}>{toneLabel(r.tone)}</span>
+              </div>
+              <div className="cell mono">{r.namespace}</div>
+              <div className="cell mono">{r.kind}</div>
+              <div className="cell id">
+                {usable(r) && (
+                  <RowMenu
+                    record={r}
+                    lang={lang}
+                    st={st}
+                    onOpen={(t) => onOpenTab(r, t)}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                )}
+                {r.name}
+              </div>
+              <div className={`cell reason-${r.tone}`}>{r.reason}</div>
+              <div className="cell num">x{r.count}</div>
+              <div className="cell">{r.message}</div>
             </div>
-            <div className="cell mono">{r.namespace}</div>
-            <div className="cell mono">{r.kind}</div>
-            <div className="cell id">{r.name}</div>
-            <div className={`cell reason-${r.tone}`}>{r.reason}</div>
-            <div className="cell num">x{r.count}</div>
-            <div className="cell">{r.message}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

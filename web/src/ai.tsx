@@ -397,24 +397,27 @@ export function AiButton({
   usable,
   st,
   onOpen,
+  className = "panel-toggle ai",
 }: {
   usable: boolean;
   st: Strings;
   onOpen: () => void;
+  /** `RowMenu` le pose comme un item de son menu déroulant plutôt que comme un bouton de barre. */
+  className?: string;
 }) {
   const available = useAiAvailable();
   const config = useAiConfig();
 
   if (config && !available) {
     return (
-      <button className="panel-toggle" title={st.aiNoProviderHelp} onClick={openAiSettings}>
+      <button className={className} title={st.aiNoProviderHelp} onClick={openAiSettings}>
         {st.actionAi}
       </button>
     );
   }
   return (
     <button
-      className="panel-toggle ai"
+      className={className}
       disabled={!usable || !available}
       title={usable ? st.aiHelp : st.objSelectRow}
       onClick={onOpen}

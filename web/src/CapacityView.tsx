@@ -17,7 +17,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   CapNodeRow,
@@ -33,15 +34,16 @@ import type {
  * `NODE CPU RESERVED MEM RESERVED CPU USED MEM USED PODS IF LOST`, dans l'ordre du TUI.
  *
  * Les quatre colonnes de ratio portent le même gabarit — `3700m/4 (92%)` — donc la même largeur :
- * en donner moins à « used » qu'à « reserved » coupait la mémoire en plein milieu du total.
+ * en donner moins à « used » qu'à « reserved » coupait la mémoire en plein milieu du total. La
+ * première piste (`44px`) porte la case de sélection multiple.
  */
 const NODE_COLUMNS =
-  "minmax(150px,1fr) minmax(150px,19ch) minmax(150px,19ch) minmax(150px,19ch)" +
+  "44px minmax(150px,1fr) minmax(150px,19ch) minmax(150px,19ch) minmax(150px,19ch)" +
   " minmax(150px,19ch) 84px minmax(130px,15ch)";
 
 /** `NAMESPACE KIND NAME PODS CPU REQ→USED MEM REQ→USED QOS FINDING`. */
 const WORKLOAD_COLUMNS =
-  "minmax(110px,18ch) minmax(90px,12ch) minmax(150px,26ch) 56px minmax(140px,18ch)" +
+  "44px minmax(110px,18ch) minmax(90px,12ch) minmax(150px,26ch) 56px minmax(140px,18ch)" +
   " minmax(140px,18ch) 104px minmax(180px,1.4fr)";
 
 /**
@@ -51,7 +53,7 @@ const WORKLOAD_COLUMNS =
  * comme les deux `Min` du TUI : rien d'autre ici ne mérite de s'étirer.
  */
 const QUOTA_COLUMNS =
-  "minmax(110px,20ch) minmax(150px,1fr) minmax(160px,1.2fr) minmax(90px,14ch)" +
+  "44px minmax(110px,20ch) minmax(150px,1fr) minmax(160px,1.2fr) minmax(90px,14ch)" +
   " minmax(90px,14ch) 64px";
 
 type World = "nodes" | "workloads" | "quotas";
@@ -87,6 +89,8 @@ export default function CapacityView({
   const [filter, setFilter] = useState<Filter>("all");
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const scope = namespaces[0] ?? "";
 
@@ -147,6 +151,16 @@ export default function CapacityView({
   const selectedRecord: EventRecord | null =
     selectedNode?.record ?? selectedWorkload?.record ?? selectedQuota?.record ?? null;
 
+  // La sélection multiple ne traverse pas les mondes : changer d'onglet vide `checked` comme il
+  // vide déjà `selected`, et l'uid d'un node ne veut rien dire dans la liste des quotas.
+  const allRecords = useMemo<{ uid: string; record: EventRecord }[]>(() => {
+    const out: { uid: string; record: EventRecord }[] = [];
+    for (const n of nodes) out.push({ uid: n.uid, record: n.record });
+    for (const w of workloads) out.push({ uid: w.uid, record: w.record });
+    for (const q of quotas) out.push({ uid: q.uid, record: q.record });
+    return out;
+  }, [nodes, workloads, quotas]);
+
   const shownCount =
     world === "nodes" ? nodes.length : world === "workloads" ? workloads.length : quotas.length;
 
@@ -196,6 +210,7 @@ export default function CapacityView({
             onClick={() => {
               setWorld(id);
               setSelected(null);
+              clear();
             }}
           >
             {label}
@@ -222,13 +237,6 @@ export default function CapacityView({
         )}
 
         <div className="right">
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -264,6 +272,30 @@ export default function CapacityView({
           setSelected(null);
           void load();
         }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={allRecords.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -278,11 +310,59 @@ export default function CapacityView({
             </div>
           </div>
         ) : world === "nodes" ? (
-          <NodeTable rows={nodes} selected={selected} st={st} onSelect={select} />
+          <NodeTable
+            rows={nodes}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : world === "workloads" ? (
-          <WorkloadTable rows={workloads} selected={selected} onSelect={select} />
+          <WorkloadTable
+            rows={workloads}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : (
-          <QuotaTable rows={quotas} selected={selected} onSelect={select} />
+          <QuotaTable
+            rows={quotas}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         )}
       </ViewBody>
 
@@ -312,21 +392,48 @@ function Ratio({ ratio }: { ratio: CapRatio | null }) {
   );
 }
 
+interface WorldTableProps {
+  lang: Lang;
+  st: Strings;
+  onOpenTab: (uid: string, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
+}
+
 function NodeTable({
   rows,
   selected,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: CapNodeRow[];
   selected: string | null;
-  st: Strings;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((n) => n.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NODE</div>
           <div className="cell num">CPU RESERVED</div>
           <div className="cell num">MEM RESERVED</div>
@@ -349,7 +456,19 @@ function NodeTable({
               if (e.key === "Enter") onSelect(n.uid);
             }}
           >
+            <RowCheckbox
+              checked={checked.has(n.uid)}
+              onToggle={() => onToggleCheck(n.uid)}
+              label={st.selectRow}
+            />
             <div className="cell id">
+              <RowMenu
+                record={n.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(n.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
               {n.name}
               {!n.ready && <span className="badge-node err">{st.capNodeNotReady}</span>}
               {n.ready && !n.schedulable && (
@@ -377,16 +496,33 @@ function NodeTable({
 function WorkloadTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: CapWorkloadRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: WORKLOAD_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((w) => w.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAMESPACE</div>
           <div className="cell">KIND</div>
           <div className="cell">NAME</div>
@@ -410,9 +546,23 @@ function WorkloadTable({
               if (e.key === "Enter") onSelect(w.uid);
             }}
           >
+            <RowCheckbox
+              checked={checked.has(w.uid)}
+              onToggle={() => onToggleCheck(w.uid)}
+              label={st.selectRow}
+            />
             <div className="cell mono dim">{w.namespace}</div>
             <div className="cell mono dim">{w.kind}</div>
-            <div className="cell id">{w.name}</div>
+            <div className="cell id">
+              <RowMenu
+                record={w.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(w.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
+              {w.name}
+            </div>
             <div className="cell num dim">{w.pods}</div>
             {/* Sans mesure, la réservation reste vraie et se dit seule : une flèche vers rien
                 donnerait à croire à une consommation nulle. */}
@@ -436,16 +586,33 @@ function WorkloadTable({
 function QuotaTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: CapQuotaRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: QUOTA_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((q) => q.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAMESPACE</div>
           <div className="cell">QUOTA</div>
           <div className="cell">RESOURCE</div>
@@ -471,8 +638,22 @@ function QuotaTable({
                 if (e.key === "Enter") onSelect(q.uid);
               }}
             >
+              <RowCheckbox
+                checked={checked.has(q.uid)}
+                onToggle={() => onToggleCheck(q.uid)}
+                label={st.selectRow}
+              />
               <div className="cell mono dim">{q.namespace}</div>
-              <div className="cell id">{q.name}</div>
+              <div className="cell id">
+                <RowMenu
+                  record={q.record}
+                  lang={lang}
+                  st={st}
+                  onOpen={(t) => onOpenTab(q.uid, t)}
+                  onNeedsAuth={onNeedsAuth}
+                />
+                {q.name}
+              </div>
               <div className="cell mono">{worstItem?.resource ?? "—"}</div>
               <div className="cell num">{worstItem?.used_text ?? "—"}</div>
               <div className="cell num dim">{worstItem?.hard_text ?? "—"}</div>

@@ -19,7 +19,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   EventRecord,
@@ -31,14 +32,15 @@ import type {
   StorageRow,
 } from "./types";
 
-/** `NAMESPACE NAME PHASE SIZE ACCESS CLASS VOLUME USED BY AGE`. */
+/** `NAMESPACE NAME PHASE SIZE ACCESS CLASS VOLUME USED BY AGE`. La première piste (`44px`) porte
+ * la case de sélection multiple. */
 const CLAIM_COLUMNS =
-  "minmax(110px,18ch) minmax(150px,26ch) 84px 72px 72px minmax(150px,22ch)" +
+  "44px minmax(110px,18ch) minmax(150px,26ch) 84px 72px 72px minmax(150px,22ch)" +
   " minmax(180px,1.2fr) minmax(140px,1fr) 52px";
 
 /** `NAME KIND PHASE SIZE ACCESS RECLAIM CLAIM / PROVISIONER AGE`. */
 const VOLUME_COLUMNS =
-  "minmax(180px,1fr) 44px 84px 72px 72px 76px minmax(200px,1.4fr) 52px";
+  "44px minmax(180px,1fr) 44px 84px 72px 72px 76px minmax(200px,1.4fr) 52px";
 
 type World = "claims" | "volumes";
 type Filter = "all" | "problems";
@@ -74,6 +76,8 @@ export default function StorageView({
   const [filter, setFilter] = useState<Filter>("all");
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
+  const { checked, toggle: toggleChecked, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
   // Les classes **repliées**, et non les dépliées : le monde Volumes existe pour montrer les
   // volumes, et l'ouvrir sur trois classes fermées n'en montrerait aucun. C'est le parti de
   // l'arbre Flux — déplié, parce que le pliage est un état de qui regarde, pas du cluster. Le pli
@@ -232,6 +236,7 @@ export default function StorageView({
             onClick={() => {
               setWorld(id);
               setSelected(null);
+              clear();
             }}
           >
             {label}
@@ -254,13 +259,6 @@ export default function StorageView({
         )}
 
         <div className="right">
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -283,6 +281,30 @@ export default function StorageView({
           setSelected(null);
           void load();
         }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={allRows.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -297,15 +319,42 @@ export default function StorageView({
             </div>
           </div>
         ) : world === "claims" ? (
-          <ClaimTable rows={claims} selected={selected} onSelect={select} />
+          <ClaimTable
+            rows={claims}
+            selected={selected}
+            lang={lang}
+            st={st}
+            onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggleChecked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+          />
         ) : (
           <VolumeTable
             groups={visibleVolumes}
             folded={folded}
             selected={selected}
+            lang={lang}
             st={st}
             onSelect={select}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
             onToggle={toggle}
+            checked={checked}
+            onToggleCheck={toggleChecked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -346,19 +395,48 @@ function ClusterBand({ payload, st }: { payload: StoragePayload; st: Strings }) 
   );
 }
 
+interface WorldTableProps {
+  lang: Lang;
+  st: Strings;
+  onOpenTab: (uid: string, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
+}
+
 function ClaimTable({
   rows,
   selected,
+  lang,
+  st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: PvcRow[];
   selected: string | null;
   onSelect: (uid: string) => void;
-}) {
+} & WorldTableProps) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: CLAIM_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((c) => c.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAMESPACE</div>
           <div className="cell">NAME</div>
           <div className="cell">PHASE</div>
@@ -383,8 +461,22 @@ function ClaimTable({
               if (e.key === "Enter") onSelect(c.uid);
             }}
           >
+            <RowCheckbox
+              checked={checked.has(c.uid)}
+              onToggle={() => onToggleCheck(c.uid)}
+              label={st.selectRow}
+            />
             <div className="cell mono dim">{c.namespace}</div>
-            <div className="cell id">{c.name}</div>
+            <div className="cell id">
+              <RowMenu
+                record={c.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(c.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
+              {c.name}
+            </div>
             <div className={`cell ${c.phase_tone}`}>{c.phase}</div>
             <div className="cell num">{c.size || "—"}</div>
             <div className="cell dim">{c.access_modes}</div>
@@ -409,21 +501,44 @@ function VolumeTable({
   groups,
   folded: foldedSet,
   selected,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onToggle,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   groups: Array<{ sc: ScRow | null; volumes: PvRow[] }>;
   folded: Set<string>;
   selected: string | null;
-  st: Strings;
   onSelect: (uid: string) => void;
   onToggle: (uid: string) => void;
-}) {
+} & WorldTableProps) {
+  // Toutes les lignes adressables actuellement visibles : les classes réelles (pas le seau
+  // « sans classe », qui n'est pas un objet) et tous les volumes, repliés ou non — « tout
+  // sélectionner » porte sur ce qui est listé, pas seulement sur ce qui est déplié à l'écran.
+  const allKeys = groups.flatMap((g) => [
+    ...(g.sc ? [g.sc.uid] : []),
+    ...g.volumes.map((v) => v.uid),
+  ]);
+
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: VOLUME_COLUMNS }}>
+          <SelectionHeaderCell
+            keys={allKeys}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAME</div>
           <div className="cell">KIND</div>
           <div className="cell">PHASE</div>
@@ -453,6 +568,11 @@ function VolumeTable({
                     if (e.key === "Enter") onSelect(g.sc!.uid);
                   }}
                 >
+                  <RowCheckbox
+                    checked={checked.has(g.sc.uid)}
+                    onToggle={() => onToggleCheck(g.sc!.uid)}
+                    label={st.selectRow}
+                  />
                   <div className="cell id">
                     <button
                       className="fold"
@@ -465,6 +585,13 @@ function VolumeTable({
                     >
                       {g.volumes.length === 0 ? "·" : folded ? "▸" : "▾"}
                     </button>
+                    <RowMenu
+                      record={g.sc.record}
+                      lang={lang}
+                      st={st}
+                      onOpen={(t) => onOpenTab(g.sc!.uid, t)}
+                      onNeedsAuth={onNeedsAuth}
+                    />
                     {g.sc.name}
                     {g.sc.is_default && <span className="badge-default">{st.stoDefault}</span>}
                     {/* Combien de volumes elle provisionne, à côté d'elle : la colonne SIZE mesure
@@ -483,6 +610,7 @@ function VolumeTable({
                 </div>
               ) : (
                 <div className="tr sto-class" style={{ gridTemplateColumns: VOLUME_COLUMNS }}>
+                  <div className="cell sel" />
                   <div className="cell id dim">
                     <span className="fold-gap">·</span>
                     {st.stoNoClass}
@@ -510,7 +638,21 @@ function VolumeTable({
                       if (e.key === "Enter") onSelect(v.uid);
                     }}
                   >
-                    <div className="cell id nested">{v.name}</div>
+                    <RowCheckbox
+                      checked={checked.has(v.uid)}
+                      onToggle={() => onToggleCheck(v.uid)}
+                      label={st.selectRow}
+                    />
+                    <div className="cell id nested">
+                      <RowMenu
+                        record={v.record}
+                        lang={lang}
+                        st={st}
+                        onOpen={(t) => onOpenTab(v.uid, t)}
+                        onNeedsAuth={onNeedsAuth}
+                      />
+                      {v.name}
+                    </div>
                     <div className="cell mono dim">PV</div>
                     <div className={`cell ${v.phase_tone}`}>{v.phase}</div>
                     <div className="cell num">{v.capacity}</div>

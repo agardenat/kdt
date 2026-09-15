@@ -17,7 +17,8 @@ import { useDismiss } from "./dismiss";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   KyCounts,
@@ -34,14 +35,21 @@ import type {
  *
  * Côté Rust : RESOURCE dimensionnée sur son contenu (30 à 64 caractères), puis 9, 11, 26, et le
  * reste au détail. RESOURCE est en `fr` parce que c'est elle qui porte l'indentation, et DETAIL en
- * second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge.
+ * second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge. La première piste (`44px`)
+ * porte la case de sélection multiple.
  */
 const POLICY_COLUMNS =
-  "minmax(300px,1.3fr) 92px minmax(104px,12ch) minmax(180px,26ch) minmax(220px,1.5fr)";
+  "44px minmax(300px,1.3fr) 92px minmax(104px,12ch) minmax(180px,26ch) minmax(220px,1.5fr)";
 
 /** Les colonnes de l'axe par ressource : `RESOURCE RESULT POLICY/RULE MESSAGE`. */
 const RESOURCE_COLUMNS =
-  "minmax(300px,1.2fr) minmax(90px,10ch) minmax(220px,34ch) minmax(220px,1.6fr)";
+  "44px minmax(300px,1.2fr) minmax(90px,10ch) minmax(220px,34ch) minmax(220px,1.6fr)";
+
+/** Une ligne synthétique (`rule`/`violation`/`namespace`) n'a pas d'objet à elle : son `record` porte
+ * un kind/name vides, même garde que partout ailleurs. */
+function usable(row: KyRow): boolean {
+  return Boolean(row.record.kind && row.record.name);
+}
 
 export default function KyvernoView({
   lang,
@@ -75,6 +83,8 @@ export default function KyvernoView({
   const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -228,7 +238,11 @@ export default function KyvernoView({
           role="tab"
           aria-selected={axis === "policy"}
           title={st.kyAxisHelp}
-          onClick={() => setAxis("policy")}
+          onClick={() => {
+            setAxis("policy");
+            setSelected(null);
+            clear();
+          }}
         >
           {st.kyByPolicy}
           {counts && <span className="count">{counts.policies}</span>}
@@ -237,7 +251,11 @@ export default function KyvernoView({
           role="tab"
           aria-selected={axis === "resource"}
           title={st.kyAxisHelp}
-          onClick={() => setAxis("resource")}
+          onClick={() => {
+            setAxis("resource");
+            setSelected(null);
+            clear();
+          }}
         >
           {st.kyByResource}
           {counts && <span className="count">{counts.violations}</span>}
@@ -304,13 +322,6 @@ export default function KyvernoView({
               <PurgeMenu stuck={payload.backlog.stuck} st={st} onRun={() => void purge()} />
             )}
           </div>
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -328,6 +339,34 @@ export default function KyvernoView({
         onTab={setTab}
         onNeedsAuth={onNeedsAuth}
         hasDetail={Boolean(selectedRow)}
+        onDeleted={() => {
+          setSelected(null);
+          void load();
+        }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={rows.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -349,6 +388,14 @@ export default function KyvernoView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: columns }}>
+                <SelectionHeaderCell
+                  keys={shown.filter(usable).map((r) => r.uid)}
+                  checked={checked}
+                  onSetAll={setAll}
+                  onClear={clear}
+                  onBulkDelete={() => setBulkOpen(true)}
+                  st={st}
+                />
                 <div className="cell">RESOURCE</div>
                 {axis === "policy" ? (
                   <>
@@ -373,11 +420,19 @@ export default function KyvernoView({
                   row={row}
                   axis={axis}
                   columns={columns}
+                  lang={lang}
                   st={st}
                   collapsed={collapsed.has(row.uid)}
                   selected={selected === row.uid}
                   onSelect={() => setSelected(row.uid)}
+                  onOpenTab={(t) => {
+                    setSelected(row.uid);
+                    setTab(t);
+                  }}
+                  onNeedsAuth={onNeedsAuth}
                   onFold={() => toggleFold(row.uid, collapsed.has(row.uid))}
+                  checked={checked.has(row.uid)}
+                  onToggleCheck={() => toggle(row.uid)}
                 />
               ))}
             </div>
@@ -488,21 +543,32 @@ function Line({
   row,
   axis,
   columns,
+  lang,
   st,
   collapsed,
   selected,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
   onFold,
+  checked,
+  onToggleCheck,
 }: {
   row: KyRow;
   axis: "policy" | "resource";
   columns: string;
+  lang: Lang;
   st: Strings;
   collapsed: boolean;
   selected: boolean;
   onSelect: () => void;
+  onOpenTab: (tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
   onFold: () => void;
+  checked: boolean;
+  onToggleCheck: () => void;
 }) {
+  const rowUsable = usable(row);
   return (
     <div
       className={`tr ${rowClass(row)}`}
@@ -518,6 +584,11 @@ function Line({
         }
       }}
     >
+      {rowUsable ? (
+        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      ) : (
+        <div className="cell sel" />
+      )}
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         {row.has_children ? (
           <button
@@ -533,6 +604,15 @@ function Line({
           </button>
         ) : (
           <span className="fold-gap" />
+        )}
+        {rowUsable && (
+          <RowMenu
+            record={row.record}
+            lang={lang}
+            st={st}
+            onOpen={onOpenTab}
+            onNeedsAuth={onNeedsAuth}
+          />
         )}
         <Label row={row} axis={axis} />
       </div>

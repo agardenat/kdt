@@ -12,13 +12,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
-import { ObjectActions } from "./objects";
+import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
+import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type { EventRecord, NetPolRow, NetpolPayload } from "./types";
 
-/** `NAMESPACE NAME ENGINE TARGET TYPES INGRESS EGRESS AGE`, dans l'ordre du TUI. */
+/** `NAMESPACE NAME ENGINE TARGET TYPES INGRESS EGRESS AGE`, dans l'ordre du TUI. La première piste
+ * (`44px`) porte la case de sélection multiple. */
 const COLUMNS =
-  "minmax(110px,18ch) minmax(150px,24ch) 72px minmax(150px,1fr) minmax(96px,14ch)" +
+  "44px minmax(110px,18ch) minmax(150px,24ch) 72px minmax(150px,1fr) minmax(96px,14ch)" +
   " minmax(180px,1.6fr) minmax(170px,1.2fr) 52px";
 
 export default function NetpolView({
@@ -47,6 +49,8 @@ export default function NetpolView({
   const [loaded, setLoaded] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<PanelTab>("detail");
+  const { checked, toggle, clear, setAll } = useMultiSelect();
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   // Un seul namespace, comme les autres vues qui listent des objets namespacés : la portée est un
   // paramètre de l'URL côté serveur, et deux namespaces mélangés ne donneraient pas une liste plus
@@ -130,13 +134,6 @@ export default function NetpolView({
         )}
 
         <div className="right">
-          <ObjectActions
-            record={selectedRecord}
-            lang={lang}
-            st={st}
-            onOpen={(t) => setTab(t)}
-            onNeedsAuth={onNeedsAuth}
-          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -153,6 +150,30 @@ export default function NetpolView({
           setSelected(null);
           void load();
         }}
+        bulk={
+          bulkOpen
+            ? {
+                label: st.bulkDeleteTitle,
+                count: checked.size,
+                node: (
+                  <BulkDeletePane
+                    records={rows.filter((r) => checked.has(r.uid)).map((r) => r.record)}
+                    lang={lang}
+                    st={st}
+                    onCancel={() => setBulkOpen(false)}
+                    onDone={() => {
+                      setBulkOpen(false);
+                      setSelected(null);
+                      clear();
+                      void load();
+                    }}
+                    onNeedsAuth={onNeedsAuth}
+                  />
+                ),
+              }
+            : null
+        }
+        onBulkClose={() => setBulkOpen(false)}
       >
         {!loaded ? (
           <div className="center" />
@@ -171,11 +192,22 @@ export default function NetpolView({
           <PolicyTable
             rows={rows}
             selected={selected}
+            lang={lang}
             st={st}
             onSelect={(uid) => {
               setSelected(uid);
               setTab("detail");
             }}
+            onOpenTab={(uid, t) => {
+              setSelected(uid);
+              setTab(t);
+            }}
+            onNeedsAuth={onNeedsAuth}
+            checked={checked}
+            onToggleCheck={toggle}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -199,18 +231,42 @@ export default function NetpolView({
 function PolicyTable({
   rows,
   selected,
+  lang,
   st,
   onSelect,
+  onOpenTab,
+  onNeedsAuth,
+  checked,
+  onToggleCheck,
+  onSetAll,
+  onClear,
+  onBulkDelete,
 }: {
   rows: NetPolRow[];
   selected: string | null;
+  lang: Lang;
   st: Strings;
   onSelect: (uid: string) => void;
+  onOpenTab: (uid: string, tab: ObjectTab) => void;
+  onNeedsAuth: (message: string) => void;
+  checked: Set<string>;
+  onToggleCheck: (key: string) => void;
+  onSetAll: (keys: string[], on: boolean) => void;
+  onClear: () => void;
+  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+          <SelectionHeaderCell
+            keys={rows.map((p) => p.uid)}
+            checked={checked}
+            onSetAll={onSetAll}
+            onClear={onClear}
+            onBulkDelete={onBulkDelete}
+            st={st}
+          />
           <div className="cell">NAMESPACE</div>
           <div className="cell">NAME</div>
           <div className="cell">ENGINE</div>
@@ -234,8 +290,22 @@ function PolicyTable({
               if (e.key === "Enter") onSelect(p.uid);
             }}
           >
+            <RowCheckbox
+              checked={checked.has(p.uid)}
+              onToggle={() => onToggleCheck(p.uid)}
+              label={st.selectRow}
+            />
             <div className="cell mono dim">{p.cluster_scoped ? st.netpolCluster : p.namespace}</div>
-            <div className="cell id">{p.name}</div>
+            <div className="cell id">
+              <RowMenu
+                record={p.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(p.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
+              {p.name}
+            </div>
             <div className={`cell mono engine-${p.engine}`}>{p.engine_label}</div>
             <div className="cell mono">{p.target}</div>
             <div className="cell dim">{p.types || "—"}</div>
