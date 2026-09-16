@@ -8,6 +8,20 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.5] — 2026-09-16
+
+- **feat(web)** — le menu `☰` d'une ligne passe en **fin de ligne**, dans sa propre colonne, et la
+  colonne est épinglée à droite : accroché devant l'identifiant, il coupait la colonne qui
+  distingue les lignes entre elles ; posé au bout sans être épinglé, il serait sorti de l'écran dès
+  qu'une table déborde. La case de sélection est épinglée à gauche pour la même raison. Une table
+  plus large que la fenêtre défile désormais sous ses deux colonnes de gestes, qui restent à
+  l'écran.
+
+- **feat(web)** — le « tout sélectionner », le compte de lignes cochées et le menu des actions
+  groupées quittent l'en-tête de la table pour la **barre horizontale de la vue** : ils commandent
+  toute la table, ils n'ont donc à défiler avec aucune ligne — ni vers le bas, ni vers la droite.
+  Dans une vue à plusieurs mondes, « tout sélectionner » ne porte que sur la table affichée.
+
 ## [2.0.0-rc.4] — 2026-09-15
 
 - **feat(web)** — les gestes qui visent une ligne sont **sur la ligne** : un menu `☰` en tête de
