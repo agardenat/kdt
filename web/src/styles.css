@@ -254,6 +254,12 @@ button, input { font: inherit; color: inherit; }
 .worlds .count { font-family: var(--mono); font-size: 10.5px; color: var(--dim); margin-left: .3rem; }
 .worlds .right { margin-left: auto; display: flex; align-items: center; gap: .5rem; color: var(--muted); font-size: 11.5px; }
 
+/* Le « tout sélectionner » de la table, monté dans la barre : il commande toutes les lignes, il ne
+   défile donc avec aucune. Le compte n'apparaît qu'une fois quelque chose de coché — une barre qui
+   annonce « 0 sélectionné » en permanence ne dit rien. */
+.sel-bar { display: flex; align-items: center; gap: .5rem; }
+.sel-count { font-size: 11px; color: var(--dim); }
+
 .body { flex: 1; min-height: 0; overflow: auto; }
 
 /* Un overlay — YAML, édition, suppression, IA, ou le geste propre d'une vue — pris à la place de
@@ -280,12 +286,17 @@ button, input { font: inherit; color: inherit; }
   border-left: 2px solid transparent;
 }
 .thead .cell { font-size: 10.5px; text-transform: uppercase; letter-spacing: .075em; }
+/* Le fond d'une ligne passe par `--row-bg` et non par `background` directement : les deux colonnes
+   épinglées (`.cell.sel`, `.cell.act`) le repeignent sur un fond opaque pour que le contenu qui
+   défile sous elles ne les traverse pas. Une ligne qui pose son propre lit — un échec, une policy
+   en alarme — n'a donc qu'à redéfinir la variable. */
 .tbody .tr {
   height: 30px; border-bottom: 1px solid var(--line-soft); cursor: pointer;
   border-left: 2px solid transparent;
+  --row-bg: var(--bg); background: var(--row-bg);
 }
-.tbody .tr:hover { background: var(--row-hover); }
-.tbody .tr[aria-selected="true"] { background: var(--row-sel); border-left-color: var(--accent); }
+.tbody .tr:hover { --row-bg: var(--row-hover); }
+.tbody .tr[aria-selected="true"] { --row-bg: var(--row-sel); border-left-color: var(--accent); }
 .tbody .tr.sev-warn { border-left-color: color-mix(in srgb, var(--warn) 70%, transparent); }
 .tbody .tr.sev-err { border-left-color: color-mix(in srgb, var(--err) 70%, transparent); }
 .cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -401,9 +412,9 @@ button, input { font: inherit; color: inherit; }
    warning ordinaire, il dit que quelque chose est déjà cassé. */
 .tbody .tr.sev-err {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.sev-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.sev-err:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 
 /* ---------------------------------------------------------------- onglets du drawer */
 .dtabs { display: flex; gap: .1rem; margin: .55rem -.2rem -.55rem; }
@@ -552,9 +563,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
    balayant la page, pas en la lisant. Même choix que la ligne rouge du TUI. */
 .tbody .tr.flux-err {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.flux-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.flux-err:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 /* Une ligne saine n'est pas peinte : colorier la normale laisse l'anormale se fondre dedans. */
 .tbody .tr.flux-plain { color: inherit; }
 
@@ -649,7 +660,7 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 
 /* ---------------------------------------------------------------- hamburger de ligne, sélection
 
-   Le hamburger de ligne (`RowMenu`, `objects.tsx`) et celui de masse (`SelectionHeaderCell`,
+   Le hamburger de ligne (`RowMenu`, `objects.tsx`) et celui de masse (`SelectionBar`,
    `selection.tsx`) réutilisent `.pop.menu`/`.menu-list`/`.menu-item` ci-dessus, mais leur déroulé
    est rendu dans `document.body` (`MenuAnchor`, `menu.tsx`) : posé dans la cellule, il serait
    découpé par le `overflow: hidden` qui élide les noms trop longs. Sa place vient donc du script,
@@ -663,10 +674,29 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
   font-size: 13px; line-height: 1; padding: .15rem .3rem; border-radius: 4px; flex: none;
 }
 .row-menu-btn:hover, .row-menu-btn[aria-expanded="true"] { color: var(--accent); background: var(--row-hover); }
-.cell.id .row-menu-btn { vertical-align: middle; margin-right: .3rem; }
 
 .cell.sel { display: flex; align-items: center; justify-content: center; gap: .25rem; }
 .cell.sel input[type="checkbox"] { margin: 0; cursor: pointer; }
+.cell.act { display: flex; align-items: center; justify-content: center; }
+
+/* Les deux colonnes qui portent des gestes et non de la donnée — la case à cocher en tête de ligne,
+   le hamburger en fin de ligne — restent à l'écran quand la table est plus large que lui : une
+   table qui défile horizontalement emporterait sinon le seul moyen d'agir sur la ligne qu'on lit.
+   D'où `sticky`, et un fond opaque sous le lit de la ligne : sans lui, les colonnes qui glissent
+   dessous se liraient au travers (`--row-sel` est translucide).
+   Le décalage est celui du rembourrage de la ligne (`.tr { padding: 0 .85rem }`) et non zéro : la
+   place épinglée est alors exactement la place naturelle, et rien ne saute quand la table se met à
+   défiler. */
+.cell.sel, .cell.act { position: sticky; z-index: 1; }
+.cell.sel { left: .85rem; }
+.cell.act { right: .85rem; }
+.tbody .cell.sel, .tbody .cell.act {
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--row-bg), var(--row-bg));
+}
+/* L'en-tête est déjà épinglé en haut (`z-index: 5`) : ses deux cellules de geste le sont dans les
+   deux sens, et doivent passer au-dessus de celles du corps. */
+.thead .cell.sel, .thead .cell.act { background: var(--bg); z-index: 6; }
 
 .bulk-list { display: flex; flex-direction: column; gap: .55rem; }
 .bulk-item { padding: .45rem .55rem; border: 1px solid var(--line-soft); border-radius: 6px; }
@@ -695,9 +725,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* Un pod en panne porte un fond : c'est le seul état qu'on doit trouver en balayant la page. */
 .tbody .tr.wl-err {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.wl-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.wl-err:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 .tbody .tr.wl-warn { color: var(--warn); }
 .tbody .tr.wl-plain { color: inherit; }
 .tbody .tr.wl-container { color: var(--muted); font-size: 12px; }
@@ -738,9 +768,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .tbody .tr.sec-warn { border-left-color: var(--warn); }
 .tbody .tr.sec-err {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.sec-err:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.sec-err:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 
 /* Le contenu du panneau du haut : deux colonnes de faits, puis les clés. */
 .detail { font-size: 12px; }
@@ -850,9 +880,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .tbody .tr.cert-unknown { color: var(--warn); }
 .tbody .tr.cert-failed {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.cert-failed:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.cert-failed:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 
 /* La feuille TLS ferme la chaîne : elle n'est pas un objet cert-manager, et sa couleur le dit —
    comme le magenta du TUI, qui la distingue au premier coup d'œil de la lignée au-dessus. */
@@ -1036,10 +1066,10 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .tbody .tr.ky-alarm {
   color: var(--err);
   font-weight: 600;
-  background: color-mix(in srgb, var(--err) 9%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 9%, transparent);
   border-left-color: var(--err);
 }
-.tbody .tr.ky-alarm:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.ky-alarm:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 
 .cell.info { color: var(--info); }
 .cell.tone-ok { color: var(--ok); }
@@ -1078,10 +1108,10 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 
 /* Une liaison critique garde son lit rouge où qu'elle ait défilé. */
 .tbody .tr.rbac-crit {
-  background: color-mix(in srgb, var(--err) 9%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 9%, transparent);
   border-left-color: var(--err);
 }
-.tbody .tr.rbac-crit:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.rbac-crit:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 .tbody .tr.rbac-sev-info { color: var(--muted); }
 .tbody .tr.rbac-role .cell.id { color: var(--info); }
 .tbody .tr.rbac-subject { font-weight: 600; }
@@ -1110,9 +1140,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 .tbody .tr.vel-warn { border-left-color: var(--warn); }
 .tbody .tr.vel-danger {
   border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 8%, transparent);
+  --row-bg: color-mix(in srgb, var(--err) 8%, transparent);
 }
-.tbody .tr.vel-danger:hover { background: color-mix(in srgb, var(--err) 14%, transparent); }
+.tbody .tr.vel-danger:hover { --row-bg: color-mix(in srgb, var(--err) 14%, transparent); }
 .tbody .tr.vel-contents { color: var(--muted); }
 .tbody .tr.vel-contents .cell.id { color: var(--info); }
 

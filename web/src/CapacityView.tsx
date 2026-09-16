@@ -18,7 +18,7 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   CapNodeRow,
@@ -35,16 +35,17 @@ import type {
  *
  * Les quatre colonnes de ratio portent le même gabarit — `3700m/4 (92%)` — donc la même largeur :
  * en donner moins à « used » qu'à « reserved » coupait la mémoire en plein milieu du total. La
- * première piste (`44px`) porte la case de sélection multiple.
+ * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * ligne.
  */
 const NODE_COLUMNS =
-  "44px minmax(150px,1fr) minmax(150px,19ch) minmax(150px,19ch) minmax(150px,19ch)" +
-  " minmax(150px,19ch) 84px minmax(130px,15ch)";
+  "34px minmax(150px,1fr) minmax(150px,19ch) minmax(150px,19ch) minmax(150px,19ch)" +
+  " minmax(150px,19ch) 84px minmax(130px,15ch) 34px";
 
 /** `NAMESPACE KIND NAME PODS CPU REQ→USED MEM REQ→USED QOS FINDING`. */
 const WORKLOAD_COLUMNS =
-  "44px minmax(110px,18ch) minmax(90px,12ch) minmax(150px,26ch) 56px minmax(140px,18ch)" +
-  " minmax(140px,18ch) 104px minmax(180px,1.4fr)";
+  "34px minmax(110px,18ch) minmax(90px,12ch) minmax(150px,26ch) 56px minmax(140px,18ch)" +
+  " minmax(140px,18ch) 104px minmax(180px,1.4fr) 34px";
 
 /**
  * `NAMESPACE QUOTA RESOURCE USED LIMIT %`.
@@ -53,8 +54,8 @@ const WORKLOAD_COLUMNS =
  * comme les deux `Min` du TUI : rien d'autre ici ne mérite de s'étirer.
  */
 const QUOTA_COLUMNS =
-  "44px minmax(110px,20ch) minmax(150px,1fr) minmax(160px,1.2fr) minmax(90px,14ch)" +
-  " minmax(90px,14ch) 64px";
+  "34px minmax(110px,20ch) minmax(150px,1fr) minmax(160px,1.2fr) minmax(90px,14ch)" +
+  " minmax(90px,14ch) 64px 34px";
 
 type World = "nodes" | "workloads" | "quotas";
 type Filter = "all" | "problems";
@@ -237,6 +238,16 @@ export default function CapacityView({
         )}
 
         <div className="right">
+          <SelectionBar
+            keys={(world === "nodes" ? nodes : world === "workloads" ? workloads : quotas).map(
+              (r) => r.uid,
+            )}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -323,9 +334,6 @@ export default function CapacityView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : world === "workloads" ? (
           <WorkloadTable
@@ -341,9 +349,6 @@ export default function CapacityView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : (
           <QuotaTable
@@ -359,9 +364,6 @@ export default function CapacityView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -399,9 +401,6 @@ interface WorldTableProps {
   onNeedsAuth: (message: string) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }
 
 function NodeTable({
@@ -414,9 +413,6 @@ function NodeTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: CapNodeRow[];
   selected: string | null;
@@ -426,14 +422,7 @@ function NodeTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((n) => n.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NODE</div>
           <div className="cell num">CPU RESERVED</div>
           <div className="cell num">MEM RESERVED</div>
@@ -441,6 +430,7 @@ function NodeTable({
           <div className="cell num">MEM USED</div>
           <div className="cell num">PODS</div>
           <div className="cell">IF LOST</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -462,13 +452,6 @@ function NodeTable({
               label={st.selectRow}
             />
             <div className="cell id">
-              <RowMenu
-                record={n.record}
-                lang={lang}
-                st={st}
-                onOpen={(t) => onOpenTab(n.uid, t)}
-                onNeedsAuth={onNeedsAuth}
-              />
               {n.name}
               {!n.ready && <span className="badge-node err">{st.capNodeNotReady}</span>}
               {n.ready && !n.schedulable && (
@@ -486,6 +469,15 @@ function NodeTable({
               {n.pod_capacity > 0 ? `${n.pods}/${n.pod_capacity}` : n.pods}
             </div>
             <div className={`cell ${n.loss.tone}`}>{n.loss.short}</div>
+            <div className="cell act">
+              <RowMenu
+                record={n.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(n.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
+            </div>
           </div>
         ))}
       </div>
@@ -503,9 +495,6 @@ function WorkloadTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: CapWorkloadRow[];
   selected: string | null;
@@ -515,14 +504,7 @@ function WorkloadTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: WORKLOAD_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((w) => w.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">KIND</div>
           <div className="cell">NAME</div>
@@ -531,6 +513,7 @@ function WorkloadTable({
           <div className="cell num">MEM REQ→USED</div>
           <div className="cell">QOS</div>
           <div className="cell">FINDING</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -553,16 +536,7 @@ function WorkloadTable({
             />
             <div className="cell mono dim">{w.namespace}</div>
             <div className="cell mono dim">{w.kind}</div>
-            <div className="cell id">
-              <RowMenu
-                record={w.record}
-                lang={lang}
-                st={st}
-                onOpen={(t) => onOpenTab(w.uid, t)}
-                onNeedsAuth={onNeedsAuth}
-              />
-              {w.name}
-            </div>
+            <div className="cell id">{w.name}</div>
             <div className="cell num dim">{w.pods}</div>
             {/* Sans mesure, la réservation reste vraie et se dit seule : une flèche vers rien
                 donnerait à croire à une consommation nulle. */}
@@ -575,6 +549,15 @@ function WorkloadTable({
             <div className={`cell qos-${w.qos}`}>{w.qos_label}</div>
             <div className={`cell ${w.record.tone === "ok" ? "dim" : w.record.tone}`}>
               {w.finding}
+            </div>
+            <div className="cell act">
+              <RowMenu
+                record={w.record}
+                lang={lang}
+                st={st}
+                onOpen={(t) => onOpenTab(w.uid, t)}
+                onNeedsAuth={onNeedsAuth}
+              />
             </div>
           </div>
         ))}
@@ -593,9 +576,6 @@ function QuotaTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: CapQuotaRow[];
   selected: string | null;
@@ -605,20 +585,14 @@ function QuotaTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: QUOTA_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((q) => q.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">QUOTA</div>
           <div className="cell">RESOURCE</div>
           <div className="cell num">USED</div>
           <div className="cell num">LIMIT</div>
           <div className="cell num">%</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -644,7 +618,14 @@ function QuotaTable({
                 label={st.selectRow}
               />
               <div className="cell mono dim">{q.namespace}</div>
-              <div className="cell id">
+              <div className="cell id">{q.name}</div>
+              <div className="cell mono">{worstItem?.resource ?? "—"}</div>
+              <div className="cell num">{worstItem?.used_text ?? "—"}</div>
+              <div className="cell num dim">{worstItem?.hard_text ?? "—"}</div>
+              <div className={`cell num cap-${worstItem?.tension ?? "ok"}`}>
+                {worstItem ? `${worstItem.pct}%` : "—"}
+              </div>
+              <div className="cell act">
                 <RowMenu
                   record={q.record}
                   lang={lang}
@@ -652,13 +633,6 @@ function QuotaTable({
                   onOpen={(t) => onOpenTab(q.uid, t)}
                   onNeedsAuth={onNeedsAuth}
                 />
-                {q.name}
-              </div>
-              <div className="cell mono">{worstItem?.resource ?? "—"}</div>
-              <div className="cell num">{worstItem?.used_text ?? "—"}</div>
-              <div className="cell num dim">{worstItem?.hard_text ?? "—"}</div>
-              <div className={`cell num cap-${worstItem?.tension ?? "ok"}`}>
-                {worstItem ? `${worstItem.pct}%` : "—"}
               </div>
             </div>
           );

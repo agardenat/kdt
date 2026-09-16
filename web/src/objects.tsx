@@ -39,8 +39,13 @@ import type {
 export type ObjectTab = "yaml" | "edit" | "delete" | "ai";
 
 /**
- * Le hamburger posé en début de ligne : YAML, Éditer, Toucher, ce que la vue ajoute pour cette
- * ligne, Supprimer, puis IA — dans cet ordre, celui que portait la barre.
+ * Le hamburger posé en **fin** de ligne, dans sa propre colonne (`.cell.act`) : YAML, Éditer,
+ * Toucher, ce que la vue ajoute pour cette ligne, Supprimer, puis IA — dans cet ordre, celui que
+ * portait la barre.
+ *
+ * En fin de ligne et non collé au nom : accroché devant l'identifiant, il coupait la colonne qui
+ * distingue les lignes entre elles et déplaçait les noms les uns par rapport aux autres. La colonne
+ * est épinglée à droite (`styles.css`), elle reste donc à l'écran même quand la table défile.
  *
  * `record` n'est plus nullable : contrairement à l'ancienne barre, un menu de ligne n'existe que
  * sur une ligne qui a déjà un objet à viser — c'est à l'appelant de ne pas le poser sur une ligne

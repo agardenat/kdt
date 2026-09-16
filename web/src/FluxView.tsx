@@ -11,7 +11,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
 import type { EventRecord, FluxCounts, FluxRow, InventoryItem, ReconcileScope } from "./types";
 
@@ -23,12 +23,14 @@ import type { EventRecord, FluxCounts, FluxRow, InventoryItem, ReconcileScope } 
  * c'est elle qui porte l'indentation, et le message en second `fr` parce que c'est lui qui dit
  * pourquoi une ligne est rouge.
  */
-const TREE_COLUMNS = "44px minmax(280px,1.3fr) 104px minmax(120px,18ch) 52px minmax(200px,1.6fr)";
+const TREE_COLUMNS =
+  "34px minmax(280px,1.3fr) 104px minmax(120px,18ch) 52px minmax(200px,1.6fr) 34px";
 
-/** Les colonnes de la vue à plat, celles de `flux_table_parts`. La première piste (`44px`) porte
- * la case de sélection multiple. */
+/** Les colonnes de la vue à plat, celles de `flux_table_parts`. La première piste (`34px`) porte
+ * la case de sélection multiple, la dernière le hamburger de la ligne. */
 const LIST_COLUMNS =
-  "44px minmax(110px,16ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(120px,18ch) 52px minmax(200px,1.6fr)";
+  "34px minmax(110px,16ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(120px,18ch) 52px" +
+  " minmax(200px,1.6fr) 34px";
 
 /** Une entrée du menu d'action, dans l'ordre et sous les mots du TUI. */
 interface Action {
@@ -272,6 +274,14 @@ export default function FluxView({
               {st.fluxReveal}
             </label>
           )}
+          <SelectionBar
+            keys={selectableKeys}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -324,14 +334,7 @@ export default function FluxView({
                 className="tr"
                 style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
               >
-                <SelectionHeaderCell
-                  keys={selectableKeys}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 {tree ? (
                   <div className="cell">RESOURCE</div>
                 ) : (
@@ -345,6 +348,7 @@ export default function FluxView({
                 <div className="cell">REVISION</div>
                 <div className="cell num">AGE</div>
                 <div className="cell">MESSAGE</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -527,18 +531,6 @@ function ResourceLine({
           ) : (
             <span className="fold-gap" />
           )}
-          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
-            {({ close }) => (
-              <ActionMenu
-                actions={buildActions(row, st)}
-                st={st}
-                onRun={(a) => {
-                  close();
-                  onRun(row, a);
-                }}
-              />
-            )}
-          </RowMenu>
           <span className="kind">{row.kind}</span> {row.name}
           {/* L'équivalent des touches `+`/`-` du TUI. Un `⊞` seul se devine mal sur une page :
               la pastille porte le mot, et le compte une fois l'inventaire ouvert. */}
@@ -565,24 +557,6 @@ function ResourceLine({
           <div className="cell kind">{row.kind}</div>
           <div className="cell mono">{row.namespace}</div>
           <div className="cell id">
-            <RowMenu
-              record={row.record}
-              lang={lang}
-              st={st}
-              onOpen={onOpenTab}
-              onNeedsAuth={onNeedsAuth}
-            >
-              {({ close }) => (
-                <ActionMenu
-                  actions={buildActions(row, st)}
-                  st={st}
-                  onRun={(a) => {
-                    close();
-                    onRun(row, a);
-                  }}
-                />
-              )}
-            </RowMenu>
             {row.name}
           </div>
         </>
@@ -601,6 +575,20 @@ function ResourceLine({
           </span>
         )}
         {row.message}
+      </div>
+      <div className="cell act">
+        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+          {({ close }) => (
+            <ActionMenu
+              actions={buildActions(row, st)}
+              st={st}
+              onRun={(a) => {
+                close();
+                onRun(row, a);
+              }}
+            />
+          )}
+        </RowMenu>
       </div>
     </div>
   );
@@ -650,13 +638,6 @@ function InventoryLine({
         style={{ paddingLeft: `${depth * 1.15}rem`, gridColumn: tree ? undefined : "2 / 5" }}
       >
         <span className="fold-gap">{glyph}</span>
-        <RowMenu
-          record={item.record}
-          lang={lang}
-          st={st}
-          onOpen={onOpenTab}
-          onNeedsAuth={onNeedsAuth}
-        />
         <span className="kind">{item.kind}</span> {nsname}
       </div>
       <div className="cell">
@@ -666,6 +647,9 @@ function InventoryLine({
       <div className="cell" />
       <div className="cell dim" title={item.msg}>
         {item.msg}
+      </div>
+      <div className="cell act">
+        <RowMenu record={item.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
       </div>
     </div>
   );

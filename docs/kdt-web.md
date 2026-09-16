@@ -147,16 +147,19 @@ Arrêtée sur maquette le 2026-09-06. Front en React + Vite + TypeScript, dans `
   pour capacity, Backups / Schedules / Restaurations / Locations pour velero. Le mapping est exact.
 - **Drawer à droite** pour le détail d'une ligne, avec les onglets Logs / Status / Related / YAML.
   La liste reste visible, on enchaîne les sélections.
-- **Les gestes d'une ligne vivent dans son menu `☰`**, en tête de ligne : les cinq gestes
-  génériques de kdt (`y`, `e`, `h`, `Ctrl-D`, `i`) et ce que la vue ajoute pour ce kind — scale,
-  cordon, réconciliation. Le clavier du TUI devient une cible visible sur la ligne qu'il vise, et
-  la barre ne garde que ce qui ne vise aucune ligne. Le menu est rendu hors de la table
-  (`MenuAnchor`, `web/src/menu.tsx`) : posé dans la cellule, il serait découpé par le
-  `overflow: hidden` qui élide les noms trop longs.
-- **Une colonne de cases** ouvre la sélection multiple, et son en-tête porte le menu des actions
-  groupées — aujourd'hui la suppression. Il n'y a pas de route de suppression en lot : chaque
-  objet garde son préflight et son garde-fou, l'écriture est séquentielle, et un objet qui échoue
-  laisse le panneau ouvert sur son erreur.
+- **Les gestes d'une ligne vivent dans son menu `☰`**, dans sa propre colonne en fin de ligne :
+  les cinq gestes génériques de kdt (`y`, `e`, `h`, `Ctrl-D`, `i`) et ce que la vue ajoute pour ce
+  kind — scale, cordon, réconciliation. Le clavier du TUI devient une cible visible sur la ligne
+  qu'il vise, et la barre ne garde que ce qui ne vise aucune ligne. La colonne est épinglée à
+  droite : une table plus large que l'écran défile sous elle sans jamais l'emporter. Le menu
+  lui-même est rendu hors de la table (`MenuAnchor`, `web/src/menu.tsx`) : posé dans la cellule, il
+  serait découpé par le `overflow: hidden` qui élide les noms trop longs.
+- **Une colonne de cases** — épinglée à gauche, en symétrique — ouvre la sélection multiple. Le
+  « tout sélectionner », le compte et le menu des actions groupées sont dans la barre horizontale
+  de la vue, pas dans l'en-tête de la table : ils commandent toutes les lignes et ne défilent donc
+  avec aucune. Une seule action groupée aujourd'hui, la suppression. Il n'y a pas de route de
+  suppression en lot : chaque objet garde son préflight et son garde-fou, l'écriture est
+  séquentielle, et un objet qui échoue laisse le panneau ouvert sur son erreur.
 - **Les arbres passent en graphique** : arbre Flux, workloads → pods → containers, chaîne
   cert-manager. Le travail est fait côté données — `build_flux_tree` rend un `Vec<FlatTreeNode>`
   avec `depth` et `last_sibling`, le TUI ne choisit que les caractères `├─` / `└─`. Les badges

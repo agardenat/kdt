@@ -20,7 +20,7 @@ import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   DrainPreflight,
@@ -34,10 +34,10 @@ import type {
   UsageRatio,
 } from "./types";
 
-/** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`44px`) porte la
- * case de sélection multiple. */
+/** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
+ * case de sélection multiple, la dernière le hamburger de la ligne. */
 const NODE_COLUMNS =
-  "44px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px minmax(180px,1.2fr)";
+  "34px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px minmax(180px,1.2fr) 34px";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -277,6 +277,18 @@ export default function NodesView({
 
         <div className="right">
           {busy && <span className="dim">{st.objWorking}</span>}
+          {/* La table d'usage n'a pas de case à cocher : ses lignes sont des pods lus sous un node,
+              pas des objets qu'on sélectionne ici. */}
+          {world === "nodes" && (
+            <SelectionBar
+              keys={shown.map((n) => n.uid)}
+              checked={checked}
+              onSetAll={setAll}
+              onClear={clear}
+              onBulkDelete={() => setBulkOpen(true)}
+              st={st}
+            />
+          )}
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -385,9 +397,6 @@ export default function NodesView({
             onDrain={drainRow}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -429,9 +438,6 @@ function NodeTable({
   onDrain,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: NodeRow[];
   selected: string | null;
@@ -444,28 +450,19 @@ function NodeTable({
   onDrain: (n: NodeRow) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((n) => n.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell">READY</div>
           <div className="cell">ROLES</div>
           <div className="cell">VERSION</div>
           <div className="cell num">AGE</div>
           <div className="cell">ALERTS</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -486,7 +483,17 @@ function NodeTable({
               onToggle={() => onToggleCheck(n.uid)}
               label={st.selectRow}
             />
-            <div className="cell id">
+            <div className="cell id">{n.name}</div>
+            <div className={`cell mono tone-${n.ready_tone}`}>{n.ready}</div>
+            <div className="cell mono">{n.roles}</div>
+            <div className="cell mono dim">{n.version}</div>
+            <div className="cell num dim">{n.age}</div>
+            {/* La liste vient du serveur, `Cordoned` en tête quand il y en a un : c'est le seul de
+                la liste qui soit un geste, et c'est celui qu'on cherche. */}
+            <div className={`cell ${n.alerts.length > 0 ? "tone-err" : "dim"}`}>
+              {n.alerts.length > 0 ? n.alerts.join(", ") : "—"}
+            </div>
+            <div className="cell act">
               <RowMenu
                 record={n.record}
                 lang={lang}
@@ -509,16 +516,6 @@ function NodeTable({
                   />
                 )}
               </RowMenu>
-              {n.name}
-            </div>
-            <div className={`cell mono tone-${n.ready_tone}`}>{n.ready}</div>
-            <div className="cell mono">{n.roles}</div>
-            <div className="cell mono dim">{n.version}</div>
-            <div className="cell num dim">{n.age}</div>
-            {/* La liste vient du serveur, `Cordoned` en tête quand il y en a un : c'est le seul de
-                la liste qui soit un geste, et c'est celui qu'on cherche. */}
-            <div className={`cell ${n.alerts.length > 0 ? "tone-err" : "dim"}`}>
-              {n.alerts.length > 0 ? n.alerts.join(", ") : "—"}
             </div>
           </div>
         ))}

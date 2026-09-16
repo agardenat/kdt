@@ -16,7 +16,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   CertActionTarget,
@@ -36,15 +36,15 @@ import type {
  * Côté Rust : RESOURCE dimensionnée sur son contenu (28 à 72 caractères), puis 10, 28, 8, 6, et le
  * reste au message. RESOURCE est en `fr` parce que c'est elle qui porte l'indentation de la lignée,
  * et MESSAGE en second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge. La première
- * piste (`44px`) porte la case de sélection multiple.
+ * piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la ligne.
  */
 const TREE_COLUMNS =
-  "44px minmax(280px,1.3fr) 104px minmax(180px,28ch) 76px 52px minmax(200px,1.4fr)";
+  "34px minmax(280px,1.3fr) 104px minmax(180px,28ch) 76px 52px minmax(200px,1.4fr) 34px";
 
 /** Les colonnes de la vue à plat : `KIND NAMESPACE NAME READY TARGET EXPIRE AGE MESSAGE`. */
 const LIST_COLUMNS =
-  "44px minmax(110px,14ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(180px,28ch) 76px 52px" +
-  " minmax(200px,1.4fr)";
+  "34px minmax(110px,14ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(180px,28ch) 76px 52px" +
+  " minmax(200px,1.4fr) 34px";
 
 export default function CertsView({
   lang,
@@ -351,6 +351,14 @@ export default function CertsView({
           >
             {st.certOpenSecret}
           </button>
+          <SelectionBar
+            keys={shown.map((r) => r.uid)}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -414,14 +422,7 @@ export default function CertsView({
                 className="tr"
                 style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
               >
-                <SelectionHeaderCell
-                  keys={shown.map((r) => r.uid)}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 {tree ? (
                   <div className="cell">RESOURCE</div>
                 ) : (
@@ -436,6 +437,7 @@ export default function CertsView({
                 <div className="cell num">EXPIRE</div>
                 <div className="cell num">AGE</div>
                 <div className="cell">MESSAGE</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -609,9 +611,6 @@ function ResourceLine({
           ) : (
             <span className="fold-gap" />
           )}
-          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
-            {certMenu}
-          </RowMenu>
           <span className="kind">{row.kind_short}</span> {row.name}
           <Keystores formats={row.keystore_formats} />
         </div>
@@ -620,15 +619,6 @@ function ResourceLine({
           <div className="cell kind">{row.kind_short}</div>
           <div className="cell mono dim">{row.namespace}</div>
           <div className="cell id">
-            <RowMenu
-              record={row.record}
-              lang={lang}
-              st={st}
-              onOpen={onOpenTab}
-              onNeedsAuth={onNeedsAuth}
-            >
-              {certMenu}
-            </RowMenu>
             {row.name}
             <Keystores formats={row.keystore_formats} />
           </div>
@@ -646,6 +636,11 @@ function ResourceLine({
       <div className="cell num dim">{row.age}</div>
       <div className={`cell ${row.ready === "failed" ? "err" : "dim"}`} title={row.message}>
         {row.message}
+      </div>
+      <div className="cell act">
+        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+          {certMenu}
+        </RowMenu>
       </div>
     </div>
   );
@@ -694,7 +689,6 @@ function SecretLine({
       <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         <span className="fold-gap">→</span>
-        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         <span className="kind">Secret</span> {row.name}
       </div>
       <div className="cell">
@@ -704,6 +698,9 @@ function SecretLine({
       <Expiry days={row.days_remaining} tone={row.expiry_tone} st={st} />
       <div className="cell" />
       <div className="cell" />
+      <div className="cell act">
+        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+      </div>
     </div>
   );
 }

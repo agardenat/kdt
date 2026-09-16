@@ -15,7 +15,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
 
 /**
@@ -29,11 +29,12 @@ import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from ".
  * La table déborde horizontalement sur un écran étroit ; `.tbl` est déjà en `width: max-content`
  * dans un conteneur qui défile, donc rien ne s'écrase.
  *
- * La première piste (`44px`) porte la case de sélection multiple, jamais mesurée sur le contenu.
+ * La première piste (`34px`) porte la case de sélection multiple et la dernière le hamburger de la
+ * ligne, ni l'une ni l'autre mesurée sur le contenu.
  */
 const COLUMNS =
-  "44px minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
-  " 60px 60px 60px 60px minmax(110px,14ch) minmax(120px,16ch) 52px";
+  "34px minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
+  " 60px 60px 60px 60px minmax(110px,14ch) minmax(120px,16ch) 52px 34px";
 
 /**
  * Ce que consomme un workload : la somme de ses pods.
@@ -187,6 +188,12 @@ export default function WorkloadsView({
     return out;
   }, [workloads, pods]);
 
+  /** Ce que « tout sélectionner » couvre : les lignes adressables **affichées**, containers exclus. */
+  const selectableKeys = useMemo(
+    () => rows.filter((entry) => entry.level !== "container").map((entry) => entry.row.uid),
+    [rows],
+  );
+
   const toggle = useCallback((uid: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -259,6 +266,14 @@ export default function WorkloadsView({
 
         <div className="right">
           {busy && <span>{st.wlWorking}</span>}
+          <SelectionBar
+            keys={selectableKeys}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -311,16 +326,7 @@ export default function WorkloadsView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
-                <SelectionHeaderCell
-                  keys={rows
-                    .filter((entry) => entry.level !== "container")
-                    .map((entry) => entry.row.uid)}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">READY</div>
@@ -345,6 +351,7 @@ export default function WorkloadsView({
                 <div className="cell">IP</div>
                 <div className="cell">NODE</div>
                 <div className="cell num">AGE</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -476,18 +483,6 @@ function WorkloadLine({
       <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell mono dim">{w.namespace}</div>
       <div className="cell id">
-        <RowMenu record={w.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
-          {({ close }) => (
-            <WorkloadMenu
-              w={w}
-              st={st}
-              onRun={(action) => {
-                close();
-                onRun(action);
-              }}
-            />
-          )}
-        </RowMenu>
         <span className="kind">{w.kind}</span> {w.name}
       </div>
       <div className="cell mono">{w.ready_label}</div>
@@ -507,6 +502,20 @@ function WorkloadLine({
       <div className="cell dim" />
       <div className="cell dim" />
       <div className="cell num dim">{w.age}</div>
+      <div className="cell act">
+        <RowMenu record={w.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+          {({ close }) => (
+            <WorkloadMenu
+              w={w}
+              st={st}
+              onRun={(action) => {
+                close();
+                onRun(action);
+              }}
+            />
+          )}
+        </RowMenu>
+      </div>
     </div>
   );
 }
@@ -661,7 +670,6 @@ function PodLine({
         ) : (
           <span className="fold-gap" />
         )}
-        <RowMenu record={p.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         {p.name}
       </div>
       <div className="cell mono">{p.ready}</div>
@@ -680,6 +688,9 @@ function PodLine({
         {p.node}
       </div>
       <div className="cell num dim">{p.age}</div>
+      <div className="cell act">
+        <RowMenu record={p.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+      </div>
     </div>
   );
 }
@@ -717,7 +728,6 @@ function ContainerLine({
       <div className="cell sel" />
       <div className="cell" />
       <div className="cell id" style={{ paddingLeft: "2.6rem" }}>
-        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
         <span className={`gl ${c.tone}`}>{c.ready ? "✓" : "✗"}</span>
         {c.display_name}
       </div>
@@ -739,6 +749,9 @@ function ContainerLine({
       <div className="cell" />
       <div className="cell" />
       <div className="cell num dim">{c.age}</div>
+      <div className="cell act">
+        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+      </div>
     </div>
   );
 }

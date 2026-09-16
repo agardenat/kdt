@@ -21,7 +21,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   Hint,
@@ -35,22 +35,22 @@ import type {
 } from "./types";
 
 /** `RANCHER ID IDENTITY LOGIN PROVIDER GLOBAL ROLE GRP ACC TOK REFRESH STATE AGE`. La première
- * piste (`44px`) porte la case de sélection multiple. */
+ * piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la ligne. */
 const USER_COLUMNS =
-  "44px minmax(110px,16ch) minmax(180px,26ch) minmax(90px,16ch) 104px minmax(140px,1fr)" +
-  " 40px 40px 40px 64px 76px 48px";
+  "34px minmax(110px,16ch) minmax(180px,26ch) minmax(90px,16ch) 104px minmax(140px,1fr)" +
+  " 40px 40px 40px 64px 76px 48px 34px";
 
 /** `SCOPE TARGET SUBJECT TYPE PROVIDER ROLE AGE`. */
 const BINDING_COLUMNS =
-  "44px 72px minmax(90px,16ch) minmax(180px,28ch) 56px 116px minmax(160px,1fr) 48px";
+  "34px 72px minmax(90px,16ch) minmax(180px,28ch) 56px 116px minmax(160px,1fr) 48px 34px";
 
 /** `PROJECT ID CLUSTER NS MEMBERS OWNERS QUOTA AGE`. */
 const PROJECT_COLUMNS =
-  "44px minmax(130px,20ch) 88px 96px 44px 68px minmax(160px,1fr) minmax(140px,26ch) 48px";
+  "34px minmax(130px,20ch) 88px 96px 44px 68px minmax(160px,1fr) minmax(140px,26ch) 48px 34px";
 
 /** `TOKEN USER PROVIDER KIND SCOPE TTL STATE AGE`. */
 const TOKEN_COLUMNS =
-  "44px minmax(180px,32ch) minmax(160px,1fr) 116px 104px 96px 76px 76px 48px";
+  "34px minmax(180px,32ch) minmax(160px,1fr) 116px 104px 96px 76px 76px 48px 34px";
 
 type World = "users" | "access" | "projects" | "tokens";
 type Filter = "all" | "problems";
@@ -213,6 +213,16 @@ export default function RancherView({
           ? projects.length
           : settings.length + tokens.length;
 
+  /** Les lignes adressables du monde affiché — la table des tokens en liste deux sortes. */
+  const selectableKeys =
+    world === "users"
+      ? users.map((u) => u.uid)
+      : world === "access"
+        ? bindings.map((b) => b.uid)
+        : world === "projects"
+          ? projects.map((p) => p.uid)
+          : [...settings.map((g) => g.uid), ...tokens.map((t) => t.uid)];
+
   // Sélectionner ne déplie pas le panneau : le pli est la décision de qui regarde, et le forcer à
   // chaque clic redécalait la table sous le curseur. Ce sont les commandes de la barre — celles qui
   // révèlent un contenu — qui l'ouvrent.
@@ -317,6 +327,14 @@ export default function RancherView({
         <div className="right">
           {busy && <span>{st.objWorking}</span>}
           <ToastLine toast={toast} onDismiss={() => setToast(null)} lang={lang} />
+          <SelectionBar
+            keys={selectableKeys}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -392,9 +410,6 @@ export default function RancherView({
             onRun={run}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : world === "access" ? (
           <BindingTable
@@ -410,9 +425,6 @@ export default function RancherView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : world === "projects" ? (
           <ProjectTable
@@ -428,9 +440,6 @@ export default function RancherView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : (
           <TokenTable
@@ -449,9 +458,6 @@ export default function RancherView({
             onRun={run}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -487,9 +493,6 @@ interface WorldTableProps {
   onNeedsAuth: (message: string) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }
 
 function UserTable({
@@ -505,9 +508,6 @@ function UserTable({
   onRun,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: RanchUserRow[];
   selected: string | null;
@@ -520,14 +520,7 @@ function UserTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: USER_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((u) => u.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">RANCHER ID</div>
           <div className="cell">IDENTITY</div>
           <div className="cell">LOGIN</div>
@@ -539,6 +532,7 @@ function UserTable({
           <div className="cell">REFRESH</div>
           <div className="cell">STATE</div>
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -553,10 +547,7 @@ function UserTable({
             checked={checked.has(u.uid)}
             onToggleCheck={() => onToggleCheck(u.uid)}
             st={st}
-          >
-            <div className="cell mono dim">{u.id}</div>
-            {/* Un principal opaque — un GUID — est montré tel quel plutôt que déguisé en nom. */}
-            <div className={`cell id ${u.identity_opaque ? "dim" : ""}`}>
+            actions={
               <RowMenu
                 record={u.record}
                 lang={lang}
@@ -580,8 +571,11 @@ function UserTable({
                     )
                   : undefined}
               </RowMenu>
-              {u.identity_cell}
-            </div>
+            }
+          >
+            <div className="cell mono dim">{u.id}</div>
+            {/* Un principal opaque — un GUID — est montré tel quel plutôt que déguisé en nom. */}
+            <div className={`cell id ${u.identity_opaque ? "dim" : ""}`}>{u.identity_cell}</div>
             <div className="cell mono">{u.username}</div>
             <div className={`cell ${u.provider_tone}`}>{u.provider}</div>
             <div className={`cell ${u.is_admin ? "" : "dim"}`}>
@@ -611,9 +605,6 @@ function BindingTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: RanchBindingRow[];
   selected: string | null;
@@ -623,14 +614,7 @@ function BindingTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: BINDING_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((b) => b.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">SCOPE</div>
           <div className="cell">TARGET</div>
           <div className="cell">SUBJECT</div>
@@ -638,6 +622,7 @@ function BindingTable({
           <div className="cell">PROVIDER</div>
           <div className="cell">ROLE</div>
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -655,10 +640,7 @@ function BindingTable({
             // Le rôle que Rancher pose sur tout compte se lit comme de l'arrière-plan : il est là
             // parce qu'il existe, pas parce que quelqu'un l'a décidé.
             className={b.automatic ? "automatic" : undefined}
-          >
-            <div className="cell mono">{b.scope_kind}</div>
-            <div className="cell mono">{b.scope_label}</div>
-            <div className="cell id">
+            actions={
               <RowMenu
                 record={b.record}
                 lang={lang}
@@ -666,6 +648,11 @@ function BindingTable({
                 onOpen={(t) => onOpenTab(b.uid, t)}
                 onNeedsAuth={onNeedsAuth}
               />
+            }
+          >
+            <div className="cell mono">{b.scope_kind}</div>
+            <div className="cell mono">{b.scope_label}</div>
+            <div className="cell id">
               {b.subject_label}
               {!b.authoritative && <span className="badge-projected">projeté</span>}
             </div>
@@ -690,9 +677,6 @@ function ProjectTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: RanchProjectRow[];
   selected: string | null;
@@ -702,14 +686,7 @@ function ProjectTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: PROJECT_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.map((p) => p.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">PROJECT</div>
           <div className="cell">ID</div>
           <div className="cell">CLUSTER</div>
@@ -718,6 +695,7 @@ function ProjectTable({
           <div className="cell">OWNERS</div>
           <div className="cell">QUOTA</div>
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -732,8 +710,7 @@ function ProjectTable({
             checked={checked.has(p.uid)}
             onToggleCheck={() => onToggleCheck(p.uid)}
             st={st}
-          >
-            <div className="cell id">
+            actions={
               <RowMenu
                 record={p.record}
                 lang={lang}
@@ -741,8 +718,9 @@ function ProjectTable({
                 onOpen={(t) => onOpenTab(p.uid, t)}
                 onNeedsAuth={onNeedsAuth}
               />
-              {p.display_name}
-            </div>
+            }
+          >
+            <div className="cell id">{p.display_name}</div>
             <div className="cell mono dim">{p.id}</div>
             <div className="cell mono dim">{p.cluster}</div>
             <div className="cell num">{p.namespaces.length || "·"}</div>
@@ -777,9 +755,6 @@ function TokenTable({
   onRun,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   settings: RanchSettingRow[];
   tokens: RanchTokenRow[];
@@ -792,14 +767,7 @@ function TokenTable({
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: TOKEN_COLUMNS }}>
-          <SelectionHeaderCell
-            keys={[...settings.map((s) => s.uid), ...tokens.map((t) => t.uid)]}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">TOKEN</div>
           <div className="cell">USER</div>
           <div className="cell">PROVIDER</div>
@@ -808,6 +776,7 @@ function TokenTable({
           <div className="cell">TTL</div>
           <div className="cell">STATE</div>
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -822,10 +791,7 @@ function TokenTable({
             checked={checked.has(s.uid)}
             onToggleCheck={() => onToggleCheck(s.uid)}
             st={st}
-          >
-            {/* Un réglage qu'un opérateur a changé mérite de se voir comme changé : le défaut est
-                de l'arrière-plan, une valeur délibérée non. */}
-            <div className={`cell ${s.is_default ? "dim" : "id"}`}>
+            actions={
               <RowMenu
                 record={s.record}
                 lang={lang}
@@ -849,8 +815,11 @@ function TokenTable({
                     )
                   : undefined}
               </RowMenu>
-              {s.name}
-            </div>
+            }
+          >
+            {/* Un réglage qu'un opérateur a changé mérite de se voir comme changé : le défaut est
+                de l'arrière-plan, une valeur délibérée non. */}
+            <div className={`cell ${s.is_default ? "dim" : "id"}`}>{s.name}</div>
             <div className="cell" />
             <div className="cell" />
             <div className="cell info">setting</div>
@@ -871,9 +840,7 @@ function TokenTable({
             checked={checked.has(t.uid)}
             onToggleCheck={() => onToggleCheck(t.uid)}
             st={st}
-          >
-            <div className="cell mono">{t.name}</div>
-            <div className="cell id" title={t.user_id}>
+            actions={
               <RowMenu
                 record={t.record}
                 lang={lang}
@@ -897,6 +864,10 @@ function TokenTable({
                     )
                   : undefined}
               </RowMenu>
+            }
+          >
+            <div className="cell mono">{t.name}</div>
+            <div className="cell id" title={t.user_id}>
               {t.owner_label}
             </div>
             <div className={`cell ${t.provider_tone}`}>{t.provider}</div>
@@ -924,6 +895,7 @@ function Row({
   checked,
   onToggleCheck,
   st,
+  actions,
   children,
 }: {
   uid: string;
@@ -935,6 +907,8 @@ function Row({
   checked: boolean;
   onToggleCheck: () => void;
   st: Strings;
+  /** Le hamburger de la ligne, posé dans la dernière piste — la colonne épinglée à droite. */
+  actions?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -950,6 +924,7 @@ function Row({
     >
       <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       {children}
+      <div className="cell act">{actions}</div>
     </div>
   );
 }

@@ -10,7 +10,7 @@ import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { recordIdentity } from "./record";
 import { age, toneLabel, type EventRecord } from "./types";
 
@@ -19,11 +19,12 @@ import { age, toneLabel, type EventRecord } from "./types";
  *
  * Côté Rust les largeurs sont en caractères — 5, 4, 20, 14, 40, 22, 4, puis le reste pour le
  * message. Transposées ici en pistes de grille, avec un minimum pour que rien ne s'écrase et un
- * `fr` sur les deux colonnes qui méritent la place restante. La première (`44px`) porte la case de
- * sélection multiple.
+ * `fr` sur les deux colonnes qui méritent la place restante. La première (`34px`) porte la case de
+ * sélection multiple, la dernière le hamburger de la ligne.
  */
 const COLUMNS =
-  "44px 52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch) 40px minmax(240px,2fr)";
+  "34px 52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch)" +
+  " 40px minmax(240px,2fr) 34px";
 
 /** Un évènement sans objet visé (kind/name vides) n'a rien pour `RowMenu`/la case à cocher. */
 function usable(r: EventRecord): boolean {
@@ -113,6 +114,10 @@ export default function EventsView({
 
   const warnings = rows.filter((r) => r.tone !== "ok").length;
 
+  // Les clés de la sélection, et non les `uid` : un évènement n'en a pas toujours un
+  // (`recordIdentity`, `record.ts`).
+  const selectableKeys = useMemo(() => visible.filter(usable).map(recordIdentity), [visible]);
+
   return (
     <>
             {/* Le panneau reste en place tant qu'il est déplié, sélection ou pas : le faire apparaître
@@ -147,6 +152,14 @@ export default function EventsView({
           <span className="count">{warnings}</span>
         </button>
         <div className="right">
+          <SelectionBar
+            keys={selectableKeys}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
           {refreshedAt && <span>{st.refreshed.replace("{age}", age(new Date(refreshedAt).toISOString()))}</span>}
         </div>
@@ -211,9 +224,6 @@ export default function EventsView({
             onNeedsAuth={onNeedsAuth}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -245,9 +255,6 @@ function EventTable({
   onNeedsAuth,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: EventRecord[];
   lang: Lang;
@@ -258,22 +265,12 @@ function EventTable({
   onNeedsAuth: (message: string) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
       <div className="thead">
         <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
-          <SelectionHeaderCell
-            keys={rows.filter(usable).map(recordIdentity)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell num">AGE</div>
           <div className="cell">SEV</div>
           <div className="cell">NS</div>
@@ -282,6 +279,7 @@ function EventTable({
           <div className="cell">REASON</div>
           <div className="cell num">CNT</div>
           <div className="cell">MESSAGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -314,7 +312,11 @@ function EventTable({
               </div>
               <div className="cell mono">{r.namespace}</div>
               <div className="cell mono">{r.kind}</div>
-              <div className="cell id">
+              <div className="cell id">{r.name}</div>
+              <div className={`cell reason-${r.tone}`}>{r.reason}</div>
+              <div className="cell num">x{r.count}</div>
+              <div className="cell">{r.message}</div>
+              <div className="cell act">
                 {usable(r) && (
                   <RowMenu
                     record={r}
@@ -324,11 +326,7 @@ function EventTable({
                     onNeedsAuth={onNeedsAuth}
                   />
                 )}
-                {r.name}
               </div>
-              <div className={`cell reason-${r.tone}`}>{r.reason}</div>
-              <div className="cell num">x{r.count}</div>
-              <div className="cell">{r.message}</div>
             </div>
           );
         })}

@@ -15,7 +15,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   VelBackupRow,
@@ -30,10 +30,11 @@ import type {
 } from "./types";
 
 /** Les colonnes du TUI : `NAMESPACE NAME KIND STATE INFO EXPIRE AGE ALERT`, dans le même ordre. La
- * première piste (`44px`) porte la case de sélection multiple. */
+ * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * ligne. */
 const COLUMNS =
-  "44px minmax(110px,16ch) minmax(240px,1.1fr) 76px minmax(120px,16ch) minmax(180px,24ch)" +
-  " 76px 56px minmax(200px,1.4fr)";
+  "34px minmax(110px,16ch) minmax(240px,1.1fr) 76px minmax(120px,16ch) minmax(180px,24ch)" +
+  " 76px 56px minmax(200px,1.4fr) 34px";
 
 /** Une ligne sans objet à elle (un `orphans` synthétique, une feuille de contenu sans
  * enregistrement) n'a pas de case ni de hamburger. */
@@ -145,6 +146,15 @@ export default function VeleroView({
     }
     return out;
   }, [filtered, group, world, collapsed, contents, ctExpanded]);
+
+  /** Ce que « tout sélectionner » couvre : les lignes affichées qui visent un objet. */
+  const selectableKeys = useMemo(
+    () =>
+      display
+        .filter((e) => ("item" in e ? usable(e.record) : usable(e.row.record)))
+        .map((e) => ("item" in e ? e.uid : e.row.uid)),
+    [display],
+  );
 
   const selectedRow = useMemo(() => rows.find((r) => r.uid === selected) ?? null, [rows, selected]);
   const selectedRecord: EventRecord | null = useMemo(() => {
@@ -334,6 +344,14 @@ export default function VeleroView({
           >
             {st.velLogs}
           </button>
+          <SelectionBar
+            keys={selectableKeys}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -434,16 +452,7 @@ export default function VeleroView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
-                <SelectionHeaderCell
-                  keys={display
-                    .filter((e) => ("item" in e ? usable(e.record) : usable(e.row.record)))
-                    .map((e) => ("item" in e ? e.uid : e.row.uid))}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">KIND</div>
@@ -452,6 +461,7 @@ export default function VeleroView({
                 <div className="cell">EXPIRE</div>
                 <div className="cell num">AGE</div>
                 <div className="cell">ALERT</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -678,11 +688,6 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
-        {rowUsable && (
-          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
-            {actionMenu}
-          </RowMenu>
-        )}
         {row.name}
         {/* L'équivalent des touches `+`/`-` du TUI. Le contenu se télécharge depuis le stockage
             objet : il n'est jamais dans la liste. */}
@@ -714,6 +719,13 @@ function Line({
       <div className="cell num dim">{"age" in row ? row.age : ""}</div>
       <div className={`cell ${hintTone(row.hints)}`} title={row.hints.map((h) => h.text).join(" · ")}>
         {row.hints[0]?.text ?? ""}
+      </div>
+      <div className="cell act">
+        {rowUsable && (
+          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+            {actionMenu}
+          </RowMenu>
+        )}
       </div>
     </div>
   );
@@ -816,6 +828,15 @@ function ContentsRow({
         ) : (
           <span className="fold-gap" />
         )}
+        {entry.label}
+      </div>
+      <div className="cell dim">{entry.kind}</div>
+      <div className="cell" />
+      <div className="cell dim">{entry.info}</div>
+      <div className="cell" />
+      <div className="cell" />
+      <div className="cell" />
+      <div className="cell act">
         {rowUsable && entry.record && (
           <RowMenu
             record={entry.record}
@@ -825,14 +846,7 @@ function ContentsRow({
             onNeedsAuth={onNeedsAuth}
           />
         )}
-        {entry.label}
       </div>
-      <div className="cell dim">{entry.kind}</div>
-      <div className="cell" />
-      <div className="cell dim">{entry.info}</div>
-      <div className="cell" />
-      <div className="cell" />
-      <div className="cell" />
     </div>
   );
 }

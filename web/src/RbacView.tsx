@@ -14,7 +14,7 @@ import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   RbacBindingRow,
@@ -29,14 +29,16 @@ import type {
 } from "./types";
 
 /** Les colonnes de la liste d'audit : `SEV SCOPE SUBJECT ROLE SOURCE RISK AGE`, celles du TUI. La
- * première piste (`44px`) porte la case de sélection multiple. */
+ * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * ligne. */
 const FLAT_COLUMNS =
-  "44px 84px minmax(140px,22ch) minmax(200px,1.2fr) minmax(200px,32ch) minmax(180px,30ch)" +
-  " minmax(120px,20ch) 56px";
+  "34px 84px minmax(140px,22ch) minmax(200px,1.2fr) minmax(200px,32ch) minmax(180px,30ch)" +
+  " minmax(120px,20ch) 56px 34px";
 
 /** Les colonnes des trois lectures en arbre : `NODE SEV SCOPE ORIGIN DETAIL AGE`. */
 const TREE_COLUMNS =
-  "44px minmax(300px,1.3fr) 84px minmax(120px,18ch) minmax(180px,28ch) minmax(200px,1.2fr) 56px";
+  "34px minmax(300px,1.3fr) 84px minmax(120px,18ch) minmax(180px,28ch) minmax(200px,1.2fr) 56px" +
+  " 34px";
 
 /** Un `nsgroup`/`rule`/`subject-leaf` n'a pas d'objet à lui : son `record` porte un kind/name vides,
  * même garde que partout ailleurs pour décider d'une case et d'un hamburger. */
@@ -237,6 +239,14 @@ export default function RbacView({
         )}
 
         <div className="right">
+          <SelectionBar
+            keys={shown.filter(usable).map((r) => r.uid)}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -295,14 +305,7 @@ export default function RbacView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: columns }}>
-                <SelectionHeaderCell
-                  keys={shown.filter(usable).map((r) => r.uid)}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 {orient === "flat" ? (
                   <>
                     <div className="cell">SEV</div>
@@ -312,6 +315,7 @@ export default function RbacView({
                     <div className="cell">SOURCE</div>
                     <div className="cell">RISK</div>
                     <div className="cell num">AGE</div>
+                    <div className="cell act" />
                   </>
                 ) : (
                   <>
@@ -321,6 +325,7 @@ export default function RbacView({
                     <div className="cell">ORIGIN</div>
                     <div className="cell">DETAIL</div>
                     <div className="cell num">AGE</div>
+                    <div className="cell act" />
                   </>
                 )}
               </div>
@@ -436,7 +441,6 @@ function Line({
           {row.scope_label}
         </div>
         <div className="cell id" title={row.subject_rows.map((s) => s.label).join(", ")}>
-          {menu}
           {row.subject_label}
         </div>
         <div className="cell info" title={row.role_label}>
@@ -449,6 +453,7 @@ function Line({
           {row.risk_top}
         </div>
         <div className="cell num dim">{row.age}</div>
+        <div className="cell act">{menu}</div>
       </div>
     );
   }
@@ -472,10 +477,10 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
-        {menu}
         <Label row={row} st={st} />
       </div>
       <TreeCells row={row} st={st} />
+      <div className="cell act">{menu}</div>
     </div>
   );
 }

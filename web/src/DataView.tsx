@@ -19,14 +19,15 @@ import type { Lang, Strings } from "./i18n";
 import { CopyButton } from "./copy";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
 
-/** La première piste (`44px`) porte la case de sélection multiple. */
+/** La première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * ligne. */
 const SECRET_COLUMNS =
-  "44px minmax(220px,1.4fr) minmax(120px,18ch) minmax(140px,20ch) 72px minmax(150px,1fr) 56px";
+  "34px minmax(220px,1.4fr) minmax(120px,18ch) minmax(140px,20ch) 72px minmax(150px,1fr) 56px 34px";
 const CM_COLUMNS =
-  "44px minmax(240px,1.6fr) minmax(120px,18ch) 64px 80px minmax(150px,1fr) 56px";
+  "34px minmax(240px,1.6fr) minmax(120px,18ch) 64px 80px minmax(150px,1fr) 56px 34px";
 
 type World = "secrets" | "configmaps";
 
@@ -270,6 +271,14 @@ export default function DataView({
               {st.secOpenChain}
             </button>
           )}
+          <SelectionBar
+            keys={(world === "secrets" ? visibleSecrets : visibleConfigmaps).map((r) => r.uid)}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -325,20 +334,14 @@ export default function DataView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: SECRET_COLUMNS }}>
-                <SelectionHeaderCell
-                  keys={visibleSecrets.map((s) => s.uid)}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">TYPE</div>
                 <div className="cell num">KEYS</div>
                 <div className="cell">EXPIRY</div>
                 <div className="cell num">AGE</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -368,20 +371,14 @@ export default function DataView({
           <div className="tbl">
             <div className="thead">
               <div className="tr" style={{ gridTemplateColumns: CM_COLUMNS }}>
-                <SelectionHeaderCell
-                  keys={visibleConfigmaps.map((c) => c.uid)}
-                  checked={checked}
-                  onSetAll={setAll}
-                  onClear={clear}
-                  onBulkDelete={() => setBulkOpen(true)}
-                  st={st}
-                />
+                <SelectionHead />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
                 <div className="cell num">KEYS</div>
                 <div className="cell num">SIZE</div>
                 <div className="cell">SOURCE</div>
                 <div className="cell num">AGE</div>
+                <div className="cell act" />
               </div>
             </div>
             <div className="tbody">
@@ -460,10 +457,7 @@ function SecretLine({
       }}
     >
       <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
-      <div className="cell id">
-        <RowMenu record={s.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
-        {s.name}
-      </div>
+      <div className="cell id">{s.name}</div>
       <div className="cell mono dim">{s.namespace}</div>
       <div className="cell mono dim" title={s.type_}>
         {s.type_.replace("kubernetes.io/", "")}
@@ -483,6 +477,9 @@ function SecretLine({
         ) : null}
       </div>
       <div className="cell num dim">{s.age}</div>
+      <div className="cell act">
+        <RowMenu record={s.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+      </div>
     </div>
   );
 }
@@ -520,15 +517,15 @@ function ConfigMapLine({
       }}
     >
       <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
-      <div className="cell id">
-        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
-        {c.name}
-      </div>
+      <div className="cell id">{c.name}</div>
       <div className="cell mono dim">{c.namespace}</div>
       <div className="cell num dim">{c.keys.length}</div>
       <div className="cell num dim">{size(c.total_bytes)}</div>
       <div className="cell dim">{c.provenance_label}</div>
       <div className="cell num dim">{c.age}</div>
+      <div className="cell act">
+        <RowMenu record={c.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth} />
+      </div>
     </div>
   );
 }

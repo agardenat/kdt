@@ -22,7 +22,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionHeaderCell, useMultiSelect } from "./selection";
+import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   Hint,
@@ -36,9 +36,10 @@ import type {
 } from "./types";
 
 /** `NAME EMAIL PHASE GROUPS INVITE SESS AGE` — les colonnes du TUI, dans le même ordre. La
- * première piste (`44px`) porte la case de sélection multiple. */
+ * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * ligne. */
 const USER_COLUMNS =
-  "44px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px";
+  "34px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px 34px";
 
 /**
  * Les mêmes, plus SRC avant l'âge.
@@ -47,14 +48,14 @@ const USER_COLUMNS =
  * que le TUI. Ailleurs ce serait une colonne de tirets prise sur celles qui distinguent.
  */
 const USER_COLUMNS_SOURCE =
-  "44px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px";
+  "34px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px 34px";
 
 /** `NAME MEM UNKNOWN RIGHTS DESCRIPTION AGE`. */
 const GROUP_COLUMNS =
-  "44px minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px";
+  "34px minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px 34px";
 
 const GROUP_COLUMNS_SOURCE =
-  "44px minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px";
+  "34px minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px 34px";
 
 type World = "users" | "groups";
 type Filter = "all" | "problems";
@@ -349,6 +350,14 @@ export default function IdentityView({
               />
             )}
           </div>
+          <SelectionBar
+            keys={(world === "users" ? shownUsers : shownGroups).map((r) => r.uid)}
+            checked={checked}
+            onSetAll={setAll}
+            onClear={clear}
+            onBulkDelete={() => setBulkOpen(true)}
+            st={st}
+          />
           <PanelToggle open={panelOpen} onOpen={onPanelOpen} lang={lang} />
         </div>
       </div>
@@ -434,9 +443,6 @@ export default function IdentityView({
             onRun={run}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         ) : (
           <GroupTable
@@ -457,9 +463,6 @@ export default function IdentityView({
             onRun={run}
             checked={checked}
             onToggleCheck={toggle}
-            onSetAll={setAll}
-            onClear={clear}
-            onBulkDelete={() => setBulkOpen(true)}
           />
         )}
       </ViewBody>
@@ -558,9 +561,6 @@ function UserTable({
   onRun,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: IdentUserRow[];
   groups: IdentGroupRow[];
@@ -576,9 +576,6 @@ function UserTable({
   onRun: (request: Record<string, unknown>) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
@@ -587,14 +584,7 @@ function UserTable({
           className="tr"
           style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
         >
-          <SelectionHeaderCell
-            keys={rows.map((u) => u.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell">EMAIL</div>
           <div className="cell">PHASE</div>
@@ -603,6 +593,7 @@ function UserTable({
           <div className="cell num">SESS</div>
           {showSource && <div className="cell">SRC</div>}
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -623,7 +614,23 @@ function UserTable({
               onToggle={() => onToggleCheck(u.uid)}
               label={st.selectRow}
             />
-            <div className="cell id">
+            <div className="cell id">{u.name}</div>
+            <div className="cell dim">{u.email}</div>
+            <div className={`cell ${u.phase_tone}`}>{u.phase_label}</div>
+            {/* Les groupes décident de ce que le compte peut faire : la colonne prend le mou. */}
+            <div className={`cell ${u.member_of.length ? "" : "dim"}`}>
+              {u.member_of.length ? u.member_of.join(", ") : "—"}
+            </div>
+            <div className={`cell ${u.invitation_tone}`}>{u.invitation_label}</div>
+            <div className={`cell num ${u.sessions_tone}`} title={st.identSessions}>
+              {u.sessions_cell}
+            </div>
+            {/* La valeur du label, telle quelle : la ligne dit `oidc` parce que l'objet dit
+                `oidc`. Les deux sources fédérées ne sont jamais fondues en un mot commun — celle
+                qui gouverne un compte décide d'où il se corrige. */}
+            {showSource && <SourceCell source={u.source} st={st} />}
+            <div className="cell num dim">{u.age}</div>
+            <div className="cell act">
               <RowMenu
                 record={u.record}
                 lang={lang}
@@ -646,23 +653,7 @@ function UserTable({
                   />
                 )}
               </RowMenu>
-              {u.name}
             </div>
-            <div className="cell dim">{u.email}</div>
-            <div className={`cell ${u.phase_tone}`}>{u.phase_label}</div>
-            {/* Les groupes décident de ce que le compte peut faire : la colonne prend le mou. */}
-            <div className={`cell ${u.member_of.length ? "" : "dim"}`}>
-              {u.member_of.length ? u.member_of.join(", ") : "—"}
-            </div>
-            <div className={`cell ${u.invitation_tone}`}>{u.invitation_label}</div>
-            <div className={`cell num ${u.sessions_tone}`} title={st.identSessions}>
-              {u.sessions_cell}
-            </div>
-            {/* La valeur du label, telle quelle : la ligne dit `oidc` parce que l'objet dit
-                `oidc`. Les deux sources fédérées ne sont jamais fondues en un mot commun — celle
-                qui gouverne un compte décide d'où il se corrige. */}
-            {showSource && <SourceCell source={u.source} st={st} />}
-            <div className="cell num dim">{u.age}</div>
           </div>
         ))}
       </div>
@@ -691,9 +682,6 @@ function GroupTable({
   onRun,
   checked,
   onToggleCheck,
-  onSetAll,
-  onClear,
-  onBulkDelete,
 }: {
   rows: IdentGroupRow[];
   selected: string | null;
@@ -706,9 +694,6 @@ function GroupTable({
   onRun: (request: Record<string, unknown>) => void;
   checked: Set<string>;
   onToggleCheck: (key: string) => void;
-  onSetAll: (keys: string[], on: boolean) => void;
-  onClear: () => void;
-  onBulkDelete: () => void;
 }) {
   return (
     <div className="tbl">
@@ -717,14 +702,7 @@ function GroupTable({
           className="tr"
           style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
         >
-          <SelectionHeaderCell
-            keys={rows.map((g) => g.uid)}
-            checked={checked}
-            onSetAll={onSetAll}
-            onClear={onClear}
-            onBulkDelete={onBulkDelete}
-            st={st}
-          />
+          <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell num">MEM</div>
           <div className="cell">UNKNOWN</div>
@@ -732,6 +710,7 @@ function GroupTable({
           {showSource && <div className="cell">SRC</div>}
           <div className="cell">DESCRIPTION</div>
           <div className="cell num">AGE</div>
+          <div className="cell act" />
         </div>
       </div>
       <div className="tbody">
@@ -752,7 +731,20 @@ function GroupTable({
               onToggle={() => onToggleCheck(g.uid)}
               label={st.selectRow}
             />
-            <div className="cell id">
+            <div className="cell id">{g.name}</div>
+            {/* Un zéro se lit comme rien plutôt que comme « 0 » : dans une colonne de comptes, ce
+                qui compte est les lignes qui en ont. */}
+            <div className="cell num">{g.resolved.length || "·"}</div>
+            <div className={`cell ${g.unknown.length ? "warn" : "dim"}`}>
+              {g.unknown.join(", ")}
+            </div>
+            <div className={`cell num ${g.rights_tone}`}>
+              {g.bindings.length ? g.bindings.length : "—"}
+            </div>
+            {showSource && <SourceCell source={g.source} st={st} />}
+            <div className="cell dim">{g.description}</div>
+            <div className="cell num dim">{g.age}</div>
+            <div className="cell act">
               <RowMenu
                 record={g.record}
                 lang={lang}
@@ -775,20 +767,7 @@ function GroupTable({
                   />
                 )}
               </RowMenu>
-              {g.name}
             </div>
-            {/* Un zéro se lit comme rien plutôt que comme « 0 » : dans une colonne de comptes, ce
-                qui compte est les lignes qui en ont. */}
-            <div className="cell num">{g.resolved.length || "·"}</div>
-            <div className={`cell ${g.unknown.length ? "warn" : "dim"}`}>
-              {g.unknown.join(", ")}
-            </div>
-            <div className={`cell num ${g.rights_tone}`}>
-              {g.bindings.length ? g.bindings.length : "—"}
-            </div>
-            {showSource && <SourceCell source={g.source} st={st} />}
-            <div className="cell dim">{g.description}</div>
-            <div className="cell num dim">{g.age}</div>
           </div>
         ))}
       </div>
