@@ -8,6 +8,18 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.7] — 2026-09-18
+
+- **feat(nodes)** — la liste des nodes porte les **trois taux d'occupation** de chaque machine :
+  `CPU` et `MEM` face à son propre allocatable (metrics-server, une lecture pour tout le cluster) et
+  `DISK`, la racine de son kubelet. Il fallait jusque-là ouvrir un node pour savoir lequel était
+  plein. Un tiret marque ce qui n'a pas été mesuré — metrics-server muet, kubelet injoignable — et
+  jamais un zéro, qui se lirait comme une machine au repos ; les tons sont ceux du bandeau pour CPU
+  et mémoire, et celui du seuil d'éviction du kubelet pour le disque. Le disque coûtant **un appel
+  par node** là où le reste de la liste tient en deux lectures, il est gardé une minute : le TUI
+  peint sa liste sans l'attendre et la complète derrière, et kdt-web ne le demande qu'une fois par
+  minute (`?disk=1`) tout en gardant la dernière valeur connue entre-temps.
+
 ## [2.0.0-rc.6] — 2026-09-18
 
 - **feat(nodes)** — la vue Nodes montre le **disque** du node, que ni l'objet `Node` ni
