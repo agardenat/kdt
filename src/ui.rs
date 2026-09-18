@@ -16988,7 +16988,9 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("NAME"), Cell::from("READY"), Cell::from("ROLES"),
-        Cell::from("VERSION"), Cell::from("AGE"), Cell::from("ALERTS"),
+        Cell::from("VERSION"), Cell::from("AGE"),
+        Cell::from("CPU"), Cell::from("MEM"), Cell::from("DISK"),
+        Cell::from("ALERTS"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
@@ -17005,20 +17007,35 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
         let alerts = n.alerts().join(",");
         let alert_color = if alerts.is_empty() { DIM } else { Color::Red };
+        // Les trois taux d'occupation, avec les tons que `NodeSummary` leur donne : CPU et mémoire
+        // sur l'échelle du bandeau, le disque sur son disponible face au seuil d'éviction du
+        // kubelet. Un tiret veut dire non mesuré — metrics-server muet, kubelet injoignable — et
+        // jamais zéro, qui se lirait comme un node au repos.
+        let pct_cell = |pct: Option<i64>, tone: LineColor| {
+            Cell::from(NodeSummary::pct_text(pct)).style(Style::default().fg(line_color(tone)))
+        };
         Row::new(vec![
             Cell::from(n.name.clone()),
             Cell::from(n.ready.clone()).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
             Cell::from(n.roles.clone()).style(Style::default().fg(Color::Cyan)),
             Cell::from(n.version.clone()).style(Style::default().fg(DIM)),
             Cell::from(n.age.clone()).style(Style::default().fg(DIM)),
+            pct_cell(n.cpu_pct(), n.cpu_tone()),
+            pct_cell(n.mem_pct(), n.mem_tone()),
+            pct_cell(n.disk_pct(), n.disk_tone()),
             Cell::from(alerts).style(Style::default().fg(alert_color).add_modifier(Modifier::BOLD)),
         ])
         .style(row_style)
     }).collect();
 
+    // La dernière colonne prend le mou en pourcentage et non en `Min` : un `Min` en fin de ligne
+    // mange la bordure droite dès que le terminal est plus étroit que la somme des largeurs fixes.
+    let name_w = col_width(nodes.iter().map(|n| n.name.as_str()), "NAME", 20, 44);
     let widths = [
-        Constraint::Min(30), Constraint::Length(7), Constraint::Length(20),
-        Constraint::Length(14), Constraint::Length(8), Constraint::Min(20),
+        Constraint::Length(name_w), Constraint::Length(7), Constraint::Length(20),
+        Constraint::Length(14), Constraint::Length(6),
+        Constraint::Length(5), Constraint::Length(5), Constraint::Length(5),
+        Constraint::Percentage(100),
     ];
 
     let table = Table::new(rows, widths)

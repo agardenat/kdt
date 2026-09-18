@@ -26,6 +26,7 @@ import type {
   DrainPreflight,
   DrainProgress,
   EventRecord,
+  LineTone,
   NodeDiskPayload,
   NodeRow,
   NodeUsagePayload,
@@ -38,7 +39,7 @@ import type {
 /** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
  * case de sélection multiple, la dernière le hamburger de la ligne. */
 const NODE_COLUMNS =
-  "34px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px minmax(180px,1.2fr) 34px";
+  "34px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px 56px 56px 56px minmax(160px,1.2fr) 34px";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -104,10 +105,31 @@ export default function NodesView({
   // lancé ne doit pas changer de cible parce qu'on a cliqué ailleurs.
   const [draining, setDraining] = useState<string | null>(null);
 
+  // Quand le disque a été lu pour la dernière fois. Il coûte un appel par node, au kubelet de
+  // chacun : la liste se relit toutes les dix secondes, lui une fois par minute.
+  const diskReadAt = useRef(0);
+  // La dernière valeur connue du disque, par node, pour les passes qui ne l'ont pas demandé : sans
+  // elle la colonne clignoterait entre son chiffre et un tiret toutes les dix secondes.
+  const diskSeen = useRef(new Map<string, Pick<NodeRow, "disk_pct" | "disk_pct_tone" | "disk_error">>());
+
   const load = useCallback(async () => {
+    const withDisk = Date.now() - diskReadAt.current >= 60_000;
     try {
-      const payload = await api.nodes(lang);
-      setNodes(payload.nodes);
+      const payload = await api.nodes(lang, withDisk);
+      if (payload.disk_included) {
+        diskReadAt.current = Date.now();
+        diskSeen.current = new Map(
+          payload.nodes.map((n) => [
+            n.name,
+            { disk_pct: n.disk_pct, disk_pct_tone: n.disk_pct_tone, disk_error: n.disk_error },
+          ]),
+        );
+      }
+      setNodes(
+        payload.disk_included
+          ? payload.nodes
+          : payload.nodes.map((n) => ({ ...n, ...(diskSeen.current.get(n.name) ?? {}) })),
+      );
       setError(null);
       setLoaded(true);
     } catch (e) {
@@ -462,6 +484,9 @@ function NodeTable({
           <div className="cell">ROLES</div>
           <div className="cell">VERSION</div>
           <div className="cell num">AGE</div>
+          <div className="cell num">CPU</div>
+          <div className="cell num">MEM</div>
+          <div className="cell num">DISK</div>
           <div className="cell">ALERTS</div>
           <div className="cell act" />
         </div>
@@ -489,6 +514,11 @@ function NodeTable({
             <div className="cell mono">{n.roles}</div>
             <div className="cell mono dim">{n.version}</div>
             <div className="cell num dim">{n.age}</div>
+            {/* Les trois taux d'occupation, avec le ton que kdt leur donne. Un tiret veut dire non
+                mesuré — metrics-server muet, kubelet injoignable — jamais un node au repos. */}
+            <Pct pct={n.cpu_pct} tone={n.cpu_pct_tone} />
+            <Pct pct={n.mem_pct} tone={n.mem_pct_tone} />
+            <Pct pct={n.disk_pct} tone={n.disk_pct_tone} title={n.disk_error ?? undefined} />
             {/* La liste vient du serveur, `Cordoned` en tête quand il y en a un : c'est le seul de
                 la liste qui soit un geste, et c'est celui qu'on cherche. */}
             <div className={`cell ${n.alerts.length > 0 ? "tone-err" : "dim"}`}>
@@ -742,6 +772,24 @@ function Disk({ fs, st }: { fs: NodeDiskPayload; st: Strings }) {
       )}
     </>
   );
+}
+
+/**
+ * Un taux d'occupation d'une ligne de la table des nodes.
+ *
+ * Le ton arrive calculé du serveur — CPU et mémoire sur l'échelle du bandeau, le disque sur son
+ * disponible face au seuil d'éviction du kubelet. `null` se rend en tiret : ce qui n'a pas été
+ * mesuré ne se peint pas en vert, et un `0 %` se lirait comme un node au repos.
+ */
+function Pct({ pct, tone, title }: { pct: number | null; tone: LineTone; title?: string }) {
+  if (pct === null) {
+    return (
+      <div className="cell num dim" title={title}>
+        —
+      </div>
+    );
+  }
+  return <div className={`cell num tone-${tone}`}>{pct}%</div>;
 }
 
 function Bucket({ label, bucket }: { label: string; bucket: UsageBucket }) {

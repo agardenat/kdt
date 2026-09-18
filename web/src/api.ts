@@ -717,8 +717,16 @@ async function postStream<T>(
 /* ------------------------------------------------------------------------ vue Nodes */
 
 /** Les nodes du cluster. Aucune portée : un node n'a pas de namespace. */
-export function nodes(lang: Lang): Promise<NodesPayload> {
-  return get<NodesPayload>(`/api/v1/nodes?lang=${lang}`);
+/**
+ * L'inventaire des nodes. `withDisk` demande en plus leur disque.
+ *
+ * Il coûte un appel par node, au kubelet de chacun, là où le reste de la liste tient en deux
+ * lectures : la vue se rafraîchit toutes les dix secondes et ne le redemande qu'une fois par
+ * minute. La réponse dit si elle le porte (`disk_included`), pour que la table garde la dernière
+ * valeur connue au lieu de la voir clignoter.
+ */
+export function nodes(lang: Lang, withDisk = false): Promise<NodesPayload> {
+  return get<NodesPayload>(`/api/v1/nodes?lang=${lang}${withDisk ? "&disk=1" : ""}`);
 }
 
 /**

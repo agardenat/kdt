@@ -217,6 +217,13 @@ déploiement.
 `:nodes` est la première vue portée dont un geste **prend du temps**, et c'est ce qui décide de sa
 forme.
 
+L'inventaire porte les trois taux d'occupation du node — `CPU`, `MEM`, `DISK` — avec les tons que
+kdt leur donne. Le disque y coûte **un appel par node** quand tout le reste tient en deux lectures :
+il ne part que sur `?disk=1`, la page ne le redemande qu'une fois par minute alors qu'elle se relit
+toutes les dix secondes, et la réponse dit si elle le porte (`disk_included`) pour que la table
+garde la dernière valeur connue au lieu de la voir clignoter. Rien n'est mis en cache d'un compte à
+l'autre : un droit `nodes/proxy` ne se prête pas.
+
 Ses deux écrans deviennent deux mondes : **Nodes**, l'inventaire, et **Usage**, la table par
 container du node sélectionné — ce que `u` ouvre en plein écran dans le TUI. Elle n'entre pas dans
 le panneau du haut : treize colonnes n'y tiennent pas, et l'objet reste le node de toute façon,

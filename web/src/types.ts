@@ -2107,11 +2107,33 @@ export interface NodeRow {
   tone: LineTone;
   /** La condition `Ready` seule — un node cordonné mais sain reste vert de ce côté-là. */
   ready_tone: LineTone;
+  /**
+   * Les trois taux d'occupation de la ligne, et le ton que kdt leur donne.
+   *
+   * `null` veut dire non mesuré — metrics-server ne répond pas, le kubelet n'a pas été lu — et se
+   * rend en tiret : un zéro se lirait comme un node au repos. Le disque est celui de la racine du
+   * kubelet, jugé sur son disponible face au seuil d'éviction, pas sur le pourcentage utilisé.
+   */
+  cpu_pct: number | null;
+  cpu_pct_tone: LineTone;
+  mem_pct: number | null;
+  mem_pct_tone: LineTone;
+  disk_pct: number | null;
+  disk_pct_tone: LineTone;
+  /** Pourquoi le disque n'a pas été lu : un refus sur `nodes/proxy`, le plus souvent. */
+  disk_error: string | null;
   record: EventRecord;
 }
 
 export interface NodesPayload {
   nodes: NodeRow[];
+  /**
+   * Vrai quand la réponse porte le disque des nodes.
+   *
+   * Faux ne veut pas dire « pas de disque » mais « pas demandé » : la table garde alors la
+   * dernière valeur qu'elle avait, au lieu de la remplacer par un tiret toutes les dix secondes.
+   */
+  disk_included: boolean;
 }
 
 /** Ce qu'un container a de discutable dans son dimensionnement, nommé par kdt. */

@@ -192,12 +192,16 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   actions visent le workload même depuis la ligne d'un de ses pods : `s` scale, `r` rescale /
   recyclage / restart. Sur une ligne container, `E` ouvre un shell dans ce container et l'onglet
   Logs s'y restreint automatiquement. `n`/`0` changent de namespace.
-- **Nodes** — liste, détail, usage CPU/mémoire/disque (`u`), tri (`s`), export PDF (`p`/`P`). Le
-  détail donne conditions, capacity/allocatable, disque, system info, adresses, réservations et OOM
-  récents, puis annotations, labels et taints en fin de panneau — la partie affichée quand le
-  curseur change de nœud.
+- **Nodes** — liste, détail, usage CPU/mémoire/disque (`u`), tri (`s`), export PDF (`p`/`P`). La
+  liste porte les trois taux d'occupation du nœud — `CPU`, `MEM` (metrics-server, face à
+  l'allocatable du nœud) et `DISK` (racine du kubelet) — un tiret marquant ce qui n'a pas été
+  mesuré plutôt qu'un zéro. Le détail donne conditions, capacity/allocatable, disque, system info,
+  adresses, réservations et OOM récents, puis annotations, labels et taints en fin de panneau — la
+  partie affichée quand le curseur change de nœud.
   - Le disque vient du résumé du kubelet (`/api/v1/nodes/<node>/proxy/stats/summary`, droit
-    `nodes/proxy`) : ni l'objet `Node` ni metrics-server ne le mesurent. `nodefs` (racine du
+    `nodes/proxy`) : ni l'objet `Node` ni metrics-server ne le mesurent. Il coûte **un appel par
+    nœud**, là où le reste de la liste tient en deux lectures : la colonne est donc gardée une
+    minute entre deux relectures, alors que la liste se rafraîchit toutes les cinq secondes. `nodefs` (racine du
     kubelet : logs, `emptyDir`, couches inscriptibles), `imagefs` (images du runtime) et
     `containerfs` quand le runtime le distingue, chacun avec ses inodes, comparé au seuil
     d'éviction **par défaut** du kubelet — 10 % libres pour `nodefs`, 15 % pour `imagefs`, 5 %
@@ -651,8 +655,8 @@ répondent — évènements, workloads, nodes, Flux, Velero, capacité, stockage
 certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les cinq gestes qui
 portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
 
-**La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge et
-les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
+**La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge,
+les trois taux d'occupation `CPU` / `MEM` / `DISK` et les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
 quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…), le cumul
 user / système / total et le disque du node lu chez son kubelet (`nodefs`, `imagefs`, inodes, et les
 pods qui écrivent le plus). Les trois gestes du menu `o` y sont : cordon et uncordon passent tout de

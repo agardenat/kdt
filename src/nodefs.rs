@@ -269,6 +269,64 @@ impl NodeFilesystems {
     }
 }
 
+/// Le disque d'un node réduit à ce qu'une ligne de table peut porter.
+///
+/// La table des nodes n'a pas la place des trois filesystems : elle montre celui qui décide, la
+/// racine du kubelet, et prend le pire ton des trois pour ne pas peindre en vert une ligne dont
+/// l'`imagefs` déborde.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiskHeadline {
+    pub used_pct: Option<i64>,
+    pub available_pct: Option<i64>,
+    pub inodes_free_pct: Option<i64>,
+    pub used_text: String,
+    pub capacity_text: String,
+    /// Le pire ton des filesystems lus, chacun face à son propre seuil.
+    pub tone: LineColor,
+}
+
+/// Le disque d'un node en une cellule, ou `None` quand le kubelet n'a rendu aucun filesystem.
+pub fn headline(fs: &NodeFilesystems) -> Option<DiskHeadline> {
+    let root = fs.nodefs.as_ref().or(fs.imagefs.as_ref()).or(fs.containerfs.as_ref())?;
+    Some(DiskHeadline {
+        used_pct: root.used_pct(),
+        available_pct: root.available_pct(),
+        inodes_free_pct: root.inodes_free_pct(),
+        used_text: root.used.map(format_memory_bytes).unwrap_or_else(|| "?".to_string()),
+        capacity_text: root.capacity.map(format_memory_bytes).unwrap_or_else(|| "?".to_string()),
+        tone: summary_tone(Some(fs)),
+    })
+}
+
+/// Combien de kubelets on interroge en parallèle.
+///
+/// Un résumé pèse quelques kilo-octets par pod du node : sur un gros cluster, lancer les appels
+/// tous ensemble ferait une rafale que l'apiserver proxifie un par un. Huit tient la liste à
+/// quelques secondes sans en faire une charge.
+const FETCH_CONCURRENCY: usize = 8;
+
+/// Le disque de plusieurs nodes, lus en parallèle borné.
+///
+/// Chaque node porte son propre résultat : un kubelet muet ne prive pas les autres de leur
+/// chiffre, et sa raison voyage avec lui pour que la ligne dise pourquoi elle est vide.
+pub async fn fetch_all(
+    client: &Client,
+    nodes: &[String],
+) -> std::collections::HashMap<String, Result<NodeFilesystems, String>> {
+    use futures::stream::StreamExt;
+    futures::stream::iter(nodes.iter().cloned())
+        .map(|name| {
+            let client = client.clone();
+            async move {
+                let result = fetch(&client, &name).await;
+                (name, result)
+            }
+        })
+        .buffer_unordered(FETCH_CONCURRENCY)
+        .collect()
+        .await
+}
+
 /// Lit le résumé du kubelet d'un node et en garde ce qui concerne le disque.
 ///
 /// L'erreur rendue est celle du proxy, chaîne des causes comprise : « refusé », « kubelet

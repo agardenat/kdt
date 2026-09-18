@@ -58,6 +58,14 @@ use crate::AppState;
 pub struct LangQuery {
     #[serde(default)]
     lang: String,
+    /// `1` pour joindre le disque des nodes.
+    ///
+    /// Il coûte un appel par node, au kubelet de chacun, quand tout le reste de la liste tient en
+    /// deux lectures : la page se rafraîchit toutes les dix secondes et ne le redemande qu'une
+    /// fois par minute. La réponse dit si elle le porte, pour que le navigateur distingue « pas
+    /// demandé » de « pas lu ».
+    #[serde(default)]
+    disk: String,
 }
 
 /// L'inventaire des nodes du cluster.
@@ -72,7 +80,7 @@ pub async fn list(
     };
     let st = lang_of(&query.lang);
 
-    let nodes = match nodes_inventory(&client).await {
+    let mut nodes = match nodes_inventory(&client).await {
         Ok(nodes) => nodes,
         // Les nodes sont la matière même de la vue : sans eux il n'y a rien à dire, et une réponse
         // vide se lirait comme un cluster sans machine plutôt que comme un refus.
@@ -86,8 +94,18 @@ pub async fn list(
         }
     };
 
+    // Demandé, le disque est lu avant de répondre : il n'y a qu'une réponse à rendre, et une
+    // colonne qui arriverait plus tard demanderait une seconde requête pour la même question. La
+    // lecture reste celle de la personne connectée, comme le reste — rien n'est mis en cache d'un
+    // compte à l'autre, un droit `nodes/proxy` ne se prête pas.
+    let with_disk = query.disk == "1" || query.disk == "true";
+    if with_disk {
+        kdt::events::fill_node_disk(&client, &mut nodes).await;
+    }
+
     axum::Json(serde_json::json!({
         "nodes": nodes.iter().map(|n| node_json(n, st)).collect::<Vec<_>>(),
+        "disk_included": with_disk,
     }))
     .into_response()
 }
@@ -102,6 +120,19 @@ fn node_json(n: &NodeSummary, st: &'static Strings) -> serde_json::Value {
         object.insert("alerts".to_string(), n.alerts().into());
         object.insert("tone".to_string(), tone_json(n.tone()));
         object.insert("ready_tone".to_string(), tone_json(n.ready_tone()));
+        // Les trois taux d'occupation et leurs tons, calculés par kdt : le navigateur peint la
+        // même cellule que le TUI plutôt que de rejuger une occupation.
+        for (field, pct, tone) in [
+            ("cpu_pct", n.cpu_pct(), n.cpu_tone()),
+            ("mem_pct", n.mem_pct(), n.mem_tone()),
+            ("disk_pct", n.disk_pct(), n.disk_tone()),
+        ] {
+            object.insert(
+                field.to_string(),
+                pct.map(Into::into).unwrap_or(serde_json::Value::Null),
+            );
+            object.insert(format!("{field}_tone"), tone_json(tone));
+        }
         object.insert("record".to_string(), record_json(n.record(st)));
     }
     value

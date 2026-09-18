@@ -1253,6 +1253,16 @@ pub struct NodeSummary {
     pub version: String,
     pub schedulable: bool,
     pub abnormal: Vec<String>,
+    /// Ce que ce node offre, lu sur l'objet : la base des trois taux d'occupation.
+    pub cpu_alloc_milli: i64,
+    pub mem_alloc_bytes: i64,
+    /// Ce qu'il consomme, vu par metrics-server. `None` quand il ne répond pas : la colonne reste
+    /// vide plutôt que d'afficher un zéro qui se lirait comme un node au repos.
+    pub cpu_use_milli: Option<i64>,
+    pub mem_use_bytes: Option<i64>,
+    /// Son disque, lu chez son kubelet. `None` avec `disk_error` renseigné : non lu.
+    pub disk: Option<crate::nodefs::DiskHeadline>,
+    pub disk_error: Option<String>,
 }
 
 impl NodeSummary {
@@ -1271,6 +1281,50 @@ impl NodeSummary {
             out.insert(0, "Cordoned".to_string());
         }
         out
+    }
+
+    /// Le taux d'occupation CPU de ce node. `None` sans metrics-server, ou sans allocatable lisible.
+    pub fn cpu_pct(&self) -> Option<i64> {
+        usage_pct(self.cpu_use_milli?, self.cpu_alloc_milli)
+    }
+
+    /// Le même pour la mémoire.
+    pub fn mem_pct(&self) -> Option<i64> {
+        usage_pct(self.mem_use_bytes?, self.mem_alloc_bytes)
+    }
+
+    /// Le taux d'occupation du disque, celui de la racine du kubelet.
+    pub fn disk_pct(&self) -> Option<i64> {
+        self.disk.as_ref()?.used_pct
+    }
+
+    /// Le ton d'un taux d'occupation CPU ou mémoire : l'échelle du bandeau, pas une seconde.
+    pub fn cpu_tone(&self) -> LineColor {
+        match self.cpu_pct() {
+            Some(pct) => usage_tone(pct),
+            None => LineColor::Dim,
+        }
+    }
+
+    pub fn mem_tone(&self) -> LineColor {
+        match self.mem_pct() {
+            Some(pct) => usage_tone(pct),
+            None => LineColor::Dim,
+        }
+    }
+
+    /// Le ton du disque vient de `nodefs` : il se juge sur le disponible face au seuil d'éviction
+    /// du kubelet, pas sur le pourcentage utilisé — l'espace réservé fausse le second.
+    pub fn disk_tone(&self) -> LineColor {
+        match &self.disk {
+            Some(disk) => disk.tone,
+            None => LineColor::Dim,
+        }
+    }
+
+    /// Une cellule de taux : `73%`, ou un tiret quand rien n'a été mesuré.
+    pub fn pct_text(pct: Option<i64>) -> String {
+        pct.map(|p| format!("{p}%")).unwrap_or_else(|| "—".to_string())
     }
 
     /// Le ton de la cellule READY : la condition `Ready` du node, et rien d'autre.
@@ -1329,6 +1383,53 @@ pub struct NodeListState {
     pub nodes: Vec<NodeSummary>,
     pub error: Option<String>,
     pub loading: bool,
+    /// Ce qu'on sait déjà du disque des nodes, et depuis quand.
+    pub disk_cache: NodeDiskCache,
+}
+
+/// Le disque des nodes, gardé d'un rafraîchissement à l'autre.
+///
+/// La liste se relit toutes les cinq secondes, et le disque coûte **un appel par node** à un
+/// kubelet qui rend quelques kilo-octets par pod : le relire à cette cadence transformerait une
+/// vue en charge. Un disque ne bouge pas en cinq secondes, donc la colonne survit entre deux
+/// lectures et n'est refaite qu'au-delà de [`NODE_DISK_TTL`].
+#[derive(Default, Debug, Clone)]
+pub struct NodeDiskCache {
+    entries: std::collections::HashMap<String, (Option<crate::nodefs::DiskHeadline>, Option<String>)>,
+    read_at: Option<std::time::Instant>,
+}
+
+/// Au-delà, le disque des nodes est relu.
+pub const NODE_DISK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl NodeDiskCache {
+    /// Pose sur un inventaire frais ce qu'on savait déjà : la colonne ne clignote pas entre deux
+    /// lectures.
+    pub fn apply(&self, nodes: &mut [NodeSummary]) {
+        for node in nodes {
+            if let Some((disk, error)) = self.entries.get(&node.name) {
+                node.disk = disk.clone();
+                node.disk_error = error.clone();
+            }
+        }
+    }
+
+    /// Vrai quand rien n'a été lu, ou plus rien de récent.
+    pub fn stale(&self) -> bool {
+        match self.read_at {
+            Some(t) => t.elapsed() >= NODE_DISK_TTL,
+            None => true,
+        }
+    }
+
+    /// Garde ce qu'une passe vient de lire. Les nodes disparus sortent du cache avec elle.
+    pub fn store(&mut self, nodes: &[NodeSummary]) {
+        self.entries = nodes
+            .iter()
+            .map(|n| (n.name.clone(), (n.disk.clone(), n.disk_error.clone())))
+            .collect();
+        self.read_at = Some(std::time::Instant::now());
+    }
 }
 
 pub type SharedNodeList = Arc<Mutex<NodeListState>>;
@@ -1345,8 +1446,41 @@ pub async fn nodes_inventory(client: &Client) -> Result<Vec<NodeSummary>, String
     let api: Api<Node> = Api::all(client.clone());
     let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
     let mut nodes: Vec<NodeSummary> = list.items.iter().map(node_summary).collect();
+    // La consommation CPU/mémoire tient en une lecture pour tout le cluster : elle voyage avec
+    // l'inventaire, où chaque ligne la porte face à son propre allocatable.
+    let usage = fetch_node_metrics_map(client).await.unwrap_or_default();
+    for node in &mut nodes {
+        if let Some(&(cpu, mem)) = usage.get(&node.name) {
+            node.cpu_use_milli = Some(cpu);
+            node.mem_use_bytes = Some(mem);
+        }
+    }
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(nodes)
+}
+
+/// Remplit la colonne disque d'un inventaire déjà lu.
+///
+/// Séparé de [`nodes_inventory`] parce que le prix n'est pas le même : le résumé d'un kubelet pèse
+/// quelques kilo-octets par pod du node, et il en faut **un appel par node**. La liste s'affiche
+/// donc sans attendre, et cette passe la complète — dans le TUI en repeignant, côté HTTP avant de
+/// répondre.
+pub async fn fill_node_disk(client: &Client, nodes: &mut [NodeSummary]) {
+    let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+    let mut disks = crate::nodefs::fetch_all(client, &names).await;
+    for node in nodes {
+        match disks.remove(&node.name) {
+            Some(Ok(fs)) => {
+                node.disk = crate::nodefs::headline(&fs);
+                node.disk_error = None;
+            }
+            Some(Err(e)) => {
+                node.disk = None;
+                node.disk_error = Some(e);
+            }
+            None => {}
+        }
+    }
 }
 
 pub async fn fetch_nodes(client: Client, state: SharedNodeList) {
@@ -1356,10 +1490,31 @@ pub async fn fetch_nodes(client: Client, state: SharedNodeList) {
         s.error = None;
     }
     match nodes_inventory(&client).await {
-        Ok(nodes) => {
+        Ok(mut nodes) => {
+            // Ce qu'on sait déjà du disque est reposé tout de suite : la colonne garde sa valeur
+            // pendant que le reste de la ligne se met à jour.
+            let stale = {
+                let mut s = state.lock().expect("node list poisoned");
+                s.disk_cache.apply(&mut nodes);
+                s.loading = false;
+                s.nodes = nodes.clone();
+                s.disk_cache.stale()
+            };
+            if !stale {
+                return;
+            }
+            // Le disque arrive après, et la liste est déjà à l'écran : un appel par node ne doit
+            // pas retenir l'inventaire, qui lui tient en une lecture.
+            fill_node_disk(&client, &mut nodes).await;
             let mut s = state.lock().expect("node list poisoned");
-            s.loading = false;
-            s.nodes = nodes;
+            s.disk_cache.store(&nodes);
+            // Une autre lecture a pu aboutir entre-temps : on ne réécrit la liste que si elle
+            // porte toujours les mêmes nodes, et le cache profite de toute façon à la suivante.
+            let same: bool = s.nodes.len() == nodes.len()
+                && s.nodes.iter().zip(nodes.iter()).all(|(a, b)| a.name == b.name);
+            if same {
+                s.nodes = nodes;
+            }
         }
         Err(e) => {
             let mut s = state.lock().expect("node list poisoned");
@@ -1397,7 +1552,32 @@ fn node_summary(n: &Node) -> NodeSummary {
             if bad { Some(c.type_.clone()) } else { None }
         }).collect())
         .unwrap_or_default();
-    NodeSummary { name, ready, roles, age, version, schedulable, abnormal }
+    let (cpu_alloc_milli, mem_alloc_bytes) = n
+        .status
+        .as_ref()
+        .and_then(|s| s.allocatable.as_ref())
+        .map(|alloc| {
+            (
+                alloc.get("cpu").and_then(|q| parse_quantity_cpu_milli(&q.0)).unwrap_or(0),
+                alloc.get("memory").and_then(|q| parse_quantity_memory_bytes(&q.0)).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    NodeSummary {
+        name,
+        ready,
+        roles,
+        age,
+        version,
+        schedulable,
+        abnormal,
+        cpu_alloc_milli,
+        mem_alloc_bytes,
+        cpu_use_milli: None,
+        mem_use_bytes: None,
+        disk: None,
+        disk_error: None,
+    }
 }
 
 pub fn format_node_oom_history(pods: &[Pod]) -> Vec<(LineColor, String)> {
@@ -2177,6 +2357,30 @@ pub async fn fetch_cluster_info(client: Client, state: SharedClusterInfo) {
     s.loaded = true;
 }
 
+/// L'usage par node, tel que metrics-server le rend. `None` quand l'API n'est pas là.
+///
+/// Même lecture que le total du bandeau, gardée au grain du node : une seule requête sert la
+/// colonne CPU et la colonne MEM de toute la liste.
+pub async fn fetch_node_metrics_map(
+    client: &Client,
+) -> Option<std::collections::HashMap<String, (i64, i64)>> {
+    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
+    let (ar, _) = discovery::pinned_kind(client, &gvk).await.ok()?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    let list = api.list(&ListParams::default()).await.ok()?;
+    let mut map = std::collections::HashMap::new();
+    for item in list.items {
+        let name = item.metadata.name.clone().unwrap_or_default();
+        let usage = item.data.get("usage");
+        let cpu = usage.and_then(|u| u.get("cpu")).and_then(|v| v.as_str()).and_then(parse_quantity_cpu_milli);
+        let mem = usage.and_then(|u| u.get("memory")).and_then(|v| v.as_str()).and_then(parse_quantity_memory_bytes);
+        if let (Some(cpu), Some(mem)) = (cpu, mem) {
+            map.insert(name, (cpu, mem));
+        }
+    }
+    Some(map)
+}
+
 // Sum CPU/memory usage across all nodes from metrics-server (metrics.k8s.io). None if unavailable.
 async fn fetch_node_metrics_total(client: &Client) -> Option<(i64, i64)> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
@@ -2239,4 +2443,106 @@ pub async fn fetch_pod_usage(
         e.1 += mem;
     }
     out
+}
+#[cfg(test)]
+mod node_row_tests {
+    use super::*;
+
+    fn node(cpu_use: Option<i64>, mem_use: Option<i64>) -> NodeSummary {
+        NodeSummary {
+            name: "n1".to_string(),
+            ready: "True".to_string(),
+            roles: "worker".to_string(),
+            age: "12d".to_string(),
+            version: "v1.31.4".to_string(),
+            schedulable: true,
+            abnormal: Vec::new(),
+            cpu_alloc_milli: 4000,
+            mem_alloc_bytes: 8 * 1024 * 1024 * 1024,
+            cpu_use_milli: cpu_use,
+            mem_use_bytes: mem_use,
+            disk: None,
+            disk_error: None,
+        }
+    }
+
+    #[test]
+    fn a_node_without_metrics_shows_a_dash_not_a_zero() {
+        // Sans metrics-server, un `0 %` vert se lirait comme un node au repos.
+        let n = node(None, None);
+        assert_eq!(n.cpu_pct(), None);
+        assert_eq!(n.mem_pct(), None);
+        assert_eq!(NodeSummary::pct_text(n.cpu_pct()), "—");
+        assert_eq!(n.cpu_tone(), LineColor::Dim);
+    }
+
+    #[test]
+    fn the_three_rates_are_read_against_the_nodes_own_allocatable() {
+        let n = node(Some(2000), Some(6 * 1024 * 1024 * 1024));
+        assert_eq!(n.cpu_pct(), Some(50));
+        assert_eq!(n.mem_pct(), Some(75));
+        // L'échelle est celle du bandeau — quatre paliers, 50 et 80 % — et non une seconde
+        // inventée pour la table : 75 % n'est pas encore un avertissement.
+        assert_eq!(n.cpu_tone(), LineColor::Info);
+        assert_eq!(n.mem_tone(), LineColor::Info);
+
+        let tendu = node(Some(3400), Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(tendu.cpu_tone(), LineColor::Warn);
+        assert_eq!(tendu.mem_tone(), LineColor::Err);
+    }
+
+    #[test]
+    fn an_unreadable_allocatable_yields_no_rate() {
+        // Zéro allocatable n'est pas un node vide : c'est une lecture qui a manqué.
+        let mut n = node(Some(100), Some(100));
+        n.cpu_alloc_milli = 0;
+        n.mem_alloc_bytes = 0;
+        assert_eq!(n.cpu_pct(), None);
+        assert_eq!(n.mem_pct(), None);
+    }
+
+    #[test]
+    fn the_disk_cache_survives_a_refresh_and_expires_on_its_own() {
+        let mut cache = NodeDiskCache::default();
+        assert!(cache.stale(), "rien lu encore");
+
+        let mut read = vec![node(None, None)];
+        read[0].disk = Some(crate::nodefs::DiskHeadline {
+            used_pct: Some(21),
+            available_pct: Some(74),
+            inodes_free_pct: Some(94),
+            used_text: "32.1Gi".to_string(),
+            capacity_text: "149.9Gi".to_string(),
+            tone: LineColor::Ok,
+        });
+        cache.store(&read);
+        assert!(!cache.stale(), "lu à l'instant");
+
+        // L'inventaire suivant arrive sans disque : le cache le repose plutôt que de laisser la
+        // colonne clignoter entre son chiffre et un tiret toutes les cinq secondes.
+        let mut fresh = vec![node(Some(400), Some(1024))];
+        cache.apply(&mut fresh);
+        assert_eq!(fresh[0].disk_pct(), Some(21));
+        assert_eq!(fresh[0].disk_tone(), LineColor::Ok);
+
+        // Un node que le cache ne connaît pas reste sans disque, pas avec celui du voisin.
+        let mut other = vec![node(None, None)];
+        other[0].name = "n2".to_string();
+        cache.apply(&mut other);
+        assert_eq!(other[0].disk_pct(), None);
+    }
+
+    #[test]
+    fn a_refused_kubelet_is_kept_as_a_refusal() {
+        let mut cache = NodeDiskCache::default();
+        let mut read = vec![node(None, None)];
+        read[0].disk_error = Some("nodes/proxy forbidden".to_string());
+        cache.store(&read);
+
+        let mut fresh = vec![node(None, None)];
+        cache.apply(&mut fresh);
+        assert_eq!(fresh[0].disk_pct(), None);
+        assert_eq!(fresh[0].disk_error.as_deref(), Some("nodes/proxy forbidden"));
+        assert_eq!(fresh[0].disk_tone(), LineColor::Dim);
+    }
 }
