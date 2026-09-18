@@ -8,6 +8,36 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.6] — 2026-09-18
+
+- **feat(nodes)** — la vue Nodes montre le **disque** du node, que ni l'objet `Node` ni
+  metrics-server ne mesurent : il est lu chez le kubelet par le proxy de l'apiserver
+  (`/api/v1/nodes/<node>/proxy/stats/summary`, droit `nodes/proxy`). `nodefs` — la racine du
+  kubelet, celle qui se remplit de logs, d'`emptyDir` et de couches inscriptibles — `imagefs` et
+  `containerfs` quand le runtime le distingue, chacun avec ses inodes, comparés au seuil d'éviction
+  **par défaut** du kubelet : 10 % libres pour `nodefs`, 15 % pour `imagefs`, 5 % d'inodes. Suivent
+  les pods qui écrivent le plus. Le bloc apparaît dans le panneau de détail d'un node et dans la vue
+  usage (`u`), qui en porte une ligne de cumul, ainsi que dans l'export PDF et le prompt de l'IA. Un
+  kubelet muet ou un refus RBAC est écrit comme tel : un disque qu'on n'a pas lu n'est pas un disque
+  sain. Même bloc dans kdt-web, avec les mêmes seuils et les mêmes constats, descendus du serveur.
+
+- **feat(diagnostic)** — une étape **Répartition des replicas** : pour chaque Deployment et
+  StatefulSet multi-replica, combien de pods vivants partagent un node. Un Deployment à trois
+  replicas tous posés sur le même node ne dit rien — ses pods sont `Ready`, son rollout est terminé
+  — et la perte de ce node emporte le service. L'écart se mesure à la répartition qu'un scheduler
+  équilibré aurait produite, donc six replicas à deux par node ne signalent rien ; les nodes
+  éligibles sont ceux qui sont `Ready`, non cordonnés, qui satisfont le `nodeSelector` et dont les
+  taints sont tolérées, pour ne pas reprocher à un workload de n'être que là où il pouvait aller. Le
+  constat nomme ce que le template demandait : rien, une `podAntiAffinity` seulement `preferred`, ou
+  une règle dure malgré laquelle un node en porte plusieurs. Une règle dure avec plus de replicas que
+  de nodes éligibles est signalée aussi : ces pods ne seront jamais placés.
+
+- **feat(k8ssandra)** — une colonne `DUR` donne la **durée** de tout ce qui commence et finit : run
+  Medusa, backup catalogué, restauration, `MedusaTask`, `CassandraTask`, Job `nodetool`. L'état dit
+  qu'un run a réussi, pas si la fenêtre de sauvegarde a tenu, ni depuis combien de temps une
+  réparation tourne. La durée est aussi dans le panneau de détail et dans ce que l'IA reçoit. Sans
+  `startTime`, la cellule reste vide plutôt que d'afficher un `0s` qui se lirait comme instantané.
+
 ## [2.0.0-rc.5] — 2026-09-16
 
 - **feat(web)** — le menu `☰` d'une ligne passe en **fin de ligne**, dans sa propre colonne, et la
