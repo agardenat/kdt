@@ -20505,6 +20505,7 @@ fn synthetic_k8c_job_record(j: &MedJob, st: &'static Strings) -> EventRecord {
                 ("total", &total),
                 ("ko", &j.failed.len().to_string()),
                 ("type", if j.backup_type.is_empty() { "—" } else { &j.backup_type }),
+                ("dur", &k8c_span_text(j.start, j.finish)),
             ],
         ),
         &j.hints,
@@ -20579,6 +20580,7 @@ fn synthetic_k8c_task_record(t: &MedTask, st: &'static Strings) -> EventRecord {
             &[
                 ("op", if t.operation.is_empty() { "—" } else { &t.operation }),
                 ("n", &t.finished.len().to_string()),
+                ("dur", &k8c_span_text(t.start, t.finish)),
             ],
         ),
         &t.hints,
@@ -20608,6 +20610,7 @@ fn synthetic_k8c_ctask_record(t: &CassTask, st: &'static Strings) -> EventRecord
                 ("cmd", &t.commands.join(", ")),
                 ("ok", &t.succeeded.to_string()),
                 ("ko", &t.failed.to_string()),
+                ("dur", &k8c_span_text(t.start, t.finish)),
             ],
         ),
         &t.hints,
@@ -20638,6 +20641,7 @@ fn synthetic_k8c_nodetool_record(j: &NtJob, st: &'static Strings) -> EventRecord
             &[
                 ("cmd", if j.command.is_empty() { "—" } else { &j.command }),
                 ("pod", if j.target.is_empty() { "—" } else { &j.target }),
+                ("dur", &k8c_span_text(j.start, j.finish)),
             ],
         ),
         &j.hints,
@@ -21594,6 +21598,35 @@ fn k8c_info_text(row: &K8cRow, st: &'static Strings) -> String {
     }
 }
 
+// La durée d'une ligne, quand la ligne en a une. Un run, une tâche, une restauration, un
+// `nodetool` : tout ce qui commence et finit. Un cluster, un datacenter ou un node n'en ont pas —
+// ils durent — et un schedule non plus : ce qui dure chez lui, ce sont ses runs.
+//
+// La règle est dans `k8ssandra::span_of` : pas de `startTime`, pas de durée, et sans `finishTime`
+// elle court jusqu'à maintenant. Ici on ne fait que la mettre en forme.
+// La durée d'un couple `(start, finish)`, pour les enregistrements synthétiques. Un run qui n'a
+// pas commencé n'a pas de durée, et c'est un tiret qui le dit — pas un `0s` qui se lirait comme
+// « instantané ».
+fn k8c_span_text(start: Option<i64>, finish: Option<i64>) -> String {
+    crate::k8ssandra::span_of(start, finish, now_secs())
+        .map(crate::k8ssandra::format_run_span)
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn k8c_duration_text(row: &K8cRow) -> String {
+    let now = now_secs();
+    let span = match row {
+        K8cRow::Job(j) => crate::k8ssandra::span_of(j.start, j.finish, now),
+        K8cRow::Backup(b) => crate::k8ssandra::span_of(b.start, b.finish, now),
+        K8cRow::Restore(r) => crate::k8ssandra::span_of(r.start, r.finish, now),
+        K8cRow::Task(t) => crate::k8ssandra::span_of(t.start, t.finish, now),
+        K8cRow::CassTask(t) => crate::k8ssandra::span_of(t.start, t.finish, now),
+        K8cRow::Nodetool(j) => crate::k8ssandra::span_of(j.start, j.finish, now),
+        _ => None,
+    };
+    span.map(crate::k8ssandra::format_run_span).unwrap_or_else(|| "—".to_string())
+}
+
 fn k8c_row_created(row: &K8cRow) -> i64 {
     match row {
         K8cRow::Cluster(c) => c.created,
@@ -21695,7 +21728,7 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let header_row = Row::new(vec![
         Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("STATE"),
-        Cell::from("INFO"), Cell::from("AGE"), Cell::from("ALERT"),
+        Cell::from("INFO"), Cell::from("DUR"), Cell::from("AGE"), Cell::from("ALERT"),
     ])
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
@@ -21730,6 +21763,9 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 Cell::from(k8c_kind_label(row, st)).style(Style::default().fg(DIM)),
                 k8c_state_cell(row, st),
                 Cell::from(k8c_info_text(row, st)),
+                // La durée d'un run se lit à côté de son état : « complete » ne dit pas si la
+                // fenêtre de sauvegarde a tenu, et « running » ne dit pas depuis quand.
+                Cell::from(k8c_duration_text(row)).style(Style::default().fg(DIM)),
                 Cell::from(age).style(Style::default().fg(DIM)),
                 alert(row.hints()),
             ])
@@ -21745,8 +21781,8 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // eats the right border as soon as the terminal is narrower than the sum of the fixed widths.
     let widths = [
         Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(10),
-        Constraint::Length(10), Constraint::Length(info_w), Constraint::Length(5),
-        Constraint::Percentage(100),
+        Constraint::Length(10), Constraint::Length(info_w), Constraint::Length(6),
+        Constraint::Length(5), Constraint::Percentage(100),
     ];
 
     let table = Table::new(rows, widths)
@@ -22043,6 +22079,13 @@ fn k8ssandra_detail_lines(
         Some(v) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(v, now_secs()))]),
         None => st.k8c_never.to_string(),
     };
+    // La durée d'un run, écrite sous ses deux horodatages : c'est leur écart qui dit si la fenêtre
+    // de sauvegarde a tenu. Sans `startTime`, il n'y a pas de durée — et non une durée nulle.
+    let span = |start: Option<i64>, finish: Option<i64>| {
+        crate::k8ssandra::span_of(start, finish, now_secs())
+            .map(crate::k8ssandra::format_run_span)
+            .unwrap_or_else(|| "—".to_string())
+    };
     // A per-node outcome list, truncated: six pod names fit, thirty do not, and the count is the
     // part that matters once the list is longer than the panel.
     let nodes = |names: &[String]| {
@@ -22178,6 +22221,7 @@ fn k8ssandra_detail_lines(
             lines.push(label("cassandraDatacenter", dash(&j.datacenter)));
             lines.push(label("startTime", stamp(j.start)));
             lines.push(label("finishTime", stamp(j.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(j.start, j.finish)));
             lines.push(Line::from(""));
             lines.push(header(st.k8c_lbl_coverage));
             lines.push(label(
@@ -22203,6 +22247,7 @@ fn k8ssandra_detail_lines(
             lines.push(label("cassandraDatacenter", dash(&b.datacenter)));
             lines.push(label("startTime", stamp(b.start)));
             lines.push(label("finishTime", stamp(b.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(b.start, b.finish)));
             // Only shown when the API actually carries them. On operators up to 1.9 they do not
             // exist, and a printed "0/0" would be a fact we invented.
             if let Some(total) = b.total_nodes {
@@ -22224,6 +22269,7 @@ fn k8ssandra_detail_lines(
             lines.push(label("cassandraDatacenter", dash(&r.datacenter)));
             lines.push(label("startTime", stamp(r.start)));
             lines.push(label("finishTime", stamp(r.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(r.start, r.finish)));
             lines.push(label("restoreKey", dash(&r.restore_key)));
             lines.push(label("restorePrepared", r.restore_prepared.to_string()));
             // The field that turns a restore into an outage: the datacenter was taken down to do it.
@@ -22241,6 +22287,7 @@ fn k8ssandra_detail_lines(
             lines.push(label("cassandraDatacenter", dash(&t.datacenter)));
             lines.push(label("startTime", stamp(t.start)));
             lines.push(label("finishTime", stamp(t.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(t.start, t.finish)));
             lines.push(label(st.k8c_lbl_finished, nodes(&t.finished)));
             if !t.failed.is_empty() {
                 lines.push(label(st.k8c_lbl_failed, nodes(&t.failed)));
@@ -22255,6 +22302,7 @@ fn k8ssandra_detail_lines(
             lines.push(label("datacenter", dash(&t.datacenter)));
             lines.push(label("startTime", stamp(t.start)));
             lines.push(label("completionTime", stamp(t.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(t.start, t.finish)));
             lines.push(label("active", t.active.to_string()));
             lines.push(label("succeeded", t.succeeded.to_string()));
             lines.push(label("failed", t.failed.to_string()));
@@ -22266,6 +22314,7 @@ fn k8ssandra_detail_lines(
             lines.push(label(crate::nodetool::ANN_LINE, dash(&j.line)));
             lines.push(label("startTime", stamp(j.start)));
             lines.push(label("completionTime", stamp(j.finish)));
+            lines.push(label(st.k8c_lbl_duration, span(j.start, j.finish)));
             lines.push(label("active", j.active.to_string()));
             lines.push(label("succeeded", j.succeeded.to_string()));
             lines.push(label("failed", j.failed.to_string()));

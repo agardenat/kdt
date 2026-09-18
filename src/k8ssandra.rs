@@ -1593,6 +1593,39 @@ pub fn age_of(then: i64, now: i64) -> String {
     crate::velero::age_of(then, now)
 }
 
+/// Combien de temps un run a duré, ou dure depuis.
+///
+/// `None` quand rien n'a commencé : un objet créé dont le pod n'a pas démarré n'a pas une durée de
+/// zéro, il n'en a pas. Sans `finish`, la durée court jusqu'à maintenant — c'est la question qu'on
+/// se pose devant une réparation qui n'en finit pas, et la colonne d'état dit déjà qu'elle tourne.
+pub fn span_of(start: Option<i64>, finish: Option<i64>, now: i64) -> Option<i64> {
+    let start = start?;
+    // Un `finishTime` antérieur au `startTime` arrive : les deux sont posés par des acteurs
+    // différents. La durée est alors ramenée à zéro plutôt que rendue négative.
+    Some(finish.unwrap_or(now).saturating_sub(start).max(0))
+}
+
+/// Une durée dans la largeur d'une cellule : deux unités au plus, la plus grande d'abord.
+///
+/// `format_span_short` de velero ne descend pas sous la minute, et un `nodetool` ou une purge
+/// Medusa se comptent en secondes — une durée affichée `0m` ne dirait rien de ce qui s'est passé.
+pub fn format_run_span(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        let (m, s) = (secs / 60, secs % 60);
+        return if s == 0 { format!("{m}m") } else { format!("{m}m{s:02}") };
+    }
+    if secs < 86400 {
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        return if m == 0 { format!("{h}h") } else { format!("{h}h{m:02}") };
+    }
+    let (d, h) = (secs / 86400, (secs % 86400) / 3600);
+    if h == 0 { format!("{d}d") } else { format!("{d}d{h:02}") }
+}
+
 /// A byte count as Cassandra reports it, which is a Java double.
 pub fn format_load(bytes: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -2079,6 +2112,35 @@ mod tests {
             pods_known: false,
             claims_known: false,
         }
+    }
+
+    #[test]
+    fn a_run_that_never_started_has_no_duration() {
+        // Pas `0s` : un objet créé dont le pod n'a pas démarré n'a rien duré, il n'a pas commencé.
+        assert_eq!(span_of(None, None, NOW), None);
+        assert_eq!(span_of(None, Some(NOW), NOW), None);
+    }
+
+    #[test]
+    fn a_running_run_is_counted_up_to_now() {
+        assert_eq!(span_of(Some(NOW - 90), None, NOW), Some(90));
+    }
+
+    #[test]
+    fn a_finish_before_the_start_does_not_go_negative() {
+        // Les deux horodatages sont posés par des acteurs différents, et l'ordre s'inverse.
+        assert_eq!(span_of(Some(NOW), Some(NOW - 30), NOW), Some(0));
+    }
+
+    #[test]
+    fn a_duration_keeps_two_units_at_most() {
+        assert_eq!(format_run_span(45), "45s");
+        assert_eq!(format_run_span(60), "1m");
+        assert_eq!(format_run_span(95), "1m35");
+        assert_eq!(format_run_span(3600), "1h");
+        assert_eq!(format_run_span(3900), "1h05");
+        assert_eq!(format_run_span(86400), "1d");
+        assert_eq!(format_run_span(90_000), "1d01");
     }
 
     fn snap(tag: &str, keyspace: &str, table: &str, size: Option<f64>) -> mgmtapi::Snapshot {

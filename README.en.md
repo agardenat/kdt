@@ -292,7 +292,10 @@ shows the query and its effect (`/coredns  (3)`).
     already exists. Velero cannot target an object by name: the selection stops at the kind.
 - **K8ssandra / Cassandra** (`:k8ssandra`, `:medusa`, `:reaper`) — three worlds through `g`: cluster
   ring, Medusa backups, operations and Reaper. `f` filters ALL / PROBLEMS, `Space` folds/unfolds,
-  `l` opens the log of the container at fault.
+  `l` opens the log of the container at fault. The `DUR` column gives the duration of everything that
+  starts and finishes — Medusa run, catalogued backup, restore, `MedusaTask`, `CassandraTask`,
+  `nodetool` Job: the gap between `startTime` and `finishTime`, or the time elapsed since it started
+  when nothing has finished yet. With no `startTime` the cell stays empty rather than showing `0s`.
   - The backup world's title shows the age of the last backup covering **every node** of the
     datacenter, a partial run counting as a failure. Detections: a schedule whose
     `lastExecution`/`nextSchedule` stays clean although the run failed, a purge CronJob completing
