@@ -2193,6 +2193,50 @@ export interface NodeUsagePayload {
   metrics_available: boolean;
   alloc: { cpu: number; mem: number; cpu_text: string; mem_text: string };
   totals: UsageTotals;
+  /** Le disque du node, lu chez son kubelet. `error` non nul : non lu, et la vue le dit. */
+  fs: NodeDiskPayload;
+}
+
+/**
+ * Un filesystem du node, tel que `nodefs` le rend.
+ *
+ * Le ton et le seuil viennent du serveur : c'est le verdict du TUI, pas un second jugement écrit
+ * dans le navigateur. Les champs `*_pct` sont `null` quand le kubelet n'a pas rendu le chiffre —
+ * un zéro se lirait comme « rien d'utilisé ».
+ */
+export interface NodeFilesystem {
+  label: string;
+  eviction_pct: number;
+  note: string;
+  tone: LineTone;
+  inodes_tone: LineTone;
+  used_text: string;
+  capacity_text: string;
+  available_text: string;
+  used_pct: number | null;
+  available_pct: number | null;
+  inodes: number | null;
+  inodes_used: number | null;
+  inodes_free_pct: number | null;
+}
+
+/** Ce qu'un pod écrit sur le disque de son node. */
+export interface NodeDiskWriter {
+  namespace: string;
+  pod: string;
+  ephemeral_text: string | null;
+  volumes_text: string | null;
+}
+
+/** Le disque d'un node : ses filesystems, les constats de kdt, et qui écrit le plus. */
+export interface NodeDiskPayload {
+  /** Non nul quand le kubelet n'a pas répondu — un refus RBAC sur `nodes/proxy`, le plus souvent. */
+  error: string | null;
+  text: string;
+  tone: LineTone;
+  filesystems: NodeFilesystem[];
+  hints: Hint[];
+  pods: NodeDiskWriter[];
 }
 
 /** L'ordre de la table d'usage. Les trois gardent les containers système en dernier. */

@@ -1141,6 +1141,23 @@ pub struct Strings {
     pub ev_node_pods_unlistable: &'static str,
     pub ev_node_reserved: &'static str,
 
+    // Node disk (nodefs.rs): what the kubelet's summary says about the node's filesystems.
+    pub nfs_header: &'static str,
+    pub nfs_line: &'static str,
+    pub nfs_inodes: &'static str,
+    pub nfs_note_nodefs: &'static str,
+    pub nfs_note_imagefs: &'static str,
+    pub nfs_same_device: &'static str,
+    pub nfs_nodefs_absent: &'static str,
+    pub nfs_top_pods: &'static str,
+    pub nfs_below_eviction: &'static str,
+    pub nfs_near_eviction: &'static str,
+    pub nfs_inodes_below_eviction: &'static str,
+    pub nfs_inodes_near_eviction: &'static str,
+    pub nfs_unread: &'static str,
+    pub nfs_timeout: &'static str,
+    pub nfs_disk_label: &'static str,
+
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.
     pub enr_kyverno: &'static str,
     pub enr_rbac: &'static str,
@@ -3088,6 +3105,23 @@ pub const FR: Strings = Strings {
     ev_node_pods_unlistable: "(impossible de lister les pods du node : {err})",
     ev_node_reserved: "Réservé par les pods (somme des requests/limits sur {active} pods actifs / {total} total ; le ratio est sur l'allocatable du node) :",
 
+    // Node disk (nodefs.rs): what the kubelet's summary says about the node's filesystems.
+    nfs_header: "Disque (kubelet stats/summary) :",
+    nfs_line: "{used} / {capacity} utilisés ({used_pct})   libre {available} ({available_pct})",
+    nfs_inodes: "inodes {used} / {total}   libres {free_pct}",
+    nfs_note_nodefs: "racine du kubelet : logs, emptyDir, couches inscriptibles — éviction sous {threshold}% libre",
+    nfs_note_imagefs: "images du runtime — éviction sous {threshold}% libre",
+    nfs_same_device: "mêmes capacité, disponible et inodes que nodefs",
+    nfs_nodefs_absent: "le kubelet n'a pas rendu de filesystem racine",
+    nfs_top_pods: "Les plus gros consommateurs :",
+    nfs_below_eviction: "{fs} : {pct}% libre, sous le seuil d'éviction par défaut du kubelet ({threshold}%)",
+    nfs_near_eviction: "{fs} : {pct}% libre, le seuil d'éviction par défaut est à {threshold}%",
+    nfs_inodes_below_eviction: "{fs} : {pct}% d'inodes libres, sous le seuil d'éviction par défaut ({threshold}%)",
+    nfs_inodes_near_eviction: "{fs} : {pct}% d'inodes libres, le seuil d'éviction par défaut est à {threshold}%",
+    nfs_unread: "non lu : {e}",
+    nfs_timeout: "le kubelet n'a pas répondu en {n} s",
+    nfs_disk_label: "DISQUE",
+
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.
     enr_kyverno: "Recherche de policies Kyverno...",
     enr_rbac: "Analyse des liaisons RBAC (RoleBindings, ClusterRoleBindings)...",
@@ -5026,6 +5060,23 @@ pub const EN: Strings = Strings {
     ev_node_addresses: "Addresses:",
     ev_node_pods_unlistable: "(cannot list the pods of this node: {err})",
     ev_node_reserved: "Reserved by pods (sum of requests/limits over {active} active pods / {total} total; the ratio is against the node's allocatable):",
+
+    // Node disk (nodefs.rs): what the kubelet's summary says about the node's filesystems.
+    nfs_header: "Disk (kubelet stats/summary):",
+    nfs_line: "{used} / {capacity} used ({used_pct})   free {available} ({available_pct})",
+    nfs_inodes: "inodes {used} / {total}   free {free_pct}",
+    nfs_note_nodefs: "kubelet root: logs, emptyDir, writable layers — eviction below {threshold}% free",
+    nfs_note_imagefs: "runtime images — eviction below {threshold}% free",
+    nfs_same_device: "same capacity, free space and inodes as nodefs",
+    nfs_nodefs_absent: "the kubelet reported no root filesystem",
+    nfs_top_pods: "Heaviest writers:",
+    nfs_below_eviction: "{fs}: {pct}% free, below the kubelet's default eviction threshold ({threshold}%)",
+    nfs_near_eviction: "{fs}: {pct}% free, the default eviction threshold is {threshold}%",
+    nfs_inodes_below_eviction: "{fs}: {pct}% inodes free, below the default eviction threshold ({threshold}%)",
+    nfs_inodes_near_eviction: "{fs}: {pct}% inodes free, the default eviction threshold is {threshold}%",
+    nfs_unread: "not read: {e}",
+    nfs_timeout: "the kubelet did not answer within {n}s",
+    nfs_disk_label: "DISK",
 
     // AI enrichment (enrich.rs): progress steps and the tool background sent to the model.
     enr_kyverno: "Looking for Kyverno policies...",

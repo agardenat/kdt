@@ -190,10 +190,17 @@ shows the query and its effect (`/coredns  (3)`).
   state, usage against *their own* requests/limits, age of the last start. Actions target the
   workload even from one of its pod rows: `s` scale, `r` rescale / recycle / restart. On a container
   row, `E` opens a shell in that container and the Logs tab narrows to it. `n`/`0` change namespace.
-- **Nodes** — list, detail, CPU/memory usage (`u`), sort (`s`), PDF export (`p`/`P`). The detail
-  panel gives conditions, capacity/allocatable, system info, addresses, reservations and recent OOM
-  kills, then annotations, labels and taints at its end — what is on screen when the cursor moves to
-  another node. `o` opens the operations: cordon, uncordon, drain. The drain prints a report before any eviction: pods no
+- **Nodes** — list, detail, CPU/memory/disk usage (`u`), sort (`s`), PDF export (`p`/`P`). The
+  detail panel gives conditions, capacity/allocatable, disk, system info, addresses, reservations and
+  recent OOM kills, then annotations, labels and taints at its end — what is on screen when the
+  cursor moves to another node.
+  - The disk comes from the kubelet's own summary (`/api/v1/nodes/<node>/proxy/stats/summary`, which
+    needs `nodes/proxy`): neither the `Node` object nor metrics-server measures it. `nodefs` (the
+    kubelet root: logs, `emptyDir`, writable layers), `imagefs` (runtime images) and `containerfs`
+    where the runtime separates it, each with its inodes, against the kubelet's **default** eviction
+    thresholds — 10% free for `nodefs`, 15% for `imagefs`, 5% of inodes. Then the pods writing the
+    most (`ephemeral-storage` and measured volumes). A refusal or a silent kubelet is written as
+    such: a disk that was not read is not a healthy disk. `o` opens the operations: cordon, uncordon, drain. The drain prints a report before any eviction: pods no
   controller will recreate, PDBs that will refuse, pods with no room elsewhere, `emptyDir` data
   lost, static pods.
 - **Capacity** (`:capacity`, `:quota`) — three worlds through `g`, `f` keeps problems only.
@@ -624,8 +631,9 @@ object: YAML, edit, touch, delete, AI analysis.
 
 **The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age
 and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
-quantities, its sizing findings (`noMemLim`, `cpuOver!!`, `OOMrisk`…) and the user / system / total
-tally. The three gestures of the `o` menu are there: cordon and uncordon go straight through, while
+quantities, its sizing findings (`noMemLim`, `cpuOver!!`, `OOMrisk`…), the user / system / total
+tally and the node's disk as its kubelet reports it (`nodefs`, `imagefs`, inodes, and the pods
+writing the most). The three gestures of the `o` menu are there: cordon and uncordon go straight through, while
 the drain first shows its guard-rails — what would move, what would stay, which budgets will refuse
 — then runs as a live stream. A severe finding asks for the node name to be typed again, and the
 server replays the guard-rails right before it evicts.
@@ -709,7 +717,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 |---|---|
 | `main.rs` · `cli.rs` · `config.rs` | Bootstrap, arguments (clap), config file |
 | `ui.rs` | ratatui TUI: modes, rendering, keyboard |
-| `events.rs` | Event watcher, logs, status, nodes, usage |
+| `events.rs` · `nodefs.rs` | Event watcher, logs, status, nodes, usage, and a node's disk read from its kubelet |
 | `pods.rs` · `svc.rs` · `configmaps.rs` | Workloads, Services/Ingress, ConfigMaps |
 | `portfwd.rs` | Service port-forward (EndpointSlice resolution, local listener) |
 | `flux.rs` · `repair.rs` | FluxCD (inventory, reconcile, tree) and the `Ctrl-R` unblock |

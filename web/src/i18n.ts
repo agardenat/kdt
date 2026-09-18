@@ -631,6 +631,10 @@ export interface Strings {
   ndSystem: string;
   ndTotal: string;
   ndWaste: string;
+  ndDisk: string;
+  ndDiskFree: string;
+  ndDiskInodes: string;
+  ndDiskWriters: string;
   ndSystemRow: string;
   ndReadyShort: string;
   ndDrainTitle: string;
@@ -1333,6 +1337,10 @@ const FR: Strings = {
   ndSystem: "SYS",
   ndTotal: "TOTAL",
   ndWaste: "réservé et jamais consommé",
+  ndDisk: "disque (kubelet)",
+  ndDiskFree: "libre",
+  ndDiskInodes: "inodes",
+  ndDiskWriters: "les plus gros consommateurs",
   ndSystemRow: "container de la plateforme",
   ndReadyShort: "prêt",
   ndDrainTitle: "Drain",
@@ -2028,6 +2036,10 @@ const EN: Strings = {
   ndSystem: "SYS",
   ndTotal: "TOTAL",
   ndWaste: "reserved and never used",
+  ndDisk: "disk (kubelet)",
+  ndDiskFree: "free",
+  ndDiskInodes: "inodes",
+  ndDiskWriters: "heaviest writers",
   ndSystemRow: "platform container",
   ndReadyShort: "ready",
   ndDrainTitle: "Drain",

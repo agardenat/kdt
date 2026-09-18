@@ -192,10 +192,17 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   actions visent le workload même depuis la ligne d'un de ses pods : `s` scale, `r` rescale /
   recyclage / restart. Sur une ligne container, `E` ouvre un shell dans ce container et l'onglet
   Logs s'y restreint automatiquement. `n`/`0` changent de namespace.
-- **Nodes** — liste, détail, usage CPU/mémoire (`u`), tri (`s`), export PDF (`p`/`P`). Le détail
-  donne conditions, capacity/allocatable, system info, adresses, réservations et OOM récents, puis
-  annotations, labels et taints en fin de panneau — la partie affichée quand le curseur change de
-  nœud. `o` ouvre les opérations : cordon, uncordon, drain. Le drain affiche un rapport avant toute éviction : pods
+- **Nodes** — liste, détail, usage CPU/mémoire/disque (`u`), tri (`s`), export PDF (`p`/`P`). Le
+  détail donne conditions, capacity/allocatable, disque, system info, adresses, réservations et OOM
+  récents, puis annotations, labels et taints en fin de panneau — la partie affichée quand le
+  curseur change de nœud.
+  - Le disque vient du résumé du kubelet (`/api/v1/nodes/<node>/proxy/stats/summary`, droit
+    `nodes/proxy`) : ni l'objet `Node` ni metrics-server ne le mesurent. `nodefs` (racine du
+    kubelet : logs, `emptyDir`, couches inscriptibles), `imagefs` (images du runtime) et
+    `containerfs` quand le runtime le distingue, chacun avec ses inodes, comparé au seuil
+    d'éviction **par défaut** du kubelet — 10 % libres pour `nodefs`, 15 % pour `imagefs`, 5 %
+    d'inodes. Suivent les pods qui écrivent le plus (`ephemeral-storage` et volumes mesurés). Un
+    refus ou un kubelet muet est écrit comme tel : un disque non lu n'est pas un disque sain. `o` ouvre les opérations : cordon, uncordon, drain. Le drain affiche un rapport avant toute éviction : pods
   qu'aucun contrôleur ne recréera, PDB qui refuseront, pods sans place ailleurs, `emptyDir` perdus,
   pods statiques.
 - **Capacité** (`:capacity`, `:quota`) — trois mondes par `g`, `f` ne garde que les problèmes.
@@ -631,8 +638,9 @@ portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse I
 
 **La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge et
 les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
-quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…) et le cumul
-user / système / total. Les trois gestes du menu `o` y sont : cordon et uncordon passent tout de
+quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…), le cumul
+user / système / total et le disque du node lu chez son kubelet (`nodefs`, `imagefs`, inodes, et les
+pods qui écrivent le plus). Les trois gestes du menu `o` y sont : cordon et uncordon passent tout de
 suite, le drain ouvre d'abord ses garde-fous — ce qui partirait, ce qui resterait, les budgets qui
 refuseront — puis s'exécute au fil de l'eau. Un constat grave y demande de retaper le nom du node,
 et le serveur rejoue les garde-fous juste avant d'évincer.
@@ -717,7 +725,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 |---|---|
 | `main.rs` · `cli.rs` · `config.rs` | Bootstrap, arguments (clap), fichier de configuration |
 | `ui.rs` | TUI ratatui : modes, rendu, clavier |
-| `events.rs` | Watcher d'évènements, logs, status, nœuds, usage |
+| `events.rs` · `nodefs.rs` | Watcher d'évènements, logs, status, nœuds, usage, et le disque d'un nœud lu chez son kubelet |
 | `pods.rs` · `svc.rs` · `configmaps.rs` | Workloads, Services/Ingress, ConfigMaps |
 | `portfwd.rs` | Port-forward des Services (résolution EndpointSlice, écoute locale) |
 | `flux.rs` · `repair.rs` | FluxCD (inventaire, reconcile, arbre) et déblocage `Ctrl-R` |

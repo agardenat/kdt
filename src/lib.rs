@@ -44,6 +44,7 @@ pub mod lang;
 pub mod mgmtapi;
 pub mod namespaces;
 pub mod netpol;
+pub mod nodefs;
 pub mod nodeops;
 pub mod nodetool;
 pub mod pdf;

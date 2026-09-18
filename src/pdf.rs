@@ -293,6 +293,10 @@ const TEMPLATE: &str = r###"
       allocatable cpu=*#node.alloc_cpu*, mem=*#node.alloc_mem*  ·  #l.metrics_server #if node.metrics_available [#text(fill: rgb("#1b5e20"))[#l.available]] else [#text(fill: rgb("#bf6500"))[#l.unavailable]]  ·  *#node.user_count* user · *#node.system_count* system
     ]
 
+    #text(fill: rgb("#666"), size: 9pt)[
+      disk #raw(node.disk, block: false)
+    ]
+
     #v(0.4em)
 
     #grid(
@@ -506,6 +510,9 @@ pub struct NodeSection {
     pub allocatable_cpu: String,
     pub allocatable_mem: String,
     pub metrics_available: bool,
+    /// Le disque du node en une ligne, tel que `nodefs::summary_text` l'écrit — ou la raison pour
+    /// laquelle le kubelet n'a rien dit.
+    pub disk: String,
     pub user_count: usize,
     pub system_count: usize,
     pub user_cpu_req: String,
@@ -662,6 +669,7 @@ fn build_node_dict(ns: &NodeSection) -> Dict {
         ("alloc_cpu", s(ns.allocatable_cpu.clone())),
         ("alloc_mem", s(ns.allocatable_mem.clone())),
         ("metrics_available", Value::Bool(ns.metrics_available)),
+        ("disk", s(ns.disk.clone())),
         ("user_count", n(ns.user_count)),
         ("system_count", n(ns.system_count)),
         ("user_cpu_req", s(ns.user_cpu_req.clone())),
@@ -961,6 +969,7 @@ mod tests {
             allocatable_cpu: "8000m".to_string(),
             allocatable_mem: "32Gi".to_string(),
             metrics_available: true,
+            disk: "nodefs 30.2Gi/100Gi 30% (inodes 92%)".to_string(),
             user_count: 12, system_count: 4,
             user_cpu_req: "4500m".to_string(), user_cpu_lim: "8000m".to_string(), user_cpu_use: "2300m".to_string(),
             user_mem_req: "16Gi".to_string(), user_mem_lim: "24Gi".to_string(), user_mem_use: "11Gi".to_string(),

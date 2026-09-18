@@ -26,6 +26,7 @@ import type {
   DrainPreflight,
   DrainProgress,
   EventRecord,
+  NodeDiskPayload,
   NodeRow,
   NodeUsagePayload,
   NodeUsageRow,
@@ -659,8 +660,87 @@ function Diagnostic({ usage, st }: { usage: NodeUsagePayload; st: Strings }) {
           </span>
         </span>
       </div>
+      <Disk fs={usage.fs} st={st} />
       {!usage.metrics_available && <p className="hint-note dim">{st.ndNoMetrics}</p>}
     </div>
+  );
+}
+
+/**
+ * Le disque du node, qui est sa troisième ressource et la seule que ni l'objet `Node` ni
+ * metrics-server ne mesurent : elle vient du kubelet, par le proxy de l'apiserver.
+ *
+ * Un refus — `nodes/proxy` manque au RBAC de la personne connectée, le plus souvent — s'écrit
+ * comme un refus. Un disque qu'on n'a pas lu n'est pas un disque qui va bien.
+ */
+function Disk({ fs, st }: { fs: NodeDiskPayload; st: Strings }) {
+  if (fs.error) {
+    return (
+      <div className="keys-row">
+        <div className="k-col">
+          <span className="k">{st.ndDisk}</span>
+        </div>
+        <span className="v info">{fs.text}</span>
+      </div>
+    );
+  }
+  return (
+    <>
+      {fs.filesystems.map((one) => (
+        <div className="keys-row" key={one.label}>
+          <div className="k-col">
+            <span className="k">
+              {st.ndDisk} <span className="dim">{one.label}</span>
+            </span>
+          </div>
+          <span className="v mono">
+            <span className={one.tone}>
+              {one.used_text} / {one.capacity_text}
+              {one.used_pct !== null && ` (${one.used_pct}%)`}
+            </span>{" "}
+            ·{" "}
+            <span className={one.tone}>
+              {st.ndDiskFree} {one.available_text}
+              {one.available_pct !== null && ` (${one.available_pct}%)`}
+            </span>
+            {one.inodes_free_pct !== null && (
+              <>
+                {"  ·  "}
+                <span className={one.inodes_tone}>
+                  {st.ndDiskInodes} {one.inodes_free_pct}% {st.ndDiskFree}
+                </span>
+              </>
+            )}
+            {one.note && <span className="dim"> — {one.note}</span>}
+          </span>
+        </div>
+      ))}
+      {fs.hints.length > 0 && (
+        <ul className="hints">
+          {fs.hints.map((h) => (
+            <li key={h.text} className={h.level}>
+              <span className="gl">{h.level === "danger" ? "✗" : h.level === "warn" ? "▲" : "·"}</span>{" "}
+              {h.text}
+            </li>
+          ))}
+        </ul>
+      )}
+      {fs.pods.length > 0 && (
+        <div className="keys-row">
+          <div className="k-col">
+            <span className="k">{st.ndDiskWriters}</span>
+          </div>
+          <span className="v mono dim">
+            {fs.pods.map((p) => (
+              <span key={`${p.namespace}/${p.pod}`} className="disk-writer">
+                {p.namespace}/{p.pod} {p.ephemeral_text ?? "—"}
+                {p.volumes_text && ` + ${p.volumes_text}`}
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
+    </>
   );
 }
 

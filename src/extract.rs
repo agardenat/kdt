@@ -282,6 +282,10 @@ pub fn format_node_usage_text(s: &NodeUsageState) -> String {
         "metrics-server: {}\n",
         if s.metrics_available { "available" } else { "unavailable (use=null)" }
     ));
+    body.push_str(&format!(
+        "disk (kubelet): {}\n",
+        crate::nodefs::summary_text(s.fs.as_ref(), s.fs_error.as_deref(), st),
+    ));
     let totals = compute_totals(&s.rows);
     body.push_str(&format!(
         "\nUser containers ({}): cpu req={} lim={} use={}, mem req={} lim={} use={}\n",
@@ -502,6 +506,7 @@ pub fn node_section_from(
         allocatable_cpu: format_cpu_milli(s.alloc_cpu_milli),
         allocatable_mem: format_memory_bytes(s.alloc_mem_bytes),
         metrics_available: s.metrics_available,
+        disk: crate::nodefs::summary_text(s.fs.as_ref(), s.fs_error.as_deref(), crate::lang::active()),
         user_count: totals.user_n,
         system_count: totals.sys_n,
         user_cpu_req: format_cpu_milli(totals.u_cpu_req),

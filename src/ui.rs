@@ -16255,9 +16255,9 @@ fn draw_extract_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (rows, loading, error, metrics_available, alloc_cpu, alloc_mem, current_node) = {
+    let (rows, loading, error, metrics_available, alloc_cpu, alloc_mem, current_node, fs, fs_error) = {
         let s = app.node_usage_state.lock().expect("node usage poisoned");
-        (s.rows.clone(), s.loading, s.error.clone(), s.metrics_available, s.alloc_cpu_milli, s.alloc_mem_bytes, s.current_node.clone())
+        (s.rows.clone(), s.loading, s.error.clone(), s.metrics_available, s.alloc_cpu_milli, s.alloc_mem_bytes, s.current_node.clone(), s.fs.clone(), s.fs_error.clone())
     };
 
     let popup_area = centered_rect(area.width, area.height, area);
@@ -16265,7 +16265,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(6), Constraint::Length(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(7), Constraint::Length(1)])
         .split(popup_area);
     let header_a = layout[0];
     let body_a = layout[1];
@@ -16477,7 +16477,7 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let st_f = lang::t(app.ai_language);
     let totals_title = format!(" {} ", st_f.lbl_node_diagnostic);
     f.render_widget(
-        Paragraph::new(build_totals_lines(&rows, alloc_cpu, alloc_mem))
+        Paragraph::new(build_totals_lines(&rows, alloc_cpu, alloc_mem, fs.as_ref(), fs_error.as_deref()))
             .block(Block::default().borders(Borders::ALL).title(totals_title)),
         totals_a,
     );
@@ -16503,7 +16503,13 @@ fn draw_node_usage_popup(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(footer, footer_a);
 }
 
-fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc_mem: i64) -> Vec<Line<'static>> {
+fn build_totals_lines(
+    rows: &[crate::events::PodUsageRow],
+    alloc_cpu: i64,
+    alloc_mem: i64,
+    fs: Option<&crate::nodefs::NodeFilesystems>,
+    fs_error: Option<&str>,
+) -> Vec<Line<'static>> {
     use crate::events::{format_cpu_milli, format_memory_bytes};
     let st = lang::active();
     // Les cumuls sont une règle — la séparation user/système en est le cœur — et vivent dans
@@ -16579,6 +16585,19 @@ fn build_totals_lines(rows: &[crate::events::PodUsageRow], alloc_cpu: i64, alloc
             Span::styled(
                 lang::fill(st.node_usage_waste, &[("pct", &waste_mem_pct.to_string())]),
                 Style::default().fg(if waste_mem_pct > 50 { Color::Yellow } else { DIM }),
+            ),
+        ]),
+        // Le disque est la troisième ressource qu'un node porte, et la seule que ni l'objet `Node`
+        // ni metrics-server ne mesurent : elle vient du kubelet, et son ton est celui de `nodefs`.
+        Line::from(vec![
+            Span::styled(
+                format!("{:<6}", st.nfs_disk_label),
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("(kubelet) ", Style::default().fg(DIM)),
+            Span::styled(
+                crate::nodefs::summary_text(fs, fs_error, st),
+                Style::default().fg(line_color(crate::nodefs::summary_tone(fs))),
             ),
         ]),
     ]
@@ -28466,6 +28485,10 @@ fn format_node_usage_for_ai(s: &crate::events::NodeUsageState) -> (String, Strin
         format_cpu_milli(s.alloc_cpu_milli), format_memory_bytes(s.alloc_mem_bytes)));
     body.push_str(&format!("metrics-server: {}\n",
         if s.metrics_available { "available" } else { "unavailable (use=null)" }));
+    body.push_str(&format!(
+        "disk (kubelet): {}\n",
+        crate::nodefs::summary_text(s.fs.as_ref(), s.fs_error.as_deref(), st),
+    ));
 
     let (mut user_cpu_req, mut user_mem_req) = (0_i64, 0_i64);
     let (mut user_cpu_lim, mut user_mem_lim) = (0_i64, 0_i64);

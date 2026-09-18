@@ -222,7 +222,10 @@ container du node sélectionné — ce que `u` ouvre en plein écran dans le TUI
 le panneau du haut : treize colonnes n'y tiennent pas, et l'objet reste le node de toute façon,
 comme dans le TUI où `i` sur cet écran analyse le node et non un container. Le **cumul**
 user / système / total, lui, est bien un contenu de l'objet : il est dans le panneau, sous son
-propre onglet.
+propre onglet, avec le **disque** du node — `nodefs`, `imagefs`, leurs inodes et les pods qui
+écrivent le plus, tels que le kubelet les rend par le proxy de l'apiserver. Les tons, les seuils
+d'éviction et les constats descendent de `kdt::nodefs` : le navigateur ne rejuge pas des octets. Un
+refus sur `nodes/proxy` s'affiche comme un refus.
 
 Le menu `o` devient une section du menu `☰` de la ligne, avec la convention de toutes les vues. Ce
 qu'il propose dépend de l'état lu : un node cordonné n'offre pas « cordon », il offre « uncordon ».

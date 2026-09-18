@@ -591,7 +591,7 @@ fn format_flux_log_line(v: &serde_json::Value, ctrl: &str, global: bool) -> Stri
 }
 
 // `Serialize` : kdt-web peint ces lignes avec le ton que le TUI leur donne, sans le recalculer.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LineColor { Plain, Ok, Warn, Err, Info, Dim }
 
@@ -642,6 +642,12 @@ async fn status_lines(
         match node_api.get(name).await {
             Ok(n) => {
                 let mut lines = format_node_status(&n);
+                // Le disque vient du kubelet : ni l'objet `Node` ni metrics-server ne le portent.
+                // Un refus sur `nodes/proxy` est rendu comme un refus, jamais comme un disque sain.
+                lines.extend(crate::nodefs::lines_or_reason(
+                    &crate::nodefs::fetch(&client, name).await,
+                    crate::lang::active(),
+                ));
                 let pod_api: Api<Pod> = Api::all(client.clone());
                 let lp = ListParams::default().fields(&format!("spec.nodeName={}", name));
                 match pod_api.list(&lp).await {
@@ -1915,6 +1921,10 @@ pub struct NodeUsageState {
     pub metrics_available: bool,
     pub alloc_cpu_milli: i64,
     pub alloc_mem_bytes: i64,
+    /// Le disque du node, lu chez son kubelet. `None` avec `fs_error` renseigné veut dire que la
+    /// lecture a été refusée : c'est un fait à afficher, pas un disque à supposer sain.
+    pub fs: Option<crate::nodefs::NodeFilesystems>,
+    pub fs_error: Option<String>,
 }
 
 /// L'usage d'un node, rendu plutôt que déposé dans un `Mutex` — le patron de `pod_logs`.
@@ -1928,6 +1938,9 @@ pub struct NodeUsage {
     pub metrics_available: bool,
     pub alloc_cpu_milli: i64,
     pub alloc_mem_bytes: i64,
+    /// Ce que le kubelet dit du disque de ce node, ou la raison pour laquelle il n'a rien dit.
+    pub fs: Option<crate::nodefs::NodeFilesystems>,
+    pub fs_error: Option<String>,
 }
 
 pub type SharedNodeUsage = Arc<Mutex<NodeUsageState>>;
@@ -1947,6 +1960,8 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
         s.error = None;
         s.loading = true;
         s.metrics_available = false;
+        s.fs = None;
+        s.fs_error = None;
     }
 
     let result = node_usage(&client, &node_name, crate::lang::active()).await;
@@ -1963,6 +1978,8 @@ pub async fn fetch_node_usage(client: Client, node_name: String, state: SharedNo
             s.metrics_available = usage.metrics_available;
             s.alloc_cpu_milli = usage.alloc_cpu_milli;
             s.alloc_mem_bytes = usage.alloc_mem_bytes;
+            s.fs = usage.fs;
+            s.fs_error = usage.fs_error;
         }
         Err(e) => s.error = Some(e),
     }
@@ -2001,6 +2018,13 @@ pub async fn node_usage(
 
     let usage_map = fetch_pod_metrics_map(&client).await.unwrap_or_default();
     let metrics_available = !usage_map.is_empty();
+
+    // Le disque du node, dans la même passe : c'est la troisième ressource qu'un node porte, et
+    // elle ne s'obtient ni par l'objet `Node` ni par metrics-server.
+    let (fs, fs_error) = match crate::nodefs::fetch(&client, &node_name).await {
+        Ok(fs) => (Some(fs), None),
+        Err(e) => (None, Some(e)),
+    };
 
     let mut rows = Vec::new();
     for p in pods {
@@ -2052,6 +2076,8 @@ pub async fn node_usage(
         metrics_available,
         alloc_cpu_milli: alloc_cpu,
         alloc_mem_bytes: alloc_mem,
+        fs,
+        fs_error,
     })
 }
 

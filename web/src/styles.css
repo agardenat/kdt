@@ -825,6 +825,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* Le nom de la clé et sa commande de copie tiennent dans la même colonne, l'une sous l'autre :
    la valeur d'à côté se replie sur dix lignes, et un bouton aligné sur elle partirait au loin. */
 .keys-row .k-col { display: flex; flex-direction: column; align-items: flex-start; gap: .25rem; }
+/* Les plus gros consommateurs de disque d'un node : plusieurs pods dans une seule valeur. Collés
+   les uns aux autres ils formaient une phrase illisible, donc chacun prend sa ligne. */
+.keys-row .v .disk-writer { display: block; }
 .keys-row .k-col .inv-pill.copy { padding: 0 .3rem; }
 
 /* ---------------------------------------------------------------- couleur des commandes

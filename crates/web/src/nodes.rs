@@ -162,6 +162,9 @@ pub async fn usage(
             "cpu_text": format_cpu_milli(alloc.0),
             "mem_text": format_memory_bytes(alloc.1),
         },
+        // Le disque du node, lu chez son kubelet. `error` renseigné veut dire non lu : la vue
+        // l'écrit plutôt que de laisser croire à un disque au repos.
+        "fs": fs_json(usage.fs.as_ref(), usage.fs_error.as_deref(), st),
         "totals": {
             "user": bucket_json(&totals.user, alloc),
             "system": bucket_json(&totals.system, alloc),
@@ -215,6 +218,65 @@ fn usage_row_json(r: &PodUsageRow) -> serde_json::Value {
         object.insert("restarts_tone".to_string(), tone_json(r.restarts_tone()));
     }
     value
+}
+
+/// Le disque d'un node : un bloc par filesystem, les constats de `nodefs`, et qui écrit le plus.
+///
+/// Rien n'est jugé ici : les tons, les seuils et les phrases des constats descendent de `nodefs`,
+/// qui est ce que le panneau du TUI affiche.
+fn fs_json(
+    fs: Option<&kdt::nodefs::NodeFilesystems>,
+    error: Option<&str>,
+    st: &'static Strings,
+) -> serde_json::Value {
+    let text = kdt::nodefs::summary_text(fs, error, st);
+    let tone = tone_json(kdt::nodefs::summary_tone(fs));
+    let Some(fs) = fs else {
+        return serde_json::json!({
+            "error": error,
+            "text": text,
+            "tone": tone,
+            "filesystems": Vec::<serde_json::Value>::new(),
+            "hints": Vec::<serde_json::Value>::new(),
+            "pods": Vec::<serde_json::Value>::new(),
+        });
+    };
+    let filesystems: Vec<serde_json::Value> = kdt::nodefs::blocks(fs, st)
+        .iter()
+        .map(|b| {
+            let mut value = serde_json::to_value(b).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("tone".to_string(), tone_json(b.tone));
+                object.insert("inodes_tone".to_string(), tone_json(b.inodes_tone));
+            }
+            value
+        })
+        .collect();
+    let bytes = |v: Option<i64>| match v {
+        Some(v) => serde_json::Value::String(format_memory_bytes(v)),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "error": serde_json::Value::Null,
+        "text": text,
+        "tone": tone,
+        "filesystems": filesystems,
+        "hints": fs
+            .hints(st)
+            .iter()
+            .map(|h| serde_json::json!({ "level": h.level, "text": h.text }))
+            .collect::<Vec<_>>(),
+        "pods": fs
+            .pods
+            .iter()
+            .map(|p| serde_json::json!({
+                "namespace": p.namespace,
+                "pod": p.pod,
+                "ephemeral_text": bytes(p.ephemeral),
+                "volumes_text": bytes(p.volumes),
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Un cumul, avec ce qu'il pèse face à l'allocatable du node.
