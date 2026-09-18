@@ -8,6 +8,19 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.8] — 2026-09-18
+
+- **feat(nodes)** — la liste des nodes porte aussi les **sommes réservées** de chaque machine :
+  `CPU req/lim` et `MEM req/lim`, à côté de ce qui est consommé. La consommation seule ne dit pas
+  si un node prendra le prochain pod — c'est la réservation que le scheduler regarde — et un node à
+  10 % de CPU consommé peut être plein à 90 % de réservations. Les limites, elles, disent le
+  sur-engagement : 471 % veut dire que le node devrait servir près de cinq fois ce qu'il a si tout
+  le monde prenait son dû. Kubernetes ne publie ces sommes nulle part : elles se recalculent depuis
+  les pods de chaque node, comme le fait déjà le panneau de détail, et les deux affichent donc les
+  mêmes chiffres. Cette lecture portant sur tous les pods du cluster, elle est gardée quinze
+  secondes (le disque, lui, une minute), et kdt-web ne la demande qu'une fois sur trois
+  rafraîchissements (`?reserved=1`).
+
 ## [2.0.0-rc.7] — 2026-09-18
 
 - **feat(nodes)** — la liste des nodes porte les **trois taux d'occupation** de chaque machine :
