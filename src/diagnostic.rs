@@ -138,6 +138,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
     check_mutating_webhooks(&client, &state, run_id).await;
     check_rancher(&client, &state, run_id).await;
     check_problem_pods(&client, &state, run_id).await;
+    check_replica_spread(&client, &state, run_id).await;
     check_persistent_volumes(&client, &state, run_id).await;
     check_storage(&client, &state, run_id).await;
     check_capacity(&client, &state, run_id).await;
@@ -1185,6 +1186,72 @@ fn push_problem_list(lines: &mut Vec<(LineColor, String)>, label: &str, items: &
             fill(active().diag_more_items, &[("n", &(items.len() - 8).to_string())]),
         ));
     }
+}
+
+// Où les replicas des workloads multi-replica ont atterri. La règle est dans `spread.rs` — ce qui
+// compte comme mal réparti, et ce que le template avait demandé — et cette étape ne fait que rendre
+// ses constats. Un cluster mono-node n'en produit aucun : il n'y a rien à répartir.
+async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+    let Some(idx) = push_step(
+        state,
+        run_id,
+        active().diag_step_spread,
+        "kubectl get deploy,sts,rs,pods,nodes -A -o wide",
+    ) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let status = match crate::spread::analyse(client).await {
+        Ok(spread) => {
+            let findings = spread.findings();
+            let mut status = if findings.is_empty() { DiagStatus::Ok } else { DiagStatus::Info };
+            lines.push((
+                if findings.is_empty() { LineColor::Ok } else { LineColor::Warn },
+                fill(
+                    active().diag_spread_summary,
+                    &[
+                        ("workloads", &spread.examined.to_string()),
+                        ("concentrated", &spread.concentrations().to_string()),
+                        ("spof", &spread.single_points().to_string()),
+                    ],
+                ),
+            ));
+            if !spread.nodes_readable {
+                lines.push((LineColor::Info, active().diag_spread_nodes_unreadable.to_string()));
+                status = worse(status, DiagStatus::Info);
+            }
+            for p in findings.iter().take(8) {
+                lines.push((
+                    LineColor::Plain,
+                    fill(
+                        active().diag_spread_row,
+                        &[
+                            ("kind", &p.kind),
+                            ("ns", &p.namespace),
+                            ("name", &p.name),
+                            ("running", &p.running.to_string()),
+                            ("nodes", &p.nodes.to_string()),
+                        ],
+                    ),
+                ));
+                let mut hint_lines = Vec::new();
+                push_storage_hints(&mut hint_lines, &p.hints, &mut status);
+                lines.extend(hint_lines.into_iter().map(|(c, t)| (c, format!("  {}", t))));
+            }
+            if findings.len() > 8 {
+                lines.push((
+                    LineColor::Dim,
+                    fill(active().diag_spread_more, &[("n", &(findings.len() - 8).to_string())]),
+                ));
+            }
+            status
+        }
+        Err(e) => {
+            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e)])));
+            DiagStatus::Err
+        }
+    };
+    finish_step(state, run_id, idx, status, lines);
 }
 
 async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run_id: u64) {

@@ -488,9 +488,21 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   ne listent alors que ce namespace.
 - **Diagnostic** (`D`) — batterie de vérifications : santé de l'API, version, nodes, namespaces
   système, pods de `kube-system`, CoreDNS, CNI, webhooks validating et mutating, Rancher, pods en
-  erreur, PV, stockage, capacité, Flux, cert-manager, Kyverno, Velero, Reflector, Argo CD,
-  kdt-identity, K8ssandra, RBAC, warnings récents. Un module absent du cluster est rapporté en Info. `r` relance, `p`/`P`
-  exportent en PDF.
+  erreur, répartition des replicas, PV, stockage, capacité, Flux, cert-manager, Kyverno, Velero,
+  Reflector, Argo CD, kdt-identity, K8ssandra, RBAC, warnings récents. Un module absent du cluster
+  est rapporté en Info. `r` relance, `p`/`P` exportent en PDF.
+  - *Répartition des replicas* : pour chaque Deployment et StatefulSet multi-replica, combien de
+    pods vivants partagent un nœud. L'écart se mesure à la répartition qu'un scheduler équilibré
+    aurait produite (`ceil(replicas / nœuds éligibles)`), donc six replicas à deux par nœud ne
+    signalent rien ; tous les replicas sur un seul nœud alors qu'il en existait d'autres est un
+    `Danger`. Les nœuds éligibles sont ceux qui sont `Ready`, non cordonnés, qui satisfont le
+    `nodeSelector` et dont les taints sont tolérées — un workload qui n'avait qu'un nœud où aller
+    n'est pas mal réparti. Le constat nomme ce que le template demandait : rien, une
+    `podAntiAffinity` seulement `preferred` (que le scheduler abandonne plutôt que de laisser un
+    pod `Pending`), ou une règle dure malgré laquelle un nœud en porte plusieurs. Une règle dure
+    avec plus de replicas que de nœuds éligibles est signalée aussi : ces pods ne seront jamais
+    placés. Les `nodeAffinity` en expressions ne sont pas évaluées, et les nœuds illisibles font
+    décrire sans juger.
 - **Extraction** (`X`) — rapport PDF complet de l'état du cluster dans `~/Downloads`.
 - **IA** (`i`) — envoie le contexte courant à une API compatible OpenAI ; la réponse est streamée
   (SSE) et s'affiche au fil de l'eau. `L` relance dans l'autre langue, `m` change de fournisseur.
@@ -738,7 +750,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, l'API de management Cassandra via le proxy apiserver, et `nodetool` lancé en Job |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
-| `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, rendu Typst |
+| `diagnostic.rs` · `spread.rs` · `extract.rs` · `pdf.rs` | Diagnostic, répartition des replicas, extraction, rendu Typst |
 | `enrich.rs` · `ai.rs` | Contexte lié à un évènement, client OpenAI |
 | `lang.rs` · `clip.rs` | Table de chaînes FR/EN, presse-papier OSC 52 |
 

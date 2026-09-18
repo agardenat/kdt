@@ -482,10 +482,21 @@ shows the query and its effect (`/coredns  (3)`).
 - **Secrets / ConfigMaps** — inventories, with TLS certificate expiry and their consumers. Both
   views follow the session namespace scope (`:cm <ns>`, `n`/`0`) and then list that namespace only.
 - **Diagnostic** (`D`) — a battery of checks: API health, version, nodes, system namespaces,
-  `kube-system` pods, CoreDNS, CNI, validating and mutating webhooks, Rancher, failing pods, PVs,
-  storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, Argo CD, kdt-identity,
-  K8ssandra, RBAC, recent warnings. A module absent from the cluster is reported as Info. `r` re-runs, `p`/`P` export the
-  PDF.
+  `kube-system` pods, CoreDNS, CNI, validating and mutating webhooks, Rancher, failing pods, replica
+  placement, PVs, storage, capacity, Flux, cert-manager, Kyverno, Velero, Reflector, Argo CD,
+  kdt-identity, K8ssandra, RBAC, recent warnings. A module absent from the cluster is reported as
+  Info. `r` re-runs, `p`/`P` export the PDF.
+  - *Replica placement*: for every multi-replica Deployment and StatefulSet, how many live pods
+    share a node. The gap is measured against the spread a balanced scheduler would have produced
+    (`ceil(replicas / eligible nodes)`), so six replicas two per node report nothing; every replica
+    on a single node while others were available is a `Danger`. Eligible nodes are those that are
+    `Ready`, not cordoned, that satisfy the `nodeSelector` and whose taints are tolerated — a
+    workload that had only one node to go to is not badly spread. The finding names what the
+    template asked for: nothing, a `podAntiAffinity` that is only `preferred` (which the scheduler
+    drops rather than leave a pod `Pending`), or a hard rule that one node carries several replicas
+    despite. A hard rule with more replicas than eligible nodes is reported too: those pods will
+    never be placed. Expression-based `nodeAffinity` is not evaluated, and unreadable nodes make it
+    describe without judging.
 - **Extract** (`X`) — full PDF report of the cluster state into `~/Downloads`.
 - **AI** (`i`) — sends the current context to an OpenAI-compatible API; the answer is streamed (SSE)
   and rendered as it arrives. `L` re-runs it in the other language, `m` switches provider.
@@ -730,7 +741,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, the Cassandra management API through the apiserver proxy, and `nodetool` run as a Job |
 | `storage.rs` | PVC / PV / StorageClass and their diagnostic rules |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |
-| `diagnostic.rs` · `extract.rs` · `pdf.rs` | Diagnostic, extraction, Typst rendering |
+| `diagnostic.rs` · `spread.rs` · `extract.rs` · `pdf.rs` | Diagnostic, replica placement, extraction, Typst rendering |
 | `enrich.rs` · `ai.rs` | Context related to an event, OpenAI client |
 | `lang.rs` · `clip.rs` | FR/EN string table, OSC 52 clipboard |
 

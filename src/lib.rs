@@ -55,6 +55,7 @@ pub mod rbac;
 pub mod reflector;
 pub mod repair;
 pub mod secrets;
+pub mod spread;
 pub mod storage;
 pub mod svc;
 pub mod touch;
