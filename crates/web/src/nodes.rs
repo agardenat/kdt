@@ -66,6 +66,13 @@ pub struct LangQuery {
     /// demandé » de « pas lu ».
     #[serde(default)]
     disk: String,
+    /// `1` pour joindre les sommes réservées par les pods de chaque node.
+    ///
+    /// Une seule lecture, mais de tous les pods du cluster : la page la redemande toutes les
+    /// trente secondes, plus souvent que le disque parce qu'une réservation change dès qu'un pod
+    /// est placé.
+    #[serde(default)]
+    reserved: String,
 }
 
 /// L'inventaire des nodes du cluster.
@@ -98,7 +105,12 @@ pub async fn list(
     // colonne qui arriverait plus tard demanderait une seconde requête pour la même question. La
     // lecture reste celle de la personne connectée, comme le reste — rien n'est mis en cache d'un
     // compte à l'autre, un droit `nodes/proxy` ne se prête pas.
-    let with_disk = query.disk == "1" || query.disk == "true";
+    let flag = |v: &str| v == "1" || v == "true";
+    let with_disk = flag(&query.disk);
+    let with_reserved = flag(&query.reserved);
+    if with_reserved {
+        kdt::events::fill_node_reserved(&client, &mut nodes).await;
+    }
     if with_disk {
         kdt::events::fill_node_disk(&client, &mut nodes).await;
     }
@@ -106,6 +118,7 @@ pub async fn list(
     axum::Json(serde_json::json!({
         "nodes": nodes.iter().map(|n| node_json(n, st)).collect::<Vec<_>>(),
         "disk_included": with_disk,
+        "reserved_included": with_reserved,
     }))
     .into_response()
 }
@@ -123,7 +136,11 @@ fn node_json(n: &NodeSummary, st: &'static Strings) -> serde_json::Value {
         // Les trois taux d'occupation et leurs tons, calculés par kdt : le navigateur peint la
         // même cellule que le TUI plutôt que de rejuger une occupation.
         for (field, pct, tone) in [
+            ("cpu_req_pct", n.cpu_req_pct(), NodeSummary::reserved_tone(n.cpu_req_pct())),
+            ("cpu_lim_pct", n.cpu_lim_pct(), NodeSummary::reserved_tone(n.cpu_lim_pct())),
             ("cpu_pct", n.cpu_pct(), n.cpu_tone()),
+            ("mem_req_pct", n.mem_req_pct(), NodeSummary::reserved_tone(n.mem_req_pct())),
+            ("mem_lim_pct", n.mem_lim_pct(), NodeSummary::reserved_tone(n.mem_lim_pct())),
             ("mem_pct", n.mem_pct(), n.mem_tone()),
             ("disk_pct", n.disk_pct(), n.disk_tone()),
         ] {

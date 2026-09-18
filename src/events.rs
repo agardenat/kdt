@@ -1263,6 +1263,26 @@ pub struct NodeSummary {
     /// Son disque, lu chez son kubelet. `None` avec `disk_error` renseigné : non lu.
     pub disk: Option<crate::nodefs::DiskHeadline>,
     pub disk_error: Option<String>,
+    /// Ce que les pods de ce node ont réservé, et ce qu'ils ont le droit de prendre.
+    ///
+    /// C'est la somme que le panneau de détail écrit depuis toujours, descendue sur la ligne : la
+    /// réservation dit ce que le scheduler considère comme pris, les limites ce que le node
+    /// devrait servir si tout le monde consommait son dû — d'où des taux au-delà de 100 %.
+    pub reserved: Option<NodeReserved>,
+}
+
+/// Les quatre sommes d'un node, et le nombre de pods sur lesquels elles portent.
+///
+/// Absentes (`None` sur le node) veut dire que les pods n'ont pas pu être listés : un `0 %` se
+/// lirait comme un node vide, ce qui est le contraire d'un refus de lecture.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NodeReserved {
+    pub cpu_req_milli: i64,
+    pub cpu_lim_milli: i64,
+    pub mem_req_bytes: i64,
+    pub mem_lim_bytes: i64,
+    /// Pods actifs comptés : ceux qui tiennent encore leur place sur ce node.
+    pub pods: usize,
 }
 
 impl NodeSummary {
@@ -1296,6 +1316,34 @@ impl NodeSummary {
     /// Le taux d'occupation du disque, celui de la racine du kubelet.
     pub fn disk_pct(&self) -> Option<i64> {
         self.disk.as_ref()?.used_pct
+    }
+
+    /// Ce que les pods ont réservé en CPU, face à l'allocatable du node.
+    pub fn cpu_req_pct(&self) -> Option<i64> {
+        usage_pct(self.reserved.as_ref()?.cpu_req_milli, self.cpu_alloc_milli)
+    }
+
+    /// Ce que leurs limites autorisent. Au-delà de 100 %, le node est sur-engagé — c'est courant,
+    /// et c'est justement ce qu'on vient lire.
+    pub fn cpu_lim_pct(&self) -> Option<i64> {
+        usage_pct(self.reserved.as_ref()?.cpu_lim_milli, self.cpu_alloc_milli)
+    }
+
+    pub fn mem_req_pct(&self) -> Option<i64> {
+        usage_pct(self.reserved.as_ref()?.mem_req_bytes, self.mem_alloc_bytes)
+    }
+
+    pub fn mem_lim_pct(&self) -> Option<i64> {
+        usage_pct(self.reserved.as_ref()?.mem_lim_bytes, self.mem_alloc_bytes)
+    }
+
+    /// Le ton d'une somme réservée : la même échelle que le reste de la ligne, et que la ligne du
+    /// panneau de détail qui dit déjà ces quatre chiffres.
+    pub fn reserved_tone(pct: Option<i64>) -> LineColor {
+        match pct {
+            Some(pct) => usage_tone(pct),
+            None => LineColor::Dim,
+        }
     }
 
     /// Le ton d'un taux d'occupation CPU ou mémoire : l'échelle du bandeau, pas une seconde.
@@ -1383,52 +1431,79 @@ pub struct NodeListState {
     pub nodes: Vec<NodeSummary>,
     pub error: Option<String>,
     pub loading: bool,
-    /// Ce qu'on sait déjà du disque des nodes, et depuis quand.
-    pub disk_cache: NodeDiskCache,
+    /// Ce qu'on sait déjà des lectures chères, et depuis quand.
+    pub extras: NodeExtrasCache,
 }
 
-/// Le disque des nodes, gardé d'un rafraîchissement à l'autre.
+/// Ce que la liste des nodes ne peut pas se permettre de relire à chaque tour.
 ///
-/// La liste se relit toutes les cinq secondes, et le disque coûte **un appel par node** à un
-/// kubelet qui rend quelques kilo-octets par pod : le relire à cette cadence transformerait une
-/// vue en charge. Un disque ne bouge pas en cinq secondes, donc la colonne survit entre deux
-/// lectures et n'est refaite qu'au-delà de [`NODE_DISK_TTL`].
+/// L'inventaire tient en deux lectures — les nodes, et l'usage de metrics-server — et se rafraîchit
+/// toutes les cinq secondes. Les deux autres colonnes coûtent bien plus cher :
+///
+/// * le **disque**, un appel par node au kubelet de chacun, qui rend quelques kilo-octets par pod ;
+/// * les **sommes réservées**, une liste de tous les pods du cluster.
+///
+/// Elles survivent donc d'un rafraîchissement à l'autre, chacune avec son propre âge : un disque ne
+/// bouge pas en une minute, une réservation change dès qu'un pod est placé.
 #[derive(Default, Debug, Clone)]
-pub struct NodeDiskCache {
-    entries: std::collections::HashMap<String, (Option<crate::nodefs::DiskHeadline>, Option<String>)>,
-    read_at: Option<std::time::Instant>,
+pub struct NodeExtrasCache {
+    disk: std::collections::HashMap<String, (Option<crate::nodefs::DiskHeadline>, Option<String>)>,
+    reserved: std::collections::HashMap<String, Option<NodeReserved>>,
+    disk_read_at: Option<std::time::Instant>,
+    reserved_read_at: Option<std::time::Instant>,
 }
 
 /// Au-delà, le disque des nodes est relu.
 pub const NODE_DISK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-impl NodeDiskCache {
-    /// Pose sur un inventaire frais ce qu'on savait déjà : la colonne ne clignote pas entre deux
-    /// lectures.
+/// Au-delà, les sommes réservées sont relues. Plus court : elles bougent à chaque placement.
+pub const NODE_RESERVED_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl NodeExtrasCache {
+    /// Pose sur un inventaire frais ce qu'on savait déjà : les colonnes ne clignotent pas entre
+    /// deux lectures chères.
     pub fn apply(&self, nodes: &mut [NodeSummary]) {
         for node in nodes {
-            if let Some((disk, error)) = self.entries.get(&node.name) {
+            if let Some((disk, error)) = self.disk.get(&node.name) {
                 node.disk = disk.clone();
                 node.disk_error = error.clone();
+            }
+            if let Some(reserved) = self.reserved.get(&node.name) {
+                node.reserved = reserved.clone();
             }
         }
     }
 
-    /// Vrai quand rien n'a été lu, ou plus rien de récent.
-    pub fn stale(&self) -> bool {
-        match self.read_at {
-            Some(t) => t.elapsed() >= NODE_DISK_TTL,
+    pub fn disk_stale(&self) -> bool {
+        Self::older_than(self.disk_read_at, NODE_DISK_TTL)
+    }
+
+    pub fn reserved_stale(&self) -> bool {
+        Self::older_than(self.reserved_read_at, NODE_RESERVED_TTL)
+    }
+
+    fn older_than(read_at: Option<std::time::Instant>, ttl: std::time::Duration) -> bool {
+        match read_at {
+            Some(t) => t.elapsed() >= ttl,
             None => true,
         }
     }
 
     /// Garde ce qu'une passe vient de lire. Les nodes disparus sortent du cache avec elle.
-    pub fn store(&mut self, nodes: &[NodeSummary]) {
-        self.entries = nodes
+    pub fn store_disk(&mut self, nodes: &[NodeSummary]) {
+        self.disk = nodes
             .iter()
             .map(|n| (n.name.clone(), (n.disk.clone(), n.disk_error.clone())))
             .collect();
-        self.read_at = Some(std::time::Instant::now());
+        self.disk_read_at = Some(std::time::Instant::now());
+    }
+
+    pub fn store_reserved(&mut self, nodes: &[NodeSummary]) {
+        self.reserved = nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.reserved.clone()))
+            .collect();
+        self.reserved_read_at = Some(std::time::Instant::now());
     }
 }
 
@@ -1457,6 +1532,56 @@ pub async fn nodes_inventory(client: &Client) -> Result<Vec<NodeSummary>, String
     }
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(nodes)
+}
+
+/// Remplit les quatre sommes d'un inventaire déjà lu, en une liste de pods pour tout le cluster.
+///
+/// Kubernetes ne publie nulle part ce qu'un node a de réservé : seul le scheduler le sait, et il ne
+/// le dit pas. Il faut donc relire les pods et sommer — une lecture, mais une lecture de tout le
+/// cluster, d'où le cache qui la garde d'un rafraîchissement à l'autre.
+pub async fn fill_node_reserved(client: &Client, nodes: &mut [NodeSummary]) {
+    let api: Api<Pod> = Api::all(client.clone());
+    let Ok(list) = api.list(&ListParams::default()).await else {
+        // Refusé : les quatre colonnes restent vides. `0 %` se lirait comme un node sans pods.
+        return;
+    };
+    let mut by_node: std::collections::HashMap<String, NodeReserved> = std::collections::HashMap::new();
+    for p in &list.items {
+        let Some(node) = p.spec.as_ref().and_then(|s| s.node_name.clone()) else { continue };
+        // Un pod terminé ne tient plus sa place : c'est la règle du panneau de détail, qui compte
+        // les pods actifs et le dit.
+        let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+        if phase == "Succeeded" || phase == "Failed" {
+            continue;
+        }
+        let entry = by_node.entry(node).or_default();
+        entry.pods += 1;
+        let Some(spec) = &p.spec else { continue };
+        for c in &spec.containers {
+            let Some(r) = &c.resources else { continue };
+            if let Some(reqs) = &r.requests {
+                if let Some(q) = reqs.get("cpu") {
+                    entry.cpu_req_milli += parse_quantity_cpu_milli(&q.0).unwrap_or(0);
+                }
+                if let Some(q) = reqs.get("memory") {
+                    entry.mem_req_bytes += parse_quantity_memory_bytes(&q.0).unwrap_or(0);
+                }
+            }
+            if let Some(lims) = &r.limits {
+                if let Some(q) = lims.get("cpu") {
+                    entry.cpu_lim_milli += parse_quantity_cpu_milli(&q.0).unwrap_or(0);
+                }
+                if let Some(q) = lims.get("memory") {
+                    entry.mem_lim_bytes += parse_quantity_memory_bytes(&q.0).unwrap_or(0);
+                }
+            }
+        }
+    }
+    for node in nodes {
+        // Un node sans pod a bien des sommes, et elles valent zéro — ce n'est pas la même chose
+        // qu'un refus de lister, qui laisse `reserved` à `None`.
+        node.reserved = Some(by_node.remove(&node.name).unwrap_or_default());
+    }
 }
 
 /// Remplit la colonne disque d'un inventaire déjà lu.
@@ -1493,21 +1618,31 @@ pub async fn fetch_nodes(client: Client, state: SharedNodeList) {
         Ok(mut nodes) => {
             // Ce qu'on sait déjà du disque est reposé tout de suite : la colonne garde sa valeur
             // pendant que le reste de la ligne se met à jour.
-            let stale = {
+            let (disk_stale, reserved_stale) = {
                 let mut s = state.lock().expect("node list poisoned");
-                s.disk_cache.apply(&mut nodes);
+                s.extras.apply(&mut nodes);
                 s.loading = false;
                 s.nodes = nodes.clone();
-                s.disk_cache.stale()
+                (s.extras.disk_stale(), s.extras.reserved_stale())
             };
-            if !stale {
+            if !disk_stale && !reserved_stale {
                 return;
             }
-            // Le disque arrive après, et la liste est déjà à l'écran : un appel par node ne doit
-            // pas retenir l'inventaire, qui lui tient en une lecture.
-            fill_node_disk(&client, &mut nodes).await;
+            // Les lectures chères arrivent après, la liste étant déjà à l'écran : ni la liste des
+            // pods ni les kubelets ne doivent retenir un inventaire qui tient en deux lectures.
+            if reserved_stale {
+                fill_node_reserved(&client, &mut nodes).await;
+            }
+            if disk_stale {
+                fill_node_disk(&client, &mut nodes).await;
+            }
             let mut s = state.lock().expect("node list poisoned");
-            s.disk_cache.store(&nodes);
+            if reserved_stale {
+                s.extras.store_reserved(&nodes);
+            }
+            if disk_stale {
+                s.extras.store_disk(&nodes);
+            }
             // Une autre lecture a pu aboutir entre-temps : on ne réécrit la liste que si elle
             // porte toujours les mêmes nodes, et le cache profite de toute façon à la suivante.
             let same: bool = s.nodes.len() == nodes.len()
@@ -1577,6 +1712,7 @@ fn node_summary(n: &Node) -> NodeSummary {
         mem_use_bytes: None,
         disk: None,
         disk_error: None,
+        reserved: None,
     }
 }
 
@@ -2463,6 +2599,7 @@ mod node_row_tests {
             mem_use_bytes: mem_use,
             disk: None,
             disk_error: None,
+            reserved: None,
         }
     }
 
@@ -2503,8 +2640,8 @@ mod node_row_tests {
 
     #[test]
     fn the_disk_cache_survives_a_refresh_and_expires_on_its_own() {
-        let mut cache = NodeDiskCache::default();
-        assert!(cache.stale(), "rien lu encore");
+        let mut cache = NodeExtrasCache::default();
+        assert!(cache.disk_stale(), "rien lu encore");
 
         let mut read = vec![node(None, None)];
         read[0].disk = Some(crate::nodefs::DiskHeadline {
@@ -2515,8 +2652,8 @@ mod node_row_tests {
             capacity_text: "149.9Gi".to_string(),
             tone: LineColor::Ok,
         });
-        cache.store(&read);
-        assert!(!cache.stale(), "lu à l'instant");
+        cache.store_disk(&read);
+        assert!(!cache.disk_stale(), "lu à l'instant");
 
         // L'inventaire suivant arrive sans disque : le cache le repose plutôt que de laisser la
         // colonne clignoter entre son chiffre et un tiret toutes les cinq secondes.
@@ -2533,11 +2670,65 @@ mod node_row_tests {
     }
 
     #[test]
+    fn the_reserved_sums_are_read_against_the_nodes_own_allocatable() {
+        let mut n = node(None, None);
+        n.reserved = Some(NodeReserved {
+            cpu_req_milli: 1850,
+            cpu_lim_milli: 18850,
+            mem_req_bytes: 4 * 1024 * 1024 * 1024,
+            mem_lim_bytes: 20 * 1024 * 1024 * 1024,
+            pods: 32,
+        });
+        assert_eq!(n.cpu_req_pct(), Some(46));
+        // Au-delà de 100 % : le node est sur-engagé, et c'est un fait qu'on vient lire, pas une
+        // valeur à écrêter.
+        assert_eq!(n.cpu_lim_pct(), Some(471));
+        assert_eq!(n.mem_req_pct(), Some(50));
+        assert_eq!(n.mem_lim_pct(), Some(250));
+        assert_eq!(NodeSummary::reserved_tone(n.cpu_lim_pct()), LineColor::Err);
+        assert_eq!(NodeSummary::reserved_tone(n.cpu_req_pct()), LineColor::Ok);
+    }
+
+    #[test]
+    fn pods_that_could_not_be_listed_leave_the_sums_empty() {
+        // `reserved` à `None` n'est pas un node sans pods : c'est une lecture qui a manqué, et un
+        // `0 %` dirait le contraire.
+        let n = node(None, None);
+        assert_eq!(n.cpu_req_pct(), None);
+        assert_eq!(n.mem_lim_pct(), None);
+        assert_eq!(NodeSummary::reserved_tone(n.cpu_req_pct()), LineColor::Dim);
+
+        // Un node réellement vide, lui, a bien des sommes, et elles valent zéro.
+        let mut vide = node(None, None);
+        vide.reserved = Some(NodeReserved::default());
+        assert_eq!(vide.cpu_req_pct(), Some(0));
+    }
+
+    #[test]
+    fn the_two_heavy_reads_expire_on_their_own_clocks() {
+        let mut cache = NodeExtrasCache::default();
+        assert!(cache.disk_stale() && cache.reserved_stale());
+
+        let mut read = vec![node(None, None)];
+        read[0].reserved = Some(NodeReserved { cpu_req_milli: 1000, pods: 3, ..NodeReserved::default() });
+        cache.store_reserved(&read);
+        // Les sommes viennent d'être lues, le disque ne l'a jamais été : les deux âges sont
+        // distincts, et c'est ce qui permet de relire l'un sans l'autre.
+        assert!(!cache.reserved_stale());
+        assert!(cache.disk_stale());
+
+        let mut fresh = vec![node(None, None)];
+        cache.apply(&mut fresh);
+        assert_eq!(fresh[0].cpu_req_pct(), Some(25));
+        assert_eq!(fresh[0].disk_pct(), None);
+    }
+
+    #[test]
     fn a_refused_kubelet_is_kept_as_a_refusal() {
-        let mut cache = NodeDiskCache::default();
+        let mut cache = NodeExtrasCache::default();
         let mut read = vec![node(None, None)];
         read[0].disk_error = Some("nodes/proxy forbidden".to_string());
-        cache.store(&read);
+        cache.store_disk(&read);
 
         let mut fresh = vec![node(None, None)];
         cache.apply(&mut fresh);

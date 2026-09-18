@@ -2108,14 +2108,26 @@ export interface NodeRow {
   /** La condition `Ready` seule — un node cordonné mais sain reste vert de ce côté-là. */
   ready_tone: LineTone;
   /**
-   * Les trois taux d'occupation de la ligne, et le ton que kdt leur donne.
+   * Les sept taux de la ligne, et le ton que kdt leur donne.
+   *
+   * Réservé, permis, consommé pour le CPU et la mémoire, puis le disque. Les sommes `req` et `lim`
+   * sont celles des pods du node — Kubernetes ne les publie nulle part, elles se recalculent — et
+   * un `lim` au-delà de 100 % dit que le node est sur-engagé, ce qui est courant et se lit.
    *
    * `null` veut dire non mesuré — metrics-server ne répond pas, le kubelet n'a pas été lu — et se
    * rend en tiret : un zéro se lirait comme un node au repos. Le disque est celui de la racine du
    * kubelet, jugé sur son disponible face au seuil d'éviction, pas sur le pourcentage utilisé.
    */
+  cpu_req_pct: number | null;
+  cpu_req_pct_tone: LineTone;
+  cpu_lim_pct: number | null;
+  cpu_lim_pct_tone: LineTone;
   cpu_pct: number | null;
   cpu_pct_tone: LineTone;
+  mem_req_pct: number | null;
+  mem_req_pct_tone: LineTone;
+  mem_lim_pct: number | null;
+  mem_lim_pct_tone: LineTone;
   mem_pct: number | null;
   mem_pct_tone: LineTone;
   disk_pct: number | null;
@@ -2134,6 +2146,8 @@ export interface NodesPayload {
    * dernière valeur qu'elle avait, au lieu de la remplacer par un tiret toutes les dix secondes.
    */
   disk_included: boolean;
+  /** Idem pour les sommes réservées, qui coûtent une lecture de tous les pods du cluster. */
+  reserved_included: boolean;
 }
 
 /** Ce qu'un container a de discutable dans son dimensionnement, nommé par kdt. */

@@ -191,15 +191,18 @@ shows the query and its effect (`/coredns  (3)`).
   workload even from one of its pod rows: `s` scale, `r` rescale / recycle / restart. On a container
   row, `E` opens a shell in that container and the Logs tab narrows to it. `n`/`0` change namespace.
 - **Nodes** — list, detail, CPU/memory/disk usage (`u`), sort (`s`), PDF export (`p`/`P`). The list
-  carries the node's three occupancy rates — `CPU`, `MEM` (metrics-server, against the node's own
-  allocatable) and `DISK` (the kubelet root) — a dash marking what was not measured rather than a
-  zero. The detail panel gives conditions, capacity/allocatable, disk, system info, addresses,
+  answers, for every node, the three questions one asks of it — what is **reserved**, what is
+  **allowed**, what is **used** — in seven columns: `CPU req/lim/use`, `MEM req/lim/use` and
+  `DISK`, all against the node's own allocatable. The `req`/`lim` sums are those of the pods it
+  carries (Kubernetes publishes them nowhere), and a `lim` above 100% simply says the node is
+  over-committed. A dash marks what was not measured rather than a zero. The detail panel gives conditions, capacity/allocatable, disk, system info, addresses,
   reservations and recent OOM kills, then annotations, labels and taints at its end — what is on
   screen when the cursor moves to another node.
   - The disk comes from the kubelet's own summary (`/api/v1/nodes/<node>/proxy/stats/summary`, which
     needs `nodes/proxy`): neither the `Node` object nor metrics-server measures it. It costs **one
-    call per node**, where the rest of the list takes two reads: the column is therefore kept for a
-    minute between reads, while the list itself refreshes every five seconds. `nodefs` (the
+    call per node**, and the reserved sums **one read of every pod** in the cluster, where the rest
+    of the list takes two reads: the disk is therefore kept for a minute and the sums for fifteen
+    seconds, while the list itself refreshes every five seconds. `nodefs` (the
     kubelet root: logs, `emptyDir`, writable layers), `imagefs` (runtime images) and `containerfs`
     where the runtime separates it, each with its inodes, against the kubelet's **default** eviction
     thresholds — 10% free for `nodefs`, 15% for `imagefs`, 5% of inodes. Then the pods writing the
@@ -648,7 +651,7 @@ RBAC, Kyverno, identity, Rancher, network policies — along with the five gestu
 object: YAML, edit, touch, delete, AI analysis.
 
 **The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age,
-the three `CPU` / `MEM` / `DISK` occupancy rates and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
+the seven `CPU req/lim/use`, `MEM req/lim/use` and `DISK` rates and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
 quantities, its sizing findings (`noMemLim`, `cpuOver!!`, `OOMrisk`…), the user / system / total
 tally and the node's disk as its kubelet reports it (`nodefs`, `imagefs`, inodes, and the pods
 writing the most). The three gestures of the `o` menu are there: cordon and uncordon go straight through, while

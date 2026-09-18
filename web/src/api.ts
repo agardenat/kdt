@@ -718,15 +718,21 @@ async function postStream<T>(
 
 /** Les nodes du cluster. Aucune portée : un node n'a pas de namespace. */
 /**
- * L'inventaire des nodes. `withDisk` demande en plus leur disque.
+ * L'inventaire des nodes, et les deux lectures chères qu'on lui joint sur demande.
  *
- * Il coûte un appel par node, au kubelet de chacun, là où le reste de la liste tient en deux
- * lectures : la vue se rafraîchit toutes les dix secondes et ne le redemande qu'une fois par
- * minute. La réponse dit si elle le porte (`disk_included`), pour que la table garde la dernière
- * valeur connue au lieu de la voir clignoter.
+ * Le **disque** coûte un appel par node, au kubelet de chacun ; les **sommes réservées** une
+ * lecture de tous les pods du cluster. Le reste de la liste tient en deux lectures et se
+ * rafraîchit toutes les dix secondes, alors que ces deux-là se redemandent toutes les minutes et
+ * toutes les trente secondes. La réponse dit ce qu'elle porte (`disk_included`,
+ * `reserved_included`) pour que la table garde la dernière valeur connue au lieu de la voir
+ * clignoter.
  */
-export function nodes(lang: Lang, withDisk = false): Promise<NodesPayload> {
-  return get<NodesPayload>(`/api/v1/nodes?lang=${lang}${withDisk ? "&disk=1" : ""}`);
+export function nodes(
+  lang: Lang,
+  heavy: { disk?: boolean; reserved?: boolean } = {},
+): Promise<NodesPayload> {
+  const flags = `${heavy.disk ? "&disk=1" : ""}${heavy.reserved ? "&reserved=1" : ""}`;
+  return get<NodesPayload>(`/api/v1/nodes?lang=${lang}${flags}`);
 }
 
 /**

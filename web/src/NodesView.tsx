@@ -39,7 +39,7 @@ import type {
 /** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
  * case de sélection multiple, la dernière le hamburger de la ligne. */
 const NODE_COLUMNS =
-  "34px minmax(220px,1fr) 72px minmax(140px,20ch) minmax(110px,14ch) 64px 56px 56px 56px minmax(160px,1.2fr) 34px";
+  "34px minmax(200px,1fr) 64px minmax(120px,18ch) minmax(100px,13ch) 56px 62px 62px 62px 62px 62px 62px 56px minmax(150px,1fr) 34px";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -105,31 +105,68 @@ export default function NodesView({
   // lancé ne doit pas changer de cible parce qu'on a cliqué ailleurs.
   const [draining, setDraining] = useState<string | null>(null);
 
-  // Quand le disque a été lu pour la dernière fois. Il coûte un appel par node, au kubelet de
-  // chacun : la liste se relit toutes les dix secondes, lui une fois par minute.
-  const diskReadAt = useRef(0);
-  // La dernière valeur connue du disque, par node, pour les passes qui ne l'ont pas demandé : sans
-  // elle la colonne clignoterait entre son chiffre et un tiret toutes les dix secondes.
-  const diskSeen = useRef(new Map<string, Pick<NodeRow, "disk_pct" | "disk_pct_tone" | "disk_error">>());
+  // Quand les deux lectures chères ont été faites pour la dernière fois. Le disque coûte un appel
+  // par node, au kubelet de chacun ; les sommes réservées une lecture de tous les pods du cluster.
+  // La liste, elle, se relit toutes les dix secondes.
+  const heavyAt = useRef({ disk: 0, reserved: 0 });
+  // Leur dernière valeur connue, par node, pour les passes qui ne les ont pas demandées : sans
+  // elle ces colonnes clignoteraient entre leur chiffre et un tiret toutes les dix secondes.
+  const heavySeen = useRef(new Map<string, Partial<NodeRow>>());
 
   const load = useCallback(async () => {
-    const withDisk = Date.now() - diskReadAt.current >= 60_000;
+    const now = Date.now();
+    // Le disque ne bouge pas en une minute ; une réservation change dès qu'un pod est placé.
+    const heavy = {
+      disk: now - heavyAt.current.disk >= 60_000,
+      reserved: now - heavyAt.current.reserved >= 30_000,
+    };
     try {
-      const payload = await api.nodes(lang, withDisk);
-      if (payload.disk_included) {
-        diskReadAt.current = Date.now();
-        diskSeen.current = new Map(
-          payload.nodes.map((n) => [
-            n.name,
-            { disk_pct: n.disk_pct, disk_pct_tone: n.disk_pct_tone, disk_error: n.disk_error },
-          ]),
-        );
-      }
-      setNodes(
-        payload.disk_included
-          ? payload.nodes
-          : payload.nodes.map((n) => ({ ...n, ...(diskSeen.current.get(n.name) ?? {}) })),
+      const payload = await api.nodes(lang, heavy);
+      const carried = (n: NodeRow): Partial<NodeRow> => ({
+        ...(payload.disk_included
+          ? { disk_pct: n.disk_pct, disk_pct_tone: n.disk_pct_tone, disk_error: n.disk_error }
+          : {}),
+        ...(payload.reserved_included
+          ? {
+              cpu_req_pct: n.cpu_req_pct,
+              cpu_req_pct_tone: n.cpu_req_pct_tone,
+              cpu_lim_pct: n.cpu_lim_pct,
+              cpu_lim_pct_tone: n.cpu_lim_pct_tone,
+              mem_req_pct: n.mem_req_pct,
+              mem_req_pct_tone: n.mem_req_pct_tone,
+              mem_lim_pct: n.mem_lim_pct,
+              mem_lim_pct_tone: n.mem_lim_pct_tone,
+            }
+          : {}),
+      });
+      if (payload.disk_included) heavyAt.current.disk = now;
+      if (payload.reserved_included) heavyAt.current.reserved = now;
+      const next = payload.nodes.map((n) => ({
+        // Ce que cette réponse ne portait pas garde sa dernière valeur connue ; ce qu'elle portait
+        // l'écrase et devient la nouvelle référence.
+        ...n,
+        ...(heavySeen.current.get(n.name) ?? {}),
+        ...carried(n),
+      }));
+      heavySeen.current = new Map(
+        next.map((n) => [
+          n.name,
+          {
+            disk_pct: n.disk_pct,
+            disk_pct_tone: n.disk_pct_tone,
+            disk_error: n.disk_error,
+            cpu_req_pct: n.cpu_req_pct,
+            cpu_req_pct_tone: n.cpu_req_pct_tone,
+            cpu_lim_pct: n.cpu_lim_pct,
+            cpu_lim_pct_tone: n.cpu_lim_pct_tone,
+            mem_req_pct: n.mem_req_pct,
+            mem_req_pct_tone: n.mem_req_pct_tone,
+            mem_lim_pct: n.mem_lim_pct,
+            mem_lim_pct_tone: n.mem_lim_pct_tone,
+          },
+        ]),
       );
+      setNodes(next);
       setError(null);
       setLoaded(true);
     } catch (e) {
@@ -484,8 +521,14 @@ function NodeTable({
           <div className="cell">ROLES</div>
           <div className="cell">VERSION</div>
           <div className="cell num">AGE</div>
-          <div className="cell num">CPU</div>
-          <div className="cell num">MEM</div>
+          {/* Réservé, permis, consommé — les trois questions d'un node, pour chacune des deux
+              ressources qu'il partage. */}
+          <div className="cell num">CPU req</div>
+          <div className="cell num">CPU lim</div>
+          <div className="cell num">CPU use</div>
+          <div className="cell num">MEM req</div>
+          <div className="cell num">MEM lim</div>
+          <div className="cell num">MEM use</div>
           <div className="cell num">DISK</div>
           <div className="cell">ALERTS</div>
           <div className="cell act" />
@@ -516,7 +559,11 @@ function NodeTable({
             <div className="cell num dim">{n.age}</div>
             {/* Les trois taux d'occupation, avec le ton que kdt leur donne. Un tiret veut dire non
                 mesuré — metrics-server muet, kubelet injoignable — jamais un node au repos. */}
+            <Pct pct={n.cpu_req_pct} tone={n.cpu_req_pct_tone} />
+            <Pct pct={n.cpu_lim_pct} tone={n.cpu_lim_pct_tone} />
             <Pct pct={n.cpu_pct} tone={n.cpu_pct_tone} />
+            <Pct pct={n.mem_req_pct} tone={n.mem_req_pct_tone} />
+            <Pct pct={n.mem_lim_pct} tone={n.mem_lim_pct_tone} />
             <Pct pct={n.mem_pct} tone={n.mem_pct_tone} />
             <Pct pct={n.disk_pct} tone={n.disk_pct_tone} title={n.disk_error ?? undefined} />
             {/* La liste vient du serveur, `Cordoned` en tête quand il y en a un : c'est le seul de

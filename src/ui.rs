@@ -16986,12 +16986,18 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         format!("nodes ({})", nodes.len())
     };
 
+    // Un en-tête sur deux lignes : six colonnes de taux tiennent en cinq caractères, pas en
+    // « CPU req ». La ressource se dit une fois, au-dessus de ses trois aspects, et la ligne du
+    // dessous nomme ce qu'on lit — réservé, permis, consommé.
     let header_row = Row::new(vec![
-        Cell::from("NAME"), Cell::from("READY"), Cell::from("ROLES"),
-        Cell::from("VERSION"), Cell::from("AGE"),
-        Cell::from("CPU"), Cell::from("MEM"), Cell::from("DISK"),
-        Cell::from("ALERTS"),
+        Cell::from("\nNAME"), Cell::from("\nREADY"), Cell::from("\nROLES"),
+        Cell::from("\nVERSION"), Cell::from("\nAGE"),
+        Cell::from("CPU\nreq"), Cell::from("\nlim"), Cell::from("\nuse"),
+        Cell::from("MEM\nreq"), Cell::from("\nlim"), Cell::from("\nuse"),
+        Cell::from("\nDISK"),
+        Cell::from("\nALERTS"),
     ])
+    .height(2)
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = nodes.iter().map(|n| {
@@ -17020,7 +17026,14 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Cell::from(n.roles.clone()).style(Style::default().fg(Color::Cyan)),
             Cell::from(n.version.clone()).style(Style::default().fg(DIM)),
             Cell::from(n.age.clone()).style(Style::default().fg(DIM)),
+            // Réservé, permis, consommé : les trois questions d'un node, et la seule qui manquait
+            // à la ligne était la première — un node plein de réservations sans consommation ne
+            // prend plus rien de nouveau, et rien ne le disait ici.
+            pct_cell(n.cpu_req_pct(), NodeSummary::reserved_tone(n.cpu_req_pct())),
+            pct_cell(n.cpu_lim_pct(), NodeSummary::reserved_tone(n.cpu_lim_pct())),
             pct_cell(n.cpu_pct(), n.cpu_tone()),
+            pct_cell(n.mem_req_pct(), NodeSummary::reserved_tone(n.mem_req_pct())),
+            pct_cell(n.mem_lim_pct(), NodeSummary::reserved_tone(n.mem_lim_pct())),
             pct_cell(n.mem_pct(), n.mem_tone()),
             pct_cell(n.disk_pct(), n.disk_tone()),
             Cell::from(alerts).style(Style::default().fg(alert_color).add_modifier(Modifier::BOLD)),
@@ -17030,11 +17043,14 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     // La dernière colonne prend le mou en pourcentage et non en `Min` : un `Min` en fin de ligne
     // mange la bordure droite dès que le terminal est plus étroit que la somme des largeurs fixes.
-    let name_w = col_width(nodes.iter().map(|n| n.name.as_str()), "NAME", 20, 44);
+    let name_w = col_width(nodes.iter().map(|n| n.name.as_str()), "NAME", 18, 44);
+    let roles_w = col_width(nodes.iter().map(|n| n.roles.as_str()), "ROLES", 8, 20);
     let widths = [
-        Constraint::Length(name_w), Constraint::Length(7), Constraint::Length(20),
-        Constraint::Length(14), Constraint::Length(6),
+        Constraint::Length(name_w), Constraint::Length(6), Constraint::Length(roles_w),
+        Constraint::Length(14), Constraint::Length(5),
         Constraint::Length(5), Constraint::Length(5), Constraint::Length(5),
+        Constraint::Length(5), Constraint::Length(5), Constraint::Length(5),
+        Constraint::Length(5),
         Constraint::Percentage(100),
     ];
 

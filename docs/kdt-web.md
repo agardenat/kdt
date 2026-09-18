@@ -217,12 +217,14 @@ déploiement.
 `:nodes` est la première vue portée dont un geste **prend du temps**, et c'est ce qui décide de sa
 forme.
 
-L'inventaire porte les trois taux d'occupation du node — `CPU`, `MEM`, `DISK` — avec les tons que
-kdt leur donne. Le disque y coûte **un appel par node** quand tout le reste tient en deux lectures :
-il ne part que sur `?disk=1`, la page ne le redemande qu'une fois par minute alors qu'elle se relit
-toutes les dix secondes, et la réponse dit si elle le porte (`disk_included`) pour que la table
-garde la dernière valeur connue au lieu de la voir clignoter. Rien n'est mis en cache d'un compte à
-l'autre : un droit `nodes/proxy` ne se prête pas.
+L'inventaire porte les sept taux du node — `CPU req/lim/use`, `MEM req/lim/use`, `DISK` — avec les
+tons que kdt leur donne. Deux d'entre eux coûtent bien plus cher que la liste elle-même, qui tient
+en deux lectures : le **disque**, un appel par node au kubelet de chacun, et les **sommes
+réservées**, une lecture de tous les pods du cluster. Ils ne partent donc que sur `?disk=1` et
+`?reserved=1` — la page les redemande toutes les minutes et toutes les trente secondes alors
+qu'elle se relit toutes les dix — et la réponse dit ce qu'elle porte (`disk_included`,
+`reserved_included`) pour que la table garde la dernière valeur connue au lieu de la voir
+clignoter. Rien n'est mis en cache d'un compte à l'autre : un droit `nodes/proxy` ne se prête pas.
 
 Ses deux écrans deviennent deux mondes : **Nodes**, l'inventaire, et **Usage**, la table par
 container du node sélectionné — ce que `u` ouvre en plein écran dans le TUI. Elle n'entre pas dans

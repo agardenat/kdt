@@ -193,15 +193,18 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   recyclage / restart. Sur une ligne container, `E` ouvre un shell dans ce container et l'onglet
   Logs s'y restreint automatiquement. `n`/`0` changent de namespace.
 - **Nodes** — liste, détail, usage CPU/mémoire/disque (`u`), tri (`s`), export PDF (`p`/`P`). La
-  liste porte les trois taux d'occupation du nœud — `CPU`, `MEM` (metrics-server, face à
-  l'allocatable du nœud) et `DISK` (racine du kubelet) — un tiret marquant ce qui n'a pas été
-  mesuré plutôt qu'un zéro. Le détail donne conditions, capacity/allocatable, disque, system info,
+  liste répond pour chaque nœud aux trois questions qu'on lui pose — ce qui est **réservé**, ce qui
+  est **permis**, ce qui est **consommé** — en sept colonnes : `CPU req/lim/use`, `MEM req/lim/use`
+  et `DISK`, toutes rapportées à l'allocatable du nœud. Les sommes `req`/`lim` sont celles des pods
+  qu'il porte (Kubernetes ne les publie nulle part), un `lim` au-delà de 100 % disant simplement
+  que le nœud est sur-engagé. Un tiret marque ce qui n'a pas été mesuré plutôt qu'un zéro. Le détail donne conditions, capacity/allocatable, disque, system info,
   adresses, réservations et OOM récents, puis annotations, labels et taints en fin de panneau — la
   partie affichée quand le curseur change de nœud.
   - Le disque vient du résumé du kubelet (`/api/v1/nodes/<node>/proxy/stats/summary`, droit
     `nodes/proxy`) : ni l'objet `Node` ni metrics-server ne le mesurent. Il coûte **un appel par
-    nœud**, là où le reste de la liste tient en deux lectures : la colonne est donc gardée une
-    minute entre deux relectures, alors que la liste se rafraîchit toutes les cinq secondes. `nodefs` (racine du
+    nœud**, et les sommes réservées **une lecture de tous les pods** du cluster, là où le reste de
+    la liste tient en deux lectures : le disque est donc gardé une minute et les sommes quinze
+    secondes, alors que la liste se rafraîchit toutes les cinq secondes. `nodefs` (racine du
     kubelet : logs, `emptyDir`, couches inscriptibles), `imagefs` (images du runtime) et
     `containerfs` quand le runtime le distingue, chacun avec ses inodes, comparé au seuil
     d'éviction **par défaut** du kubelet — 10 % libres pour `nodefs`, 15 % pour `imagefs`, 5 %
@@ -656,7 +659,7 @@ certificats, RBAC, Kyverno, identity, Rancher, network policies — avec les cin
 portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
 
 **La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge,
-les trois taux d'occupation `CPU` / `MEM` / `DISK` et les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
+les sept taux `CPU req/lim/use`, `MEM req/lim/use`, `DISK` et les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
 quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…), le cumul
 user / système / total et le disque du node lu chez son kubelet (`nodefs`, `imagefs`, inodes, et les
 pods qui écrivent le plus). Les trois gestes du menu `o` y sont : cordon et uncordon passent tout de
