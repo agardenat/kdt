@@ -8,7 +8,7 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
-## [Non publié]
+## [2.0.0-rc.9] — 2026-09-21
 
 - **feat(identity)** — `:identity` lit le **mode `proxy`** de kdt-identity 1.4, qui en est le
   nouveau défaut. Le portail y remet un kubeconfig ne portant qu'un jeton et l'adresse de
