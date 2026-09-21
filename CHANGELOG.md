@@ -8,6 +8,44 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [Non publié]
+
+- **feat(identity)** — `:identity` lit le **mode `proxy`** de kdt-identity 1.4, qui en est le
+  nouveau défaut. Le portail y remet un kubeconfig ne portant qu'un jeton et l'adresse de
+  kdt-identity, lequel vérifie ce jeton à chaque requête puis relaie à l'apiserver en
+  impersonation : `kubectl` le lit sans rien installer, et il cesse de fonctionner dès que l'accès
+  est coupé.
+
+  La conséquence pour cette vue est la **fenêtre de révocation**, qui n'est plus le TTL de ce qui
+  est remis. Le jeton d'un kubeconfig téléchargé vit sept jours par défaut, et cela ne dit rien du
+  délai : chaque requête relit le compte et ses groupes derrière un cache. kdt affiche donc
+  `proxy.cacheTtl` — trente secondes — et jamais le TTL du jeton, qui ferait paraître une
+  révocation sans effet pendant une semaine.
+
+  Le panneau nomme le reste de ce qui ne se lit sur aucun objet : l'adresse que porte le kubeconfig
+  remis, recomposée comme l'amont la compose et **tue dès qu'une moitié manque** — une demi-adresse
+  ne joint rien ; la durée du jeton ; l'autorité épinglée quand `proxy.caSecret` est posé ; et la
+  contrepartie du mode, kdt-identity sur le chemin de chaque requête. La ligne
+  `portal.kubeconfigDownload` ne s'y affiche pas : le téléchargement y existe **et** se révoque, il
+  n'y a pas d'exception à signaler — la peindre en jaune comme en mode certificat dirait le
+  contraire de ce qui est vrai.
+
+- **feat(identity)** — les sessions portent un **usage** depuis kdt-identity 1.4, et le panneau les
+  partage : `2 ouvertes · dont 1 kubeconfig téléchargé`. Un poste qui renouvelle et un fichier
+  parti dans la nature ne sont pas la même chose à retirer, et le total seul ne dit pas lequel des
+  deux court dehors. Une entrée sans `kind` vient d'un Secret écrit avant 1.4, que l'amont lit en
+  `refresh` : kdt fait pareil plutôt que d'inventer un usage inconnu. Des jetons de kubeconfig
+  trouvés sur un déploiement qui n'est plus en `proxy` sont signalés — ils n'ouvrent plus rien, et
+  **SESS** les compterait sinon comme de l'accès vivant.
+
+- **fix(identity)** — la commande d'installation proposée par `o` part du **dépôt Helm** publié
+  (`helm repo add kdt …`, `helm upgrade --install`) au lieu d'un `git clone`, qui installait ce que
+  `main` portait ce jour-là. Elle ne pose pas `credentialMode` : le mode est celui du chart, et en
+  épingler un ici distribuerait une installation qui n'est pas celle de l'amont.
+
+- **fix(web)** — la suite de tests de kdt-web recompile : la fixture de `NodeSummary` n'avait pas
+  suivi les sept champs ajoutés en rc.7 et rc.8.
+
 ## [2.0.0-rc.8] — 2026-09-18
 
 - **feat(nodes)** — la liste des nodes porte aussi les **sommes réservées** de chaque machine :

@@ -20,10 +20,16 @@
 //!
 //! # Le mode de délivrance appartient au déploiement
 //!
-//! `certificate` ou `oidc` est une valeur du chart, lue dans l'`env` du pod controller, et c'est
-//! elle qui décide en combien de temps une révocation mord. Variable absente ⇒ on n'affirme rien :
-//! l'amont défaute à `certificate`, mais l'absence décrit aussi un déploiement 0.1 qui ne révoque
-//! rien du tout.
+//! `proxy`, `certificate` ou `oidc` est une valeur du chart, lue dans l'`env` du pod controller, et
+//! c'est elle qui décide en combien de temps une révocation mord. Variable absente ⇒ on n'affirme
+//! rien : l'amont défaute à `certificate`, mais l'absence décrit aussi un déploiement 0.1 qui ne
+//! révoque rien du tout.
+//!
+//! En `proxy` — le défaut de l'amont depuis 1.4 — la fenêtre de révocation n'est pas le TTL de ce
+//! qui est remis. Le jeton d'un kubeconfig téléchargé vit des jours, et cela ne change rien : le
+//! proxy relit le compte et ses groupes à chaque requête, derrière un cache. C'est donc
+//! `proxy.cacheTtl` qui fait la fenêtre, et y lire le TTL du jeton ferait de trente secondes sept
+//! jours.
 //!
 //! # Le mode d'authentification est un second axe
 //!
@@ -122,14 +128,19 @@ pub async fn list(
 
 /// Ce que le déploiement déclare de la délivrance, plus les deux questions qu'on lui pose.
 ///
-/// `revocation_window` et `download_open` sont des règles de kdt, pas des champs : la première
-/// choisit le TTL selon le mode, la seconde nomme le seul accès que ni `revoke` ni `spec.disabled`
-/// n'atteignent. Les calculer ici évite que le navigateur les redevine.
+/// Ce sont des règles de kdt, pas des champs. `revocation_window` choisit selon le mode — et en
+/// `proxy` ce n'est **pas** le TTL de ce qui est remis mais celui du cache, le jeton vivant des
+/// jours pendant que chaque requête est revérifiée. `download_open` nomme le seul accès que ni
+/// `revoke` ni `spec.disabled` n'atteignent, et reste donc faux en `proxy`, où le kubeconfig remis
+/// est révocable. `proxy_server` recompose l'adresse comme l'amont la compose, et se tait dès
+/// qu'une moitié manque. Les calculer ici évite que le navigateur les redevine.
 fn delivery_json(d: &kdt::identity::Delivery) -> serde_json::Value {
     let mut value = serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = value.as_object_mut() {
         object.insert("revocation_window".to_string(), d.revocation_window().into());
         object.insert("download_open".to_string(), d.download_open().into());
+        object.insert("on_request_path".to_string(), d.on_request_path().into());
+        object.insert("proxy_server".to_string(), d.proxy_server().into());
     }
     value
 }
@@ -362,7 +373,12 @@ mod tests {
             phase: Phase::Active,
             member_of: vec!["platform".into()],
             invitation: Invitation::None,
-            sessions: Some(SessionFacts { open: 2, stale: 1, last_expiry: Some(1_800_000_000) }),
+            sessions: Some(SessionFacts {
+                open: 2,
+                stale: 1,
+                last_expiry: Some(1_800_000_000),
+                kubeconfig: 1,
+            }),
             age: "12d".into(),
             uid: "kdtuser|alice".into(),
             ..IdentUser::default()

@@ -658,6 +658,17 @@ mod tests {
             version: "v1.31.2".into(),
             schedulable,
             abnormal: abnormal.iter().map(|s| s.to_string()).collect(),
+            // Ce que ce node offre. Ces tests portent sur les alertes et le ton d'une ligne, pas
+            // sur les taux : les capacités sont posées pour que la ligne soit complète, et les
+            // lectures qui peuvent manquer — metrics-server, le kubelet, la liste des pods —
+            // restent absentes, ce qui est l'état qu'une fixture doit décrire par défaut.
+            cpu_alloc_milli: 4_000,
+            mem_alloc_bytes: 16 * 1024 * 1024 * 1024,
+            cpu_use_milli: None,
+            mem_use_bytes: None,
+            disk: None,
+            disk_error: None,
+            reserved: None,
         }
     }
 

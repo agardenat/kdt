@@ -505,7 +505,9 @@ function DeliveryStatus({ delivery, st }: { delivery: IdentDelivery; st: Strings
         {delivery.revocation_window ? ` ≤ ${delivery.revocation_window}` : ""}
       </span>
       {/* Le seul accès que ni la révocation ni `spec.disabled` n'atteignent. C'est le défaut du
-          chart, donc jamais un badge par ligne : une ligne au niveau de la vue. */}
+          chart, donc jamais un badge par ligne : une ligne au niveau de la vue. Rien d'équivalent
+          en `proxy` : son kubeconfig est téléchargeable **et** révocable, il n'y a pas
+          d'exception à signaler. */}
       {delivery.download_open && <span className="warn">{st.identDownloadOpen}</span>}
     </>
   );
@@ -838,6 +840,12 @@ function UserDetail({
               ? st.identNone
               : `${user.sessions.open}` +
                 (user.sessions.last_expiry ? ` → ${stamp(user.sessions.last_expiry)}` : "") +
+                // Le partage entre les deux usages, seulement là où il y en a un à faire : un
+                // kubeconfig téléchargé et un poste qui renouvelle ne sont pas la même chose à
+                // retirer, et le total seul ne dit pas lequel des deux court dehors.
+                (user.sessions.kubeconfig
+                  ? ` · ${st.identSessionsKubeconfig.replace("{n}", String(user.sessions.kubeconfig))}`
+                  : "") +
                 (user.sessions.stale ? ` · ${user.sessions.stale} stale` : "")
         }
         tone={user.sessions_tone}
@@ -859,6 +867,33 @@ function DeliveryLines({ delivery, st }: { delivery: IdentDelivery; st: Strings 
         <Line label={st.identRevocation} value={`≤ ${delivery.revocation_window}`} />
       )}
       {delivery.refresh_ttl && <Line label={st.identRefresh} value={delivery.refresh_ttl} />}
+      {/* Le bloc proxy : l'adresse remise, le jeton, l'autorité épinglée, et la seule contrepartie
+          du mode. Le téléchargement s'y énonce comme un fait et non comme une alerte — il est
+          l'exception en mode certificat et l'intérêt du mode ici, et les peindre pareil
+          effacerait la différence. */}
+      {delivery.mode === "proxy" && (
+        <>
+          {/* Une demi-adresse ne joint rien : le serveur se tait dès qu'une moitié manque, et
+              `proxy_server` porte déjà cette règle. */}
+          {delivery.proxy_server && (
+            <Line label={st.identProxyServer} value={delivery.proxy_server} mono />
+          )}
+          {delivery.proxy_token_ttl && (
+            <Line
+              label={st.identProxyToken}
+              value={st.identProxyTokenLine.replace("{ttl}", delivery.proxy_token_ttl)}
+            />
+          )}
+          {delivery.proxy_ca_pinned && (
+            <Line label={st.identProxyCa} value={st.identProxyCaPinned} />
+          )}
+          {/* La contrepartie du mode, qui n'est visible sur aucun objet : même forme que la note
+              de l'API fournisseur absente, parce que c'est la même nature de constat. */}
+          <p className="guard dim">
+            <span className="gl">·</span> {st.identProxyPath}
+          </p>
+        </>
+      )}
       {/* En mode OIDC le portail n'a rien à télécharger : une ligne « fermé » laisserait croire
           que quelqu'un l'a fermé. */}
       {delivery.mode === "certificate" && delivery.kubeconfig_download !== null && (

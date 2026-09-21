@@ -1381,6 +1381,10 @@ export interface IdentSessions {
   /** Entrées périmées. L'amont les purge à la prochaine écriture : ce n'est pas de l'accès. */
   stale: number;
   last_expiry: number | null;
+  /** Parmi les ouvertes, combien sont un kubeconfig téléchargé plutôt que le plugin qui
+   *  renouvelle. Deux usages depuis 1.4, chacun avec son plafond, et ils ne sont pas
+   *  interchangeables : le partage dit ce qu'une révocation retirerait vraiment. */
+  kubeconfig: number;
 }
 
 /** Les trois faits non secrets lus dans le Secret de credential. */
@@ -1525,15 +1529,32 @@ export interface IdentFederation {
  * variable absente décrit aussi un déploiement 0.1 qui ne révoque rien. On n'affirme rien.
  */
 export interface IdentDelivery {
-  mode: "certificate" | "oidc" | null;
+  mode: "proxy" | "certificate" | "oidc" | null;
   cert_ttl: string | null;
   token_ttl: string | null;
   refresh_ttl: string | null;
   kubeconfig_download: boolean | null;
-  /** Combien de temps un accès survit à sa révocation, selon le mode. */
+  /** Le TTL du cache du proxy — et donc toute la fenêtre de révocation du mode. */
+  proxy_cache_ttl: string | null;
+  /** Combien de temps vit le jeton d'un kubeconfig téléchargé. Des jours, et c'est sans danger
+   *  justement parce que ce n'est pas la fenêtre de révocation. */
+  proxy_token_ttl: string | null;
+  proxy_url: string | null;
+  portal_url: string | null;
+  cluster_name: string | null;
+  /** Une autorité est inscrite dans les kubeconfigs remis. Seule sa présence est lue. */
+  proxy_ca_pinned: boolean;
+  /** Combien de temps un accès survit à sa révocation, selon le mode. En `proxy` c'est le cache,
+   *  pas le TTL du jeton : lire le second ferait de trente secondes sept jours. */
   revocation_window: string | null;
-  /** Le seul accès que ni `revoke` ni `spec.disabled` n'atteignent. */
+  /** Le seul accès que ni `revoke` ni `spec.disabled` n'atteignent. Jamais vrai en `proxy`, et
+   *  c'est l'intérêt du mode : son kubeconfig est téléchargeable **et** révocable. */
   download_open: boolean;
+  /** kdt-identity est sur le chemin de chaque requête : son indisponibilité coupe ces accès. */
+  on_request_path: boolean;
+  /** L'adresse qu'un kubeconfig remis porte. `null` dès qu'une moitié manque — une demi-adresse
+   *  ne joint rien. */
+  proxy_server: string | null;
 }
 
 export interface IdentityPayload {

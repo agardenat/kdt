@@ -384,13 +384,31 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     Un refus RBAC est annoncé une fois dans le titre, pas répété en tirets sur chaque ligne. Le
     Secret de sessions est lu de la même façon, et son échec est annoncé séparément : les deux
     lectures taisent des colonnes différentes.
-  - Le **mode de délivrance** est une propriété du déploiement, pas d'une ligne : `certificate` ou
-    `oidc`, lu dans l'environnement du pod contrôleur (`KDT_IDENTITY_CREDENTIAL_MODE`) et dit une
-    fois dans le titre avec la fenêtre de révocation qu'il implique (`<= 10m` en certificat,
-    `<= 5m` en OIDC). Variable absente ⇒ kdt n'affirme rien : c'est aussi ce à quoi ressemble un
-    déploiement antérieur à 1.0, qui ne révoque pas. Le panneau de détail ajoute le droit de session
-    (`refreshTtl`) et, en mode certificat seulement, l'état de `portal.kubeconfigDownload` — le seul
-    accès que ni `revoke` ni `spec.disabled` n'atteignent.
+  - Le **mode de délivrance** est une propriété du déploiement, pas d'une ligne : `proxy`,
+    `certificate` ou `oidc`, lu dans l'environnement du pod contrôleur
+    (`KDT_IDENTITY_CREDENTIAL_MODE`) et dit une fois dans le titre avec la fenêtre de révocation
+    qu'il implique (`<= 30s` en proxy, `<= 10m` en certificat, `<= 5m` en OIDC). Variable absente ⇒
+    kdt n'affirme rien : c'est aussi ce à quoi ressemble un déploiement antérieur à 1.0, qui ne
+    révoque pas. Le panneau de détail ajoute le droit de session (`refreshTtl`) et, en mode
+    certificat seulement, l'état de `portal.kubeconfigDownload` — le seul accès que ni `revoke` ni
+    `spec.disabled` n'atteignent.
+  - En **`proxy`** (défaut du chart depuis kdt-identity 1.4), la fenêtre de révocation n'est pas le
+    TTL de ce qui est remis : le jeton d'un kubeconfig téléchargé vit des jours, mais chaque requête
+    passe par kdt-identity qui relit le compte et ses groupes derrière un cache. kdt lit donc
+    `proxy.cacheTtl` (`KDT_IDENTITY_PROXY_CACHE_TTL`) et non le TTL du jeton — y lire le second
+    ferait de trente secondes sept jours. Le panneau ajoute l'adresse que porte le kubeconfig remis
+    (`<proxy.url ou portalUrl>/k8s/<clusterName>`, tue si l'une des deux moitiés manque : une
+    demi-adresse ne joint rien), la durée du jeton, l'autorité épinglée si `proxy.caSecret` est
+    posé, et la contrepartie du mode — kdt-identity est sur le chemin de chaque requête, son
+    indisponibilité coupe ces kubeconfigs, pas ceux des administrateurs. La ligne
+    `portal.kubeconfigDownload` ne s'y affiche pas : le téléchargement y existe **et** se révoque,
+    il n'y a pas d'exception à signaler.
+  - Les sessions portent un **usage** depuis 1.4, `refresh` ou `kubeconfig`, et le panneau les
+    partage : `2 ouvertes · dont 1 kubeconfig téléchargé`. Un poste qui renouvelle et un fichier
+    parti dans la nature ne sont pas la même chose à retirer. Une entrée sans `kind` est celle d'un
+    Secret écrit avant 1.4, que l'amont lit en `refresh` — kdt fait pareil. Des jetons de kubeconfig
+    ouverts sur un déploiement qui n'est plus en `proxy` sont signalés : ils n'ouvrent plus rien, et
+    **SESS** les compterait sinon comme de l'accès vivant.
   - Le **mode d'authentification** est un second axe, indépendant du précédent : `authMode: local`,
     `ldap` ou `oidc`, lu dans la même variable d'environnement du pod contrôleur
     (`KDT_IDENTITY_AUTH_MODE`), dit qui le portail **reconnaît** là où `credentialMode` dit ce

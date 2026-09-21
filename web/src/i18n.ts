@@ -306,6 +306,13 @@ export interface Strings {
   identDownload: string;
   identDownloadOpen: string;
   identDownloadClosed: string;
+  identProxyServer: string;
+  identProxyToken: string;
+  identProxyTokenLine: string;
+  identProxyCa: string;
+  identProxyCaPinned: string;
+  identProxyPath: string;
+  identSessionsKubeconfig: string;
   identAuth: string;
   identAuthUnknown: string;
   identSource: string;
@@ -981,6 +988,16 @@ const FR: Strings = {
   identDownload: "kubeconfig",
   identDownloadOpen: "téléchargement ouvert — cet accès échappe à la révocation",
   identDownloadClosed: "téléchargement fermé",
+  identProxyServer: "adresse remise",
+  identProxyToken: "kubeconfig portail",
+  identProxyTokenLine:
+    "jeton de {ttl}, révocable : ce fichier ne vaut que par le proxy, et revoke comme spec.disabled l'atteignent",
+  identProxyCa: "autorité",
+  identProxyCaPinned:
+    "épinglée depuis proxy.caSecret : les kubeconfigs remis ne vérifient le proxy que contre elle",
+  identProxyPath:
+    "kdt-identity est sur le chemin de chaque requête : son indisponibilité coupe ces kubeconfigs — pas les kubeconfigs administrateur, qui ne passent pas par lui",
+  identSessionsKubeconfig: "dont {n} kubeconfig(s) téléchargé(s)",
   identAuth: "authentification",
   identAuthUnknown:
     "non déclarée (déploiement antérieur à 1.2, ou variable absente du pod)",
@@ -1686,6 +1703,16 @@ const EN: Strings = {
   identDownload: "kubeconfig",
   identDownloadOpen: "download open — this access escapes revocation",
   identDownloadClosed: "download closed",
+  identProxyServer: "server handed out",
+  identProxyToken: "portal kubeconfig",
+  identProxyTokenLine:
+    "a {ttl} token, revocable: that file is only worth anything through the proxy, and both revoke and spec.disabled reach it",
+  identProxyCa: "authority",
+  identProxyCaPinned:
+    "pinned from proxy.caSecret: the kubeconfigs handed out verify the proxy against it and nothing else",
+  identProxyPath:
+    "kdt-identity sits on the path of every request: its outage takes these kubeconfigs down — not the administrator kubeconfigs, which do not go through it",
+  identSessionsKubeconfig: "{n} of them downloaded kubeconfigs",
   identAuth: "authentication",
   identAuthUnknown:
     "not declared (a pre-1.2 deployment, or the variable is absent from the pod)",

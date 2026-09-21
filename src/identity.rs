@@ -22,11 +22,16 @@
 //!   credential lives minutes and is renewed against a *session* held in the cluster, one Secret
 //!   per account. Closing those sessions is the revocation, and it is the only reason an operator
 //!   can act on someone's access at all — so the count of live sessions is a column, not a detail.
-//! * **The delivery mode belongs to the deployment, not to a row.** `certificate` or `oidc` is a
-//!   chart value, readable off the controller pod's environment, and it decides how long a
-//!   revocation takes to bite and whether the non-revocable kubeconfig download exists at all.
-//!   Absent variable, absent statement: kdt reads what the deployment declares and invents no
+//! * **The delivery mode belongs to the deployment, not to a row.** `proxy`, `certificate` or
+//!   `oidc` is a chart value, readable off the controller pod's environment, and it decides how
+//!   long a revocation takes to bite and whether the non-revocable kubeconfig download exists at
+//!   all. Absent variable, absent statement: kdt reads what the deployment declares and invents no
 //!   default, because a missing variable also describes a pre-1.0 deployment.
+//! * **In `proxy` the revocation window is not a TTL of what is handed out.** The token a
+//!   downloaded kubeconfig carries lives days, and none of that matters: the proxy re-reads the
+//!   account and its groups on every request, under one cache. `proxy.cacheTtl` is therefore the
+//!   window, and stating the token's own TTL there would overstate the delay by four orders of
+//!   magnitude.
 //!
 //! Nothing secret is carried into a row. The credential Secret is read by name for three
 //! non-secret facts — when the pending invitation expires, whether the account is locked, and how
@@ -90,6 +95,9 @@ const K_FAILED_ATTEMPTS: &str = "failed-attempts";
 /// name. Reading it under another name would find nothing on a certificate-mode cluster.
 const SESSION_SECRET_PREFIX: &str = "kdt-identity-oidc-";
 const K_SESSIONS: &str = "sessions";
+/// The usage a session entry carries since 1.4, as upstream serialises it. The other value is
+/// `refresh`, which is also what an entry without the field means.
+const SESSION_KIND_KUBECONFIG: &str = "kubeconfig";
 
 /// What the chart puts on both Deployments. The controller carries them too — the admin commands
 /// run there — which is why one pod answers for the whole deployment.
@@ -98,6 +106,21 @@ const ENV_CERT_TTL: &str = "KDT_IDENTITY_CERT_TTL";
 const ENV_TOKEN_TTL: &str = "KDT_IDENTITY_OIDC_TOKEN_TTL";
 const ENV_REFRESH_TTL: &str = "KDT_IDENTITY_REFRESH_TTL";
 const ENV_KUBECONFIG_DOWNLOAD: &str = "KDT_IDENTITY_KUBECONFIG_DOWNLOAD";
+
+/// What the proxy mode declares, since 1.4. The cache TTL is the one that matters: it is the whole
+/// revocation window of the mode, and upstream calls it the only knob there is.
+///
+/// `KDT_IDENTITY_PROXY_LISTEN` is deliberately not among them. The chart writes it on the *portal*
+/// Deployment alone, and this module reads the controller — so it would be absent here on a
+/// deployment that does declare it, which is worse than not asking.
+const ENV_PROXY_URL: &str = "KDT_IDENTITY_PROXY_URL";
+const ENV_PROXY_CACHE_TTL: &str = "KDT_IDENTITY_PROXY_CACHE_TTL";
+const ENV_DOWNLOAD_TOKEN_TTL: &str = "KDT_IDENTITY_DOWNLOAD_TOKEN_TTL";
+const ENV_PROXY_CA_FILE: &str = "KDT_IDENTITY_PROXY_CA_FILE";
+/// Where the portal lives, which is where the proxy is mounted when it has no address of its own.
+const ENV_PORTAL_URL: &str = "KDT_IDENTITY_PORTAL_URL";
+/// The cluster the kubeconfig names, and the last path segment of the proxy's address.
+const ENV_CLUSTER_NAME: &str = "KDT_IDENTITY_CLUSTER_NAME";
 
 /// The second axis, since 1.2: who the portal *recognises*, where the variables above say what it
 /// *hands out*. The combinations are all valid, which is why this is not a third delivery mode.
@@ -214,6 +237,10 @@ pub struct CredentialFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialMode {
+    /// A token kdt-identity verifies on every request before relaying to the apiserver under
+    /// impersonation. Needs nothing of the control plane, and its downloadable kubeconfig *is*
+    /// revocable — the only mode where those two are true at once. Upstream's default since 1.4.
+    Proxy,
     /// X.509 signed by the cluster CA. Needs nothing of the apiserver, and offers a downloadable
     /// kubeconfig that no revocation reaches.
     Certificate,
@@ -225,6 +252,7 @@ pub enum CredentialMode {
 impl CredentialMode {
     pub fn label(&self) -> &'static str {
         match self {
+            CredentialMode::Proxy => "proxy",
             CredentialMode::Certificate => "certificate",
             CredentialMode::Oidc => "oidc",
         }
@@ -246,13 +274,37 @@ pub struct Delivery {
     /// Only rendered by the chart in certificate mode; `None` in OIDC, where the path does not
     /// exist.
     pub kubeconfig_download: Option<bool>,
+    /// How long the proxy reuses an identity it has already verified — and therefore the whole
+    /// revocation window of the mode. Upstream calls it the only knob it has.
+    pub proxy_cache_ttl: Option<String>,
+    /// How long a downloaded kubeconfig's token lives on its own. Days, and that is safe here
+    /// precisely because it is not the revocation window: it says when an access nobody thought to
+    /// revoke finally goes out, and nothing more.
+    pub proxy_token_ttl: Option<String>,
+    /// The address the kubeconfigs point at, when the proxy has one of its own. `None` is the
+    /// ordinary deployment, where it is served by the portal under `/k8s`.
+    pub proxy_url: Option<String>,
+    /// The portal's own address, used to state where the proxy answers when it has no `proxy_url`.
+    pub portal_url: Option<String>,
+    /// The cluster's name, which is the last path segment of the proxy's address.
+    pub cluster_name: Option<String>,
+    /// Whether a CA is pinned into the kubeconfigs handed out. Only its presence is read: the file
+    /// lives in the pod and its content says nothing an operator needs here.
+    pub proxy_ca_pinned: bool,
 }
 
 impl Delivery {
-    /// How long an access survives its revocation: the TTL of whatever is handed out in this mode.
-    /// `None` when the deployment says neither, in which case kdt states no window at all.
+    /// How long an access survives its revocation.
+    ///
+    /// In `certificate` and `oidc` that is the TTL of what is handed out, because nothing else is
+    /// consulted once it is issued. In `proxy` it is **not**: the token lives days, but every
+    /// request re-reads the account and its groups behind one cache, so `proxy.cacheTtl` is the
+    /// whole delay. Reading the token TTL there would turn thirty seconds into seven days.
+    ///
+    /// `None` when the deployment says nothing, in which case kdt states no window at all.
     pub fn revocation_window(&self) -> Option<&str> {
         match self.mode? {
+            CredentialMode::Proxy => self.proxy_cache_ttl.as_deref(),
             CredentialMode::Certificate => self.cert_ttl.as_deref(),
             CredentialMode::Oidc => self.token_ttl.as_deref(),
         }
@@ -260,8 +312,31 @@ impl Delivery {
 
     /// Whether the one access revocation cannot reach is open. Certificate mode only, and only
     /// when the download was left on.
+    ///
+    /// Never true in `proxy`, and that is the point of the mode rather than an omission: the
+    /// kubeconfig it hands out is downloadable *and* revocable, so there is no exception to name.
     pub fn download_open(&self) -> bool {
         self.mode == Some(CredentialMode::Certificate) && self.kubeconfig_download == Some(true)
+    }
+
+    /// Whether kdt-identity sits on the path of every `kubectl` request here. The one cost of the
+    /// mode, and it is not visible on any object: its outage takes these kubeconfigs down.
+    pub fn on_request_path(&self) -> bool {
+        self.mode == Some(CredentialMode::Proxy)
+    }
+
+    /// The root a handed-out kubeconfig points at, as upstream builds it: the proxy's own address
+    /// when it has one, the portal's otherwise, and the cluster name as the last segment.
+    ///
+    /// `None` when either half is missing. The path is fixed upstream, the host and the cluster
+    /// are not, and half an address is one nobody can reach — better said not at all.
+    pub fn proxy_server(&self) -> Option<String> {
+        if !self.on_request_path() {
+            return None;
+        }
+        let root = self.proxy_url.as_deref().or(self.portal_url.as_deref())?;
+        let cluster = self.cluster_name.as_deref()?;
+        Some(format!("{}/k8s/{cluster}", root.trim_end_matches('/')))
     }
 }
 
@@ -481,6 +556,13 @@ pub struct SessionFacts {
     pub stale: usize,
     /// When the last session standing runs out on its own.
     pub last_expiry: Option<i64>,
+    /// Of the open ones, how many are a downloaded kubeconfig rather than the plugin renewing.
+    ///
+    /// Two usages since 1.4, each with its own cap, and they are not interchangeable: a kubeconfig
+    /// token opens the proxy and issues nothing, a refresh token issues and opens nothing. The
+    /// split says what a revocation would actually take away — a laptop still connected, or a file
+    /// someone downloaded and walked off with.
+    pub kubeconfig: usize,
 }
 
 /// A binding whose subject is one of this system's groups.
@@ -827,6 +909,7 @@ pub async fn identity_inventory(client: &Client, st: &'static Strings) -> Identi
             creds_error.is_some(),
             &sessions,
             &federation,
+            &delivery,
         ),
         controller,
         delivery,
@@ -971,6 +1054,7 @@ fn delivery_from_env(container: &k8s_openapi::api::core::v1::Container) -> Deliv
     let get = |key: &str| env_value(container, key);
     Delivery {
         mode: get(ENV_MODE).and_then(|v| match v.as_str() {
+            "proxy" => Some(CredentialMode::Proxy),
             "certificate" => Some(CredentialMode::Certificate),
             "oidc" => Some(CredentialMode::Oidc),
             _ => None,
@@ -983,6 +1067,14 @@ fn delivery_from_env(container: &k8s_openapi::api::core::v1::Container) -> Deliv
             "false" => Some(false),
             _ => None,
         }),
+        proxy_cache_ttl: get(ENV_PROXY_CACHE_TTL),
+        proxy_token_ttl: get(ENV_DOWNLOAD_TOKEN_TTL),
+        proxy_url: get(ENV_PROXY_URL),
+        portal_url: get(ENV_PORTAL_URL),
+        cluster_name: get(ENV_CLUSTER_NAME),
+        // Presence only. The variable holds a path inside the pod, and reading the file it names
+        // would say nothing the operator cannot get from `proxy.caSecret` itself.
+        proxy_ca_pinned: get(ENV_PROXY_CA_FILE).is_some(),
     }
 }
 
@@ -1138,6 +1230,11 @@ async fn read_sessions(
 #[serde(rename_all = "camelCase")]
 struct SessionEntry {
     expires_at: String,
+    /// `refresh` or `kubeconfig`, as upstream spells them. Absent on every entry written before
+    /// 1.4, and upstream reads that absence as `refresh` — so kdt does too, rather than inventing
+    /// an "unknown" usage that no cluster can produce.
+    #[serde(default)]
+    kind: String,
 }
 
 pub fn session_facts(secret: &Secret, now: i64) -> SessionFacts {
@@ -1151,6 +1248,9 @@ pub fn session_facts(secret: &Secret, now: i64) -> SessionFacts {
         let Some(expires) = parse_rfc3339(&e.expires_at) else { continue };
         if expires > now {
             facts.open += 1;
+            if e.kind == SESSION_KIND_KUBECONFIG {
+                facts.kubeconfig += 1;
+            }
             facts.last_expiry = Some(facts.last_expiry.map_or(expires, |cur: i64| cur.max(expires)));
         } else {
             facts.stale += 1;
@@ -1213,6 +1313,7 @@ fn build_users(
     creds_unreadable: bool,
     sessions: &BTreeMap<String, SessionFacts>,
     federation: &Federation,
+    delivery: &Delivery,
 ) -> Vec<IdentUser> {
     // Who is listed where, straight off `spec.members` — the source of truth. `status.memberOf` is
     // derived and can lag a reconciliation behind, so it is not what the "still a member" checks
@@ -1300,8 +1401,13 @@ fn build_users(
                     .unwrap_or_default(),
                 name,
             };
-            user.hints =
-                user_hints(st, &user, listed_in.get(&user.name).map(Vec::as_slice), federation);
+            user.hints = user_hints(
+                st,
+                &user,
+                listed_in.get(&user.name).map(Vec::as_slice),
+                federation,
+                delivery,
+            );
             user
         })
         .collect();
@@ -1315,6 +1421,7 @@ fn user_hints(
     u: &IdentUser,
     listed_in: Option<&[String]>,
     federation: &Federation,
+    delivery: &Delivery,
 ) -> Vec<Hint> {
     let mut out = Vec::new();
 
@@ -1411,6 +1518,21 @@ fn user_hints(
         out.push(warn(fill(
             st.ident_hint_disabled_sessions,
             &[("n", &open.to_string())],
+        )));
+    }
+
+    // Kubeconfig tokens only open anything through the proxy. Finding them on a deployment that is
+    // no longer in `proxy` says the mode was changed under them: they are dead, the person holding
+    // one gets a refusal with no explanation, and the SESS column counts accesses that do not
+    // exist. Only ever asked where the mode is known — an undeclared one is not a mode change.
+    let kubeconfig = u.sessions.as_ref().map(|s| s.kubeconfig).unwrap_or(0);
+    if kubeconfig > 0 && delivery.mode.is_some_and(|m| m != CredentialMode::Proxy) {
+        out.push(info(fill(
+            st.ident_hint_kubeconfig_orphan,
+            &[
+                ("n", &kubeconfig.to_string()),
+                ("mode", delivery.mode.map(|m| m.label()).unwrap_or_default()),
+            ],
         )));
     }
 
@@ -2007,10 +2129,12 @@ pub fn install_command(cluster: &str, apiserver: &str) -> String {
     } else {
         apiserver.trim()
     };
+    // The chart has been published to a Helm repository since 1.2.1; cloning to install it stopped
+    // being the way in. `credentialMode` is left out on purpose: the chart defaults to `proxy`
+    // since 1.4, and pinning a mode here would hand out an install that is not upstream's.
     format!(
-        "git clone https://github.com/agardenat/kdt-identity\n\
-         cd kdt-identity\n\
-         helm install kdt-identity deploy/helm/kdt-identity \\\n    \
+        "helm repo add kdt https://agardenat.github.io/helm-charts\n\
+         helm upgrade --install kdt-identity kdt/kdt-identity \\\n    \
          --namespace kdt-identity --create-namespace \\\n    \
          --set clusterName={cluster} \\\n    \
          --set portalUrl=https://identity.example.com \\\n    \
@@ -2198,7 +2322,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Active", false, &["ops"])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert_eq!(rows[0].phase, Phase::Locked);
         // The controller's own word is kept, so the detail panel can show both.
         assert_eq!(rows[0].raw_phase, "Active");
@@ -2213,16 +2337,16 @@ mod tests {
             CredentialFacts { locked_until: Some(now_secs() + 600), ..CredentialFacts::default() },
         );
         let users = vec![user_obj("alice", "Active", true, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert_eq!(rows[0].phase, Phase::Disabled);
     }
 
     #[test]
     fn an_unreadable_secret_does_not_read_as_never_invited() {
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), true, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert_eq!(rows[0].invitation, Invitation::Unreadable);
-        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
+        let readable = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert_eq!(readable[0].invitation, Invitation::None);
     }
 
@@ -2237,7 +2361,7 @@ mod tests {
             },
         );
         let users = vec![user_obj("alice", "Pending", false, &[])];
-        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert!(matches!(rows[0].invitation, Invitation::Expired { .. }));
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Warn));
 
@@ -2248,7 +2372,7 @@ mod tests {
                 ..CredentialFacts::default()
             },
         );
-        let live = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default());
+        let live = build_users(&FR, &users, &[], &creds, false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert!(matches!(live[0].invitation, Invitation::Pending { .. }));
         assert!(live[0].hints.is_empty());
         assert_eq!(invitation_label(&live[0].invitation, &FR), "1h");
@@ -2270,14 +2394,14 @@ mod tests {
         // `status.memberOf` can lag; `spec.members` is the source of truth for "still listed".
         let users = vec![user_obj("alice", "Active", true, &[])];
         let groups = vec![group_obj("ops", &["alice"], Some(&["alice"]))];
-        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &groups, &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert!(rows[0].hints.iter().any(|h| h.text.contains("ops")));
     }
 
     #[test]
     fn an_active_account_in_no_group_is_noted_without_alarm() {
         let users = vec![user_obj("alice", "Active", false, &[])];
-        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default());
+        let rows = build_users(&FR, &users, &[], &BTreeMap::new(), false, &BTreeMap::new(), &Federation::default(), &Delivery::default());
         assert!(rows[0].hints.iter().any(|h| h.level == HintLevel::Info));
         assert!(rows[0].hints.iter().all(|h| h.level != HintLevel::Warn));
     }
@@ -2338,6 +2462,62 @@ mod tests {
         assert_eq!(facts.last_expiry, None);
     }
 
+    // Two usages since 1.4, and they are not the same thing to take away: a laptop renewing, or a
+    // file someone downloaded. An entry with no `kind` is the pre-1.4 shape, which upstream reads
+    // as `refresh` — so kdt counts it there rather than inventing a third usage.
+    #[test]
+    fn a_downloaded_kubeconfig_is_counted_apart_from_a_renewing_plugin() {
+        let now = 1_700_000_000;
+        let secret = sessions_secret(serde_json::json!([
+            { "id": "a", "secretHash": "deadbeef", "kind": "refresh",
+              "issuedAt": "2023-11-14T22:13:20Z", "expiresAt": "2023-11-21T22:13:20Z" },
+            { "id": "b", "secretHash": "deadbeef", "kind": "kubeconfig",
+              "issuedAt": "2023-11-14T22:13:20Z", "expiresAt": "2023-11-21T22:13:20Z" },
+            // Written before 1.4: no `kind` at all.
+            { "id": "c", "secretHash": "deadbeef",
+              "issuedAt": "2023-11-14T22:13:20Z", "expiresAt": "2023-11-21T22:13:20Z" },
+            // Expired, and a kubeconfig: stale, and counted in neither open total.
+            { "id": "d", "secretHash": "deadbeef", "kind": "kubeconfig",
+              "issuedAt": "2023-10-14T22:13:20Z", "expiresAt": "2023-10-21T22:13:20Z" },
+        ]));
+        let facts = session_facts(&secret, now);
+        assert_eq!(facts.open, 3);
+        assert_eq!(facts.stale, 1);
+        assert_eq!(facts.kubeconfig, 1, "only the open kubeconfig counts");
+    }
+
+    // A kubeconfig token is only worth anything through the proxy. Finding one on a deployment that
+    // has left the mode says the tokens are dead and SESS is overstating live access — and it is
+    // never said where the mode is undeclared, which is not a mode change.
+    #[test]
+    fn kubeconfig_tokens_left_behind_by_a_mode_change_are_named() {
+        let users = vec![user_obj("alice", "Active", false, &["ops"])];
+        let sessions = BTreeMap::from([(
+            "alice".to_string(),
+            SessionFacts { open: 2, kubeconfig: 2, ..SessionFacts::default() },
+        )]);
+        let orphaned = |mode: Option<CredentialMode>| {
+            build_users(
+                &FR,
+                &users,
+                &[],
+                &BTreeMap::new(),
+                false,
+                &sessions,
+                &Federation::default(),
+                &Delivery { mode, ..Delivery::default() },
+            )[0]
+                .hints
+                .iter()
+                .any(|h| h.text.starts_with("2 jeton(s) de kubeconfig"))
+        };
+
+        assert!(orphaned(Some(CredentialMode::Certificate)));
+        assert!(orphaned(Some(CredentialMode::Oidc)));
+        assert!(!orphaned(Some(CredentialMode::Proxy)), "in proxy they are live access");
+        assert!(!orphaned(None), "an undeclared mode is not a mode change");
+    }
+
     // The window is the TTL of what this mode hands out, and nothing is stated when the deployment
     // declared neither — a default restated here would describe a cluster kdt has not read.
     #[test]
@@ -2348,6 +2528,9 @@ mod tests {
             token_ttl: Some("5m".to_string()),
             refresh_ttl: Some("7d".to_string()),
             kubeconfig_download: Some(true),
+            proxy_cache_ttl: Some("30s".to_string()),
+            proxy_token_ttl: Some("7d".to_string()),
+            ..Delivery::default()
         };
         assert_eq!(d.revocation_window(), Some("10m"));
         assert!(d.download_open());
@@ -2357,9 +2540,56 @@ mod tests {
         // No download exists in OIDC, whatever the leftover variable says.
         assert!(!d.download_open());
 
+        // The one mode whose window is not the TTL of what it hands out. The token lives seven
+        // days and every request is still re-checked behind the cache, so reading `proxy_token_ttl`
+        // here would turn thirty seconds into seven days.
+        d.mode = Some(CredentialMode::Proxy);
+        assert_eq!(d.revocation_window(), Some("30s"));
+        // The downloadable kubeconfig exists here and *is* revocable: there is no exception to
+        // flag, which is not the same as a download nobody offers.
+        assert!(!d.download_open());
+        assert!(d.on_request_path());
+
         d.mode = None;
         assert_eq!(d.revocation_window(), None, "a window without a mode is a guess");
         assert!(!d.download_open());
+        assert!(!d.on_request_path());
+    }
+
+    // The address a kubeconfig points at is built from two halves, and half of it reaches nothing.
+    #[test]
+    fn the_proxy_address_is_stated_only_when_both_halves_are_declared() {
+        let base = Delivery {
+            mode: Some(CredentialMode::Proxy),
+            portal_url: Some("https://identity.example.com/".to_string()),
+            cluster_name: Some("production".to_string()),
+            ..Delivery::default()
+        };
+        assert_eq!(
+            base.proxy_server().as_deref(),
+            Some("https://identity.example.com/k8s/production"),
+            "the portal serves the proxy under /k8s when it has no address of its own"
+        );
+
+        let own = Delivery {
+            proxy_url: Some("https://kube.example.com".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            own.proxy_server().as_deref(),
+            Some("https://kube.example.com/k8s/production"),
+            "a declared proxy address wins over the portal's"
+        );
+
+        let nameless = Delivery { cluster_name: None, ..base.clone() };
+        assert_eq!(nameless.proxy_server(), None);
+
+        let hostless = Delivery { portal_url: None, ..base.clone() };
+        assert_eq!(hostless.proxy_server(), None);
+
+        // Not a proxy deployment: there is no address to state, whatever the leftover variables say.
+        let certificate = Delivery { mode: Some(CredentialMode::Certificate), ..base };
+        assert_eq!(certificate.proxy_server(), None);
     }
 
     // A mode kdt does not know is an absent mode, not a certificate one: a deployment that says
@@ -2416,7 +2646,13 @@ mod tests {
         assert!(cmd.contains("--set apiserverUrl=https://k8s.example.com:6443"));
         // Never invented: a portal hostname kdt cannot possibly know stays an example.
         assert!(cmd.contains("identity.example.com"));
-        assert!(cmd.starts_with("git clone"));
+        // From the published Helm repository, which is how the chart has been installed since
+        // 1.2.1 — a `git clone` installs whatever `main` happens to hold that day.
+        assert!(cmd.starts_with("helm repo add kdt "));
+        assert!(cmd.contains("helm upgrade --install kdt-identity kdt/kdt-identity"));
+        // The mode is the chart's to decide, and it defaults to `proxy` since 1.4. Pinning one
+        // here would hand out an install that is not upstream's.
+        assert!(!cmd.contains("credentialMode"));
     }
 
     // --- The federation, the second axis ----------------------------------------------------------
@@ -2587,6 +2823,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &ldap_federation(None),
+            &Delivery::default(),
         );
         assert_eq!(ldap[0].name, "alice");
         assert_eq!(ldap[0].source, Source::Local);
@@ -2606,6 +2843,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &Federation { auth_mode: Some(AuthMode::Local), ..Federation::default() },
+            &Delivery::default(),
         );
         assert!(!local[0].hints.iter().any(|h| h.text == FR.ident_hint_local_in_ldap));
         assert!(local[1]
@@ -2623,6 +2861,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &Federation::default(),
+            &Delivery::default(),
         );
         for u in &silent {
             assert!(!u.hints.iter().any(|h| h.text == FR.ident_hint_local_in_ldap));
@@ -2779,6 +3018,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &oidc_federation(true, None),
+            &Delivery::default(),
         );
         assert_eq!(rows[0].source, Source::Oidc);
         assert_eq!(rows[0].pin, "00000000-1111-2222-3333-444444444444");
@@ -2804,6 +3044,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &oidc_federation(true, None),
+            &Delivery::default(),
         );
         assert!(rows[0].pin.is_empty(), "a DN is not read through the provider's annotation");
     }
@@ -2821,6 +3062,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &oidc_federation(false, None),
+            &Delivery::default(),
         );
         assert!(rows[0].hints.iter().any(|h| h.text == FR.ident_hint_local_in_oidc));
     }
@@ -2840,6 +3082,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &oidc_federation(false, None),
+            &Delivery::default(),
         );
         assert!(without[0].hints.iter().any(|h| h.text == FR.ident_hint_oidc_disabled_manual));
 
@@ -2851,6 +3094,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             &oidc_federation(true, None),
+            &Delivery::default(),
         );
         assert!(with[0]
             .hints

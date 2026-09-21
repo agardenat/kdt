@@ -19878,6 +19878,30 @@ fn ident_delivery_lines(delivery: &Delivery, st: &'static lang::Strings) -> Vec<
     if let Some(refresh) = &delivery.refresh_ttl {
         out.push(ident_label_line(st.ident_lbl_refresh, refresh.clone()));
     }
+    // Proxy mode: the address, the token, the pinned authority, and the one cost. The download is
+    // stated as a fact and not as a warning — it is the exception in certificate mode and the
+    // point of the mode here, and colouring both the same would flatten the difference.
+    if mode == CredentialMode::Proxy {
+        if let Some(server) = delivery.proxy_server() {
+            out.push(ident_label_line(st.ident_lbl_proxy_server, server));
+        }
+        if let Some(ttl) = &delivery.proxy_token_ttl {
+            out.push(ident_label_line(
+                st.ident_lbl_proxy_token,
+                lang::fill(st.ident_proxy_token_line, &[("ttl", ttl)]),
+            ));
+        }
+        if delivery.proxy_ca_pinned {
+            out.push(ident_label_line(
+                st.ident_lbl_proxy_ca,
+                st.ident_proxy_ca_pinned.to_string(),
+            ));
+        }
+        out.push(Line::from(Span::styled(
+            st.ident_proxy_path,
+            Style::default().fg(DIM),
+        )));
+    }
     // Certificate mode only: in OIDC the portal has no download to offer, and a line saying
     // "closed" would suggest someone closed it.
     if mode == CredentialMode::Certificate {
@@ -20103,6 +20127,16 @@ fn ident_detail_lines(
                             ),
                         ],
                     );
+                    // The split between the two usages, only where there is one to make. A
+                    // downloaded kubeconfig and a laptop renewing are not the same thing to take
+                    // away, and the count alone does not say which of the two is out there.
+                    if sess.kubeconfig > 0 {
+                        text.push_str(" · ");
+                        text.push_str(&lang::fill(
+                            st.ident_sessions_kubeconfig,
+                            &[("n", &sess.kubeconfig.to_string())],
+                        ));
+                    }
                     if sess.stale > 0 {
                         text.push_str(" · ");
                         text.push_str(&lang::fill(
@@ -30273,6 +30307,22 @@ mod identity_view_tests {
             token_ttl: None,
             refresh_ttl: Some("7d".to_string()),
             kubeconfig_download: Some(true),
+            ..Delivery::default()
+        }
+    }
+
+    // The proxy deployment, which declares more than any other: an address, a token, a pinned
+    // authority and the caveat line. It is the block that competes hardest for the right border.
+    fn proxy_delivery() -> Delivery {
+        Delivery {
+            mode: Some(CredentialMode::Proxy),
+            refresh_ttl: Some("7d".to_string()),
+            proxy_cache_ttl: Some("30s".to_string()),
+            proxy_token_ttl: Some("7d".to_string()),
+            portal_url: Some("https://identity.a-rather-long-domain.example.com".to_string()),
+            cluster_name: Some("production-eu-west".to_string()),
+            proxy_ca_pinned: true,
+            ..Delivery::default()
         }
     }
 
@@ -30296,6 +30346,7 @@ mod identity_view_tests {
                 open: 2,
                 stale: 1,
                 last_expiry: Some(1_900_000_000),
+                kubeconfig: 1,
             }),
             creds: Some(CredentialFacts {
                 invite_expires: Some(1_756_000_000),
@@ -30434,13 +30485,17 @@ mod identity_view_tests {
     fn the_detail_panel_keeps_its_frame_at_every_width() {
         let st = lang::t(crate::ai::AiLanguage::Fr);
         let border = ratatui::symbols::border::PLAIN;
+        // Both delivery blocks, because they are not the same height nor the same width: proxy
+        // carries an address, a sentence about the request path and a pinned authority on top of
+        // what certificate mode declares.
+        for deliv in [delivery(), proxy_delivery()] {
         for (_, src) in rows() {
             let row = src.into_iter().next().expect("one row");
             for width in [40_u16, 60, 100, 196] {
                 let mut terminal =
                     Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
                 let (title, lines) =
-                    ident_detail_lines(&row, st, width.saturating_sub(2) as usize, &delivery());
+                    ident_detail_lines(&row, st, width.saturating_sub(2) as usize, &deliv);
                 terminal
                     .draw(|f| {
                         let p = Paragraph::new(lines.clone())
@@ -30464,6 +30519,7 @@ mod identity_view_tests {
                     assert_eq!(cell.symbol(), expected, "frame eaten at width {width}, row {y}");
                 }
             }
+        }
         }
     }
 
@@ -30648,6 +30704,50 @@ mod identity_view_tests {
         assert!(oidc.contains("<= 5m"));
         assert!(!oidc.contains(st.ident_download_open));
         assert!(!oidc.contains(st.ident_download_closed));
+    }
+
+    // The proxy block says what no other mode can: the window is the cache and not the token, the
+    // download exists and is revocable, and kdt-identity is on the path of every request.
+    #[test]
+    fn the_proxy_block_names_the_cache_and_never_the_non_revocable_download() {
+        let st = lang::t(crate::ai::AiLanguage::Fr);
+        let text = |lines: Vec<Line<'static>>| {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let proxy = text(ident_delivery_lines(&proxy_delivery(), st));
+        assert!(proxy.contains("proxy"));
+        // The cache, not the seven days the token lives: the two differ by four orders of
+        // magnitude, and naming the wrong one would make a revocation look hopeless.
+        assert!(proxy.contains("<= 30s"), "the window is the cache: {proxy}");
+        assert!(!proxy.contains("<= 7d"));
+        assert!(
+            proxy.contains("https://identity.a-rather-long-domain.example.com/k8s/production-eu-west"),
+            "the address handed out must be shown whole: {proxy}"
+        );
+        assert!(proxy.contains(st.ident_proxy_path), "the one cost of the mode must be named");
+        assert!(proxy.contains(st.ident_proxy_ca_pinned));
+        // The download here is revocable, so the line that names the exception must not appear —
+        // it belongs to certificate mode and says the opposite of what is true here.
+        assert!(!proxy.contains(st.ident_download_open));
+        assert!(!proxy.contains(st.ident_download_closed));
+
+        // A proxy deployment whose address kdt could not read says nothing rather than half of it.
+        let bare = text(ident_delivery_lines(
+            &Delivery {
+                mode: Some(CredentialMode::Proxy),
+                proxy_cache_ttl: Some("30s".to_string()),
+                ..Delivery::default()
+            },
+            st,
+        ));
+        assert!(bare.contains("<= 30s"));
+        assert!(!bare.contains("/k8s/"), "no half address: {bare}");
+        assert!(!bare.contains(st.ident_proxy_ca_pinned));
     }
 
     // The second axis, and the same rule: an undeclared `authMode` is also what every deployment
