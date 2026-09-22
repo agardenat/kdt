@@ -14,7 +14,7 @@
 import { useEffect, useState, type ReactNode, type RefObject } from "react";
 import * as api from "./api";
 import type { Lang, Strings } from "./i18n";
-import { AiPane } from "./ai";
+import { AiPane, type AiExtra } from "./ai";
 import { DeletePane, EditPane, YamlPane } from "./objects";
 import { useRecordChanged } from "./record";
 import {
@@ -256,6 +256,7 @@ function ObjectOverlay({
   onClose,
   onDeleted,
   onNeedsAuth,
+  aiExtra,
 }: {
   tab: PanelTab;
   record: EventRecord;
@@ -266,6 +267,8 @@ function ObjectOverlay({
   onClose: () => void;
   onDeleted?: (message: string) => void;
   onNeedsAuth: (message: string) => void;
+  /** Ce que la vue ajoute au prompt — le texte du diagnostic, qui ne vit pas côté serveur. */
+  aiExtra?: AiExtra;
 }) {
   useEscapeCloses(onClose);
 
@@ -308,7 +311,14 @@ function ObjectOverlay({
         {/* L'analyse survit à la fermeture de l'overlay : elle vit dans un état de module, pas
             dans ce composant. Y revenir relit ce qui a été écrit, sans rappeler le modèle. */}
         {tab === "ai" && (
-          <AiPane key={record.uid} record={record} lang={lang} st={st} onNeedsAuth={onNeedsAuth} />
+          <AiPane
+            key={record.uid}
+            record={record}
+            lang={lang}
+            st={st}
+            onNeedsAuth={onNeedsAuth}
+            extra={aiExtra}
+          />
         )}
         {tab === "delete" && (
           <DeletePane
@@ -393,6 +403,7 @@ export function ViewBody({
   bodyRef,
   bulk,
   onBulkClose,
+  aiExtra,
   children,
 }: {
   tab: PanelTab;
@@ -409,6 +420,8 @@ export function ViewBody({
   /** Le hamburger de masse a ouvert une action groupée (`BulkDeletePane` aujourd'hui). */
   bulk?: { label: string; count: number; node: ReactNode } | null;
   onBulkClose?: () => void;
+  /** Passé tel quel à l'analyse : ce que la vue a lu et que le serveur ne retrouverait pas. */
+  aiExtra?: AiExtra;
   children: ReactNode;
 }) {
   // `y`, `e` et `Ctrl-D` visent l'objet Kubernetes derrière la ligne : sans kind ni nom, il n'y en
@@ -434,6 +447,7 @@ export function ViewBody({
           onClose={() => onTab(fallbackTab(Boolean(hasDetail)))}
           onDeleted={onDeleted}
           onNeedsAuth={onNeedsAuth}
+          aiExtra={aiExtra}
         />
       ) : (
         children

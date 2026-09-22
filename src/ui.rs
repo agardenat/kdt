@@ -2503,7 +2503,7 @@ impl App {
             } else {
                 Some((
                     "Cluster diagnostic".to_string(),
-                    format_diagnostic_for_ai(&s),
+                    format_diagnostic_for_ai(&s, lang::t(self.ai_language)),
                 ))
             }
         } else { None };
@@ -2615,7 +2615,10 @@ impl App {
         self.diagnostic_scroll = 0;
         let client = self.client.clone();
         let state = self.diagnostic_state.clone();
-        tokio::spawn(async move { run_diagnostic(client, state).await; });
+        // The language is fixed at launch, as it is for every background task: the run writes its
+        // sentences as it goes, and `L` during a run would leave the steps in two languages.
+        let st = lang::t(self.ai_language);
+        tokio::spawn(async move { run_diagnostic(client, state, st).await; });
     }
 
     fn exit_diagnostic(&mut self) {
@@ -2625,7 +2628,10 @@ impl App {
     fn refresh_diagnostic(&self) {
         let client = self.client.clone();
         let state = self.diagnostic_state.clone();
-        tokio::spawn(async move { run_diagnostic(client, state).await; });
+        // The language is fixed at launch, as it is for every background task: the run writes its
+        // sentences as it goes, and `L` during a run would leave the steps in two languages.
+        let st = lang::t(self.ai_language);
+        tokio::spawn(async move { run_diagnostic(client, state, st).await; });
     }
 
     fn export_diagnostic_pdf(&mut self, with_ai: bool) {
@@ -2728,7 +2734,7 @@ impl App {
             }
             Mode::Diagnostic => {
                 let d = self.diagnostic_state.lock().expect("diag poisoned");
-                crate::diagnostic::format_diagnostic_for_ai(&d)
+                crate::diagnostic::format_diagnostic_for_ai(&d, lang::t(self.ai_language))
             }
             Mode::NodeUsage => {
                 let s = self.node_usage_state.lock().expect("node usage poisoned");
@@ -3900,28 +3906,13 @@ impl App {
     }
 
     // Build a placeholder EventRecord so the diagnostic/node views can reuse the event-oriented
-    // AI pipeline (which keys everything off an EventRecord).
+    // AI pipeline (which keys everything off an EventRecord). Built by `diagnostic` itself so
+    // kdt-web sends the model the same record for the same analysis.
     fn synthetic_diagnostic_record(&self) -> EventRecord {
-        EventRecord {
-            uid: format!(
-                "diagnostic-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            ),
-            time: k8s_openapi::jiff::Timestamp::now(),
-            severity: Severity::Normal,
-            reason: "ClusterDiagnostic".to_string(),
-            api_version: "kdt/v1".to_string(),
-            kind: "Diagnostic".to_string(),
-            namespace: String::new(),
-            name: self.context_label.clone(),
-            message: lang::t(self.ai_language).msg_diagnostic_record.to_string(),
-            component: "kdt".to_string(),
-            host: String::new(),
-            count: 1,
-        }
+        crate::diagnostic::synthetic_diagnostic_record(
+            &self.context_label,
+            lang::t(self.ai_language),
+        )
     }
 
     fn enter_nodes_mode(&mut self) {

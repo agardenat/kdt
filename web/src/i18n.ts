@@ -666,6 +666,22 @@ export interface Strings {
   netpolNoVerdict: string;
   netpolTarget: string;
 
+  // --- Le `D` de kdt : une séquence fixe d'étapes, et rien d'autre à décider que de la relancer.
+  // Les titres d'étapes, les commandes et les constats sont rédigés par le serveur.
+  diagTitle: string;
+  diagRun: string;
+  diagRerun: string;
+  diagRunning: string;
+  diagFinished: string;
+  diagIdle: string;
+  diagSteps: string;
+  diagDuration: string;
+  diagIntro: string;
+  diagScopeless: string;
+  diagEmpty: string;
+  diagNoMatch: string;
+  diagOnlyProblems: string;
+
   // --- Filtre partagé par les vues d'inventaire, là où le TUI cycle une touche.
   filterAll: string;
   filterProblems: string;
@@ -1384,6 +1400,21 @@ const FR: Strings = {
     "Ce moteur n'a pas de verdict de posture : sa sémantique par défaut n'est pas celle du natif, et l'affirmer serait deviner.",
   netpolTarget: "cible",
 
+  diagTitle: "Diagnostic du cluster",
+  diagRun: "Lancer",
+  diagRerun: "Relancer",
+  diagRunning: "en cours",
+  diagFinished: "terminé",
+  diagIdle: "prêt",
+  diagSteps: "étapes",
+  diagDuration: "durée",
+  diagIntro:
+    "Une séquence fixe d'étapes en lecture seule, sous votre identité : une étape refusée dit que vous n'avez pas le droit de la lire, jamais qu'il n'y a rien.",
+  diagScopeless: "Le diagnostic porte sur le cluster entier : cette vue ignore la portée.",
+  diagEmpty: "Aucune étape : le diagnostic n'a pas encore tourné.",
+  diagNoMatch: "Aucune étape ne correspond au filtre.",
+  diagOnlyProblems: "Warn et Err seulement",
+
   filterAll: "tout",
   filterProblems: "problèmes",
 
@@ -2092,6 +2123,21 @@ const EN: Strings = {
   netpolNoVerdict:
     "This engine gets no posture verdict: its default semantics are not the native ones, and asserting them would be guessing.",
   netpolTarget: "target",
+
+  diagTitle: "Cluster diagnostic",
+  diagRun: "Run",
+  diagRerun: "Run again",
+  diagRunning: "running",
+  diagFinished: "finished",
+  diagIdle: "ready",
+  diagSteps: "steps",
+  diagDuration: "duration",
+  diagIntro:
+    "A fixed sequence of read-only steps, under your identity: a refused step says you are not allowed to read it, never that there is nothing there.",
+  diagScopeless: "The diagnostic covers the whole cluster: this view ignores the scope.",
+  diagEmpty: "No step yet: the diagnostic has not run.",
+  diagNoMatch: "No step matches the filter.",
+  diagOnlyProblems: "Warn and Err only",
 
   filterAll: "all",
   filterProblems: "problems",

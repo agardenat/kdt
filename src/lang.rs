@@ -2000,6 +2000,20 @@ pub struct Strings {
     pub diag_identity_unmapped: &'static str,
     pub diag_identity_mapped_not_federated: &'static str,
     pub diag_identity_mapped_missing: &'static str,
+    pub diag_identity_mode_proxy: &'static str,
+    pub diag_identity_mode_proxy_no_ttl: &'static str,
+    pub diag_identity_mode_issued: &'static str,
+    pub diag_identity_mode_issued_no_ttl: &'static str,
+    pub diag_identity_mode_absent: &'static str,
+    pub diag_identity_proxy_path: &'static str,
+    pub diag_identity_proxy_down: &'static str,
+    pub diag_identity_proxy_degraded: &'static str,
+    pub diag_identity_proxy_single: &'static str,
+    pub diag_identity_proxy_unreadable: &'static str,
+    pub diag_identity_proxy_server: &'static str,
+    pub diag_identity_proxy_ca: &'static str,
+    pub diag_identity_proxy_kubeconfigs: &'static str,
+    pub diag_identity_kubeconfig_orphan: &'static str,
 }
 
 pub const FR: Strings = Strings {
@@ -3980,6 +3994,20 @@ pub const FR: Strings = Strings {
     diag_identity_unmapped: "groups marqués comme fédérés et absents de {setting} : {groups} — leurs members ne bougent plus",
     diag_identity_mapped_not_federated: "groups déclarés dans {setting} sans le label identity.kdt.sh/source : {groups} — le contrôleur ne les alimente pas",
     diag_identity_mapped_missing: "groups de la table pas encore créés : {groups} — chacun naîtra à la première connexion d'un de ses members",
+    diag_identity_mode_proxy: "credentialMode proxy : chaque requête repasse par kdt-identity, qui relit le compte et ses groups — une révocation prend effet en {window} (proxy.cacheTtl), et non au TTL du jeton",
+    diag_identity_mode_proxy_no_ttl: "credentialMode proxy : proxy.cacheTtl n'est pas déclaré sur le pod controller, aucune fenêtre de révocation n'est affirmée ici",
+    diag_identity_mode_issued: "credentialMode {mode} : rien n'est relu une fois remis — une révocation prend effet en {window}, la durée de ce qui a été émis",
+    diag_identity_mode_issued_no_ttl: "credentialMode {mode} : la durée de ce qui est remis n'est pas déclarée sur le pod controller, aucune fenêtre de révocation n'est affirmée ici",
+    diag_identity_mode_absent: "credentialMode non déclaré sur le pod controller : déploiement antérieur aux modes, ou variable posée par un valueFrom que kdt ne lit pas",
+    diag_identity_proxy_path: "portail sur le chemin de chaque kubectl : {ready}/{desired} replicas prêts",
+    diag_identity_proxy_down: "aucun replica du portail n'est prêt : en mode proxy, tous les kubectl des kubeconfig remis échouent — le cluster, lui, répond",
+    diag_identity_proxy_degraded: "{ready}/{desired} replicas du portail prêts : en mode proxy, une requête kubectl aboutit ou non selon l'endpoint tiré",
+    diag_identity_proxy_single: "portail à un seul replica : en mode proxy, chaque roulement — mise à jour, éviction, drain — coupe kubectl pour tout le monde le temps du remplacement",
+    diag_identity_proxy_unreadable: "aucun Deployment de portail parmi les {sel} : en mode proxy, l'état du chemin des requêtes n'est pas lisible d'ici",
+    diag_identity_proxy_server: "les kubeconfig remis visent {server}",
+    diag_identity_proxy_ca: "CA épinglée dans les kubeconfig remis (proxy.caSecret) : un renouvellement par une autre autorité les invalide tous d'un coup",
+    diag_identity_proxy_kubeconfigs: "{n} kubeconfig(s) téléchargé(s) en cours sur {users} compte(s) : révocables, à la différence du mode certificate",
+    diag_identity_kubeconfig_orphan: "{n} kubeconfig(s) de proxy encore comptés alors que le mode est {mode} : ils n'ouvrent plus rien, et qui en détient un reçoit un refus sans explication",
 };
 
 pub const EN: Strings = Strings {
@@ -5959,6 +5987,20 @@ pub const EN: Strings = Strings {
     diag_identity_unmapped: "groups marked as federated and absent from {setting}: {groups} - their members no longer move",
     diag_identity_mapped_not_federated: "groups declared in {setting} without the identity.kdt.sh/source label: {groups} - the controller does not feed them",
     diag_identity_mapped_missing: "groups from the table not created yet: {groups} - each is born at the first sign-in of one of its members",
+    diag_identity_mode_proxy: "credentialMode proxy: every request goes back through kdt-identity, which re-reads the account and its groups - a revocation takes effect within {window} (proxy.cacheTtl), not at the token's TTL",
+    diag_identity_mode_proxy_no_ttl: "credentialMode proxy: proxy.cacheTtl is not declared on the controller pod, so no revocation window is stated here",
+    diag_identity_mode_issued: "credentialMode {mode}: nothing is re-read once handed out - a revocation takes effect within {window}, the lifetime of what was issued",
+    diag_identity_mode_issued_no_ttl: "credentialMode {mode}: the lifetime of what is handed out is not declared on the controller pod, so no revocation window is stated here",
+    diag_identity_mode_absent: "credentialMode not declared on the controller pod: a deployment older than the modes, or a variable set from a valueFrom kdt does not read",
+    diag_identity_proxy_path: "portal on the path of every kubectl: {ready}/{desired} replicas ready",
+    diag_identity_proxy_down: "no portal replica is ready: in proxy mode every kubectl run with a handed-out kubeconfig fails - the cluster itself answers",
+    diag_identity_proxy_degraded: "{ready}/{desired} portal replicas ready: in proxy mode a kubectl request lands or not depending on the endpoint picked",
+    diag_identity_proxy_single: "portal on a single replica: in proxy mode every rollout - upgrade, eviction, drain - takes kubectl away from everyone for the length of the swap",
+    diag_identity_proxy_unreadable: "no portal Deployment among the {sel} ones: in proxy mode the state of the request path cannot be read from here",
+    diag_identity_proxy_server: "handed-out kubeconfigs point at {server}",
+    diag_identity_proxy_ca: "CA pinned into the handed-out kubeconfigs (proxy.caSecret): a renewal under another authority invalidates all of them at once",
+    diag_identity_proxy_kubeconfigs: "{n} downloaded kubeconfig(s) live across {users} account(s): revocable, unlike in certificate mode",
+    diag_identity_kubeconfig_orphan: "{n} proxy kubeconfig(s) still counted while the mode is {mode}: they open nothing any more, and whoever holds one gets a refusal with no explanation",
 };
 
 // Return the string table for the active language.

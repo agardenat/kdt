@@ -118,6 +118,13 @@ enum ProviderChoice {
     },
 }
 
+/// Une section de contexte que la vue apporte elle-même.
+#[derive(Deserialize)]
+pub struct ExtraSection {
+    title: String,
+    text: String,
+}
+
 #[derive(Deserialize)]
 pub struct AnalyzeRequest {
     /// La ligne visée, telle que le serveur l'a émise — comme pour `/related`.
@@ -125,6 +132,17 @@ pub struct AnalyzeRequest {
     provider: ProviderChoice,
     #[serde(default)]
     lang: String,
+    /// Ce que la vue a déjà lu et que l'enrichissement ne retrouverait pas.
+    ///
+    /// Le diagnostic est le cas qui l'exige : son analyse porte sur vingt-cinq étapes dont le
+    /// serveur ne garde rien entre deux requêtes, et les refaire tourner pour remplir un prompt
+    /// coûterait au cluster une seconde séquence complète. C'est le même geste que dans le TUI,
+    /// où le texte du diagnostic est inséré en tête des sections.
+    ///
+    /// Ce que le navigateur envoie ici part chez le fournisseur choisi par la personne connectée,
+    /// et nulle part ailleurs : ce champ n'ouvre aucune lecture du cluster.
+    #[serde(default)]
+    extra: Vec<ExtraSection>,
 }
 
 /// L'analyse, en SSE.
@@ -204,12 +222,18 @@ pub async fn analyze(
                 }
             })
         };
-        let extra = kdt::enrich::gather_extra_context_with_progress(&client, &record, |s, _| {
+        let mut extra = kdt::enrich::gather_extra_context_with_progress(&client, &record, |s, _| {
             let _ = progress_tx.send(s.to_string());
         })
         .await;
         drop(progress_tx);
         let _ = pump.await;
+
+        // En tête, comme dans le TUI : c'est le sujet de l'analyse, et le budget de caractères
+        // taille par la fin.
+        for section in request.extra.into_iter().rev() {
+            extra.insert(0, (section.title, section.text));
+        }
 
         stage(st.ai_building_prompt.to_string()).await;
         let prompt = kdt::ai::build_ai_prompt(

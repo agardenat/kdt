@@ -92,10 +92,10 @@ pub async fn run_full_extract(
         return;
     }
     let diag_state = new_diagnostic_state();
-    run_diagnostic(client.clone(), diag_state.clone()).await;
+    run_diagnostic(client.clone(), diag_state.clone(), st).await;
     let (diag_steps, diag_summary) = {
         let s = diag_state.lock().expect("diag poisoned");
-        (s.steps.clone(), format_diagnostic_for_ai(&s))
+        (s.steps.clone(), format_diagnostic_for_ai(&s, st))
     };
 
     current += 1;

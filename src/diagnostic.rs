@@ -14,7 +14,7 @@ use k8s_openapi::api::admissionregistration::v1::{
 };
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Event as K8sEvent, Namespace, Node, PersistentVolume, Pod};
-use crate::lang::{active, fill};
+use crate::lang::{fill, Strings};
 use kube::api::{DynamicObject, ListParams, LogParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Api, Client};
@@ -29,11 +29,12 @@ use crate::storage::{fetch_storage, new_storage_state};
 use crate::capacity::{fetch_capacity, new_capacity_state};
 use crate::rbac::{critical_namespaces, fetch_rbac, new_rbac_state, Severity};
 use crate::argocd::{fetch_argocd, new_argo_state};
-use crate::identity::{fetch_identity, new_identity_state, Phase};
+use crate::identity::Phase;
 use crate::reflector::{fetch_reflector, new_reflector_state};
 use crate::k8ssandra::{fetch_k8ssandra, new_k8c_state};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DiagStatus {
     Running,
     Ok,
@@ -114,7 +115,7 @@ fn finish_step(
     }
 }
 
-pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
+pub async fn run_diagnostic(client: Client, state: SharedDiagnostic, st: &'static Strings) {
     let run_id = {
         let mut s = state.lock().expect("diagnostic poisoned");
         s.run_id = s.run_id.wrapping_add(1).max(1);
@@ -127,31 +128,31 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
         s.run_id
     };
 
-    check_api_health(&client, &state, run_id).await;
-    check_cluster_version(&client, &state, run_id).await;
-    check_nodes(&client, &state, run_id).await;
-    check_system_namespaces(&client, &state, run_id).await;
-    check_kube_system_pods(&client, &state, run_id).await;
-    check_dns(&client, &state, run_id).await;
-    check_cni(&client, &state, run_id).await;
-    check_validating_webhooks(&client, &state, run_id).await;
-    check_mutating_webhooks(&client, &state, run_id).await;
-    check_rancher(&client, &state, run_id).await;
-    check_problem_pods(&client, &state, run_id).await;
-    check_replica_spread(&client, &state, run_id).await;
-    check_persistent_volumes(&client, &state, run_id).await;
-    check_storage(&client, &state, run_id).await;
-    check_capacity(&client, &state, run_id).await;
-    check_flux(&client, &state, run_id).await;
-    check_cert_manager(&client, &state, run_id).await;
-    check_kyverno(&client, &state, run_id).await;
-    check_velero(&client, &state, run_id).await;
-    check_reflector(&client, &state, run_id).await;
-    check_argocd(&client, &state, run_id).await;
-    check_identity(&client, &state, run_id).await;
-    check_k8ssandra(&client, &state, run_id).await;
-    check_rbac(&client, &state, run_id).await;
-    check_recent_warnings(&client, &state, run_id).await;
+    check_api_health(&client, &state, run_id, st).await;
+    check_cluster_version(&client, &state, run_id, st).await;
+    check_nodes(&client, &state, run_id, st).await;
+    check_system_namespaces(&client, &state, run_id, st).await;
+    check_kube_system_pods(&client, &state, run_id, st).await;
+    check_dns(&client, &state, run_id, st).await;
+    check_cni(&client, &state, run_id, st).await;
+    check_validating_webhooks(&client, &state, run_id, st).await;
+    check_mutating_webhooks(&client, &state, run_id, st).await;
+    check_rancher(&client, &state, run_id, st).await;
+    check_problem_pods(&client, &state, run_id, st).await;
+    check_replica_spread(&client, &state, run_id, st).await;
+    check_persistent_volumes(&client, &state, run_id, st).await;
+    check_storage(&client, &state, run_id, st).await;
+    check_capacity(&client, &state, run_id, st).await;
+    check_flux(&client, &state, run_id, st).await;
+    check_cert_manager(&client, &state, run_id, st).await;
+    check_kyverno(&client, &state, run_id, st).await;
+    check_velero(&client, &state, run_id, st).await;
+    check_reflector(&client, &state, run_id, st).await;
+    check_argocd(&client, &state, run_id, st).await;
+    check_identity(&client, &state, run_id, st).await;
+    check_k8ssandra(&client, &state, run_id, st).await;
+    check_rbac(&client, &state, run_id, st).await;
+    check_recent_warnings(&client, &state, run_id, st).await;
 
     let mut s = state.lock().expect("diagnostic poisoned");
     if s.run_id != run_id {
@@ -166,7 +167,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic) {
 }
 
 // Probe the apiserver health endpoints directly via raw requests (equivalent to `kubectl get --raw`).
-async fn check_api_health(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_api_health(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     for path in ["/livez", "/readyz", "/healthz"] {
         let title = format!("API server {}", path);
         let cmd = format!("kubectl get --raw='{}'", path);
@@ -184,20 +185,20 @@ async fn check_api_health(client: &Client, state: &SharedDiagnostic, run_id: u64
                 _ => LineColor::Err,
             },
             if status == DiagStatus::Ok {
-                fill(active().diag_response, &[("body", snippet.trim())])
+                fill(st.diag_response, &[("body", snippet.trim())])
             } else {
-                fill(active().diag_error, &[("e", snippet.trim())])
+                fill(st.diag_error, &[("e", snippet.trim())])
             },
         ));
         finish_step(state, run_id, idx, status, lines);
     }
 }
 
-async fn check_cluster_version(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_cluster_version(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_version,
+        st.diag_step_version,
         "kubectl get --raw='/version'",
     ) else {
         return;
@@ -222,14 +223,14 @@ async fn check_cluster_version(client: &Client, state: &SharedDiagnostic, run_id
             DiagStatus::Ok
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(state, run_id, "Nodes", "kubectl get nodes") else {
         return;
     };
@@ -280,7 +281,7 @@ async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                     any_issue = true;
                     lines.push((
                         LineColor::Warn,
-                        fill(active().diag_node_cordoned, &[("name", &name)]),
+                        fill(st.diag_node_cordoned, &[("name", &name)]),
                     ));
                 }
             }
@@ -315,18 +316,18 @@ async fn check_nodes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_system_namespaces(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_system_namespaces(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_system_ns,
+        st.diag_step_system_ns,
         "kubectl get ns",
     ) else {
         return;
@@ -368,26 +369,26 @@ async fn check_system_namespaces(client: &Client, state: &SharedDiagnostic, run_
             let found: Vec<&&str> = candidates.iter().filter(|c| names.contains(**c)).collect();
             lines.push((
                 LineColor::Info,
-                fill(active().diag_ns_total, &[("n", &names.len().to_string())]),
+                fill(st.diag_ns_total, &[("n", &names.len().to_string())]),
             ));
             lines.push((
                 LineColor::Plain,
                 fill(
-                    active().diag_ns_found,
+                    st.diag_ns_found,
                     &[("list", &found.iter().map(|s| **s).collect::<Vec<_>>().join(", "))],
                 ),
             ));
             DiagStatus::Info
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
@@ -435,11 +436,11 @@ async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_i
             for (n, r) in &high_restarts {
                 lines.push((
                     LineColor::Warn,
-                    fill(active().diag_restarts, &[("name", n), ("n", &r.to_string())]),
+                    fill(st.diag_restarts, &[("name", n), ("n", &r.to_string())]),
                 ));
             }
             let summary = fill(
-                active().diag_pods_summary,
+                st.diag_pods_summary,
                 &[
                     ("total", &total.to_string()),
                     ("notready", &not_ready.to_string()),
@@ -462,18 +463,18 @@ async fn check_kube_system_pods(client: &Client, state: &SharedDiagnostic, run_i
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_dns,
+        st.diag_step_dns,
         "kubectl -n kube-system get pods -l k8s-app=kube-dns",
     ) else {
         return;
@@ -486,7 +487,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             if list.items.is_empty() {
                 lines.push((
                     LineColor::Warn,
-                    active().diag_no_coredns.into(),
+                    st.diag_no_coredns.into(),
                 ));
                 DiagStatus::Warn
             } else {
@@ -510,7 +511,7 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                     } else {
                         LineColor::Warn
                     },
-                    fill(active().diag_coredns_ready, &[("ready", &ready.to_string()), ("total", &total.to_string())]),
+                    fill(st.diag_coredns_ready, &[("ready", &ready.to_string()), ("total", &total.to_string())]),
                 ));
                 if ready == total {
                     DiagStatus::Ok
@@ -520,14 +521,14 @@ async fn check_dns(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
@@ -572,7 +573,7 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let status = if !found_any {
         lines.push((
             LineColor::Info,
-            active().diag_no_cni.into(),
+            st.diag_no_cni.into(),
         ));
         DiagStatus::Info
     } else {
@@ -584,7 +585,7 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             }
             lines.push((
                 if ok { LineColor::Ok } else { LineColor::Warn },
-                fill(active().diag_cni_ready, &[("name", k), ("ready", &ready.to_string()), ("total", &total.to_string())]),
+                fill(st.diag_cni_ready, &[("name", k), ("ready", &ready.to_string()), ("total", &total.to_string())]),
             ));
         }
         if all_ok {
@@ -596,7 +597,7 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
@@ -637,7 +638,7 @@ async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, ru
                         LineColor::Ok
                     },
                     fill(
-                        active().diag_validating_webhooks,
+                        st.diag_validating_webhooks,
                         &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
                     ),
                 ),
@@ -649,14 +650,14 @@ async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, ru
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
@@ -697,7 +698,7 @@ async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_
                         LineColor::Ok
                     },
                     fill(
-                        active().diag_mutating_webhooks,
+                        st.diag_mutating_webhooks,
                         &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
                     ),
                 ),
@@ -709,7 +710,7 @@ async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -741,11 +742,11 @@ fn highlight_webhook_owner(name: &str) -> String {
 
 // Detect how Rancher relates to this cluster (local server, imported via cattle-cluster-agent,
 // or fleet-only) and analyze the relevant pod logs to confirm the management tunnel is healthy.
-async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_rancher,
+        st.diag_step_rancher,
         "kubectl -n cattle-system get deploy,pods",
     ) else {
         return;
@@ -758,7 +759,7 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     if !cattle_present && !fleet_present && !fleet_local_present {
         lines.push((
             LineColor::Info,
-            active().diag_no_cattle.into(),
+            st.diag_no_cattle.into(),
         ));
         finish_step(state, run_id, idx, DiagStatus::Info, lines);
         return;
@@ -777,7 +778,6 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let local_total = local_pods.as_ref().map(|l| l.items.len()).unwrap_or(0);
     let agent_total = agent_pods.as_ref().map(|l| l.items.len()).unwrap_or(0);
 
-    let st = active();
     let kind = if local_total > 0 {
         st.diag_rancher_local
     } else if agent_total > 0 {
@@ -860,9 +860,9 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     }
 
     let status = if agent_total > 0 {
-        analyze_agent_logs(client, &mut lines).await
+        analyze_agent_logs(client, &mut lines, st).await
     } else if local_total > 0 {
-        analyze_rancher_logs(client, &mut lines).await
+        analyze_rancher_logs(client, &mut lines, st).await
     } else {
         lines.push((
             LineColor::Info,
@@ -876,12 +876,16 @@ async fn check_rancher(client: &Client, state: &SharedDiagnostic, run_id: u64) {
 
 // Scan the last ~200 lines of cattle-cluster-agent logs and classify failures (DNS/TLS/websocket)
 // vs. a healthy tunnel, returning the worst observed severity.
-async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)>) -> DiagStatus {
+async fn analyze_agent_logs(
+    client: &Client,
+    lines: &mut Vec<(LineColor, String)>,
+    st: &'static Strings,
+) -> DiagStatus {
     let pods: Api<Pod> = Api::namespaced(client.clone(), "cattle-system");
     let list = match pods.list(&ListParams::default().labels("app=cattle-cluster-agent")).await {
         Ok(l) => l.items,
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_list_agent_pods, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_list_agent_pods, &[("e", &e.to_string())])));
             return DiagStatus::Err;
         }
     };
@@ -894,12 +898,12 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     }) {
         Some(p) => p,
         None => {
-            lines.push((LineColor::Warn, active().diag_no_agent_running.into()));
+            lines.push((LineColor::Warn, st.diag_no_agent_running.into()));
             return DiagStatus::Warn;
         }
     };
     let pod_name = pod.metadata.name.clone().unwrap_or_default();
-    lines.push((LineColor::Dim, fill(active().diag_logs_from_pod, &[("name", &pod_name)])));
+    lines.push((LineColor::Dim, fill(st.diag_logs_from_pod, &[("name", &pod_name)])));
 
     let lp = LogParams { tail_lines: Some(200), ..Default::default() };
     let text = match pods.logs(&pod_name, &lp).await {
@@ -907,7 +911,7 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
         Err(e) => {
             lines.push((
                 LineColor::Err,
-                fill(active().diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
+                fill(st.diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
             ));
             return DiagStatus::Err;
         }
@@ -959,11 +963,11 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     };
 
     if tunnel_ok && dns_failures.is_empty() && tls_failures.is_empty() && connect_failures.len() <= 1 {
-        lines.push((LineColor::Ok, active().diag_tunnel_ok.into()));
+        lines.push((LineColor::Ok, st.diag_tunnel_ok.into()));
         if let Some(l) = last_relevant {
             lines.push((
                 LineColor::Dim,
-                fill(active().diag_last_trace, &[("line", &truncate(&l, 200))]),
+                fill(st.diag_last_trace, &[("line", &truncate(&l, 200))]),
             ));
         }
         return DiagStatus::Ok;
@@ -977,7 +981,6 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
         worst = DiagStatus::Err;
     }
 
-    let st = active();
     push_some(lines, st.diag_dns_failures, &dns_failures, LineColor::Err);
     push_some(lines, st.diag_tls_failures, &tls_failures, LineColor::Err);
     push_some(lines, st.diag_ws_failures, &connect_failures, LineColor::Err);
@@ -988,12 +991,16 @@ async fn analyze_agent_logs(client: &Client, lines: &mut Vec<(LineColor, String)
     worst
 }
 
-async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, String)>) -> DiagStatus {
+async fn analyze_rancher_logs(
+    client: &Client,
+    lines: &mut Vec<(LineColor, String)>,
+    st: &'static Strings,
+) -> DiagStatus {
     let pods: Api<Pod> = Api::namespaced(client.clone(), "cattle-system");
     let list = match pods.list(&ListParams::default().labels("app=rancher")).await {
         Ok(l) => l.items,
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_list_rancher_pods, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_list_rancher_pods, &[("e", &e.to_string())])));
             return DiagStatus::Err;
         }
     };
@@ -1002,12 +1009,12 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
     }) {
         Some(p) => p,
         None => {
-            lines.push((LineColor::Warn, active().diag_no_rancher_running.into()));
+            lines.push((LineColor::Warn, st.diag_no_rancher_running.into()));
             return DiagStatus::Warn;
         }
     };
     let pod_name = pod.metadata.name.clone().unwrap_or_default();
-    lines.push((LineColor::Dim, fill(active().diag_logs_from_pod, &[("name", &pod_name)])));
+    lines.push((LineColor::Dim, fill(st.diag_logs_from_pod, &[("name", &pod_name)])));
 
     let lp = LogParams { tail_lines: Some(150), ..Default::default() };
     let text = match pods.logs(&pod_name, &lp).await {
@@ -1015,7 +1022,7 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
         Err(e) => {
             lines.push((
                 LineColor::Err,
-                fill(active().diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
+                fill(st.diag_logs_failed, &[("name", &pod_name), ("e", &e.to_string())]),
             ));
             return DiagStatus::Err;
         }
@@ -1035,20 +1042,20 @@ async fn analyze_rancher_logs(client: &Client, lines: &mut Vec<(LineColor, Strin
         }
     }
     if serving_ok && errors.len() <= 2 {
-        lines.push((LineColor::Ok, active().diag_rancher_serving.into()));
+        lines.push((LineColor::Ok, st.diag_rancher_serving.into()));
         return DiagStatus::Ok;
     }
     if !errors.is_empty() {
         lines.push((
             LineColor::Warn,
-            fill(active().diag_rancher_errors, &[("n", &errors.len().to_string())]),
+            fill(st.diag_rancher_errors, &[("n", &errors.len().to_string())]),
         ));
         for e in errors.iter().take(3) {
             lines.push((LineColor::Dim, format!("  {}", truncate(e, 200))));
         }
     }
     if !serving_ok {
-        lines.push((LineColor::Warn, active().diag_no_rancher_start.into()));
+        lines.push((LineColor::Warn, st.diag_no_rancher_start.into()));
     }
     DiagStatus::Warn
 }
@@ -1095,11 +1102,11 @@ async fn rancher_url_from_agent_deploy(client: &Client) -> Option<String> {
 }
 
 
-async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_failing_pods,
+        st.diag_step_failing_pods,
         "kubectl get pods -A",
     ) else {
         return;
@@ -1150,12 +1157,12 @@ async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u
             oom.dedup();
             lines.push((
                 LineColor::Info,
-                fill(active().diag_pods_total, &[("n", &total.to_string())]),
+                fill(st.diag_pods_total, &[("n", &total.to_string())]),
             ));
-            push_problem_list(&mut lines, "CrashLoopBackOff", &crashloop, LineColor::Err);
-            push_problem_list(&mut lines, "ImagePullBackOff", &imagepull, LineColor::Err);
-            push_problem_list(&mut lines, "Pending", &pending, LineColor::Warn);
-            push_problem_list(&mut lines, "OOMKilled (last)", &oom, LineColor::Warn);
+            push_problem_list(&mut lines, "CrashLoopBackOff", &crashloop, LineColor::Err, st);
+            push_problem_list(&mut lines, "ImagePullBackOff", &imagepull, LineColor::Err, st);
+            push_problem_list(&mut lines, "Pending", &pending, LineColor::Warn, st);
+            push_problem_list(&mut lines, "OOMKilled (last)", &oom, LineColor::Warn, st);
             if !crashloop.is_empty() || !imagepull.is_empty() {
                 DiagStatus::Err
             } else if !pending.is_empty() || !oom.is_empty() {
@@ -1165,14 +1172,20 @@ async fn check_problem_pods(client: &Client, state: &SharedDiagnostic, run_id: u
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-fn push_problem_list(lines: &mut Vec<(LineColor, String)>, label: &str, items: &[String], color: LineColor) {
+fn push_problem_list(
+    lines: &mut Vec<(LineColor, String)>,
+    label: &str,
+    items: &[String],
+    color: LineColor,
+    st: &'static Strings,
+) {
     if items.is_empty() {
         return;
     }
@@ -1183,7 +1196,7 @@ fn push_problem_list(lines: &mut Vec<(LineColor, String)>, label: &str, items: &
     if items.len() > 8 {
         lines.push((
             LineColor::Dim,
-            fill(active().diag_more_items, &[("n", &(items.len() - 8).to_string())]),
+            fill(st.diag_more_items, &[("n", &(items.len() - 8).to_string())]),
         ));
     }
 }
@@ -1191,11 +1204,11 @@ fn push_problem_list(lines: &mut Vec<(LineColor, String)>, label: &str, items: &
 // Où les replicas des workloads multi-replica ont atterri. La règle est dans `spread.rs` — ce qui
 // compte comme mal réparti, et ce que le template avait demandé — et cette étape ne fait que rendre
 // ses constats. Un cluster mono-node n'en produit aucun : il n'y a rien à répartir.
-async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_spread,
+        st.diag_step_spread,
         "kubectl get deploy,sts,rs,pods,nodes -A -o wide",
     ) else {
         return;
@@ -1208,7 +1221,7 @@ async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id:
             lines.push((
                 if findings.is_empty() { LineColor::Ok } else { LineColor::Warn },
                 fill(
-                    active().diag_spread_summary,
+                    st.diag_spread_summary,
                     &[
                         ("workloads", &spread.examined.to_string()),
                         ("concentrated", &spread.concentrations().to_string()),
@@ -1217,14 +1230,14 @@ async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id:
                 ),
             ));
             if !spread.nodes_readable {
-                lines.push((LineColor::Info, active().diag_spread_nodes_unreadable.to_string()));
+                lines.push((LineColor::Info, st.diag_spread_nodes_unreadable.to_string()));
                 status = worse(status, DiagStatus::Info);
             }
             for p in findings.iter().take(8) {
                 lines.push((
                     LineColor::Plain,
                     fill(
-                        active().diag_spread_row,
+                        st.diag_spread_row,
                         &[
                             ("kind", &p.kind),
                             ("ns", &p.namespace),
@@ -1241,20 +1254,20 @@ async fn check_replica_spread(client: &Client, state: &SharedDiagnostic, run_id:
             if findings.len() > 8 {
                 lines.push((
                     LineColor::Dim,
-                    fill(active().diag_spread_more, &[("n", &(findings.len() - 8).to_string())]),
+                    fill(st.diag_spread_more, &[("n", &(findings.len() - 8).to_string())]),
                 ));
             }
             status
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e)])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e)])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(state, run_id, "Persistent Volumes", "kubectl get pv") else {
         return;
     };
@@ -1288,7 +1301,7 @@ async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run
             lines.push((
                 head,
                 fill(
-                    active().diag_pv_summary,
+                    st.diag_pv_summary,
                     &[("n", &list.items.len().to_string()), ("summary", &summary)],
                 ),
             ));
@@ -1302,18 +1315,18 @@ async fn check_persistent_volumes(client: &Client, state: &SharedDiagnostic, run
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_warnings,
+        st.diag_step_warnings,
         "kubectl get events -A --field-selector type=Warning",
     ) else {
         return;
@@ -1337,7 +1350,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
                 } else {
                     LineColor::Warn
                 },
-                fill(active().diag_warning_count, &[("n", &total.to_string())]),
+                fill(st.diag_warning_count, &[("n", &total.to_string())]),
             ));
             let mut sorted: Vec<(String, usize)> = by_reason.into_iter().collect();
             sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -1351,7 +1364,7 @@ async fn check_recent_warnings(client: &Client, state: &SharedDiagnostic, run_id
             }
         }
         Err(e) => {
-            lines.push((LineColor::Err, fill(active().diag_error, &[("e", &e.to_string())])));
+            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
             DiagStatus::Err
         }
     };
@@ -1407,8 +1420,8 @@ fn push_reflector_hints(
     }
 }
 
-async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_storage, "kubectl get pvc,pv,sc -A") else {
+async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_storage, "kubectl get pvc,pv,sc -A") else {
         return;
     };
     let store = new_storage_state();
@@ -1416,7 +1429,7 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = store.lock().expect("storage poisoned");
     let mut lines = Vec::new();
     let status = if let Some(e) = &s.error {
-        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        lines.push((LineColor::Err, fill(st.diag_error, &[("e", e)])));
         DiagStatus::Err
     } else {
         let mut status = DiagStatus::Ok;
@@ -1424,7 +1437,7 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
         lines.push((
             LineColor::Info,
             fill(
-                active().diag_storage_summary,
+                st.diag_storage_summary,
                 &[
                     ("pvcs", &s.pvcs.len().to_string()),
                     ("pvs", &s.pvs.len().to_string()),
@@ -1437,7 +1450,7 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             lines.push((
                 LineColor::Warn,
                 fill(
-                    active().diag_storage_released,
+                    st.diag_storage_released,
                     &[("size", &crate::events::format_memory_bytes(s.released_bytes))],
                 ),
             ));
@@ -1449,7 +1462,7 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
         if pending > 6 {
             lines.push((
                 LineColor::Dim,
-                fill(active().diag_more_items, &[("n", &(pending - 6).to_string())]),
+                fill(st.diag_more_items, &[("n", &(pending - 6).to_string())]),
             ));
         }
         if pending > 0 {
@@ -1461,8 +1474,8 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_capacity, "kubectl get nodes,resourcequota -A") else {
+async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_capacity, "kubectl get nodes,resourcequota -A") else {
         return;
     };
     let cap = new_capacity_state();
@@ -1470,7 +1483,7 @@ async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
     let s = cap.lock().expect("capacity poisoned");
     let mut lines = Vec::new();
     let status = if let Some(e) = &s.error {
-        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        lines.push((LineColor::Err, fill(st.diag_error, &[("e", e)])));
         DiagStatus::Err
     } else {
         let mut status = DiagStatus::Info;
@@ -1478,7 +1491,7 @@ async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
         lines.push((
             if tight > 0 { LineColor::Warn } else { LineColor::Info },
             fill(
-                active().diag_capacity_summary,
+                st.diag_capacity_summary,
                 &[("nodes", &s.nodes.len().to_string()), ("quotas", &tight.to_string())],
             ),
         ));
@@ -1495,11 +1508,11 @@ async fn check_capacity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_flux,
+        st.diag_step_flux,
         "kubectl get kustomizations,helmreleases,gitrepositories -A",
     ) else {
         return;
@@ -1509,7 +1522,7 @@ async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = fx.lock().expect("flux poisoned");
     let mut lines = Vec::new();
     let status = if s.resources.is_empty() {
-        lines.push((LineColor::Info, active().diag_flux_absent.into()));
+        lines.push((LineColor::Info, st.diag_flux_absent.into()));
         DiagStatus::Info
     } else {
         let (ready, failed, unknown, suspended, reconciling) = s.counts();
@@ -1522,7 +1535,7 @@ async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 LineColor::Ok
             },
             fill(
-                active().diag_flux_summary,
+                st.diag_flux_summary,
                 &[
                     ("total", &s.resources.len().to_string()),
                     ("failed", &failed.to_string()),
@@ -1549,8 +1562,8 @@ async fn check_flux(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_certs, "kubectl get certificates -A") else {
+async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_certs, "kubectl get certificates -A") else {
         return;
     };
     let cs = new_certs_state();
@@ -1558,7 +1571,7 @@ async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u
     let s = cs.lock().expect("certs poisoned");
     let mut lines = Vec::new();
     let status = if !s.installed {
-        lines.push((LineColor::Info, active().diag_certs_absent.into()));
+        lines.push((LineColor::Info, st.diag_certs_absent.into()));
         DiagStatus::Info
     } else {
         let (total, ready, failed, inflight, expiring) = s.counts();
@@ -1571,7 +1584,7 @@ async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u
                 LineColor::Ok
             },
             fill(
-                active().diag_certs_summary,
+                st.diag_certs_summary,
                 &[
                     ("total", &total.to_string()),
                     ("failed", &failed.to_string()),
@@ -1603,8 +1616,8 @@ async fn check_cert_manager(client: &Client, state: &SharedDiagnostic, run_id: u
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_kyverno, "kubectl get clusterpolicies,polr -A") else {
+async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_kyverno, "kubectl get clusterpolicies,polr -A") else {
         return;
     };
     let ky = new_kyverno_state();
@@ -1612,7 +1625,7 @@ async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = ky.lock().expect("kyverno poisoned");
     let mut lines = Vec::new();
     let status = if !s.installed {
-        lines.push((LineColor::Info, active().diag_kyverno_absent.into()));
+        lines.push((LineColor::Info, st.diag_kyverno_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Ok;
@@ -1624,7 +1637,7 @@ async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 LineColor::Ok
             },
             fill(
-                active().diag_kyverno_summary,
+                st.diag_kyverno_summary,
                 &[
                     ("policies", &policies.to_string()),
                     ("enforcing", &enforcing.to_string()),
@@ -1639,18 +1652,18 @@ async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             status = worse(status, DiagStatus::Warn);
         }
         if !s.health.controllers_ok() {
-            lines.push((LineColor::Err, active().diag_kyverno_ctrl_down.into()));
+            lines.push((LineColor::Err, st.diag_kyverno_ctrl_down.into()));
             status = worse(status, DiagStatus::Err);
         }
         if s.health.silently_inactive() {
-            lines.push((LineColor::Warn, active().diag_kyverno_silent.into()));
+            lines.push((LineColor::Warn, st.diag_kyverno_silent.into()));
             status = worse(status, DiagStatus::Warn);
         }
         if s.backlog.stuck() > 0 {
             lines.push((
                 if s.backlog.has_pileup() { LineColor::Err } else { LineColor::Warn },
                 fill(
-                    active().diag_kyverno_backlog,
+                    st.diag_kyverno_backlog,
                     &[
                         ("stuck", &s.backlog.stuck().to_string()),
                         ("pending", &s.backlog.pending.to_string()),
@@ -1660,12 +1673,12 @@ async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             ));
             status = worse(status, if s.backlog.has_pileup() { DiagStatus::Err } else { DiagStatus::Warn });
             if let Some(age) = &s.backlog.oldest_stuck {
-                lines.push((LineColor::Dim, fill(active().diag_kyverno_oldest, &[("age", age)])));
+                lines.push((LineColor::Dim, fill(st.diag_kyverno_oldest, &[("age", age)])));
             }
         } else if s.backlog.known {
             lines.push((
                 LineColor::Ok,
-                fill(active().diag_kyverno_ur_ok, &[("total", &s.backlog.total.to_string())]),
+                fill(st.diag_kyverno_ur_ok, &[("total", &s.backlog.total.to_string())]),
             ));
         }
         status
@@ -1673,8 +1686,8 @@ async fn check_kyverno(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_velero, "kubectl get backups,schedules -A") else {
+async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_velero, "kubectl get backups,schedules -A") else {
         return;
     };
     let vel = new_velero_state();
@@ -1682,7 +1695,7 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = vel.lock().expect("velero poisoned");
     let mut lines = Vec::new();
     let status = if !s.installed {
-        lines.push((LineColor::Info, active().diag_velero_absent.into()));
+        lines.push((LineColor::Info, st.diag_velero_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Info;
@@ -1690,7 +1703,7 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
         lines.push((
             if problems > 0 { LineColor::Warn } else { LineColor::Ok },
             fill(
-                active().diag_velero_summary,
+                st.diag_velero_summary,
                 &[
                     ("schedules", &s.schedules.len().to_string()),
                     ("backups", &s.backups.len().to_string()),
@@ -1700,7 +1713,7 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
             ),
         ));
         if !s.server.running() {
-            lines.push((LineColor::Err, active().diag_velero_server_down.into()));
+            lines.push((LineColor::Err, st.diag_velero_server_down.into()));
             status = worse(status, DiagStatus::Err);
         }
         match s.last_success {
@@ -1708,11 +1721,11 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 let now = chrono::Utc::now().timestamp();
                 lines.push((
                     LineColor::Ok,
-                    fill(active().diag_velero_last_success, &[("age", &age_of(ts, now))]),
+                    fill(st.diag_velero_last_success, &[("age", &age_of(ts, now))]),
                 ));
             }
             None => {
-                lines.push((LineColor::Warn, active().diag_velero_no_success.into()));
+                lines.push((LineColor::Warn, st.diag_velero_no_success.into()));
                 status = worse(status, DiagStatus::Warn);
             }
         }
@@ -1723,7 +1736,7 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
         if !s.uncovered.is_empty() {
             lines.push((
                 LineColor::Warn,
-                fill(active().diag_velero_uncovered, &[("n", &s.uncovered.len().to_string())]),
+                fill(st.diag_velero_uncovered, &[("n", &s.uncovered.len().to_string())]),
             ));
             status = worse(status, DiagStatus::Warn);
         }
@@ -1735,8 +1748,8 @@ async fn check_velero(client: &Client, state: &SharedDiagnostic, run_id: u64) {
 
 // Cassandra's own question, which no other step asks: is anything restorable. A cluster whose
 // schedules all fire on time and whose runs all fail reads as healthy everywhere else.
-async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_k8ssandra, "kubectl get k8ssandraclusters,medusabackupjobs -A") else {
+async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_k8ssandra, "kubectl get k8ssandraclusters,medusabackupjobs -A") else {
         return;
     };
     let k8c = new_k8c_state();
@@ -1745,7 +1758,7 @@ async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64)
     let mut lines = Vec::new();
     let status = if !s.installed {
         // Absence is never a fault: most clusters do not run k8ssandra.
-        lines.push((LineColor::Info, active().diag_k8ssandra_absent.into()));
+        lines.push((LineColor::Info, st.diag_k8ssandra_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Info;
@@ -1753,7 +1766,7 @@ async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64)
         lines.push((
             if problems > 0 { LineColor::Warn } else { LineColor::Ok },
             fill(
-                active().diag_k8ssandra_summary,
+                st.diag_k8ssandra_summary,
                 &[
                     ("clusters", &s.clusters.len().to_string()),
                     ("nodes", &s.nodes.len().to_string()),
@@ -1767,12 +1780,12 @@ async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64)
                 let now = chrono::Utc::now().timestamp();
                 lines.push((
                     LineColor::Ok,
-                    fill(active().diag_k8ssandra_last_backup, &[("age", &age_of(ts, now))]),
+                    fill(st.diag_k8ssandra_last_backup, &[("age", &age_of(ts, now))]),
                 ));
             }
             // Not a warning: a database with no restore point is the worst state this step can find.
             None if !s.schedules.is_empty() => {
-                lines.push((LineColor::Err, active().diag_k8ssandra_no_backup.into()));
+                lines.push((LineColor::Err, st.diag_k8ssandra_no_backup.into()));
                 status = worse(status, DiagStatus::Err);
             }
             None => {}
@@ -1801,8 +1814,8 @@ async fn check_k8ssandra(client: &Client, state: &SharedDiagnostic, run_id: u64)
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_reflector, "kubectl get deploy -A -l app.kubernetes.io/name=reflector") else {
+async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_reflector, "kubectl get deploy -A -l app.kubernetes.io/name=reflector") else {
         return;
     };
     let refl = new_reflector_state();
@@ -1810,7 +1823,7 @@ async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64)
     let s = refl.lock().expect("reflector poisoned");
     let mut lines = Vec::new();
     let status = if s.controller_present == Some(false) && s.sources.is_empty() && s.orphans.is_empty() {
-        lines.push((LineColor::Info, active().diag_reflector_absent.into()));
+        lines.push((LineColor::Info, st.diag_reflector_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Info;
@@ -1818,7 +1831,7 @@ async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64)
         lines.push((
             if problems > 0 { LineColor::Warn } else { LineColor::Ok },
             fill(
-                active().diag_reflector_summary,
+                st.diag_reflector_summary,
                 &[
                     ("sources", &sources.to_string()),
                     ("mirrors", &mirrors.to_string()),
@@ -1832,8 +1845,8 @@ async fn check_reflector(client: &Client, state: &SharedDiagnostic, run_id: u64)
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_argocd, "kubectl get applications.argoproj.io -A") else {
+async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_argocd, "kubectl get applications.argoproj.io -A") else {
         return;
     };
     let argo = new_argo_state();
@@ -1841,7 +1854,7 @@ async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = argo.lock().expect("argocd poisoned");
     let mut lines = Vec::new();
     let status = if !s.server.present {
-        lines.push((LineColor::Info, active().diag_argocd_absent.into()));
+        lines.push((LineColor::Info, st.diag_argocd_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Info;
@@ -1857,7 +1870,7 @@ async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 LineColor::Ok
             },
             fill(
-                active().diag_argocd_summary,
+                st.diag_argocd_summary,
                 &[
                     ("apps", &s.apps.len().to_string()),
                     ("oos", &oos.to_string()),
@@ -1901,22 +1914,31 @@ async fn check_argocd(client: &Client, state: &SharedDiagnostic, run_id: u64) {
 //
 // The finding worth the step is the one nothing else surfaces: a group nobody bound. Its members
 // authenticate and then get 403 everywhere, and every object involved reconciles perfectly.
-async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) {
+async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
     let Some(idx) = push_step(
         state,
         run_id,
-        active().diag_step_identity,
+        st.diag_step_identity,
         "kubectl get kdtusers,kdtgroups",
     ) else {
         return;
     };
-    let ident = new_identity_state();
-    fetch_identity(client.clone(), ident.clone()).await;
-    let s = ident.lock().expect("identity poisoned");
+    // `identity_inventory` rather than `fetch_identity`: the language is this run's, not the
+    // process global, so a server answering two people at once does not write one of them the
+    // other's sentences.
+    let s = crate::identity::identity_inventory(client, st).await;
+    // The portal is read only where it carries requests. In `certificate` and `oidc` its
+    // availability is a web page's, and reporting it here would say a cluster is broken because a
+    // page is down.
+    let proxy = if s.installed && s.delivery.on_request_path() {
+        crate::identity::proxy_availability(client).await
+    } else {
+        None
+    };
     let mut lines = Vec::new();
     let status = if !s.installed {
         // Absence is not a problem to report: most clusters have no local accounts at all.
-        lines.push((LineColor::Info, active().diag_identity_absent.into()));
+        lines.push((LineColor::Info, st.diag_identity_absent.into()));
         DiagStatus::Info
     } else {
         let mut status = DiagStatus::Info;
@@ -1925,7 +1947,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
         lines.push((
             if unbound > 0 { LineColor::Warn } else { LineColor::Ok },
             fill(
-                active().diag_identity_summary,
+                st.diag_identity_summary,
                 &[
                     ("users", &s.users.len().to_string()),
                     ("active", &s.active_users().to_string()),
@@ -1937,7 +1959,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
         if locked > 0 {
             lines.push((
                 LineColor::Warn,
-                fill(active().diag_identity_locked, &[("n", &locked.to_string())]),
+                fill(st.diag_identity_locked, &[("n", &locked.to_string())]),
             ));
             status = worse(status, DiagStatus::Warn);
         }
@@ -1945,7 +1967,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             lines.push((
                 LineColor::Warn,
                 fill(
-                    active().diag_identity_unbound,
+                    st.diag_identity_unbound,
                     &[("group", &g.name), ("subject", &g.effective_subject())],
                 ),
             ));
@@ -1955,7 +1977,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
             lines.push((
                 LineColor::Warn,
                 fill(
-                    active().diag_identity_unknown,
+                    st.diag_identity_unknown,
                     &[("group", &g.name), ("members", &g.unknown.join(", "))],
                 ),
             ));
@@ -1973,7 +1995,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
         if !stuck.is_empty() {
             lines.push((
                 LineColor::Warn,
-                fill(active().diag_identity_stuck_sessions, &[("users", &stuck.join(", "))]),
+                fill(st.diag_identity_stuck_sessions, &[("users", &stuck.join(", "))]),
             ));
             status = worse(status, DiagStatus::Warn);
         }
@@ -1994,7 +2016,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 LineColor::Info,
                 match s.federation.resync() {
                     Some(resync) => fill(
-                        active().diag_identity_federated,
+                        st.diag_identity_federated,
                         &[
                             ("mode", mode.label()),
                             ("source", source),
@@ -2004,7 +2026,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                         ],
                     ),
                     None => fill(
-                        active().diag_identity_federated_no_resync,
+                        st.diag_identity_federated_no_resync,
                         &[
                             ("mode", mode.label()),
                             ("source", source),
@@ -2027,7 +2049,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 lines.push((
                     LineColor::Warn,
                     fill(
-                        active().diag_identity_local_in_federated,
+                        st.diag_identity_local_in_federated,
                         &[("mode", mode.label()), ("users", &orphans.join(", "))],
                     ),
                 ));
@@ -2049,7 +2071,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 lines.push((
                     LineColor::Warn,
                     fill(
-                        active().diag_identity_unmapped,
+                        st.diag_identity_unmapped,
                         &[("setting", setting), ("groups", &unmapped.join(", "))],
                     ),
                 ));
@@ -2066,7 +2088,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 lines.push((
                     LineColor::Warn,
                     fill(
-                        active().diag_identity_mapped_not_federated,
+                        st.diag_identity_mapped_not_federated,
                         &[("setting", setting), ("groups", &untouched.join(", "))],
                     ),
                 ));
@@ -2078,7 +2100,7 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
                 lines.push((
                     LineColor::Info,
                     fill(
-                        active().diag_identity_mapped_missing,
+                        st.diag_identity_mapped_missing,
                         &[("groups", &missing.join(", "))],
                     ),
                 ));
@@ -2088,15 +2110,160 @@ async fn check_identity(client: &Client, state: &SharedDiagnostic, run_id: u64) 
         // it is the chart's default and a deliberate trade, not a fault — but it is the fact that
         // decides whether "sessions closed" means the person is actually out.
         if s.delivery.download_open() {
-            lines.push((LineColor::Info, active().diag_identity_download.into()));
+            lines.push((LineColor::Info, st.diag_identity_download.into()));
+        }
+
+        // The delivery axis, always stated — it is the one fact that turns "I revoked them" into a
+        // delay an operator can act on, and it is nowhere on any object. The window comes from
+        // `revocation_window()` so the source is never guessed here: `proxy.cacheTtl` in `proxy`,
+        // the TTL of what was issued in the other two.
+        match s.delivery.mode {
+            None => lines.push((LineColor::Dim, st.diag_identity_mode_absent.into())),
+            Some(crate::identity::CredentialMode::Proxy) => {
+                lines.push((
+                    LineColor::Info,
+                    match s.delivery.revocation_window() {
+                        Some(window) => {
+                            fill(st.diag_identity_mode_proxy, &[("window", window)])
+                        }
+                        None => st.diag_identity_mode_proxy_no_ttl.to_string(),
+                    },
+                ));
+            }
+            Some(mode) => {
+                lines.push((
+                    LineColor::Info,
+                    match s.delivery.revocation_window() {
+                        Some(window) => fill(
+                            st.diag_identity_mode_issued,
+                            &[("mode", mode.label()), ("window", window)],
+                        ),
+                        None => fill(
+                            st.diag_identity_mode_issued_no_ttl,
+                            &[("mode", mode.label())],
+                        ),
+                    },
+                ));
+            }
+        }
+
+        // What `proxy` costs, and it is the whole reason the mode is checked apart: kdt-identity
+        // is then on the path of every `kubectl` run with a handed-out kubeconfig. Nothing on any
+        // object says that a portal outage is a cluster outage *for those people* — the cluster
+        // itself keeps answering, which is precisely what makes it hard to find.
+        if s.delivery.on_request_path() {
+            match proxy {
+                None => lines.push((
+                    LineColor::Dim,
+                    fill(
+                        st.diag_identity_proxy_unreadable,
+                        &[("sel", crate::identity::PORTAL_SELECTOR)],
+                    ),
+                )),
+                Some(p) if p.down() => {
+                    lines.push((LineColor::Err, st.diag_identity_proxy_down.into()));
+                    status = worse(status, DiagStatus::Err);
+                }
+                Some(p) => {
+                    if p.degraded() {
+                        lines.push((
+                            LineColor::Warn,
+                            fill(
+                                st.diag_identity_proxy_degraded,
+                                &[
+                                    ("ready", &p.ready.to_string()),
+                                    ("desired", &p.desired.to_string()),
+                                ],
+                            ),
+                        ));
+                        status = worse(status, DiagStatus::Warn);
+                    } else {
+                        lines.push((
+                            LineColor::Ok,
+                            fill(
+                                st.diag_identity_proxy_path,
+                                &[
+                                    ("ready", &p.ready.to_string()),
+                                    ("desired", &p.desired.to_string()),
+                                ],
+                            ),
+                        ));
+                    }
+                    // The chart's own default, and harmless in the other two modes — there, a
+                    // portal that is down is a web page nobody can open. Here it is `kubectl`.
+                    if p.single() {
+                        lines.push((LineColor::Warn, st.diag_identity_proxy_single.into()));
+                        status = worse(status, DiagStatus::Warn);
+                    }
+                }
+            }
+
+            // Where the files point, when both halves are declared. Said rather than left to be
+            // read off a kubeconfig someone would have to download first.
+            if let Some(server) = s.delivery.proxy_server() {
+                lines.push((
+                    LineColor::Info,
+                    fill(st.diag_identity_proxy_server, &[("server", &server)]),
+                ));
+            }
+            // A pinned CA is a deliberate choice with one consequence worth naming: the day the
+            // proxy's certificate is renewed under another authority, every file handed out so far
+            // stops verifying at once, and nothing in the cluster reports it.
+            if s.delivery.proxy_ca_pinned {
+                lines.push((LineColor::Info, st.diag_identity_proxy_ca.into()));
+            }
+            // What is live right now through those files. Info, not a warning: in `proxy` they are
+            // revocable, and that is the point of the mode rather than an exposure.
+            let holders = s
+                .users
+                .iter()
+                .filter(|u| u.sessions.as_ref().is_some_and(|x| x.kubeconfig > 0))
+                .count();
+            let kubeconfigs: usize = s
+                .users
+                .iter()
+                .filter_map(|u| u.sessions.as_ref().map(|x| x.kubeconfig))
+                .sum();
+            if kubeconfigs > 0 {
+                lines.push((
+                    LineColor::Info,
+                    fill(
+                        st.diag_identity_proxy_kubeconfigs,
+                        &[
+                            ("n", &kubeconfigs.to_string()),
+                            ("users", &holders.to_string()),
+                        ],
+                    ),
+                ));
+            }
+        } else if let Some(mode) = s.delivery.mode {
+            // The mirror image, and the reason the count is read in both branches: a deployment
+            // moved off `proxy` leaves these tokens behind, still counted and opening nothing.
+            let orphaned: usize = s
+                .users
+                .iter()
+                .filter_map(|u| u.sessions.as_ref().map(|x| x.kubeconfig))
+                .sum();
+            if orphaned > 0 {
+                // Info, like the row hint `identity` already writes for the same finding. The two
+                // interfaces must not weigh the same fact differently — a tighter verdict here
+                // would make the diagnostic and the directory disagree about one deployment.
+                lines.push((
+                    LineColor::Info,
+                    fill(
+                        st.diag_identity_kubeconfig_orphan,
+                        &[("n", &orphaned.to_string()), ("mode", mode.label())],
+                    ),
+                ));
+            }
         }
         status
     };
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64) {
-    let Some(idx) = push_step(state, run_id, active().diag_step_rbac, "kubectl get clusterrolebindings,rolebindings -A") else {
+async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
+    let Some(idx) = push_step(state, run_id, st.diag_step_rbac, "kubectl get clusterrolebindings,rolebindings -A") else {
         return;
     };
     let rb = new_rbac_state();
@@ -2104,7 +2271,7 @@ async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     let s = rb.lock().expect("rbac poisoned");
     let mut lines = Vec::new();
     let status = if let Some(e) = &s.error {
-        lines.push((LineColor::Err, fill(active().diag_error, &[("e", e)])));
+        lines.push((LineColor::Err, fill(st.diag_error, &[("e", e)])));
         DiagStatus::Err
     } else {
         let crit = s.bindings.iter().filter(|b| b.severity == Severity::Critical).count();
@@ -2118,7 +2285,7 @@ async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64) {
                 LineColor::Ok
             },
             fill(
-                active().diag_rbac_summary,
+                st.diag_rbac_summary,
                 &[
                     ("bindings", &s.bindings.len().to_string()),
                     ("roles", &s.roles.len().to_string()),
@@ -2149,13 +2316,41 @@ async fn check_rbac(client: &Client, state: &SharedDiagnostic, run_id: u64) {
     finish_step(state, run_id, idx, status, lines);
 }
 
+/// The placeholder record the diagnostic hands to the AI pipeline, which keys everything off an
+/// `EventRecord`.
+///
+/// It lives here rather than in the TUI because both interfaces send the same thing: the analysis
+/// is of a cluster, not of an object, and the record only carries which cluster and when.
+pub fn synthetic_diagnostic_record(cluster: &str, st: &'static Strings) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: format!(
+            "diagnostic-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: "ClusterDiagnostic".to_string(),
+        api_version: "kdt/v1".to_string(),
+        kind: "Diagnostic".to_string(),
+        namespace: String::new(),
+        name: cluster.to_string(),
+        message: st.msg_diagnostic_record.to_string(),
+        component: "kdt".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 // Flatten the diagnostic steps into a plain-text block suitable for the AI prompt or clipboard.
-pub fn format_diagnostic_for_ai(state: &DiagnosticState) -> String {
+pub fn format_diagnostic_for_ai(state: &DiagnosticState, st: &'static Strings) -> String {
     let mut out = String::new();
-    out.push_str(active().diag_ai_header);
+    out.push_str(st.diag_ai_header);
     if let Some(ms) = state.elapsed_ms {
         out.push_str(&fill(
-            active().diag_ai_duration,
+            st.diag_ai_duration,
             &[("ms", &ms.to_string()), ("n", &state.steps.len().to_string())],
         ));
     }

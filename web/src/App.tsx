@@ -20,6 +20,7 @@ import VeleroView from "./VeleroView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
+import DiagnosticView from "./DiagnosticView";
 import { AiSettings, openAiSettings, useAiSettingsOpen } from "./ai";
 import { useDismiss } from "./dismiss";
 import { storedLang, storeLang, strings, type Lang, type Strings } from "./i18n";
@@ -41,7 +42,8 @@ type ViewId =
   | "rancher"
   | "kyverno"
   | "rbac"
-  | "velero";
+  | "velero"
+  | "diagnostic";
 
 /**
  * Les vues, dans l'ordre du rail.
@@ -76,7 +78,7 @@ const VIEWS: Array<{
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
   { id: "netpol", label: "NetPol", key: "p", ready: true },
-  { id: "diagnostic", label: "Diagnostic", key: "d" },
+  { id: "diagnostic", label: "Diagnostic", key: "d", ready: true },
 ];
 
 export default function App() {
@@ -340,7 +342,9 @@ export default function App() {
           ? st.ranchScopeless
           : view === "kyverno"
             ? st.kyScopeless
-            : st.fluxScopeless;
+            : view === "diagnostic"
+              ? st.diagScopeless
+              : st.fluxScopeless;
 
   return (
     <div className="app">
@@ -647,6 +651,10 @@ export default function App() {
               onPanelOpen={setPanelOpen}
               onNeedsAuth={onNeedsAuth}
             />
+          ) : view === "diagnostic" ? (
+            // Ni portée, ni panneau d'inspection : le diagnostic ne liste pas des objets, il
+            // déroule une séquence. Le seul geste est `i`, et il vise la séquence entière.
+            <DiagnosticView lang={lang} st={st} query={query} onNeedsAuth={onNeedsAuth} />
           ) : view === "flux" ? (
             <FluxView
               lang={lang}

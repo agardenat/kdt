@@ -26,6 +26,8 @@ import type {
   SecretsPayload,
   SecretValue,
   DeletePreflight,
+  DiagDone,
+  DiagStep,
   EditDiff,
   EditPreflight,
   IdentityPayload,
@@ -657,11 +659,35 @@ export function aiConfig(): Promise<AiConfigPayload> {
  * rassembler), `delta` (un morceau de la réponse), `error`, `done`.
  */
 export function aiAnalyze(
-  body: { record: EventRecord; provider: AiProviderChoice; lang: Lang },
+  body: {
+    record: EventRecord;
+    provider: AiProviderChoice;
+    lang: Lang;
+    /** Ce que la vue a déjà lu et que l'enrichissement ne retrouverait pas — le diagnostic, dont
+     *  le serveur ne garde rien entre deux requêtes. Inséré en tête des sections du prompt. */
+    extra?: Array<{ title: string; text: string }>;
+  },
   on: (event: { type: string; data: Record<string, string> }) => void,
   signal: AbortSignal,
 ): Promise<void> {
   return postStream("/api/v1/ai/analyze", body, on, signal);
+}
+
+/**
+ * Le diagnostic du cluster, étape par étape — le `D` de kdt.
+ *
+ * Vingt-cinq étapes en lecture seule, dont certaines lisent des logs de pods : la séquence dure, et
+ * chaque étape part dès qu'elle est née puis de nouveau quand son verdict tombe. Une seule réponse
+ * à la fin laisserait la page devant un sablier alors que le TUI, lui, remplit sa liste.
+ *
+ * Les évènements : `step` puis `done`.
+ */
+export function diagnostic(
+  lang: Lang,
+  on: (event: { type: string; data: DiagStep & DiagDone }) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  return postStream("/api/v1/diagnostic", { lang }, on, signal);
 }
 
 /**

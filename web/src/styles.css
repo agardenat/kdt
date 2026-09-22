@@ -1381,3 +1381,76 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
    container de kube-system qui touche sa limite mémoire est exactement ce qu'on veut voir rouge. */
 .tbody .tr.nd-system .cell.mono,
 .tbody .tr.nd-system .cell.id { color: var(--dim); }
+
+/* --------------------------------------------------------------- le diagnostic
+
+   Une séquence, pas une table : chaque étape est un bloc — pastille, titre, commande — suivi de
+   ses constats. La pastille porte le glyphe que le TUI dessine (`✓ ! ✗ i …`) plutôt qu'une
+   couleur seule : une couleur ne se lit pas pour qui ne la distingue pas, et le glyphe vient du
+   serveur, donc les deux interfaces disent le même mot. */
+.diag {
+  padding: .5rem .85rem 1.2rem;
+  overflow: auto;
+  height: 100%;
+}
+
+.diag-step {
+  border-left: 3px solid var(--line);
+  padding: .3rem 0 .45rem .7rem;
+  margin-bottom: .55rem;
+}
+/* Seules les deux étapes qui demandent quelque chose teintent leur bord. `info` et `ok` gardent le
+   trait neutre : un constat qui ne demande rien n'a pas à attirer l'œil autant qu'un refus. */
+.diag-step.warn { border-left-color: var(--warn); }
+.diag-step.err { border-left-color: var(--err); }
+.diag-step.running { border-left-color: var(--accent); }
+
+.diag-hd {
+  display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap;
+}
+.diag-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 1.35rem; padding: 0 .25rem; border-radius: 4px;
+  font-family: var(--mono); font-size: var(--fs-micro); font-weight: 600;
+  color: var(--bg);
+}
+.diag-badge.ok { background: var(--ok); }
+.diag-badge.info { background: var(--info); }
+.diag-badge.warn { background: var(--warn); }
+.diag-badge.err { background: var(--err); }
+.diag-badge.running { background: var(--dim); }
+
+.diag-title { font-size: var(--fs-base); font-weight: 600; color: var(--fg); }
+/* La commande `kubectl` équivalente : elle dit ce qui a été lu, donc sur quoi un refus RBAC
+   portait, et elle se recopie telle quelle dans un terminal. */
+.diag-cmd {
+  font-family: var(--mono); font-size: var(--fs-sm); color: var(--muted);
+  user-select: all;
+}
+
+.diag-lines {
+  margin-top: .25rem;
+  font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.55;
+}
+/* `plain` n'est pas un ton : c'est du texte ordinaire, et lui donner une couleur inventerait un
+   verdict que le serveur n'a pas posé. */
+.diag-line { white-space: pre-wrap; word-break: break-word; color: var(--fg); }
+.diag-line.ok { color: var(--ok); }
+.diag-line.warn { color: var(--warn); }
+.diag-line.err { color: var(--err); }
+.diag-line.info { color: var(--info); }
+.diag-line.dim { color: var(--dim); }
+
+/* L'état de la séquence, dans le décompte du bandeau. */
+.tally .chip {
+  border: 1px solid currentColor; border-radius: 999px;
+  padding: 0 .4rem; font-size: var(--fs-micro);
+}
+.tally .chip.ok { color: var(--ok); }
+.tally .chip.warn { color: var(--warn); }
+.tally .chip.err { color: var(--err); }
+.tally .chip.info { color: var(--info); }
+
+/* Un bouton de barre qui retient un choix — « Warn et Err seulement ». Le même traitement que
+   `[aria-expanded]` ailleurs : l'état se voit, il ne se devine pas au libellé. */
+.panel-toggle.on { color: var(--accent); border-color: var(--accent); }

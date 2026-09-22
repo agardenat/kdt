@@ -42,6 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
 use kube::api::{Api, DynamicObject, ListParams};
@@ -81,6 +82,17 @@ pub const CONTROLLER_SELECTOR: &str =
     "app.kubernetes.io/name=kdt-identity,app.kubernetes.io/component=controller";
 /// The container the chart declares. Read off the pod when present rather than assumed.
 const CONTROLLER_CONTAINER: &str = "controller";
+/// The other half of the chart. It serves the portal — and, in `proxy`, the `/k8s` mount every
+/// `kubectl` of every handed-out kubeconfig goes through.
+///
+/// Only the name, because the chart puts `app.kubernetes.io/component` on the **pod template and
+/// the selector**, never on the Deployment's own metadata. Asking the apiserver for
+/// `component=portal` therefore matches no Deployment at all — on a cluster that has one. Which
+/// half is which is read from `spec.selector` instead, where the chart does write it.
+pub const PORTAL_SELECTOR: &str = "app.kubernetes.io/name=kdt-identity";
+/// The label whose value tells the two Deployments apart, read off their selector.
+const LABEL_COMPONENT: &str = "app.kubernetes.io/component";
+const COMPONENT_PORTAL: &str = "portal";
 /// Absolute, because the image is `FROM scratch`: it has neither a shell nor a `PATH`.
 const SERVER_BIN: &str = "/usr/local/bin/kdt-identity-server";
 
@@ -996,6 +1008,80 @@ pub fn is_group_subject(kind: &str, name: &str) -> bool {
 /// from the chart's own labels, and the caller only names the account.
 pub async fn controller_ref(client: &Client) -> Option<ControllerRef> {
     find_controller(client).await.map(|(c, ..)| c)
+}
+
+/// What the portal Deployment declares and what it actually has.
+///
+/// Only asked in `proxy`, where it answers a question no other object does: the portal is then on
+/// the request path of every `kubectl` run with a handed-out kubeconfig, so its own availability is
+/// the availability of the cluster *for those people*. In the other two modes what it serves is a
+/// web page, and a page being down is not an outage of `kubectl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct ProxyAvailability {
+    /// `spec.replicas`, summed over the Deployments the selector matches — one, in every chart
+    /// install. Zero is a deployment scaled to nothing, which is not the same as one that is down.
+    pub desired: i32,
+    /// `status.readyReplicas`, which is what is actually answering.
+    pub ready: i32,
+}
+
+impl ProxyAvailability {
+    /// Nothing is answering. In `proxy` that is a refusal for every `kubectl`, and the cluster
+    /// itself is fine — which is exactly why it has to be said here rather than left to be found.
+    pub fn down(&self) -> bool {
+        self.ready == 0 && self.desired > 0
+    }
+
+    /// Some are answering and some are not. Requests land or not depending on which endpoint the
+    /// Service picks.
+    pub fn degraded(&self) -> bool {
+        self.ready > 0 && self.ready < self.desired
+    }
+
+    /// One replica, which the chart ships by default. Every rollout, eviction or node drain then
+    /// takes `kubectl` away from everyone for the length of the swap — a cost the mode has and the
+    /// other two do not.
+    pub fn single(&self) -> bool {
+        self.desired == 1
+    }
+}
+
+/// Whether this Deployment is the portal half of the chart.
+///
+/// Read off `spec.selector`, the only place the chart writes `component`. The Deployment's own
+/// labels say it belongs to kdt-identity, and both halves say exactly that.
+fn is_portal(d: &Deployment) -> bool {
+    d.spec
+        .as_ref()
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .and_then(|l| l.get(LABEL_COMPONENT))
+        .is_some_and(|c| c == COMPONENT_PORTAL)
+}
+
+/// The portal Deployment's replica counts, or `None` when the chart's portal is not found.
+///
+/// `None` is not zero: it says kdt could not read the Deployment — no permission, or a deployment
+/// that does not carry these labels — and claiming an outage from that would be inventing one.
+pub async fn proxy_availability(client: &Client) -> Option<ProxyAvailability> {
+    let deployments: Api<Deployment> = Api::all(client.clone());
+    let list = deployments
+        .list(&ListParams::default().labels(PORTAL_SELECTOR))
+        .await
+        .ok()?;
+
+    let mut out = ProxyAvailability::default();
+    let mut found = false;
+    for d in list.items {
+        if !is_portal(&d) {
+            continue;
+        }
+        found = true;
+        // An absent `spec.replicas` means one, as the apiserver defaults it; an absent
+        // `readyReplicas` means none are ready yet, which the Deployment omits rather than zeroes.
+        out.desired += d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+        out.ready += d.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
+    }
+    found.then_some(out)
 }
 
 async fn find_controller(client: &Client) -> Option<(ControllerRef, Delivery, Federation)> {
@@ -2554,6 +2640,78 @@ mod tests {
         assert_eq!(d.revocation_window(), None, "a window without a mode is a guess");
         assert!(!d.download_open());
         assert!(!d.on_request_path());
+    }
+
+    // The bug this function was born with: the chart writes `app.kubernetes.io/component` on the
+    // pod template and on the selector, and **not** on the Deployment's own labels. A label
+    // selector asking the apiserver for `component=portal` matched no Deployment on a cluster that
+    // had one, and the diagnostic then reported the request path as unreadable.
+    #[test]
+    fn the_portal_half_is_named_by_its_selector_not_by_its_labels() {
+        use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+
+        let half = |component: Option<&str>| {
+            let mut match_labels = std::collections::BTreeMap::new();
+            match_labels.insert("app.kubernetes.io/name".to_string(), "kdt-identity".to_string());
+            if let Some(c) = component {
+                match_labels.insert(LABEL_COMPONENT.to_string(), c.to_string());
+            }
+            Deployment {
+                // What the chart actually puts here: the release labels, and nothing that tells
+                // the two halves apart.
+                metadata: kube::api::ObjectMeta {
+                    labels: Some(
+                        [("app.kubernetes.io/name".to_string(), "kdt-identity".to_string())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+                spec: Some(DeploymentSpec {
+                    selector: LabelSelector {
+                        match_labels: Some(match_labels),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+
+        assert!(is_portal(&half(Some("portal"))));
+        assert!(!is_portal(&half(Some("controller"))));
+        // A Deployment of the chart with no component at all is not the portal by default.
+        assert!(!is_portal(&half(None)));
+    }
+
+    // The three states the portal's replicas put `proxy` in. They are apart from one another
+    // because they are three different pieces of news: nothing answers, something answers and
+    // something does not, and the chart's default — one replica, which works right up to the next
+    // rollout.
+    #[test]
+    fn the_portal_replicas_say_three_different_things_in_proxy() {
+        let down = ProxyAvailability { desired: 2, ready: 0 };
+        assert!(down.down());
+        assert!(!down.degraded());
+
+        let degraded = ProxyAvailability { desired: 3, ready: 1 };
+        assert!(!degraded.down());
+        assert!(degraded.degraded());
+        assert!(!degraded.single());
+
+        let healthy = ProxyAvailability { desired: 2, ready: 2 };
+        assert!(!healthy.down() && !healthy.degraded() && !healthy.single());
+
+        // The chart's default: it answers, and every rollout takes `kubectl` away meanwhile.
+        let default = ProxyAvailability { desired: 1, ready: 1 };
+        assert!(default.single());
+        assert!(!default.down() && !default.degraded());
+
+        // Scaled to nothing is not an outage: nobody asked for a replica, so none missing.
+        let scaled_down = ProxyAvailability { desired: 0, ready: 0 };
+        assert!(!scaled_down.down(), "no replica wanted is not a replica lost");
+        assert!(!scaled_down.degraded());
     }
 
     // The address a kubeconfig points at is built from two halves, and half of it reaches nothing.

@@ -524,6 +524,17 @@ shows the query and its effect (`/coredns  (3)`).
     despite. A hard rule with more replicas than eligible nodes is reported too: those pods will
     never be placed. Expression-based `nodeAffinity` is not evaluated, and unreadable nodes make it
     describe without judging.
+  - *kdt-identity*: beyond the directory — accounts, groups, bindings, sessions — the step states
+    what the deployment **hands out**, which no object carries. The `credentialMode` and the
+    revocation window that goes with it, read from the right source: the lifetime of what is issued
+    under `certificate` and `oidc`, `proxy.cacheTtl` under `proxy` — reading the token's TTL there
+    would turn thirty seconds into seven days. Under `proxy` comes what the mode costs, and nothing
+    else reports it: kdt-identity is then on the path of **every** `kubectl` run with a handed-out
+    kubeconfig, so the portal's ready replicas carry a verdict — none ready is an error, and the
+    chart's single replica a warning, since every upgrade takes `kubectl` away from everyone for the
+    length of the swap. The address the kubeconfigs point at, the CA they pin if any, and how many
+    are live complete the picture. Outside `proxy`, kubeconfig tokens still counted say the mode was
+    changed under them: they open nothing any more.
 - **Extract** (`X`) — full PDF report of the cluster state into `~/Downloads`.
 - **AI** (`i`) — sends the current context to an OpenAI-compatible API; the answer is streamed (SSE)
   and rendered as it arrives. `L` re-runs it in the other language, `m` switches provider.
@@ -662,10 +673,10 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Fourteen views are
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Fifteen views are
 live — events, workloads, nodes, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates,
-RBAC, Kyverno, identity, Rancher, network policies — along with the five gestures that apply to any
-object: YAML, edit, touch, delete, AI analysis.
+RBAC, Kyverno, identity, Rancher, network policies, diagnostic — along with the five gestures that
+apply to any object: YAML, edit, touch, delete, AI analysis.
 
 **The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age,
 the seven `CPU req/lim/use`, `MEM req/lim/use` and `DISK` rates and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
@@ -675,6 +686,12 @@ writing the most). The three gestures of the `o` menu are there: cordon and unco
 the drain first shows its guard-rails — what would move, what would stay, which budgets will refuse
 — then runs as a live stream. A severe finding asks for the node name to be typed again, and the
 server replays the guard-rails right before it evicts.
+
+**The Diagnostic view** runs the TUI's `D` sequence step by step: each one appears as "…" then
+closes on its verdict, with the equivalent `kubectl` command and the same findings — those of
+`kdt::diagnostic`, computed server-side. A refused step says **you** are not allowed to read it,
+never that there is nothing there. A filter keeps `Warn` and `Err` only, and `i` sends the whole
+diagnostic to the model, not one step.
 
 **Every request carries the credential of the person signed in**: the apiserver sees their name and
 groups, and the cluster's RBAC applies as-is. The pod's service account has no rights on any

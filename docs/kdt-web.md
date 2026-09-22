@@ -358,8 +358,17 @@ Quatre frictions, qui se paient à l'entrée :
    `velero.rs:39`) et deux `Severity` (`rbac.rs:57`, `events.rs:25`) : à unifier **avant**
    d'exposer une API, sans quoi la duplication se fige dans le contrat JSON.
 4. `diagnostic.rs` produit des lignes de texte, pas des données structurées : une API qui les sert
-   telles quelles interdit tout tri ou filtre côté client. À trancher au moment de la vue
-   diagnostic, pas avant.
+   telles quelles interdit tout tri ou filtre côté client. **Tranché à la vue diagnostic** : les
+   lignes restent du texte, et elles gardent ce qui compte — leur `LineColor` et le `DiagStatus` de
+   leur étape. Ce sont les deux seules clés sur lesquelles on voudrait filtrer (« ne montre que ce
+   qui cloche »), et elles sont structurées ; le reste est une phrase, qui se cherche au texte comme
+   le `/` du TUI la cherche. Structurer la phrase aurait refait la signature des vingt-cinq étapes
+   et de leurs constats pour un tri que personne ne demande.
+
+   Ce qui a **effectivement** changé, et qui était le vrai point de friction : `run_diagnostic` et
+   `format_diagnostic_for_ai` prennent maintenant `st: &'static Strings` au lieu de lire
+   `lang::active()`. Le global ne pouvait pas tenir : deux personnes connectées en même temps
+   auraient partagé la langue posée en dernier.
 
 Les écritures (`apply_identity_write`, `apply_rancher_write`, `apply_argo_write`,
 `apply_k8c_write`, `apply_write` velero, `run_scale`, `run_drain`, `set_cordon`, `run_touch`,
@@ -451,6 +460,12 @@ finale le jour venu, section du CHANGELOG comprise ; une pré-version taguée, n
 4. **kdt-web v0**, lecture seule : session, client kube par utilisateur, trois vues sans
    équivalent ailleurs — `diagnostic`, `flux`, `capacity` — branchées sur l'app blanche.
 5. Vues restantes, puis les écritures, puis logs et exec.
+6. **Diagnostic** — la quinzième vue, et la dernière du rail. Elle est à part : elle ne liste pas
+   des objets mais déroule une séquence, donc ni portée, ni panneau d'inspection, ni gestes de
+   ligne. Le flux SSE pousse chaque étape à sa naissance puis à son verdict ; `i` vise le
+   diagnostic entier, et le texte à plat part avec le `done` plutôt que d'être recalculé — le
+   serveur ne garde rien entre deux requêtes, et refaire tourner vingt-cinq étapes pour remplir un
+   prompt coûterait une seconde séquence au cluster.
 
 La chaîne de livraison est en place : `Dockerfile` (musl, `FROM scratch`, avec le
 `LABEL org.opencontainers.image.source`), job `image` dans `release.yml` sur le même tag `v*`, et

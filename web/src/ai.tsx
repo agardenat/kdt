@@ -240,6 +240,15 @@ export function useAiAvailable(): boolean {
 // L'analyse en cours
 // ---------------------------------------------------------------------------
 
+/**
+ * Ce qu'une vue apporte au prompt en plus de ce que le serveur sait retrouver.
+ *
+ * Le diagnostic est le cas qui l'exige : ses vingt-cinq étapes ne vivent nulle part côté serveur,
+ * et les refaire tourner pour remplir un prompt coûterait au cluster une seconde séquence. Inséré
+ * en tête des sections, comme dans le TUI.
+ */
+export type AiExtra = Array<{ title: string; text: string }>;
+
 export interface AnalysisState {
   /** L'objet analysé, tel qu'on le renomme dans l'en-tête. `null` : aucune analyse. */
   key: string | null;
@@ -316,6 +325,7 @@ export function startAnalysis(
   record: EventRecord,
   provider: AiProviderChoice,
   lang: Lang,
+  extra?: AiExtra,
 ): void {
   controller?.abort();
   const key = analysisKey(record);
@@ -338,7 +348,7 @@ export function startAnalysis(
 
   void api
     .aiAnalyze(
-      { record, provider, lang },
+      { record, provider, lang, extra },
       (event) => {
         // Une réponse arrivée après un abandon appartient à une analyse qu'on ne regarde plus.
         if (mine.signal.aborted || state.key !== key) return;
@@ -443,11 +453,14 @@ export function AiPane({
   lang,
   st,
   onNeedsAuth,
+  extra,
 }: {
   record: EventRecord;
   lang: Lang;
   st: Strings;
   onNeedsAuth: (message: string) => void;
+  /** Le contexte que la vue apporte elle-même — le texte du diagnostic, aujourd'hui. */
+  extra?: AiExtra;
 }) {
   const analysis = useAnalysis();
   const config = useAiConfig();
@@ -462,13 +475,13 @@ export function AiPane({
 
   const launch = useCallback(() => {
     if (!choice) return;
-    startAnalysis(record, choice, lang);
-  }, [choice, record, lang]);
+    startAnalysis(record, choice, lang, extra);
+  }, [choice, record, lang, extra]);
 
   // La première ouverture sur une ligne lance l'analyse ; les suivantes la relisent.
   useEffect(() => {
     if (mine || !choice) return;
-    startAnalysis(record, choice, lang);
+    startAnalysis(record, choice, lang, extra);
     // `lang` volontairement hors des dépendances : changer de langue ne relance pas une analyse
     // déjà payée, c'est le bouton qui le fait.
     // eslint-disable-next-line react-hooks/exhaustive-deps

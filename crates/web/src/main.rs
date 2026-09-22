@@ -16,6 +16,7 @@ mod certs;
 mod cluster;
 mod config;
 mod config_secrets;
+mod diagnostic;
 mod flux;
 mod identity;
 mod kyverno;
@@ -230,6 +231,10 @@ async fn main() -> Result<()> {
         // en supprimant la demande en cours.
         .route("/api/v1/certs/renew", post(certs::renew))
         .route("/api/v1/certs/acme-retry", post(certs::acme_retry))
+        // Le `D` de kdt : la séquence fixe d'étapes en lecture seule, poussée au fil de l'eau.
+        // Elle ne porte aucune écriture — `post` parce que la langue voyage dans le corps et que
+        // le navigateur lit le flux à la main, comme pour le drain.
+        .route("/api/v1/diagnostic", post(diagnostic::run))
         // Les gestes de kdt qui portent sur n'importe quel objet — `y`, `e`, `h`, `Ctrl-D`.
         // Ils ne connaissent aucune vue : chaque vue leur passe les coordonnées de sa ligne.
         .route("/api/v1/object/yaml", get(objects::yaml))

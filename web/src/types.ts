@@ -2346,3 +2346,50 @@ export interface DrainDone {
   ok: boolean;
   message: string;
 }
+
+/* ------------------------------------------------------------------- vue Diagnostic */
+
+/**
+ * Le verdict d'une étape, tel que `kdt::diagnostic` le pose.
+ *
+ * `info` n'est pas un demi-`warn` : c'est un constat qui ne demande rien — un add-on absent, un
+ * réglage du déploiement qui décide comment lire le reste. `running` est l'étape en cours.
+ */
+export type DiagStatus = "running" | "ok" | "info" | "warn" | "err";
+
+/** Une ligne de détail d'une étape, avec le ton que le TUI lui donne. */
+export interface DiagLine {
+  tone: LineTone;
+  text: string;
+}
+
+/** Une étape du diagnostic, poussée à sa naissance puis à son verdict. */
+export interface DiagStep {
+  index: number;
+  title: string;
+  /** La commande `kubectl` équivalente, telle que le TUI l'affiche sous le titre. */
+  command: string;
+  status: DiagStatus;
+  /** Le glyphe de la pastille — `✓`, `!`, `✗`, `i`, `…` — rendu par le serveur. */
+  label: string;
+  lines: DiagLine[];
+}
+
+/** Les compteurs de l'en-tête. Une étape encore en cours n'en alimente aucun. */
+export interface DiagCounts {
+  steps: number;
+  ok: number;
+  info: number;
+  warn: number;
+  err: number;
+}
+
+/** Ce que le `done` du flux porte : la durée, les compteurs, et de quoi lancer une analyse. */
+export interface DiagDone {
+  elapsed_ms: number | null;
+  counts: DiagCounts;
+  /** L'enregistrement synthétique que `i` vise : le cluster, pas un objet. */
+  record: EventRecord;
+  /** Le diagnostic mis à plat, tel qu'il part au modèle en tête des sections. */
+  ai_text: string;
+}
