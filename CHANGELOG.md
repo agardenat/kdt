@@ -8,6 +8,41 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.13] — 2026-09-22
+
+- **feat(web)** — la vue **Diagnostic**, quinzième et dernière du rail. Elle déroule la séquence
+  du `D` du TUI — les vingt-cinq étapes, dans le même ordre, avec les mêmes verdicts — et chaque
+  étape arrive au fil de l'eau : elle apparaît en « … » puis se referme sur son statut, avec la
+  commande `kubectl` équivalente et ses constats. Le flux est du SSE, comme le drain : une
+  séquence qui lit les logs de plusieurs pods dure, et une seule réponse à la fin aurait laissé le
+  navigateur devant un sablier alors que la liste du TUI, elle, se remplit. Un filtre ne garde que
+  `Warn` et `Err`, le champ de recherche cherche dans les titres, les commandes et les constats, et
+  `i` envoie le diagnostic entier au modèle plutôt qu'une étape — le texte à plat voyage avec la
+  fin du flux, le serveur ne gardant rien entre deux requêtes.
+
+- **feat(diagnostic)** — l'étape kdt-identity dit désormais ce que le déploiement **remet**, ce
+  qu'aucun objet du cluster ne porte : le `credentialMode` et la fenêtre de révocation qui va avec,
+  lue à la bonne source — la durée de ce qui est émis en `certificate` et `oidc`, `proxy.cacheTtl`
+  en `proxy`, où y lire le TTL du jeton ferait de trente secondes sept jours.
+
+  En `proxy` s'ajoute ce que le mode coûte, et que rien ne signale ailleurs : kdt-identity est sur
+  le chemin de **chaque** `kubectl` lancé avec un kubeconfig remis. Les replicas prêts du portail
+  y valent donc verdict — aucun prêt est une erreur (tous ces `kubectl` échouent alors que le
+  cluster, lui, répond), une partie seulement un avertissement, et le replica unique que le chart
+  installe par défaut un avertissement aussi, puisque chaque mise à jour, éviction ou drain coupe
+  `kubectl` pour tout le monde le temps du remplacement. S'y ajoutent l'adresse que visent les
+  kubeconfig, la CA qu'ils épinglent le cas échéant — un renouvellement par une autre autorité les
+  invaliderait tous d'un coup — et le nombre de ceux qui sont en cours. Hors `proxy`, des jetons de
+  kubeconfig encore comptés disent que le mode a changé sous eux : ils n'ouvrent plus rien, et qui
+  en détient un reçoit un refus sans explication — rapporté en Info, comme le constat que la vue
+  `:identity` pose déjà sur la ligne, pour que les deux ne pèsent pas le même fait différemment.
+
+- **refactor(diagnostic)** — `run_diagnostic` et `format_diagnostic_for_ai` prennent la table de
+  chaînes en argument au lieu de lire `lang::active()`. Le global convenait à un TUI, qui n'a
+  qu'une langue à la fois ; un serveur répond à plusieurs personnes dont rien ne dit qu'elles
+  lisent la même, et elles auraient partagé celle posée en dernier. Dans le TUI, la langue est
+  fixée au lancement de la séquence — ce qu'elle était déjà en pratique.
+
 ## [2.0.0-rc.12] — 2026-09-22
 
 - **fix(web)** — le texte de kdt-web se lit. Quatre causes se cumulaient, et aucune seule
