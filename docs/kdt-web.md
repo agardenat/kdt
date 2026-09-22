@@ -22,6 +22,7 @@ le premier client. kdt-web en serait le second :
 | `POST /api/v1/session` | `user` + `password` + `totp`, **ou** `user` + `refreshToken` | `token` (quelques secondes), `subject` (`kdt:alice`), `groups`, `mode`, et un `refreshToken` de 7 j à la seule authentification par mot de passe |
 | `POST /api/v1/credentials` | `token` + CSR PEM | certificat PEM + `expiresAt` (10 min) |
 | `POST /api/v1/token` | `token` | `idToken` + `expiresAt` (5 min), mode OIDC seulement |
+| `POST /api/v1/proxy` | `token` | jeton + `server` (`<portail>/k8s/<cluster>`) + `expiresAt` (10 min), mode proxy seulement — kdt-identity 1.5.0 |
 | `POST /api/v1/revoke` | `user` + `refreshToken` | ferme la session |
 
 Les types sont dans `kdt-identity-api` (`crates/api/src/portal.rs`), qui compile **sans la feature
@@ -31,7 +32,8 @@ image commune ni un protocole à réinventer. `crates/cli/src/main.rs` est l'imp
 référence du flux.
 
 Le montage : session web → credential utilisateur court → `kube::Config` (certificat client et
-clé, ou jeton bearer en mode OIDC) → `connect::build(config)`, déjà écrit dans `src/connect.rs` →
+clé, jeton bearer en mode OIDC, ou jeton et adresse du proxy en mode proxy — où le `cluster_url`
+n'est plus celui du pod) → `connect::build(config)`, déjà écrit dans `src/connect.rs` →
 **un `kube::Client` par session**. `kube::Client` est `Clone`, et tous les `fetch_*` de kdt le
 prennent en argument : rien à changer dans les modules métier.
 
@@ -42,7 +44,8 @@ Trois conséquences :
   service account du pod kdt-web n'a besoin d'aucun droit sur les ressources.
 - **La révocation couvre l'interface web.** `kdt-identity-server revoke` et `spec.disabled`
   coupent le renouvellement : l'accès web s'arrête au renouvellement suivant, soit 10 min au plus
-  en mode certificat et 5 min en OIDC.
+  en mode certificat et 5 min en OIDC. En mode proxy, elle ne l'attend pas — le jeton est vérifié
+  à chaque requête, et l'accès tombe sous `proxy.cacheTtl`, 30 s par défaut.
 - **Le portail devient une dépendance de disponibilité** de kdt-web, comme il l'est déjà des
   postes de travail. Deux répliques au moins, et un accès de secours qui ne dépende pas de
   kdt-identity.
