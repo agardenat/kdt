@@ -8,6 +8,13 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.11] — 2026-09-22
+
+- **fix(web)** — `/healthz` reste servi **à la racine** quand kdt-web est servi sous un chemin.
+  En rc.10 il partait sous le chemin avec le reste : la sonde du kubelet, qui frappe le pod
+  directement et ne connaît pas l'adresse publique, recevait un 404 et le pod était tué en
+  boucle. La sonde répond désormais aux deux endroits.
+
 ## [2.0.0-rc.10] — 2026-09-22
 
 - **feat(web)** — kdt-web ouvre ses sessions face à un portail en **mode `proxy`**. Jusqu'ici il ne

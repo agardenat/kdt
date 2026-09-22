@@ -280,10 +280,17 @@ async fn main() -> Result<()> {
             // sur l'adresse que les gens tapent le plus naturellement.
             let with_slash = format!("{base}/");
             let target = base.to_string();
-            Router::new().nest(base, app).route(
-                &with_slash,
-                get(|| async move { axum::response::Redirect::permanent(&target) }),
-            )
+            Router::new()
+                .nest(base, app)
+                .route(
+                    &with_slash,
+                    get(|| async move { axum::response::Redirect::permanent(&target) }),
+                )
+                // La sonde reste à la racine, en plus de sa place sous le chemin : le kubelet
+                // frappe le pod directement et n'a aucune raison de connaître l'adresse publique.
+                // L'y déplacer ferait échouer la sonde de tout déploiement existant, et le pod
+                // serait tué en boucle sans que rien ne soit cassé.
+                .route("/healthz", get(|| async { "ok" }))
         }
     };
 
