@@ -310,7 +310,7 @@ export interface Identity {
   /** Identité vue par l'apiserver, préfixe compris. */
   subject: string;
   groups: string[];
-  /** Ce que le cluster remet : `certificate` ou `oidc`. */
+  /** Ce que le cluster remet : `proxy`, `certificate` ou `oidc`. */
   mode: string;
 }
 

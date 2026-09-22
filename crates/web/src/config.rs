@@ -96,6 +96,26 @@ impl WebConfig {
         format!("{}{}", self.web_url, kdt_identity_api::portal::AUTHORIZE_CALLBACK_PATH)
     }
 
+    /// Le chemin sous lequel kdt-web est servi, déduit de sa racine publique.
+    ///
+    /// Vide à la racine d'un hôte, le cas ordinaire. `/web` quand kdt-web partage l'hôte du
+    /// portail — un seul nom à publier, un seul certificat. Déduit plutôt que déclaré : le
+    /// portail n'accepte déjà que `<web_url>/auth/callback`, et une seconde valeur à tenir
+    /// d'accord avec la première finirait par en diverger.
+    ///
+    /// Jamais de barre oblique finale : c'est ce qu'attendent le `nest` d'axum et l'attribut
+    /// `Path` d'un cookie, pour qui `/web` couvre `/web` **et** ce qui est dessous.
+    pub fn base_path(&self) -> &str {
+        let start = match self.web_url.find("://") {
+            Some(i) => i + 3,
+            None => 0,
+        };
+        match self.web_url[start..].find('/') {
+            None => "",
+            Some(i) => &self.web_url[start + i..],
+        }
+    }
+
     fn validated(self) -> Result<Self, ConfigError> {
         // Le cookie de session porte `Secure` : sur http, le navigateur ne le renverrait pas, et
         // l'application serait inutilisable sans que rien ne dise pourquoi. La boucle locale fait
@@ -113,6 +133,48 @@ impl WebConfig {
             ));
         }
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(web_url: &str) -> WebConfig {
+        WebConfig {
+            web_url: web_url.trim_end_matches('/').to_string(),
+            portal_url: "https://kdt.example.com".to_string(),
+            listen: "0.0.0.0:8080".to_string(),
+            cluster_name: None,
+            assets: None,
+            session_key: None,
+            session_ttl: Duration::from_secs(3600),
+            ai_providers: AiProviders(Vec::new()),
+            ai_allow_custom: true,
+        }
+    }
+
+    #[test]
+    fn a_la_racine_d_un_hote_le_chemin_est_vide() {
+        assert_eq!(config("https://kdt.example.com").base_path(), "");
+        assert_eq!(config("https://kdt.example.com/").base_path(), "");
+        assert_eq!(config("http://127.0.0.1:8080").base_path(), "");
+    }
+
+    #[test]
+    fn sous_un_chemin_il_est_rendu_sans_barre_finale() {
+        assert_eq!(config("https://kdt.example.com/web").base_path(), "/web");
+        assert_eq!(config("https://kdt.example.com/web/").base_path(), "/web");
+        assert_eq!(config("https://kdt.example.com/a/b").base_path(), "/a/b");
+    }
+
+    /// L'adresse de retour est la seule que le portail accepte : elle doit porter le chemin.
+    #[test]
+    fn l_adresse_de_retour_reste_sous_le_chemin() {
+        assert_eq!(
+            config("https://kdt.example.com/web").redirect_uri(),
+            "https://kdt.example.com/web/auth/callback"
+        );
     }
 }
 

@@ -65,12 +65,13 @@ pub async fn callback(
     };
 
     info!(subject = %subject, "session ouverte");
+    let base = state.config.base_path();
     (
         [(
             header::SET_COOKIE,
-            cookie(&id, state.sessions.ttl().as_secs() as i64),
+            cookie(&id, state.sessions.ttl().as_secs() as i64, base),
         )],
-        Redirect::to("/"),
+        Redirect::to(&format!("{base}/")),
     )
         .into_response()
 }
@@ -90,9 +91,10 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
             info!(subject = %session.subject, "session fermée");
         }
     }
+    let base = state.config.base_path();
     (
-        [(header::SET_COOKIE, cookie("", 0))],
-        Redirect::to("/"),
+        [(header::SET_COOKIE, cookie("", 0, base))],
+        Redirect::to(&format!("{base}/")),
     )
         .into_response()
 }
@@ -138,8 +140,13 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
 /// `HttpOnly` le rend invisible au JavaScript de la page, `Secure` interdit le transport en
 /// clair, `SameSite=Strict` empêche qu'un autre site déclenche une requête authentifiée. Les
 /// mêmes attributs que le portail, pour les mêmes raisons.
-fn cookie(id: &str, max_age: i64) -> String {
-    format!("{COOKIE}={id}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+///
+/// Le `Path` est celui sous lequel kdt-web est servi : à la racine il vaut `/`, et sous un
+/// chemin il s'y borne — un cookie posé pour `/` partirait aussi vers le portail, qui partage
+/// alors l'hôte et n'a rien à faire de celui-ci.
+fn cookie(id: &str, max_age: i64, base: &str) -> String {
+    let path = if base.is_empty() { "/" } else { base };
+    format!("{COOKIE}={id}; Path={path}; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
 }
 
 fn refused(message: &str) -> Response {
@@ -156,15 +163,22 @@ mod tests {
 
     #[test]
     fn le_cookie_porte_toutes_ses_protections() {
-        let c = cookie("abc", 3600);
+        let c = cookie("abc", 3600, "");
         for attribut in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
             assert!(c.contains(attribut), "{attribut} manquant : {c}");
         }
     }
 
+    /// Sous un chemin, le cookie s'y borne — et sans barre finale, sans quoi il ne reviendrait
+    /// pas sur `/web` lui-même.
+    #[test]
+    fn sous_un_chemin_le_cookie_s_y_borne() {
+        assert!(cookie("abc", 3600, "/web").contains("Path=/web;"));
+    }
+
     #[test]
     fn la_deconnexion_expire_le_cookie() {
-        assert!(cookie("", 0).contains("Max-Age=0"));
+        assert!(cookie("", 0, "").contains("Max-Age=0"));
     }
 
     #[test]

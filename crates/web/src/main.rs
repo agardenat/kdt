@@ -34,6 +34,7 @@ mod workloads;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::handler::HandlerWithoutStateExt;
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
@@ -149,6 +150,9 @@ async fn main() -> Result<()> {
         cluster_label,
     };
 
+    let base = state.config.base_path().to_string();
+    let base = base.as_str();
+
     let mut app = Router::new()
         .route("/auth/login", get(auth::login))
         .route(
@@ -242,9 +246,17 @@ async fn main() -> Result<()> {
     // Le bundle est servi par le même serveur que l'API, sous la même origine : le cookie de
     // session est `SameSite=Strict`, et une origine séparée pour le front ne le recevrait pas.
     if let Some(dir) = &config.assets {
-        let index = format!("{dir}/index.html");
+        let page = index_html(dir, base)?;
+        let page = move || {
+            let page = page.clone();
+            async move { axum::response::Html(page) }
+        };
         app = app.fallback_service(
             tower_http::services::ServeDir::new(dir)
+                // La page vient du fallback ci-dessous, jamais du disque : c'est là qu'elle
+                // reçoit sa racine. Servie telle quelle pour `/`, elle chercherait ses assets
+                // là où le déploiement ne les a pas mis.
+                .append_index_html_on_directories(false)
                 // Une SPA a des routes que le disque ne connaît pas : `/events` n'est pas un
                 // fichier. Tout ce qui n'existe pas retombe sur la page, qui saura quoi faire.
                 //
@@ -252,11 +264,28 @@ async fn main() -> Result<()> {
                 // Le navigateur afficherait tout de même l'interface, mais chaque lien profond
                 // serait annoncé comme une page manquante — à la supervision, à un cache, et à
                 // qui lit les journaux de l'ingress.
-                .fallback(tower_http::services::ServeFile::new(index)),
+                .fallback(page.into_service()),
         );
     }
 
     let app = app.with_state(state);
+
+    // Tout ce qui précède est écrit à la racine, et déplacé d'un bloc si kdt-web est servi sous
+    // un chemin : axum retire le préfixe avant de router, donc rien d'autre n'a à le connaître.
+    let app = match base {
+        "" => app,
+        base => {
+            // `/web/` n'est attrapé ni par les routes imbriquées ni par le joker du fallback,
+            // qui exige au moins un segment derrière lui. Le renvoyer sur `/web` évite un 404
+            // sur l'adresse que les gens tapent le plus naturellement.
+            let with_slash = format!("{base}/");
+            let target = base.to_string();
+            Router::new().nest(base, app).route(
+                &with_slash,
+                get(|| async move { axum::response::Redirect::permanent(&target) }),
+            )
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -269,6 +298,27 @@ async fn main() -> Result<()> {
         .context("service HTTP")?;
 
     Ok(())
+}
+
+/// La page du front, avec la racine des liens qu'elle porte.
+///
+/// Le bundle est construit une fois et déployé n'importe où : ses liens sont relatifs, et c'est
+/// `<base href>` qui leur donne leur racine au moment de servir. Sans cela, une page servie sous
+/// `/web` irait chercher ses assets à la racine de l'hôte — c'est-à-dire chez le portail.
+///
+/// Injectée ici plutôt que dans le bundle parce que le chemin n'est connu qu'au déploiement, et
+/// qu'une image par chemin serait une image par cluster.
+fn index_html(dir: &str, base: &str) -> Result<String> {
+    let path = format!("{dir}/index.html");
+    let page = std::fs::read_to_string(&path).with_context(|| format!("lecture de {path}"))?;
+
+    let tag = format!("<base href=\"{base}/\">");
+    match page.split_once("<head>") {
+        Some((avant, apres)) => Ok(format!("{avant}<head>\n    {tag}{apres}")),
+        // Une page sans `<head>` n'est pas celle qu'on croit : le dire plutôt que servir une
+        // interface dont tous les liens seraient faux, ce qui se verrait beaucoup plus tard.
+        None => Err(anyhow::anyhow!("{path} ne contient pas de <head>")),
+    }
 }
 
 /// Arrêt propre sur SIGTERM et Ctrl-C.

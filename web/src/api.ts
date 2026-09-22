@@ -63,8 +63,20 @@ export class NeedsAuth extends Error {}
 /** Le serveur a refusé, et la raison mérite d'être lue — un refus RBAC, par exemple. */
 export class ApiError extends Error {}
 
+/**
+ * L'adresse d'un chemin, sous la racine où kdt-web est servi.
+ *
+ * Le bundle est construit une fois et déployé n'importe où : à la racine d'un hôte, ou sous un
+ * chemin quand kdt-web partage celui du portail. Le serveur pose un `<base href>` dans la page,
+ * et tout ce qui est relatif s'y rattache — c'est la seule chose que le front ait à connaître de
+ * son déploiement.
+ */
+function url(path: string): string {
+  return new URL(path.replace(/^\//, ""), document.baseURI).toString();
+}
+
 async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(url(path), {
     headers: { accept: "application/json" },
     // Le cookie de session est `SameSite=Strict` et l'API est sur la même origine : rien à
     // ajouter, mais on le dit pour que personne ne le retire par erreur.
@@ -89,7 +101,7 @@ async function get<T>(path: string): Promise<T> {
 
 /** Même traitement des refus que `get`, pour un corps posté. */
 async function send<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(url(path), {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
     credentials: "same-origin",
@@ -209,13 +221,13 @@ export function configmaps(namespace: string): Promise<{ configmaps: ConfigMapRo
 
 /** Envoie le navigateur ouvrir une session. Le portail fait le reste. */
 export function login(): void {
-  window.location.href = "/auth/login";
+  window.location.href = url("/auth/login");
 }
 
 /** Ferme la session ici et le droit de session côté portail. */
 export async function logout(): Promise<void> {
-  await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
-  window.location.href = "/";
+  await fetch(url("/auth/logout"), { method: "POST", credentials: "same-origin" });
+  window.location.href = document.baseURI;
 }
 
 export function related(record: EventRecord): Promise<{ sections: RelatedSection[] }> {
@@ -665,7 +677,7 @@ async function postStream<T>(
   on: (event: { type: string; data: T }) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(path, {
+  const response = await fetch(url(path), {
     method: "POST",
     headers: { "content-type": "application/json", accept: "text/event-stream" },
     credentials: "same-origin",

@@ -8,6 +8,27 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.10] — 2026-09-22
+
+- **feat(web)** — kdt-web ouvre ses sessions face à un portail en **mode `proxy`**. Jusqu'ici il ne
+  savait demander qu'un certificat ou un jeton OIDC : sur un déploiement en proxy — le défaut de
+  kdt-identity depuis 1.4 — la connexion échouait, le mode annoncé par le portail n'étant même pas
+  un mot qu'il comprenait. Il demande désormais son accès sur `/api/v1/proxy` (kdt-identity 1.5.0)
+  et parle au cluster à travers le proxy, sous l'identité de la personne connectée comme dans les
+  autres modes.
+
+  Deux propriétés viennent avec le mode, et elles valent mieux que ce qu'elles remplacent : les
+  groupes sont relus à chaque requête, donc un retrait s'applique tout de suite, et `revoke` coupe
+  l'accès de kdt-web sous `proxy.cacheTtl` — un certificat de dix minutes le laissait travailler
+  jusqu'à son expiration.
+
+- **feat(web)** — kdt-web se sert **sous un chemin**, pour partager l'hôte du portail : un seul nom
+  à publier, un seul certificat. `webUrl: https://kdt.example.com/web` suffit — routes, assets et
+  cookie s'y bornent, et le chart pose `ingress.path` en accord, qu'il refuse de laisser diverger.
+  La page reçoit sa racine à l'instant d'être servie, par un `<base href>` : le bundle reste
+  construit une fois et déployé n'importe où, là où une base figée à la compilation aurait demandé
+  une image par chemin.
+
 ## [2.0.0-rc.9] — 2026-09-21
 
 - **feat(identity)** — `:identity` lit le **mode `proxy`** de kdt-identity 1.4, qui en est le

@@ -137,12 +137,52 @@ async fn build_credential(
             config.auth_info.token = Some(secrecy::SecretString::from(issued.id_token));
             parse_time(&issued.expires_at)?
         }
+        CredentialMode::Proxy => {
+            let issued = portal.proxy(&session.token).await?;
+
+            // Le cluster n'est plus celui du pod : les requêtes vont au proxy, qui les relaie en
+            // impersonation. Tout ce qui décrivait l'apiserver doit partir avec — l'identité du
+            // service account, qui ne vaut rien ici et que le proxy écarterait, et la CA du
+            // cluster, qui n'a pas émis le certificat public du proxy. Sans autorité déclarée,
+            // c'est le magasin de l'image qui vérifie, comme pour les appels au portail.
+            config.cluster_url = issued
+                .server
+                .parse()
+                .with_context(|| format!("adresse du proxy {:?}", issued.server))?;
+            config.auth_info = kube::config::AuthInfo {
+                token: Some(secrecy::SecretString::from(issued.token)),
+                ..Default::default()
+            };
+            config.root_cert = match &issued.certificate_authority {
+                None => None,
+                Some(pem) => Some(der_certificates(pem)?),
+            };
+
+            parse_time(&issued.expires_at)?
+        }
     };
 
     let client = kdt::connect::build(config)
         .map_err(|e| anyhow!("construction du client : {e}"))?;
 
     Ok(Credential { expires_at, client })
+}
+
+/// Les certificats d'un PEM, en DER — la forme que `kube::Config` attend pour une autorité.
+///
+/// Le PEM peut en porter plusieurs : une autorité intermédiaire et sa racine voyagent ensemble,
+/// et n'en garder qu'un casserait la chaîne.
+fn der_certificates(pem: &str) -> Result<Vec<Vec<u8>>> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let certificates = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("autorité du proxy illisible")?;
+    if certificates.is_empty() {
+        return Err(anyhow!("l'autorité du proxy ne contient aucun certificat"));
+    }
+    Ok(certificates.into_iter().map(|der| der.to_vec()).collect())
 }
 
 /// Le sujet, tel que le portail l'a annoncé, reconstruit par le constructeur validant.

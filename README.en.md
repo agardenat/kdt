@@ -681,7 +681,8 @@ groups, and the cluster's RBAC applies as-is. The pod's service account has no r
 resource, and the chart installs neither Role nor ClusterRole.
 
 Two prerequisites, without which nobody can sign in: kdt-identity **1.1.0 or later**, which carries
-the authorization flow, and its chart's `webUrl` value set to the public address of kdt-web.
+the authorization flow — **1.5.0 or later** under `credentialMode: proxy`, which hands an
+application its proxy access — and its chart's `webUrl` value set to the public address of kdt-web.
 
 ```bash
 helm repo add kdt https://agardenat.github.io/helm-charts
@@ -719,6 +720,21 @@ Two ways to declare a provider, side by side:
 An endpoint named by a browser makes the **pod** issue an outbound request: kdt-web requires `https`
 and refuses loopback, private and link-local addresses. A name that resolves inside the cluster
 would pass — that is the residual risk `allowCustom: false` removes.
+
+**Under the portal's own host.** `webUrl` may carry a path, and kdt-web then serves itself below
+it — routes, assets and cookie all stay there, with nothing else to declare:
+
+```bash
+helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
+    --set webUrl=https://kdt.example.com/web \
+    --set portalUrl=https://kdt.example.com \
+    --set ingress.enabled=true --set ingress.host=kdt.example.com --set ingress.path=/web
+```
+
+One name to publish, one certificate. The chart refuses an `ingress.path` that is not `webUrl`'s.
+Two Ingress resources sharing a host may need something from the controller — NGINX Ingress
+Controller's *mergeable* resources, a `VirtualServer` elsewhere: that is settled on its side, not
+in the chart.
 
 Image: `ghcr.io/agardenat/kdt-web:<version>`. The chart refuses what could not work — a plaintext
 `webUrl`, an ingress without TLS, a second replica — because the session cookie is `Secure` and

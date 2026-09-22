@@ -690,8 +690,9 @@ ses groupes, et le RBAC du cluster s'applique tel quel. Le compte de service du 
 sur les ressources, et le chart n'installe ni Role ni ClusterRole.
 
 Deux prérequis, sans lesquels personne ne peut se connecter : kdt-identity **1.1.0 ou plus**, qui
-porte le flow d'autorisation, et la valeur `webUrl` renseignée dans son chart avec l'adresse
-publique de kdt-web.
+porte le flow d'autorisation — **1.5.0 ou plus** en `credentialMode: proxy`, qui remet un accès de
+proxy à une application — et la valeur `webUrl` renseignée dans son chart avec l'adresse publique
+de kdt-web.
 
 ```bash
 helm repo add kdt https://agardenat.github.io/helm-charts
@@ -729,6 +730,21 @@ Deux façons de déclarer un fournisseur, qui coexistent :
 Un endpoint nommé par un navigateur fait émettre une requête sortante **au pod** : kdt-web exige
 `https` et refuse les adresses de bouclage, privées et de lien-local. Un nom qui résout vers
 l'intérieur du cluster passerait, lui — c'est le risque résiduel que `allowCustom: false` retire.
+
+**Sous le même hôte que le portail.** `webUrl` peut porter un chemin, et kdt-web se sert alors
+dessous — routes, assets et cookie s'y bornent, sans rien d'autre à déclarer :
+
+```bash
+helm upgrade --install kdt-web kdt/kdt-web -n kdt-web --create-namespace \
+    --set webUrl=https://kdt.example.com/web \
+    --set portalUrl=https://kdt.example.com \
+    --set ingress.enabled=true --set ingress.host=kdt.example.com --set ingress.path=/web
+```
+
+Un seul nom à publier, un seul certificat. Le chart refuse un `ingress.path` qui ne serait pas
+celui de `webUrl`. Deux Ingress qui se partagent un hôte peuvent demander quelque chose au
+contrôleur — les ressources *mergeable* de NGINX Ingress Controller, une `VirtualServer` ailleurs :
+c'est de son côté que ça se règle, pas du chart.
 
 Image : `ghcr.io/agardenat/kdt-web:<version>`. Le chart refuse ce qui ne pourrait pas fonctionner —
 une `webUrl` en clair, un ingress sans TLS, une seconde réplique — parce que le cookie de session

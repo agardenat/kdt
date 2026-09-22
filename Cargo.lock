@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "kdt"
-version = "2.0.0-rc.9"
+version = "2.0.0-rc.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -2418,8 +2418,8 @@ dependencies = [
 
 [[package]]
 name = "kdt-identity-api"
-version = "1.0.0"
-source = "git+https://github.com/agardenat/kdt-identity?rev=cf89d012ca083ab39137164051a1fbd4e9737571#cf89d012ca083ab39137164051a1fbd4e9737571"
+version = "1.5.0"
+source = "git+https://github.com/agardenat/kdt-identity?rev=39d07e663b125119c5b74f59a4803de6b940941b#39d07e663b125119c5b74f59a4803de6b940941b"
 dependencies = [
  "chrono",
  "der",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "kdt-web"
-version = "2.0.0-rc.9"
+version = "2.0.0-rc.10"
 dependencies = [
  "anyhow",
  "axum",

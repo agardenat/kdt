@@ -7,6 +7,11 @@
 # https est exigé : le cookie de session porte `Secure`, et un navigateur ne le renverrait
 # jamais sur du HTTP. La boucle locale fait exception, c'est le seul chemin praticable derrière
 # un port-forward.
+#
+# Elle peut porter un chemin — `https://kdt.example.com/web` — et kdt-web se sert alors dessous :
+# routes, assets et cookie s'y bornent, sans rien d'autre à déclarer. C'est ce qui permet de
+# partager l'hôte du portail : un seul nom, un seul certificat. `ingress.path` ci-dessous doit
+# alors porter le même chemin.
 webUrl: ""
 
 # Racine du portail kdt-identity, telle que kdt-web l'atteint — et telle que le navigateur
@@ -51,6 +56,10 @@ ingress:
   className: ""
   annotations: {}
   host: ""
+  # Chemin servi, à tenir d'accord avec celui de `webUrl` : le rendu refuse s'ils divergent,
+  # parce qu'un ingress qui route ce que l'application ne sert pas donne un 404 que rien
+  # n'explique.
+  path: /
   tls:
     enabled: true
     secretName: ""

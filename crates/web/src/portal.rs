@@ -7,9 +7,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use kdt_identity_api::portal::{
-    AuthorizeTokenRequest, CredentialRequest, CredentialResponse, SessionRequest, SessionResponse,
-    TokenRequest, TokenResponse, AUTHORIZE_PATH, AUTHORIZE_TOKEN_PATH, CREDENTIAL_PATH,
-    REVOKE_PATH, SESSION_PATH, TOKEN_PATH, WEB_CLIENT_ID,
+    AuthorizeTokenRequest, CredentialRequest, CredentialResponse, ProxyCredentialRequest,
+    ProxyCredentialResponse, SessionRequest, SessionResponse, TokenRequest, TokenResponse,
+    AUTHORIZE_PATH, AUTHORIZE_TOKEN_PATH, CREDENTIAL_PATH, PROXY_PATH, REVOKE_PATH, SESSION_PATH,
+    TOKEN_PATH, WEB_CLIENT_ID,
 };
 use kdt_identity_api::portal::RevokeRequest;
 
@@ -96,6 +97,17 @@ impl Portal {
             token: token.to_string(),
         };
         self.post(TOKEN_PATH, &request).await
+    }
+
+    /// Demande un accès par le proxy, en mode proxy.
+    ///
+    /// Rien n'est engendré ici, contrairement au mode certificat : l'adresse du cluster vient du
+    /// portail, qui seul sait où son proxy est publié.
+    pub async fn proxy(&self, token: &str) -> Result<ProxyCredentialResponse, PortalError> {
+        let request = ProxyCredentialRequest {
+            token: token.to_string(),
+        };
+        self.post(PROXY_PATH, &request).await
     }
 
     /// Ferme le droit de session. Appelé à la déconnexion : sans cela, le droit vivrait ses sept

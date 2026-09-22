@@ -28,6 +28,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
+  Le chemin sous lequel kdt-web est servi, déduit de `webUrl` — vide à la racine d'un hôte.
+
+  Le serveur fait la même lecture à partir de la même valeur : c'est elle qui décide, et rien
+  d'autre n'est à déclarer. Ici, elle ne sert qu'à vérifier que l'ingress route bien ce que
+  l'application sert.
+*/}}
+{{- define "kdt-web.basePath" -}}
+{{- regexReplaceAll "^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+" .Values.webUrl "" -}}
+{{- end -}}
+
+{{/*
   Refuse une combinaison de valeurs qui produirait un déploiement inerte : kdt-web démarrerait,
   redirigerait vers le portail, et le portail refuserait chaque retour sans que rien ne dise
   pourquoi.
@@ -43,6 +54,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $portal := required "portalUrl est obligatoire : sans portail, personne ne peut se connecter" .Values.portalUrl -}}
 {{- if hasSuffix "/" $portal -}}
 {{- fail "portalUrl ne se termine pas par un /" -}}
+{{- end -}}
+{{- if .Values.ingress.enabled -}}
+{{- $base := include "kdt-web.basePath" . -}}
+{{- $servi := default "/" $base -}}
+{{- $route := default "/" (trimSuffix "/" .Values.ingress.path) -}}
+{{- if ne $route $servi -}}
+{{- fail (printf "ingress.path vaut %q alors que webUrl sert %q : l'ingress routerait ce que l'application ne sert pas, et chaque page répondrait 404 sans que rien ne dise pourquoi" .Values.ingress.path $servi) -}}
+{{- end -}}
 {{- end -}}
 {{- if gt (int .Values.replicas) 1 -}}
 {{- fail "replicas > 1 : les sessions vivent en mémoire du processus, et une requête sur deux tomberait sur la réplique qui ne connaît pas le visiteur" -}}
