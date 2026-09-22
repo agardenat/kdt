@@ -6,6 +6,19 @@ on:
     tags:
       - 'v*'
 
+# L'image des runners Linux est **nommée**, pas `ubuntu-latest`. Le label bascule vers Ubuntu 26
+# le 19 octobre 2026, et une release ne doit pas changer de base de construction au moment où on
+# pose un tag : c'est le pire moment pour découvrir qu'un outil de packaging a bougé. À relever
+# délibérément, en regardant ce que `packaging/` y gagne ou y perd.
+#
+# `macos-latest` n'est pas épinglé pour l'instant : le libellé de la bouteille Homebrew porte le
+# nom de la plateforme, donc changer de runner change ce que la formule publie — un choix qui se
+# fait avec le tap, pas ici.
+#
+# Les actions sont sur leur première version majeure en Node 24 (checkout v5, setup-helm v5,
+# gh-release v3, docker v4/v7). Node 20 est déprécié côté runner depuis septembre 2026 : il était
+# encore forcé sur Node 24, ce qui marchait sans être promis.
+
 jobs:
   # L'image de kdt-web, construite sur le même tag que les binaires : ce qui tourne dans un
   # cluster correspond alors à une version publiée, et non à ce qu'un poste avait sous la main.
@@ -15,16 +28,16 @@ jobs:
   # arm64 sera nécessaire, ce sera par un runner arm natif et un manifeste fusionné, pas par
   # l'émulation.
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -42,7 +55,7 @@ jobs:
           esac
           echo "TAGS=$tags" >> $GITHUB_ENV
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -56,16 +69,16 @@ jobs:
   # copie du dépôt. Une pré-version peut y figurer sans danger — Helm ne retient une version
   # instable que si `--devel` ou un `--version` explicite la demande.
   chart:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
 
       - name: Dépôt de charts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: agardenat/helm-charts
           token: ${{ secrets.CHARTS_TOKEN }}
@@ -109,7 +122,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -149,7 +162,7 @@ jobs:
       - name: Release notes from the CHANGELOG
         run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
           # une v2.0.0-beta.1 serait publiée comme la dernière version stable.
@@ -162,11 +175,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -196,7 +209,7 @@ jobs:
       - name: Release notes from the CHANGELOG
         run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
           # une v2.0.0-beta.1 serait publiée comme la dernière version stable.
@@ -210,7 +223,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   update-homebrew:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-macos, build-linux]
     # La formule du tap est ce que `brew upgrade` suit : une pré-version n'a rien à y faire, elle
     # basculerait tout le monde sur une alpha.
@@ -219,7 +232,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: agardenat/homebrew-kdt
           token: ${{ secrets.COMMITTER_TOKEN }}
