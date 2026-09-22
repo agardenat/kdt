@@ -8,6 +8,33 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0-rc.12] — 2026-09-22
+
+- **fix(web)** — le texte de kdt-web se lit. Quatre causes se cumulaient, et aucune seule
+  n'expliquait tout : le `body` forçait `-webkit-font-smoothing: antialiased`, qui coupe le rendu
+  sous-pixel sous X11 et Wayland et vidait les fûts de leur densité ; IBM Plex Sans, dont la
+  hauteur d'x fait qu'elle se lit plus petite que son corps ; un corps de 13 px avec un plancher à
+  10 px pour les libellés en capitales ; et `--dim`, le ton des en-têtes de colonnes et des
+  raccourcis du rail, à 3,26:1 sur le fond clair. Le lissage est retiré, la fonte sans empattement
+  est désormais Inter, le corps passe à 14 px sur des lignes de 34, et `--dim` repasse au-dessus de
+  4,5:1 dans les deux thèmes.
+
+- **fix(web)** — les polices sont **embarquées dans le bundle** au lieu d'être tirées de
+  fonts.googleapis.com. Une console d'exploitation tourne derrière un proxy d'entreprise ou sur un
+  réseau fermé : la feuille de style ne répondait pas, la page tombait en repli système, et les
+  tailles restaient calées pour une fonte qui n'était pas là. Elles arrivent maintenant par le même
+  serveur que le reste de l'interface.
+
+- **fix(web)** — les colonnes d'une ligne en gras ne se décalent plus de leur en-tête. Les gabarits
+  sont écrits en `ch`, et le `ch` d'une fonte variable se mesure sur la graisse en vigueur : les
+  quatre vues qui mettaient une ligne entière en gras — Workloads, Kyverno, RBAC — élargissaient
+  ainsi leurs propres pistes de 4,5 %, soit 17 px de dérive en bout de table. La graisse se pose
+  désormais sur les cellules, jamais sur la grille.
+
+- **fix(web)** — les tailles de police ne sont plus écrites règle par règle mais viennent de sept
+  jetons `--fs-*`. La densité de l'interface se règle en un endroit, et une vue ne peut plus sortir
+  du barème sans qu'on le voie.
+
 ## [2.0.0-rc.11] — 2026-09-22
 
 - **fix(web)** — `/healthz` reste servi **à la racine** quand kdt-web est servi sous un chemin.
