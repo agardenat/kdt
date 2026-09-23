@@ -10,6 +10,7 @@ import CapacityView from "./CapacityView";
 import CertsView from "./CertsView";
 import EventsView from "./EventsView";
 import FluxView from "./FluxView";
+import HooksView from "./HooksView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
 import NetpolView from "./NetpolView";
@@ -36,6 +37,7 @@ type ViewId =
   | "nodes"
   | "storage"
   | "netpol"
+  | "hooks"
   | "data"
   | "certs"
   | "identity"
@@ -78,6 +80,8 @@ const VIEWS: Array<{
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
   { id: "netpol", label: "NetPol", key: "p", ready: true },
+  // Les quatre kinds sont natifs de tout apiserver : pas de `needs`, la vue répond partout.
+  { id: "hooks", label: "Hooks", key: "h", ready: true },
   { id: "diagnostic", label: "Diagnostic", key: "d", ready: true },
 ];
 
@@ -344,7 +348,9 @@ export default function App() {
             ? st.kyScopeless
             : view === "diagnostic"
               ? st.diagScopeless
-              : st.fluxScopeless;
+              : view === "hooks"
+                ? st.hooksScopeless
+                : st.fluxScopeless;
 
   return (
     <div className="app">
@@ -587,6 +593,17 @@ export default function App() {
               st={st}
               query={query}
               namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "hooks" ? (
+            <HooksView
+              lang={lang}
+              st={st}
+              query={query}
               panelHeight={panelHeight}
               onPanelHeight={setPanelHeight}
               panelOpen={panelOpen}

@@ -2055,6 +2055,190 @@ export interface NetpolPayload {
   error: string | null;
 }
 
+// --- Vue hooks ---------------------------------------------------------------------------------
+
+/** Un constat rédigé par `kdt::hooks`, avec son niveau. Le navigateur le peint, il ne le rejuge pas. */
+export interface HookHint {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/** Où un hook envoie sa requête. `url` est hors cluster, `local` est l'apiserver lui-même. */
+export type HookBackend =
+  | { kind: "service"; namespace: string; name: string; path: string; port: number }
+  | { kind: "url"; url: string }
+  | { kind: "local" };
+
+/**
+ * L'état **observé** du backend.
+ *
+ * `unchecked` n'est pas une panne : c'est « je n'ai pas pu demander ». La vue le dit tel quel et ne
+ * le peint jamais en rouge — inventer une panne pousserait quelqu'un à supprimer un contrôle
+ * d'admission qui fonctionne.
+ */
+export type HookReach =
+  | "ready"
+  | "no-endpoints"
+  | "service-gone"
+  | "namespace-gone"
+  | "not-ours"
+  | "unchecked";
+
+export type HookCaBundle =
+  | { state: "absent"; injector: string | null }
+  | { state: "parsed"; bytes: number; certs: HookCaCert[] }
+  | { state: "opaque"; bytes: number };
+
+export interface HookCaCert {
+  subject_cn: string;
+  issuer_cn: string;
+  not_before: string;
+  not_after: string;
+  days_remaining: number;
+  is_ca: boolean;
+  self_signed: boolean;
+}
+
+export interface HookRuleScope {
+  api_groups: string[];
+  api_versions: string[];
+  resources: string[];
+  operations: string[];
+  scope: string;
+}
+
+export interface HookSelector {
+  /** Vide quand le sélecteur est absent, ce qui en admission veut dire « tout ». */
+  summary: string;
+  matches_everything: boolean;
+  excludes_system: boolean;
+}
+
+/**
+ * Un webhook d'admission — une entrée **nommée** de `webhooks[]`, pas la configuration.
+ *
+ * `record` désigne la configuration : un webhook nommé n'est pas un objet d'API, donc les gestes
+ * génériques agissent sur l'objet qui le porte, et le panneau de détail le dit.
+ */
+export interface AdmissionHookRow {
+  uid: string;
+  kind: "validating" | "mutating";
+  kind_label: string;
+  config: string;
+  index: number;
+  name: string;
+  /** Combien de webhooks la configuration porte : ce qu'une suppression emporterait. */
+  siblings: number;
+  backend: HookBackend;
+  backend_label: string;
+  reach: HookReach;
+  reach_label: string;
+  broken: boolean;
+  catch_all: boolean;
+  fail_closed: boolean;
+  failure_policy_defaulted: boolean;
+  timeout_seconds: number | null;
+  side_effects: string;
+  match_policy: string;
+  reinvocation_policy: string | null;
+  admission_review_versions: string[];
+  rules: HookRuleScope[];
+  namespace_selector: HookSelector;
+  object_selector: HookSelector;
+  /** Compté, jamais évalué : kdt n'exécute pas de CEL. */
+  match_conditions: number;
+  ca: HookCaBundle;
+  hints: HookHint[];
+  age: string;
+  record: EventRecord;
+}
+
+/** Une configuration, ligne parente du groupement. */
+export interface AdmissionConfigRow {
+  uid: string;
+  kind: "validating" | "mutating";
+  kind_label: string;
+  api_kind: string;
+  name: string;
+  hooks: number;
+  hints: HookHint[];
+  age: string;
+  record: EventRecord;
+}
+
+export interface ConversionHookRow {
+  uid: string;
+  name: string;
+  group: string;
+  kind: string;
+  scope: string;
+  versions: Array<{ name: string; served: boolean; storage: boolean; deprecated: boolean }>;
+  storage_version: string;
+  storage_version_served: boolean;
+  served_label: string;
+  backend: HookBackend;
+  backend_label: string;
+  reach: HookReach;
+  reach_label: string;
+  broken: boolean;
+  ca: HookCaBundle;
+  conversion_review_versions: string[];
+  hints: HookHint[];
+  age: string;
+  record: EventRecord;
+}
+
+export interface ApiServiceHookRow {
+  uid: string;
+  name: string;
+  group: string;
+  version: string;
+  backend: HookBackend;
+  backend_label: string;
+  reach: HookReach;
+  reach_label: string;
+  broken: boolean;
+  ca: HookCaBundle;
+  insecure: boolean;
+  group_priority_minimum: number;
+  version_priority: number;
+  /** `status.conditions[type=Available]`, verbatim. */
+  available: string | null;
+  available_label: string;
+  reason: string;
+  message: string;
+  hints: HookHint[];
+  age: string;
+  record: EventRecord;
+}
+
+export interface HookCounts {
+  rows: number;
+  fail_closed: number;
+  broken: number;
+  catch_all: number;
+}
+
+/**
+ * Les trois mondes d'un coup.
+ *
+ * Un seul appel les rend tous, parce qu'un seul fetch les lit : changer de monde ne coûte donc
+ * aucune requête, comme le `g` du TUI.
+ */
+export interface HooksPayload {
+  configs: AdmissionConfigRow[];
+  admission: AdmissionHookRow[];
+  conversion: ConversionHookRow[];
+  apiservices: ApiServiceHookRow[];
+  counts: { admission: HookCounts; conversion: HookCounts; apiservice: HookCounts };
+  /** Une erreur par monde : un refus sur les CRD ne blanchit pas le monde admission. */
+  error: string | null;
+  conversion_error: string | null;
+  apiservice_error: string | null;
+  /** Les APIService locales, comptées mais pas listées. */
+  local_apiservices: number;
+}
+
 /**
  * Un fournisseur d'IA déclaré par l'exploitant, tel que le serveur consent à le décrire.
  *

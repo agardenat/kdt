@@ -113,6 +113,9 @@ the RBAC view).
 | `forward` | `pf`, `portforward`, `tunnels` | Running port-forwards (over the current view) |
 | `ingress [ns]` | `ing`, `ingressclass` | Ingress / IngressClass |
 | `netpol [ns]` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (native, Cilium, Calico) |
+| `hooks` | `webhooks`, `wh`, `vwc`, `mwc`, `admissionwebhooks` | Admission webhooks (validating + mutating) |
+| `conversion` | `crdconversion`, `convert` | CRDs converting through a webhook |
+| `apiservice` | `apisvc`, `aggregated`, `agg` | Aggregated APIServices |
 | `storage [ns]` | `stockage`, `pvc`, `claims` | Storage, claim side (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Storage, volume side (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacity, node side |
@@ -160,6 +163,7 @@ the RBAC view).
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, close the sessions, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
 | Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
+| Hooks | `g` admission → conversion → apiservices · `t` webhooks under their configuration (admission) · `←`/`→` read the verdict past the edge · `P` flip `failurePolicy` |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
 | YAML | `t` neat ↔ raw · `c` copy · `r` reload |
@@ -492,6 +496,25 @@ shows the query and its effect (`/coredns  (3)`).
   `policyTypes` and the effect per direction: `Deny` (direction governed, no rule allows anything),
   `AllowAll` (empty `from`/`to`), `Selective` (explicit peers), `Unaffected` (direction not in
   `policyTypes`). Cilium and Calico CRDs are listed as they are, with no verdict.
+- **Hooks** (`:hooks`, `:conversion`, `:apiservice`) — three worlds through `g`, off one call: the
+  admission webhooks, the CRDs in `spec.conversion.strategy: Webhook`, and the aggregated
+  APIServices. What they share is the backing service, resolved down to its EndpointSlices: does the
+  namespace exist, does the Service exist, does it carry a `ready` endpoint. A backend kdt could not
+  query is said to be unchecked, never down.
+  - An admission row is a **named webhook**, not a configuration: `failurePolicy`, `rules`,
+    `timeoutSeconds` and `clientConfig` all live per entry, and that name is what the API server
+    puts in `failed calling webhook "..."`. The generic gestures (`y`, `e`, `Ctrl-D`) act on the
+    configuration holding it, and the detail panel says so.
+  - Findings run from the write refusal (`failurePolicy=Fail` with a silent service) to the
+    catch-all `*/*/*` rule with no system-namespace exclusion, the expired or absent `caBundle`, the
+    `sideEffects` that forbids dry-run, and the hook governing the namespace its own service lives in.
+  - Conversion world: the served versions, the storage one, and what an outage costs here —
+    `kubectl get <cr>` fails, **reads included**.
+  - APIServices world: only the aggregated ones (`spec.service` set) are listed, the local ones are
+    counted; the `Available` condition carries the API server's own `reason`, verbatim.
+  - `P` flips a webhook's `failurePolicy` (JSON patch with a `test` on its name, never a merge that
+    would replace the array). Cluster-wide, so the gesture is armed before it runs: the menu note
+    names the configuration, the entry, and what stops being refused.
 - **Port-forward** (`f` on a Service, `F` or `:forward` for the list) — the tunnel is opened by kdt
   itself, with no `kubectl`: the form lists the Service ports, offers the same number as the local
   port (`0` takes any free one), `Enter` starts or stops. It listens on `127.0.0.1`, and the table's

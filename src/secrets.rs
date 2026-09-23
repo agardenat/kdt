@@ -473,7 +473,9 @@ fn parse_ca_bundle(ca: &[u8]) -> Option<CaBundle> {
     })
 }
 
-fn first_cn(name: &x509_parser::x509::X509Name) -> String {
+// `pub(crate)` for `hooks`, which reads the same certificates out of a caBundle: a second way of
+// saying how many days are left would drift from what the certs view shows.
+pub(crate) fn first_cn(name: &x509_parser::x509::X509Name) -> String {
     name.iter_common_name()
         .next()
         .and_then(|a| a.as_str().ok())
@@ -509,12 +511,12 @@ fn key_algo(cert: &x509_parser::certificate::X509Certificate) -> String {
     }
 }
 
-fn days_until(ts: i64) -> i64 {
+pub(crate) fn days_until(ts: i64) -> i64 {
     let now = chrono::Utc::now().timestamp();
     (ts - now).div_euclid(86_400)
 }
 
-fn fmt_date(ts: i64) -> String {
+pub(crate) fn fmt_date(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "?".to_string())

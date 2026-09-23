@@ -8,6 +8,62 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.0] — 2026-09-23
+
+Le majeur sort de sa série de pré-versions. Ce qu'il marque n'a pas changé depuis `beta.1` — le
+dépôt porte deux binaires, `kdt` le TUI et `kdt-web` l'interface web, adossés au même métier — mais
+ce qui manquait pour s'en servir est là : **seize vues** répondent dans kdt-web, là où `beta.1` en
+annonçait dix et disait que « le reste n'existe pas », et le **support de kdt-identity** couvre les
+trois `credentialMode` et les trois `authMode`, portail compris, dans les deux clients.
+
+**Rien de ce que fait le TUI ne change.** Une mise à jour depuis la 1.26 ne retire rien : le majeur
+dit la refonte du dépôt et l'arrivée d'un second client, pas une rupture d'usage. Ce que les
+pré-versions ont ajouté est listé dans leurs sections, de `beta.1` à `rc.13`.
+
+Ce qui reste à porter est nommé plutôt que passé sous silence : **Argo CD** figure au rail de kdt-web mais y est
+encore désactivée, et le TUI reste le seul des deux à la servir. Côté kdt-identity, `authMode: ldap`
+est lu et rendu par les deux clients sans avoir été éprouvé contre un annuaire d'entreprise réel.
+
+- **feat(hooks)** — la vue `:hooks`, et les trois surfaces que l'apiserver appelle réunies dans un
+  onglet : les **webhooks d'admission** (validating et mutating), les **CRD** qui confient leur
+  conversion à un webhook, et les **APIService agrégées**. Trois mondes par `g`, un seul fetch pour
+  les trois — un même Service en backe souvent plusieurs, et il n'est interrogé qu'une fois.
+
+  Le point commun est le service backing, résolu jusqu'à ses EndpointSlices : le namespace
+  existe-t-il, le Service existe-t-il, porte-t-il un endpoint `ready`. Un backend que kdt n'a pas
+  pu interroger est dit **non interrogé**, jamais en panne : inventer une panne d'admission pousse
+  à supprimer un contrôle qui fonctionne.
+
+  Une ligne d'admission est un **webhook nommé**, pas une configuration. Kyverno déclare
+  `validate.kyverno.svc-fail` et `validate.kyverno.svc-ignore` dans un seul objet, avec des
+  `failurePolicy` opposées ; et c'est le nom de l'entrée que l'apiserver met dans
+  `failed calling webhook "…"`, donc celui qu'on cherche. Les gestes génériques agissent sur la
+  configuration qui la porte, et le panneau de détail écrit ce que la suppression emporterait.
+
+  Les constats vont du refus d'écriture (`failurePolicy=Fail` et service muet) à la règle
+  attrape-tout `*/*/*` sans exclusion des namespaces système, au `caBundle` expiré, absent ou
+  illisible, au `sideEffects` qui interdit le dry-run, au hook qui gouverne le namespace de son
+  propre service — celui qu'on ne peut plus redéployer s'il tombe. Le monde conversion nomme le
+  coût qui surprend : un backend mort casse `kubectl get <cr>`, **lecture comprise**. Le monde
+  apiservices ne liste que les agrégées, compte les locales, et reprend le `reason` de l'apiserver
+  verbatim.
+
+  `P` bascule le `failurePolicy` d'un webhook : JSON patch avec un `test` sur son nom, jamais un
+  merge qui remplacerait le tableau, et `add` plutôt que `replace` parce qu'une entrée qui
+  n'écrit pas le champ se verrait refuser un `replace`. Portée cluster, donc geste armé avant de
+  partir : la note du menu nomme la configuration, l'entrée visée, et dit ce qui cesse d'être
+  refusé — « ni ce qu'il refusait à tort, ni ce qu'il refusait à raison ».
+
+- **feat(web)** — la même vue dans kdt-web, seizième du rail : `GET /api/v1/hooks` rend les trois
+  mondes d'un coup, `POST /api/v1/hooks/failure-policy` porte la bascule.
+
+- **refactor(repair, diagnostic)** — les deux lectures partielles des webhooks qui existaient
+  reposent désormais sur `hooks.rs`, source unique. `Ctrl-R` garde son repli — une configuration,
+  rapportée sur son pire webhook, parce que sa sortie est une cible de suppression — et son
+  comportement à l'identique. Les deux étapes de diagnostic lisent un seul inventaire au lieu de
+  deux listes, et leur compteur ajoute les backends injoignables aux `failurePolicy=Fail` : un
+  webhook fail-closed dont le service ne répond pas n'est plus un avertissement mais une erreur.
+
 ## [2.0.0-rc.13] — 2026-09-22
 
 - **feat(web)** — la vue **Diagnostic**, quinzième et dernière du rail. Elle déroule la séquence

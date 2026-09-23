@@ -9,11 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use http::Request;
-use k8s_openapi::api::admissionregistration::v1::{
-    MutatingWebhookConfiguration, ValidatingWebhookConfiguration,
-};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Event as K8sEvent, Namespace, Node, PersistentVolume, Pod};
+use crate::hooks::WebhookKind;
 use crate::lang::{fill, Strings};
 use kube::api::{DynamicObject, ListParams, LogParams};
 use kube::core::GroupVersionKind;
@@ -135,8 +133,7 @@ pub async fn run_diagnostic(client: Client, state: SharedDiagnostic, st: &'stati
     check_kube_system_pods(&client, &state, run_id, st).await;
     check_dns(&client, &state, run_id, st).await;
     check_cni(&client, &state, run_id, st).await;
-    check_validating_webhooks(&client, &state, run_id, st).await;
-    check_mutating_webhooks(&client, &state, run_id, st).await;
+    check_admission_hooks(&client, &state, run_id, st).await;
     check_rancher(&client, &state, run_id, st).await;
     check_problem_pods(&client, &state, run_id, st).await;
     check_replica_spread(&client, &state, run_id, st).await;
@@ -597,147 +594,126 @@ async fn check_cni(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &
     finish_step(state, run_id, idx, status, lines);
 }
 
-async fn check_validating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
-    let Some(idx) = push_step(
-        state,
-        run_id,
-        "ValidatingWebhookConfigurations",
-        "kubectl get validatingwebhookconfigurations",
-    ) else {
-        return;
-    };
-    let api: Api<ValidatingWebhookConfiguration> = Api::all(client.clone());
-    let mut lines = Vec::new();
-    let status = match api.list(&ListParams::default()).await {
-        Ok(list) => {
-            let mut total = 0usize;
-            let mut fail_close = 0usize;
-            for w in &list.items {
-                total += 1;
-                let name = w.metadata.name.clone().unwrap_or_default();
-                if let Some(hooks) = &w.webhooks {
-                    let fail = hooks
-                        .iter()
-                        .any(|h| h.failure_policy.as_deref() == Some("Fail"));
-                    if fail {
-                        fail_close += 1;
-                        let hl = highlight_webhook_owner(&name);
-                        lines.push((
-                            LineColor::Warn,
-                            format!("{} (failurePolicy=Fail){}", name, hl),
-                        ));
-                    }
-                }
-            }
-            lines.insert(
-                0,
-                (
-                    if fail_close > 0 {
-                        LineColor::Warn
-                    } else {
-                        LineColor::Ok
-                    },
-                    fill(
-                        st.diag_validating_webhooks,
-                        &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
-                    ),
-                ),
-            );
-            if fail_close > 0 {
-                DiagStatus::Warn
-            } else {
-                DiagStatus::Ok
-            }
-        }
-        Err(e) => {
-            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
-            DiagStatus::Err
-        }
-    };
-    finish_step(state, run_id, idx, status, lines);
-}
-
-async fn check_mutating_webhooks(client: &Client, state: &SharedDiagnostic, run_id: u64, st: &'static Strings) {
-    let Some(idx) = push_step(
-        state,
-        run_id,
-        "MutatingWebhookConfigurations",
-        "kubectl get mutatingwebhookconfigurations",
-    ) else {
-        return;
-    };
-    let api: Api<MutatingWebhookConfiguration> = Api::all(client.clone());
-    let mut lines = Vec::new();
-    let status = match api.list(&ListParams::default()).await {
-        Ok(list) => {
-            let mut total = 0usize;
-            let mut fail_close = 0usize;
-            for w in &list.items {
-                total += 1;
-                let name = w.metadata.name.clone().unwrap_or_default();
-                if let Some(hooks) = &w.webhooks {
-                    let fail = hooks
-                        .iter()
-                        .any(|h| h.failure_policy.as_deref() == Some("Fail"));
-                    if fail {
-                        fail_close += 1;
-                        let hl = highlight_webhook_owner(&name);
-                        lines.push((
-                            LineColor::Warn,
-                            format!("{} (failurePolicy=Fail){}", name, hl),
-                        ));
-                    }
-                }
-            }
-            lines.insert(
-                0,
-                (
-                    if fail_close > 0 {
-                        LineColor::Warn
-                    } else {
-                        LineColor::Ok
-                    },
-                    fill(
-                        st.diag_mutating_webhooks,
-                        &[("total", &total.to_string()), ("closed", &fail_close.to_string())],
-                    ),
-                ),
-            );
-            if fail_close > 0 {
-                DiagStatus::Warn
-            } else {
-                DiagStatus::Ok
-            }
-        }
-        Err(e) => {
-            lines.push((LineColor::Err, fill(st.diag_error, &[("e", &e.to_string())])));
-            DiagStatus::Err
-        }
-    };
-    finish_step(state, run_id, idx, status, lines);
-}
-
-// Annotate a fail-closed webhook with the product likely behind it, to explain cluster-wide impact.
-fn highlight_webhook_owner(name: &str) -> String {
-    let n = name.to_lowercase();
-    let known = [
-        ("kyverno", "policy engine"),
-        ("gatekeeper", "OPA"),
-        ("cert-manager", "TLS"),
-        ("rancher", "rancher webhook"),
-        ("istio", "service mesh"),
-        ("linkerd", "service mesh"),
-        ("vault", "secrets"),
-        ("argo", "argo"),
-        ("flux", "fluxcd"),
-        ("trivy", "image scan"),
+/// Both admission configuration kinds, off one inventory.
+///
+/// Still two steps, because `ValidatingWebhookConfigurations` and `MutatingWebhookConfigurations`
+/// are the names people look for in the sequence — but one read of [`crate::hooks::list_admission`]
+/// instead of two `Api::all().list()`, which also buys the backing-service probe: a fail-closed
+/// webhook whose service cannot answer is not a warning, it is a cluster that refuses writes.
+async fn check_admission_hooks(
+    client: &Client,
+    state: &SharedDiagnostic,
+    run_id: u64,
+    st: &'static Strings,
+) {
+    let steps = [
+        (
+            WebhookKind::Validating,
+            push_step(
+                state,
+                run_id,
+                "ValidatingWebhookConfigurations",
+                "kubectl get validatingwebhookconfigurations",
+            ),
+            st.diag_validating_webhooks,
+        ),
+        (
+            WebhookKind::Mutating,
+            push_step(
+                state,
+                run_id,
+                "MutatingWebhookConfigurations",
+                "kubectl get mutatingwebhookconfigurations",
+            ),
+            st.diag_mutating_webhooks,
+        ),
     ];
-    for (k, label) in known {
-        if n.contains(k) {
-            return format!(" — {}", label);
+
+    let inventory = crate::hooks::list_admission(client, st).await;
+
+    for (kind, idx, tpl) in steps {
+        let Some(idx) = idx else { continue };
+        let (configs, hooks) = match &inventory {
+            Ok(pair) => pair,
+            Err(e) => {
+                finish_step(
+                    state,
+                    run_id,
+                    idx,
+                    DiagStatus::Err,
+                    vec![(LineColor::Err, fill(st.diag_error, &[("e", e)]))],
+                );
+                continue;
+            }
+        };
+
+        let mut lines = Vec::new();
+        let mut total = 0usize;
+        let mut fail_close = 0usize;
+        let mut broken = 0usize;
+        let mut blocking = false;
+
+        for config in configs.iter().filter(|c| c.kind == kind) {
+            total += 1;
+            let mine: Vec<_> = hooks
+                .iter()
+                .filter(|h| h.kind == kind && h.config == config.name)
+                .collect();
+            let closed = mine.iter().any(|h| h.fail_closed);
+            let down = mine.iter().any(|h| h.reach.is_broken());
+            let closed_and_down = mine.iter().any(|h| h.fail_closed && h.reach.is_broken());
+            if closed {
+                fail_close += 1;
+            }
+            if down {
+                broken += 1;
+            }
+            blocking |= closed_and_down;
+
+            if !closed && !down {
+                continue;
+            }
+            let owner = crate::hooks::hook_owner(&config.name)
+                .map(|label| format!(" — {}", label))
+                .unwrap_or_default();
+            let state_text = if closed_and_down {
+                st.diag_webhook_fail_down
+            } else if down {
+                st.diag_webhook_down
+            } else {
+                st.diag_webhook_fail
+            };
+            let tone = if closed_and_down { LineColor::Err } else { LineColor::Warn };
+            lines.push((tone, format!("{} ({}){}", config.name, state_text, owner)));
         }
+
+        let status = if blocking {
+            DiagStatus::Err
+        } else if fail_close > 0 || broken > 0 {
+            DiagStatus::Warn
+        } else {
+            DiagStatus::Ok
+        };
+        lines.insert(
+            0,
+            (
+                match status {
+                    DiagStatus::Err => LineColor::Err,
+                    DiagStatus::Warn => LineColor::Warn,
+                    _ => LineColor::Ok,
+                },
+                fill(
+                    tpl,
+                    &[
+                        ("total", &total.to_string()),
+                        ("closed", &fail_close.to_string()),
+                        ("broken", &broken.to_string()),
+                    ],
+                ),
+            ),
+        );
+        finish_step(state, run_id, idx, status, lines);
     }
-    String::new()
 }
 
 // Detect how Rancher relates to this cluster (local server, imported via cattle-cluster-agent,

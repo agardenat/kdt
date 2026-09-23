@@ -1,0 +1,26 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: kdt-hooks-orphan-ignore
+webhooks:
+  - name: orphan-ignore.kdt.test
+    failurePolicy: Ignore
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    timeoutSeconds: 25
+    clientConfig:
+      service:
+        namespace: kdt-hooks-test
+        name: nobody-listens-here
+        path: /validate
+        port: 443
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kdt-hooks-test"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["configmaps"]
+        operations: ["CREATE", "UPDATE"]

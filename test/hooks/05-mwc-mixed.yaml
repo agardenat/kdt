@@ -1,0 +1,66 @@
+# Trois webhooks dans une seule configuration, avec trois failurePolicy différentes : c'est ce
+# manifeste qui prouve qu'une ligne doit être un webhook nommé et non une configuration. Replié sur
+# l'objet, la colonne POLICY devrait écrire « mixte ».
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: kdt-hooks-mixed
+  annotations:
+    cert-manager.io/inject-ca-from: kdt-hooks-test/nothing-here
+webhooks:
+  - name: mixed-fail.kdt.test
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        namespace: kdt-hooks-test
+        name: nobody-listens-here
+        path: /mutate
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kdt-hooks-test"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations: ["CREATE"]
+  - name: mixed-ignore.kdt.test
+    failurePolicy: Ignore
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        namespace: kdt-hooks-test
+        name: nobody-listens-here
+        path: /mutate
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kdt-hooks-test"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["secrets"]
+        operations: ["CREATE"]
+  # Pas de failurePolicy du tout : le défaut de l'apiserver est `Fail`, et la colonne doit le dire
+  # en grisé — « déduit », pas « écrit ».
+  - name: mixed-default.kdt.test
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      url: https://hooks.example.invalid/mutate
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kdt-hooks-test"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["serviceaccounts"]
+        operations: ["CREATE"]

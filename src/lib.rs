@@ -37,6 +37,7 @@ pub mod events;
 pub mod exec;
 pub mod extract;
 pub mod flux;
+pub mod hooks;
 pub mod identity;
 pub mod k8ssandra;
 pub mod kyverno;

@@ -183,6 +183,25 @@ explicite inverse, et le cas non stampé où seul `prefers-color-scheme` tranche
 La langue se bascule comme dans le TUI, par un bouton de la barre supérieure : le chrome change
 sur-le-champ, les phrases calculées suivent au refetch — voir §7.
 
+### La vue Hooks, et la ligne qui n'est pas un objet
+
+Trois mondes dans un onglet — admission, conversion, apiservices — servis par **un seul** appel,
+parce qu'un seul fetch les lit côté serveur : changer d'onglet ne coûte donc aucune requête, comme
+le `g` du TUI.
+
+Une ligne d'admission est un **webhook nommé**, une entrée de `webhooks[]`, et pas la configuration
+qui la porte : `failurePolicy`, `rules`, `timeoutSeconds` et `clientConfig` vivent tous à ce
+niveau-là, et c'est ce nom que l'apiserver met dans `failed calling webhook "…"`. Mais un webhook
+nommé n'est pas un objet d'API : son `record` désigne la **configuration**, ce qui donne à la ligne
+les gestes génériques sans rien ajouter — et ce qui oblige le panneau à écrire noir sur blanc que
+la suppression emporte tous les webhooks de l'objet. C'est le même arrangement que la ligne
+d'endpoint de la vue réseau, dont l'enregistrement désigne le Pod.
+
+L'écriture de la vue, `POST /api/v1/hooks/failure-policy`, bascule le `failurePolicy` d'une entrée.
+JSON patch avec une opération `test` sur le nom du webhook, jamais un merge : un merge remplacerait
+le tableau entier, et l'index seul viserait le mauvais hook si `webhooks[]` a été réordonné entre
+la lecture et l'écriture.
+
 ### L'analyse par une IA, et où vit sa configuration
 
 Le `i` de kdt est le cinquième geste générique : une entrée du menu `☰` de la ligne, la réponse en
@@ -330,7 +349,10 @@ Pièges qui cassent la chaîne de livraison existante :
 ## 7. L'API
 
 Une route par vue, miroir des `fetch_*` : `GET /api/v1/{diagnostic,flux,velero,capacity,storage,
-certs,rbac,kyverno,argocd,identity,k8ssandra,netpol,…}`, rendant le `XxxState` sérialisé. **Les
+certs,rbac,kyverno,argocd,identity,k8ssandra,netpol,hooks,…}`, rendant le `XxxState` sérialisé.
+`GET /api/v1/hooks` fait exception au « une route par monde » : les trois mondes de la vue partent
+ensemble, parce qu'un seul inventaire les produit et qu'un même Service en backe souvent plusieurs —
+le découper en trois routes ferait sonder trois fois le même endpoint. **Les
 verdicts, sévérités et abstentions restent calculés côté serveur** : c'est la valeur de kdt, pas
 la couleur du texte. Le flux d'évènements (`events::spawn_watcher`), les logs et le `follow`
 passent en SSE ; l'exec en websocket.

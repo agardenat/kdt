@@ -15,11 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use k8s_openapi::api::admissionregistration::v1::{
-    MutatingWebhookConfiguration, ValidatingWebhookConfiguration,
-};
-use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::Client;
 use serde_json::Value;
@@ -27,41 +23,14 @@ use serde_json::Value;
 use crate::delete::Level;
 use crate::yaml::dynamic_api;
 
-// Label EndpointSlices carry to name the Service they back.
-const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
+/// The admission model lives in [`crate::hooks`], which owns it; the paths stay exported from here
+/// so that every existing `repair::WebhookKind` keeps resolving. What this module adds is the fold:
+/// one configuration, reported on its worst webhook, because its output is a deletion target rather
+/// than a finding.
+pub use crate::hooks::{WebhookFault, WebhookKind};
 // Helm 3 stores the release state in the secret's labels, so the state of a release can be read
 // without decompressing the release blob itself.
 const HELM_OWNER_LABEL: &str = "owner=helm";
-
-// Which of the two admission configurations a webhook lives in. They are separate cluster-scoped
-// kinds with identical structure, and a repair has to name the right one to delete it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WebhookKind {
-    Validating,
-    Mutating,
-}
-
-impl WebhookKind {
-    pub fn api_kind(&self) -> &'static str {
-        match self {
-            WebhookKind::Validating => "ValidatingWebhookConfiguration",
-            WebhookKind::Mutating => "MutatingWebhookConfiguration",
-        }
-    }
-}
-
-// Why a webhook cannot be reached. The three cases are worth distinguishing because they say
-// different things about whether the operator is coming back.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum WebhookFault {
-    // The namespace the backing service lives in is gone: the operator was uninstalled.
-    NamespaceGone,
-    // The namespace is there but the Service is not.
-    ServiceGone,
-    // The Service exists and resolves, but nothing is behind it — the operator is scaled to zero or
-    // crash-looping. This one may well fix itself, which is why it is not treated as an orphan.
-    NoEndpoints,
-}
 
 // A lead extracted from the controller's message. Never shown as-is: a suspicion that the probe
 // cannot confirm is dropped rather than reported, because a wrong diagnosis costs more than none.
@@ -429,133 +398,48 @@ async fn run_probe(client: &Client, target: &Target) -> Result<(Vec<Blocker>, bo
     Ok((out, swept))
 }
 
-// One webhook of a configuration, flattened: which Service backs it (absent for a URL-addressed
-// webhook, which points outside the cluster and cannot be judged from here) and whether it fails
-// closed.
-struct WebhookEntry {
-    service: Option<(String, String)>,
-    fail_closed: bool,
-}
-
-// A configuration of either kind, reduced to what the orphan check needs.
-struct WebhookConfig {
-    kind: WebhookKind,
-    name: String,
-    hooks: Vec<WebhookEntry>,
-}
-
-// Every admission configuration whose backing service cannot serve. Both kinds are listed once and
-// their distinct services resolved, rather than one lookup per webhook: a configuration commonly
-// declares a dozen webhooks all pointing at the same service.
+/// Every admission configuration whose backing service cannot serve.
+///
+/// [`crate::hooks::list_admission`] does the reading, the probing and the wording; what happens here
+/// is the fold. A configuration is reported once, on its worst webhook, because the remedy on offer
+/// deletes the object and takes every webhook it holds with it. `hooks` keeps the fine grain for the
+/// view, where the output is a finding about one named webhook and folding it would have to write
+/// "mixed" in the column that decides everything.
 async fn webhook_blockers(client: &Client) -> Result<Vec<Blocker>, String> {
+    let (configs, hooks) = crate::hooks::list_admission(client, crate::lang::active()).await?;
     let mut out = Vec::new();
-    let mut checked: Vec<(String, String, Option<WebhookFault>)> = Vec::new();
 
-    let validating: Api<ValidatingWebhookConfiguration> = Api::all(client.clone());
-    let mutating: Api<MutatingWebhookConfiguration> = Api::all(client.clone());
-    let (v, m) = futures::future::join(
-        validating.list(&ListParams::default()),
-        mutating.list(&ListParams::default()),
-    )
-    .await;
-
-    // Both configurations reduced to the same shape, so the inspection below is written once
-    // despite Validating and Mutating being distinct Rust types with no common trait.
-    let mut configs: Vec<WebhookConfig> = Vec::new();
-    for c in v.map_err(|e| e.to_string())?.items {
-        configs.push(WebhookConfig {
-            kind: WebhookKind::Validating,
-            name: c.metadata.name.clone().unwrap_or_default(),
-            hooks: c
-                .webhooks
-                .unwrap_or_default()
-                .into_iter()
-                .map(|w| WebhookEntry {
-                    service: w.client_config.service.map(|s| (s.namespace, s.name)),
-                    fail_closed: w.failure_policy.as_deref() != Some("Ignore"),
-                })
-                .collect(),
-        });
-    }
-    for c in m.map_err(|e| e.to_string())?.items {
-        configs.push(WebhookConfig {
-            kind: WebhookKind::Mutating,
-            name: c.metadata.name.clone().unwrap_or_default(),
-            hooks: c
-                .webhooks
-                .unwrap_or_default()
-                .into_iter()
-                .map(|w| WebhookEntry {
-                    service: w.client_config.service.map(|s| (s.namespace, s.name)),
-                    fail_closed: w.failure_policy.as_deref() != Some("Ignore"),
-                })
-                .collect(),
-        });
-    }
-
-    for WebhookConfig { kind, name, hooks } in configs {
-        if hooks.is_empty() {
-            out.push(Blocker::EmptyWebhookConfig { kind, name });
+    for config in configs {
+        if config.hooks == 0 {
+            out.push(Blocker::EmptyWebhookConfig { kind: config.kind, name: config.name });
             continue;
         }
-        // A configuration is reported once, on its worst webhook: deleting it takes them all.
         let mut worst: Option<(String, bool, WebhookFault)> = None;
-        for WebhookEntry { service, fail_closed } in hooks {
-            let Some((ns, svc_name)) = service else { continue };
-            let fault = match checked.iter().find(|(n, s, _)| n == &ns && s == &svc_name) {
-                Some((_, _, f)) => f.clone(),
-                None => {
-                    let f = service_fault(client, &ns, &svc_name).await;
-                    checked.push((ns.clone(), svc_name.clone(), f.clone()));
-                    f
-                }
-            };
-            let Some(fault) = fault else { continue };
+        for h in hooks
+            .iter()
+            .filter(|h| h.kind == config.kind && h.config == config.name)
+        {
+            let Some(fault) = h.reach.fault() else { continue };
             let better = match &worst {
                 // Fail-closed beats fail-open; among equals the first wins.
-                Some((_, w_closed, _)) => fail_closed && !w_closed,
+                Some((_, w_closed, _)) => h.fail_closed && !w_closed,
                 None => true,
             };
             if better {
-                worst = Some((format!("{}/{}", ns, svc_name), fail_closed, fault));
+                worst = Some((h.backend.short(), h.fail_closed, fault));
             }
         }
         if let Some((service, fail_closed, fault)) = worst {
-            out.push(Blocker::OrphanWebhook { kind, name, service, fail_closed, fault });
+            out.push(Blocker::OrphanWebhook {
+                kind: config.kind,
+                name: config.name,
+                service,
+                fail_closed,
+                fault,
+            });
         }
     }
     Ok(out)
-}
-
-// `None` when the service can serve. A lookup that fails for any reason other than a clean 404 is
-// treated as healthy: being unable to ask is not evidence that the answer is bad, and inventing an
-// orphan would push someone to delete working admission control.
-async fn service_fault(client: &Client, ns: &str, name: &str) -> Option<WebhookFault> {
-    let svc: Api<Service> = Api::namespaced(client.clone(), ns);
-    match svc.get_opt(name).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            // Distinguish "the operator is gone" from "this one service was removed".
-            let ns_api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client.clone());
-            return match ns_api.get_opt(ns).await {
-                Ok(None) => Some(WebhookFault::NamespaceGone),
-                _ => Some(WebhookFault::ServiceGone),
-            };
-        }
-        Err(_) => return None,
-    }
-
-    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), ns);
-    let lp = ListParams::default().labels(&format!("{}={}", SERVICE_NAME_LABEL, name));
-    let Ok(list) = slices.list(&lp).await else {
-        return None;
-    };
-    let ready = list.items.iter().any(|s| {
-        s.endpoints
-            .iter()
-            .any(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-    });
-    (!ready).then_some(WebhookFault::NoEndpoints)
 }
 
 // The diagnosed object's own deletion state.

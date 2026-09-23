@@ -666,6 +666,51 @@ export interface Strings {
   netpolNoVerdict: string;
   netpolTarget: string;
 
+  // --- Vue hooks : admission, conversion, APIService agrégées.
+  // Les constats et les verdicts arrivent traduits du serveur ; le front ne traduit que son
+  // propre chrome. Le jargon k8s (failurePolicy, caBundle, sideEffects) reste tel quel.
+  hooksEmpty: string;
+  hooksScopeless: string;
+  hooksAdmission: string;
+  hooksConversion: string;
+  hooksApiServices: string;
+  hooksGroup: string;
+  hooksFailClosed: string;
+  hooksBroken: string;
+  hooksCatchAll: string;
+  hooksRule: string;
+  hooksRules: string;
+  hooksWebhook: string;
+  hooksWebhooks: string;
+  hooksLocalApi: string;
+  hooksFailClosedOne: string;
+  hooksBrokenOne: string;
+  hooksCatchAllOne: string;
+  hooksSecIdentity: string;
+  hooksSecReach: string;
+  hooksSecPolicy: string;
+  hooksSecScope: string;
+  hooksSecVersions: string;
+  hooksSecFindings: string;
+  hooksDeleteNote: string;
+  hooksMatchConditions: string;
+  hooksConvCost: string;
+  hooksApiCost: string;
+  hooksReachReady: string;
+  hooksReachNoEndpoints: string;
+  hooksReachServiceGone: string;
+  hooksReachNamespaceGone: string;
+  hooksReachNotOurs: string;
+  hooksReachUnchecked: string;
+  hooksCaNone: string;
+  hooksCaInjected: string;
+  hooksCaOpaque: string;
+  hooksCaSelfSigned: string;
+  hooksCaExpires: string;
+  hooksPolicyAction: string;
+  hooksPolicyTitle: string;
+  hooksPolicyNote: string;
+
   // --- Le `D` de kdt : une séquence fixe d'étapes, et rien d'autre à décider que de la relancer.
   // Les titres d'étapes, les commandes et les constats sont rédigés par le serveur.
   diagTitle: string;
@@ -1400,6 +1445,49 @@ const FR: Strings = {
     "Ce moteur n'a pas de verdict de posture : sa sémantique par défaut n'est pas celle du natif, et l'affirmer serait deviner.",
   netpolTarget: "cible",
 
+  // --- Vue hooks ---
+  hooksEmpty: "Aucun hook dans ce monde.",
+  hooksScopeless: "Les webhooks, les CRD et les APIService sont cluster-scoped : la portée ne les réduit pas.",
+  hooksAdmission: "Admission",
+  hooksConversion: "Conversion",
+  hooksApiServices: "APIServices",
+  hooksGroup: "Grouper par configuration",
+  hooksFailClosed: "en Fail",
+  hooksBroken: "injoignables",
+  hooksCatchAll: "attrape-tout",
+  hooksRule: "{n} règle",
+  hooksRules: "{n} règles",
+  hooksWebhook: "{n} webhook",
+  hooksWebhooks: "{n} webhooks",
+  hooksLocalApi: "{n} APIService locales, non listées : l'apiserver s'y décrit lui-même.",
+  hooksFailClosedOne: "en Fail",
+  hooksBrokenOne: "injoignable",
+  hooksCatchAllOne: "attrape-tout",
+  hooksSecIdentity: "identité",
+  hooksSecReach: "joignabilité",
+  hooksSecPolicy: "politique",
+  hooksSecScope: "portée",
+  hooksSecVersions: "versions",
+  hooksSecFindings: "constats",
+  hooksDeleteNote: "Supprimer cette ligne supprime la configuration {config} et ses {n} webhooks.",
+  hooksMatchConditions: "{n} matchConditions — filtres CEL, non évalués par kdt.",
+  hooksConvCost: "Backend en panne : kubectl get {kind} échoue, lecture comprise.",
+  hooksApiCost: "Une découverte partielle rend kubectl api-resources incomplet pour tout le cluster.",
+  hooksReachReady: "Le service répond.",
+  hooksReachNoEndpoints: "Le Service existe, aucune EndpointSlice ne porte d'endpoint ready.",
+  hooksReachServiceGone: "Le Service n'existe pas.",
+  hooksReachNamespaceGone: "Le namespace n'existe pas.",
+  hooksReachNotOurs: "Backend hors cluster : kdt ne l'interroge pas.",
+  hooksReachUnchecked: "Le service n'a pas pu être interrogé : rien n'est conclu.",
+  hooksCaNone: "Aucun caBundle.",
+  hooksCaInjected: "caBundle injecté par {injector} ; absent tant que le contrôleur n'a pas tourné.",
+  hooksCaOpaque: "caBundle de {n} o, illisible par kdt.",
+  hooksCaSelfSigned: "auto-signé",
+  hooksCaExpires: "expire le {date} ({n} j)",
+  hooksPolicyAction: "failurePolicy = {to}",
+  hooksPolicyTitle: "Basculer failurePolicy",
+  hooksPolicyNote: "Portée cluster : {config}, entrée {i} ({name}). En Ignore, ce webhook ne bloque plus rien — ni ce qu'il refusait à tort, ni ce qu'il refusait à raison.",
+
   diagTitle: "Diagnostic du cluster",
   diagRun: "Lancer",
   diagRerun: "Relancer",
@@ -2123,6 +2211,49 @@ const EN: Strings = {
   netpolNoVerdict:
     "This engine gets no posture verdict: its default semantics are not the native ones, and asserting them would be guessing.",
   netpolTarget: "target",
+
+  // --- Vue hooks ---
+  hooksEmpty: "No hook in this world.",
+  hooksScopeless: "Webhooks, CRDs and APIServices are cluster-scoped: the scope does not narrow them.",
+  hooksAdmission: "Admission",
+  hooksConversion: "Conversion",
+  hooksApiServices: "APIServices",
+  hooksGroup: "Group by configuration",
+  hooksFailClosed: "fail-closed",
+  hooksBroken: "unreachable",
+  hooksCatchAll: "catch-all",
+  hooksRule: "{n} rule",
+  hooksRules: "{n} rules",
+  hooksWebhook: "{n} webhook",
+  hooksWebhooks: "{n} webhooks",
+  hooksLocalApi: "{n} local APIServices, not listed: the API server describes itself in them.",
+  hooksFailClosedOne: "fail-closed",
+  hooksBrokenOne: "unreachable",
+  hooksCatchAllOne: "catch-all",
+  hooksSecIdentity: "identity",
+  hooksSecReach: "reachability",
+  hooksSecPolicy: "policy",
+  hooksSecScope: "scope",
+  hooksSecVersions: "versions",
+  hooksSecFindings: "findings",
+  hooksDeleteNote: "Deleting this row deletes configuration {config} and its {n} webhooks.",
+  hooksMatchConditions: "{n} matchConditions — CEL filters, not evaluated by kdt.",
+  hooksConvCost: "Backend down: kubectl get {kind} fails, reads included.",
+  hooksApiCost: "A partial discovery leaves kubectl api-resources incomplete cluster-wide.",
+  hooksReachReady: "The service answers.",
+  hooksReachNoEndpoints: "The Service exists, no EndpointSlice carries a ready endpoint.",
+  hooksReachServiceGone: "The Service does not exist.",
+  hooksReachNamespaceGone: "The namespace does not exist.",
+  hooksReachNotOurs: "Out-of-cluster backend: kdt does not query it.",
+  hooksReachUnchecked: "The service could not be queried: nothing is concluded.",
+  hooksCaNone: "No caBundle.",
+  hooksCaInjected: "caBundle injected by {injector}; absent until the controller has run.",
+  hooksCaOpaque: "caBundle of {n} B, unreadable by kdt.",
+  hooksCaSelfSigned: "self-signed",
+  hooksCaExpires: "expires on {date} ({n} d)",
+  hooksPolicyAction: "failurePolicy = {to}",
+  hooksPolicyTitle: "Flip failurePolicy",
+  hooksPolicyNote: "Cluster-wide: {config}, entry {i} ({name}). On Ignore this webhook blocks nothing any more — neither what it wrongly refused, nor what it rightly did.",
 
   diagTitle: "Cluster diagnostic",
   diagRun: "Run",

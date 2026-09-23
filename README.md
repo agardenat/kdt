@@ -114,6 +114,9 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | `forward` | `pf`, `portforward`, `tunnels` | Port-forwards en cours (superposé à la vue courante) |
 | `ingress [ns]` | `ing`, `ingressclass` | Ingress / IngressClass |
 | `netpol [ns]` | `np`, `networkpolicies`, `cilium`, `calico` | NetworkPolicies (natives, Cilium, Calico) |
+| `hooks` | `webhooks`, `wh`, `vwc`, `mwc`, `admissionwebhooks` | Webhooks d'admission (validating + mutating) |
+| `conversion` | `crdconversion`, `convert` | CRD qui convertissent par webhook |
+| `apiservice` | `apisvc`, `aggregated`, `agg` | APIService agrégées |
 | `storage [ns]` | `stockage`, `pvc`, `claims` | Stockage, côté demandes (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Stockage, côté volumes (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacité, côté nœuds |
@@ -161,6 +164,7 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (inviter, fermer les sessions, désactiver/réactiver, appartenance, créer, copier le subject) · dans l'overlay d'invitation : `l` copier le lien, `c` copier le code |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
+| Hooks | `g` admission → conversion → apiservices · `t` webhooks sous leur configuration (admission) · `←`/`→` lire le verdict qui déborde · `P` basculer `failurePolicy` |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
 | YAML | `t` neat ↔ brut · `c` copier · `r` recharger |
@@ -495,6 +499,25 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   `policyTypes` et l'effet par direction : `Deny` (direction gouvernée, aucune règle n'autorise),
   `AllowAll` (`from`/`to` vide), `Selective` (pairs explicites), `Unaffected` (direction hors
   `policyTypes`). Les CRD Cilium et Calico sont listées telles quelles, sans verdict.
+- **Hooks** (`:hooks`, `:conversion`, `:apiservice`) — trois mondes par `g`, un seul appel pour les
+  trois : les webhooks d'admission, les CRD en `spec.conversion.strategy: Webhook`, et les APIService
+  agrégées. Le point commun est le service backing, résolu jusqu'à ses EndpointSlices : le namespace
+  existe-t-il, le Service existe-t-il, porte-t-il un endpoint `ready`. Un backend que kdt n'a pas pu
+  interroger est dit « non interrogé », jamais en panne.
+  - Une ligne d'admission est un **webhook nommé**, pas une configuration : `failurePolicy`,
+    `rules`, `timeoutSeconds` et `clientConfig` sont par entrée, et c'est ce nom que l'apiserver met
+    dans `failed calling webhook "..."`. Les gestes génériques (`y`, `e`, `Ctrl-D`) agissent sur la
+    configuration qui la porte, et le panneau de détail le dit.
+  - Les constats vont du refus d'écriture (`failurePolicy=Fail` + service muet) à la règle
+    attrape-tout `*/*/*` sans exclusion système, au `caBundle` expiré ou absent, au `sideEffects`
+    qui interdit le dry-run, au hook qui gouverne le namespace de son propre service.
+  - Monde conversion : les versions servies, celle de stockage, et le coût qu'une panne a ici —
+    `kubectl get <cr>` échoue, **lecture comprise**.
+  - Monde apiservices : seules les agrégées (`spec.service` non nul) sont listées, les locales sont
+    comptées ; la condition `Available` est reprise avec le `reason` de l'apiserver, verbatim.
+  - `P` bascule le `failurePolicy` d'un webhook (JSON patch avec un `test` sur son nom, jamais un
+    merge qui remplacerait le tableau). Portée cluster, donc confirmation armée : la note du menu
+    nomme la configuration, l'entrée visée, et dit ce qui cesse d'être refusé.
 - **Port-forward** (`f` sur un Service, `F` ou `:forward` pour la liste) — tunnel ouvert par kdt
   lui-même, sans `kubectl` : le formulaire liste les ports du Service, propose le même numéro en
   port local (`0` en prend un libre au hasard), `Entrée` démarre ou arrête. L'écoute est sur

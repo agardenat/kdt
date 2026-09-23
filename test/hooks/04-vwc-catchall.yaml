@@ -1,0 +1,29 @@
+# DANGER. Ce manifeste met un webhook devant CHAQUE écriture du cluster, kube-system compris.
+#
+# Il est en `Ignore` exprès : en `Fail`, avec un service qui ne répond pas, plus aucune écriture ne
+# passerait — et le désinstaller demande précisément d'écrire.
+#
+# `timeoutSeconds: 1` pour la même raison : en `Ignore` rien n'est bloqué, mais chaque écriture du
+# cluster attend le timeout avant de passer. À 30 s, poser cette fixture reviendrait à arrêter le
+# cluster sans le dire.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: kdt-hooks-catchall
+webhooks:
+  - name: catchall.kdt.test
+    failurePolicy: Ignore
+    sideEffects: Unknown
+    admissionReviewVersions: ["v1"]
+    timeoutSeconds: 1
+    clientConfig:
+      service:
+        namespace: kdt-hooks-test
+        name: nobody-listens-here
+        path: /validate
+        port: 443
+    rules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*"]
+        operations: ["*"]

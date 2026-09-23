@@ -1,0 +1,20 @@
+# Une APIService agrégée vers un service qui ne répond pas : elle passe en Available=False avec une
+# raison de l'apiserver (`FailedDiscoveryCheck`), et la découverte du groupe est incomplète.
+#
+# Effet de bord réel : `kubectl api-resources` se plaint tant qu'elle est là, et certains clients
+# mettent quelques secondes de plus à démarrer. C'est exactement ce que la vue sert à voir — mais
+# c'est aussi pourquoi elle se retire après le test.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.kdt.test
+spec:
+  group: kdt.test
+  version: v1alpha1
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  insecureSkipTLSVerify: true
+  service:
+    namespace: kdt-hooks-test
+    name: nobody-listens-here
+    port: 443

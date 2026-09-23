@@ -18,6 +18,7 @@ mod config;
 mod config_secrets;
 mod diagnostic;
 mod flux;
+mod hooks;
 mod identity;
 mod kyverno;
 mod lang;
@@ -226,6 +227,11 @@ async fn main() -> Result<()> {
         .route("/api/v1/capacity", get(capacity::list))
         .route("/api/v1/storage", get(storage::list))
         .route("/api/v1/netpol", get(netpol::list))
+        // Les hooks que l'apiserver appelle : admission, conversion, APIService agrégées. Un seul
+        // appel rend les trois mondes, parce qu'un seul fetch les lit et qu'un même Service en
+        // backe souvent plusieurs.
+        .route("/api/v1/hooks", get(hooks::list))
+        .route("/api/v1/hooks/failure-policy", post(hooks::failure_policy))
         .route("/api/v1/certs", get(certs::list))
         // Les deux leviers de la chaîne : forcer la ré-émission, et relancer un cycle ACME bloqué
         // en supprimant la demande en cours.

@@ -1454,3 +1454,29 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* Un bouton de barre qui retient un choix — « Warn et Err seulement ». Le même traitement que
    `[aria-expanded]` ailleurs : l'état se voit, il ne se devine pas au libellé. */
 .panel-toggle.on { color: var(--accent); border-color: var(--accent); }
+
+/* --- Vue hooks ------------------------------------------------------------------------------ */
+
+/* Les deux kinds d'admission, distingués comme les moteurs de policy le sont : le badge porte la
+   couleur, pas la ligne — un mutating n'est pas plus inquiétant qu'un validating, il s'exécute
+   seulement avant lui. */
+.cell.wh-validating { color: var(--info); font-weight: 600; }
+.cell.wh-mutating { color: #b950c8; font-weight: 600; }
+:root:not([data-theme="light"]) .cell.wh-mutating,
+:root[data-theme="dark"] .cell.wh-mutating { color: #d08ce0; }
+
+/* Un intertitre dans le panneau de détail. Quatre blocs s'y succèdent — identité, joignabilité,
+   caBundle, constats — et sans repère ils se lisent comme une seule liste de champs. */
+.detail-section {
+  margin: .7rem 0 .25rem; font-family: var(--mono); font-size: var(--fs-sm);
+  font-weight: 600; color: var(--accent);
+}
+.detail-section:first-child { margin-top: 0; }
+
+/* Une option de la barre de vue, à côté des onglets de monde : le groupement des webhooks sous leur
+   configuration. Une case et non un bouton, parce que c'est un état retenu, pas une action. */
+.worlds .chk {
+  display: flex; align-items: center; gap: .3rem; margin-left: .7rem;
+  font-size: var(--fs-sm); color: var(--dim); cursor: pointer; user-select: none;
+}
+.worlds .chk input { margin: 0; cursor: pointer; }

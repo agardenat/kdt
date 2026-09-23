@@ -34,6 +34,7 @@ import type {
   IdentityWriteResult,
   KyFilter,
   KyvernoPayload,
+  HooksPayload,
   NetpolPayload,
   NodesPayload,
   NodeUsagePayload,
@@ -640,6 +641,40 @@ export function storage(namespace: string, lang: Lang): Promise<StoragePayload> 
 export function netpol(namespace: string): Promise<NetpolPayload> {
   const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
   return get<NetpolPayload>(`/api/v1/netpol${query}`);
+}
+
+/**
+ * Les hooks que l'apiserver appelle : admission, conversion, APIService agrégées.
+ *
+ * Pas de portée : les quatre kinds sont cluster-scoped. La langue voyage parce que les constats
+ * sont rédigés côté serveur, par le même code que le TUI.
+ */
+export function hooks(lang: string): Promise<HooksPayload> {
+  return get<HooksPayload>(`/api/v1/hooks?lang=${encodeURIComponent(lang)}`);
+}
+
+/**
+ * Bascule le `failurePolicy` d'un webhook. Portée cluster.
+ *
+ * Le nom du webhook part avec l'index : le patch le teste avant d'écrire, parce qu'entre la lecture
+ * et l'écriture un opérateur peut avoir réordonné `webhooks[]`.
+ */
+export function hookFailurePolicy(
+  kind: string,
+  config: string,
+  index: number,
+  name: string,
+  to: string,
+  lang: string,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/hooks/failure-policy", {
+    kind,
+    config,
+    index,
+    name,
+    to,
+    lang,
+  });
 }
 
 /** Ce que ce serveur offre en matière d'IA : ses fournisseurs, et s'il en accepte d'autres. */

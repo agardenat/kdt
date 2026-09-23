@@ -361,6 +361,11 @@ use crate::svc::{
 };
 use crate::portfwd::{self, PfRequest, PfRow, PfState, SharedForwards};
 use crate::netpol::{DirEffect, NetPolEngine, NetPolResource};
+use crate::hooks::{
+    admission_record, apiservice_record, config_record, conversion_record, fetch_hooks,
+    new_hooks_state, AdmissionConfig, AdmissionHook, ApiServiceHook, Backend, CaBundle,
+    ConversionHook, HookWorld, Reach, SharedHooks, WebhookKind,
+};
 use crate::argocd::{
     fetch_argocd, new_argo_state, ArgoApp, ArgoAppSet, ArgoEndpoint, ArgoProject, ArgoWrite,
     EndpointKind, SharedArgo,
@@ -587,6 +592,68 @@ enum RancRow {
     /// thing on both, and a token that never expires is only readable next to the setting that made
     /// it so.
     Setting(Box<TokenSetting>),
+}
+
+// One visual row of the hooks view. Under `t` an admission configuration becomes the parent of its
+// webhooks; the other two worlds have nothing to nest, so their rows stand alone. The order of
+// `App::hooks_rows` is the on-screen order and stays aligned with `App::snapshot`.
+#[derive(Clone)]
+pub enum HookRow {
+    Config(AdmissionConfig),
+    Admission(Box<AdmissionHook>),
+    Conversion(Box<ConversionHook>),
+    ApiService(Box<ApiServiceHook>),
+}
+
+// The rows one world shows, in on-screen order. Pure: `refresh_hooks_snapshot` only holds the lock
+// long enough to call it, and the grouping rule is then testable against a state built by hand.
+fn hook_rows_for(state: &crate::hooks::HooksState, world: HookWorld, group: bool) -> Vec<HookRow> {
+    match (world, group) {
+        // Admission, grouped: each configuration followed by the webhooks it holds.
+        (HookWorld::Admission, true) => {
+            let mut rows: Vec<HookRow> =
+                Vec::with_capacity(state.configs.len() + state.admission.len());
+            for cfg in &state.configs {
+                rows.push(HookRow::Config(cfg.clone()));
+                for h in state
+                    .admission
+                    .iter()
+                    .filter(|h| h.kind == cfg.kind && h.config == cfg.name)
+                {
+                    rows.push(HookRow::Admission(Box::new(h.clone())));
+                }
+            }
+            rows
+        }
+        // Admission, flat: one row per named webhook, which is the grain of the view.
+        (HookWorld::Admission, false) => state
+            .admission
+            .iter()
+            .cloned()
+            .map(|h| HookRow::Admission(Box::new(h)))
+            .collect(),
+        (HookWorld::Conversion, _) => state
+            .conversion
+            .iter()
+            .cloned()
+            .map(|c| HookRow::Conversion(Box::new(c)))
+            .collect(),
+        (HookWorld::ApiService, _) => state
+            .apiservices
+            .iter()
+            .cloned()
+            .map(|a| HookRow::ApiService(Box::new(a)))
+            .collect(),
+    }
+}
+
+fn synthetic_hook_record(row: &HookRow) -> EventRecord {
+    match row {
+        HookRow::Config(c) => config_record(c),
+        HookRow::Admission(h) => admission_record(h),
+        HookRow::Conversion(c) => conversion_record(c),
+        HookRow::ApiService(a) => apiservice_record(a),
+    }
 }
 
 // The two object worlds the Services/Ingress view toggles between (palette `svc` vs `ingress`).
@@ -923,7 +990,7 @@ impl Filter {
 // Event reasons treated as "errors" by the Errors filter (crash/oom/scheduling/mount failures…).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull, Hooks, HooksFull }
 
 // One visual line in the merged workloads view: a workload (parent/group row), one of its pods
 // (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
@@ -961,6 +1028,8 @@ enum MenuAction {
     VelDeleteBackup,
     // Kyverno: delete every stuck (Pending/Failed) UpdateRequest to unjam the generate queue.
     KyPurgeRequests,
+    // Hooks: flip one admission webhook to the failurePolicy named here. Break glass, cluster-wide.
+    HookFailurePolicy(&'static str),
     // K8ssandra: run a schedule now, restore a catalogue entry, run a Medusa maintenance task, or
     // hand cass-operator a job to run across the datacenter.
     K8cBackupNow,
@@ -1090,6 +1159,7 @@ fn is_split_mode(mode: Mode) -> bool {
             | Mode::Secrets
             | Mode::Certs
             | Mode::Kyverno
+            | Mode::Hooks
             | Mode::Reflector
             | Mode::Velero
             | Mode::K8ssandra
@@ -1316,6 +1386,17 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("ingress", &["ing", "ingresses", "ingressclass", "ingressclasses"]),
     // NetworkPolicies (native + Cilium/Calico CRDs) are the third world of the network view.
     ("netpol", &["netpols", "networkpolicy", "networkpolicies", "np", "cilium", "ciliumnetworkpolicy", "calico"]),
+    // The hooks the API server calls out to. `admission` stays Kyverno's — on a cluster running it
+    // that is what the word means — and the longer `admissionwebhooks` lands here, the way
+    // `backupstoragelocation` lands on `bsl` while `backup` stays Velero's. `conversion` and
+    // `apiservice` are commands of their own so that each opens on the world it names instead of
+    // one `g` away from it; `conversion` deliberately does not answer to `crd`, because the view
+    // lists only the CRDs that hand their conversion to a webhook, not the inventory of CRDs.
+    ("hooks", &["hook", "webhook", "webhooks", "wh", "admissionwebhook", "admissionwebhooks",
+                "validatingwebhookconfiguration", "validatingwebhookconfigurations", "vwc",
+                "mutatingwebhookconfiguration", "mutatingwebhookconfigurations", "mwc"]),
+    ("conversion", &["conversions", "crdconversion", "crdconversions", "convert"]),
+    ("apiservice", &["apiservices", "apisvc", "aggregated", "aggregation", "agg"]),
     // The claims world answers to the PVC words, the volumes world to the PV/class ones — `:pv` and
     // `:pvc` land on the side of the view the user was already thinking in.
     ("storage", &["stockage", "pvc", "claims", "volumes"]),
@@ -1588,6 +1669,16 @@ pub struct App {
     net_group: bool,
     pub net_refresh_handle: Option<JoinHandle<()>>,
     last_net_sel_uid: Option<String>,
+    // Hooks view: the three worlds the API server calls out to. Same shape as the network view
+    // above — one shared inventory for all three, flattened rows index-aligned with the snapshot,
+    // the active world and the `t` grouping.
+    pub hooks_state: SharedHooks,
+    hooks_rows: Vec<HookRow>,
+    hook_world: HookWorld,
+    hook_group: bool,
+    pub hooks_refresh_handle: Option<JoinHandle<()>>,
+    last_hook_sel_uid: Option<String>,
+    pub hooks_detail_scroll: usize,
     // The port-forwards kdt is carrying, and the two overlays that start and stop them. The list is
     // shared with the background tasks, which are the only writers of the counters and the state.
     forwards: SharedForwards,
@@ -1937,6 +2028,13 @@ impl App {
             net_group: false,
             net_refresh_handle: None,
             last_net_sel_uid: None,
+            hooks_state: new_hooks_state(),
+            hooks_rows: Vec::new(),
+            hook_world: HookWorld::Admission,
+            hook_group: false,
+            hooks_refresh_handle: None,
+            last_hook_sel_uid: None,
+            hooks_detail_scroll: 0,
             forwards: portfwd::new_forwards(),
             pf_view: None,
             forwards_view: None,
@@ -3793,7 +3891,8 @@ impl App {
         };
         match view_mode(self) {
             Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux
-            | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Services | Mode::ServicesFull => {
+            | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Services | Mode::ServicesFull
+             => {
                 self.scroll_detail(-delta)
             }
             Mode::Rbac | Mode::RbacFull => step(&mut self.rbac_detail_scroll, delta),
@@ -3801,6 +3900,7 @@ impl App {
             Mode::Secrets | Mode::SecretsFull => step(&mut self.secrets_detail_scroll, delta),
             Mode::Certs | Mode::CertsFull => step(&mut self.certs_detail_scroll, delta),
             Mode::Kyverno | Mode::KyvernoFull => step(&mut self.ky_detail_scroll, delta),
+            Mode::Hooks | Mode::HooksFull => step(&mut self.hooks_detail_scroll, delta),
             Mode::Reflector | Mode::ReflectorFull => step(&mut self.refl_detail_scroll, delta),
             Mode::Velero | Mode::VeleroFull => step(&mut self.vel_detail_scroll, delta),
             Mode::K8ssandra | Mode::K8ssandraFull => step(&mut self.k8c_detail_scroll, delta),
@@ -3829,7 +3929,8 @@ impl App {
             // right to reach.
             Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull
             | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull
-            | Mode::Identity | Mode::IdentityFull => {}
+            | Mode::Identity | Mode::IdentityFull
+            | Mode::Hooks | Mode::HooksFull => {}
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
             Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
             _ => step(&mut self.detail_h_scroll, delta),
@@ -3842,6 +3943,7 @@ impl App {
             Mode::Flux | Mode::FluxFull => self.refresh_flux(),
             Mode::Pods | Mode::PodsFull => self.schedule_pods_refresh(800),
             Mode::Services | Mode::ServicesFull => self.refresh_network(),
+            Mode::Hooks | Mode::HooksFull => self.refresh_hooks(),
             Mode::Storage | Mode::StorageFull => self.refresh_storage(),
             Mode::Capacity | Mode::CapacityFull => self.refresh_capacity(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac(),
@@ -4218,6 +4320,7 @@ impl App {
             Mode::Capacity | Mode::CapacityFull => self.refresh_capacity_snapshot(),
             Mode::Certs | Mode::CertsFull => self.refresh_certs_snapshot(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno_snapshot(),
+            Mode::Hooks | Mode::HooksFull => self.refresh_hooks_snapshot(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac_snapshot(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
@@ -4425,6 +4528,18 @@ impl App {
                 self.switch_view(origin, ns_arg);
                 self.enter_network_mode(NetWorld::NetworkPolicy);
             }
+            "hooks" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_hooks_mode(HookWorld::Admission);
+            }
+            "conversion" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_hooks_mode(HookWorld::Conversion);
+            }
+            "apiservice" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_hooks_mode(HookWorld::ApiService);
+            }
             "storage" => {
                 self.switch_view(origin, ns_arg);
                 self.enter_storage_mode(StoWorld::Claims);
@@ -4485,6 +4600,10 @@ impl App {
             }
             Mode::Kyverno | Mode::KyvernoFull => {
                 self.stop_kyverno_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::Hooks | Mode::HooksFull => {
+                self.stop_hooks_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Reflector | Mode::ReflectorFull => {
@@ -5101,6 +5220,226 @@ impl App {
         self.last_related_key = None;
         self.reset_scroll();
         self.refresh_net_snapshot();
+    }
+
+    // --- hooks view ------------------------------------------------------------------------
+
+    fn enter_hooks_mode(&mut self, world: HookWorld) {
+        self.mode = Mode::Hooks;
+        self.hook_world = world;
+        self.hooks_rows.clear();
+        // Status is the useful default here: these objects have no logs of their own, and what one
+        // wants first is the object the row designates.
+        self.detail_tab = DetailTab::Status;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_hook_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_hooks();
+        self.start_hooks_auto_refresh();
+        self.refresh_hooks_snapshot();
+    }
+
+    fn exit_hooks_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_hooks_auto_refresh();
+        self.hooks_rows.clear();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_hook_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_hooks_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.mode = Mode::HooksFull;
+    }
+
+    fn exit_hooks_full(&mut self) {
+        self.mode = Mode::Hooks;
+    }
+
+    // `t`: nest each webhook under the configuration that holds it. Only the admission world has
+    // anything to nest, so the key is a no-op elsewhere and the footer does not offer it there.
+    fn toggle_hooks_group(&mut self) {
+        self.hook_group = !self.hook_group;
+        self.refresh_hooks_snapshot();
+    }
+
+    // `g`: admission → conversion → apiservices. One fetch feeds all three, so nothing is reloaded.
+    fn cycle_hooks_world(&mut self) {
+        self.hook_world = self.hook_world.next();
+        self.last_hook_sel_uid = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_hooks_snapshot();
+    }
+
+    fn refresh_hooks(&self) {
+        {
+            let mut s = self.hooks_state.lock().expect("hooks poisoned");
+            s.loading = true;
+        }
+        let client = self.client.clone();
+        let state = self.hooks_state.clone();
+        tokio::spawn(async move { fetch_hooks(client, state).await; });
+    }
+
+    // A minute, where the network view refreshes every five seconds: this fetch lists every CRD on
+    // the cluster, and each one carries its whole OpenAPI schema — several megabytes on a Rancher or
+    // OpenShift cluster. Admission configurations change on a deploy, not on a heartbeat.
+    fn start_hooks_auto_refresh(&mut self) {
+        self.stop_hooks_auto_refresh();
+        let client = self.client.clone();
+        let state = self.hooks_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_hooks(client.clone(), state.clone()).await;
+            }
+        });
+        self.hooks_refresh_handle = Some(handle);
+    }
+
+    fn stop_hooks_auto_refresh(&mut self) {
+        if let Some(h) = self.hooks_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuild the display rows and the index-aligned snapshot from the shared inventory, honoring
+    // the active world and the `t` grouping. Mirrors `refresh_net_snapshot`: the two vectors are
+    // built in the same pass and filtered together, because a mismatch does not crash — it points
+    // the detail panel, and `Ctrl-D`, at the wrong object.
+    fn refresh_hooks_snapshot(&mut self) {
+        let rows = {
+            let s = self.hooks_state.lock().expect("hooks poisoned");
+            hook_rows_for(&s, self.hook_world, self.hook_group)
+        };
+        let recs: Vec<EventRecord> = rows.iter().map(synthetic_hook_record).collect();
+        self.hooks_rows = rows;
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.hooks_rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            self.last_hook_sel_uid = None;
+            return;
+        }
+        let idx = prev_uid
+            .as_deref()
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or(0)
+            .min(self.snapshot.len() - 1);
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        let cur_uid = self.snapshot[idx].uid.clone();
+        if self.last_hook_sel_uid.as_deref() != Some(cur_uid.as_str()) {
+            self.last_hook_sel_uid = Some(cur_uid);
+            self.maybe_fetch_status();
+            self.maybe_fetch_related();
+        }
+    }
+
+    fn move_hook_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let last = self.snapshot.len() - 1;
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let new = (cur + delta).clamp(0, last as i32) as usize;
+        self.table_state.select(Some(new));
+        self.selected_uid = self.snapshot.get(new).map(|r| r.uid.clone());
+        self.last_hook_sel_uid = self.selected_uid.clone();
+        self.reset_scroll();
+        self.maybe_fetch_status();
+        self.maybe_fetch_related();
+    }
+
+    // The admission webhook under the cursor, whichever world or grouping is in force.
+    fn selected_admission_hook(&self) -> Option<&AdmissionHook> {
+        match self.hooks_rows.get(self.table_state.selected()?)? {
+            HookRow::Admission(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    // `P`: the break-glass menu. Flipping a failurePolicy is a cluster-wide write, so it is
+    // confirmed the way a deletion is: the note spells out what stops being enforced, and the
+    // configuration name has to be typed back.
+    fn open_hooks_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(h) = self.selected_admission_hook() else {
+            self.toast(st.msg_hk_policy_none.to_string());
+            return;
+        };
+        let to = crate::hooks::failure_policy_toggle(h.fail_closed);
+        let note = lang::fill(
+            st.hk_policy_note,
+            &[("config", &h.config), ("i", &h.index.to_string()), ("name", &h.name)],
+        );
+        let items = vec![ActionItem {
+            label: st.k_hk_policy,
+            desc: lang::fill(st.desc_hk_policy, &[("to", to)]),
+            action: MenuAction::HookFailurePolicy(to),
+        }];
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_hk_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note: Some(note),
+        });
+    }
+
+    fn set_hook_failure_policy(&mut self, to: &'static str) {
+        let st = lang::t(self.ai_language);
+        let Some(h) = self.selected_admission_hook() else {
+            self.toast(st.msg_hk_policy_none.to_string());
+            return;
+        };
+        let (kind, config, index, name) =
+            (h.kind, h.config.clone(), h.index, h.name.clone());
+        let client = self.client.clone();
+        let state = self.hooks_state.clone();
+        let status = self.reconcile_status.clone();
+        let done = lang::fill(st.msg_hk_policy_done, &[("name", &name), ("to", to)]);
+        tokio::spawn(async move {
+            let msg = match crate::hooks::set_failure_policy(
+                &client, kind, &config, index, &name, to,
+            )
+            .await
+            {
+                Ok(()) => done,
+                Err(e) => e,
+            };
+            {
+                let mut s = status.lock().expect("reconcile poisoned");
+                *s = Some((std::time::Instant::now(), msg));
+            }
+            // Refetch straight away rather than waiting out the minute-long ticker: the person
+            // just wrote, and the row has to show what they wrote.
+            fetch_hooks(client, state).await;
+        });
     }
 
     // --- port-forward -------------------------------------------------------------------------
@@ -11334,6 +11673,7 @@ impl App {
             Some(MenuAction::VelRestoreOptions) => self.open_vel_restore_view(),
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
             Some(MenuAction::KyPurgeRequests) => self.ky_purge_requests(),
+            Some(MenuAction::HookFailurePolicy(to)) => self.set_hook_failure_policy(to),
             Some(MenuAction::K8cBackupNow) => self.k8c_backup_now(),
             Some(MenuAction::K8cRestore) => self.k8c_restore(),
             Some(MenuAction::K8cMedusaTask(op)) => self.k8c_medusa_task(op),
@@ -11999,6 +12339,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if matches!(app.mode, Mode::Kyverno | Mode::KyvernoFull) {
             app.refresh_kyverno_snapshot();
+        }
+        if matches!(app.mode, Mode::Hooks | Mode::HooksFull) {
+            app.refresh_hooks_snapshot();
+            // La bascule de `failurePolicy` rend compte par le même canal que les reconciles Flux.
+            app.drain_reconcile_status();
         }
         if matches!(app.mode, Mode::Rbac | Mode::RbacFull) {
             app.refresh_rbac_snapshot();
@@ -12916,6 +13261,40 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::Namespaces) => app.enter_ai_panel(),
         (_, _, Mode::Namespaces) => {}
 
+        (KeyCode::Up, _, Mode::Hooks) => app.move_hook_selection(-1),
+        (KeyCode::Down, _, Mode::Hooks) => app.move_hook_selection(1),
+        (KeyCode::PageUp, _, Mode::Hooks) => app.move_hook_selection(-10),
+        (KeyCode::PageDown, _, Mode::Hooks) => app.move_hook_selection(10),
+        (KeyCode::Left, m, Mode::Hooks) if !m.contains(KeyModifiers::SHIFT) => {
+            app.msg_scroll = app.msg_scroll.saturating_sub(1);
+        }
+        (KeyCode::Right, m, Mode::Hooks) if !m.contains(KeyModifiers::SHIFT) => {
+            app.msg_scroll = app.msg_scroll.saturating_add(1);
+        }
+        (KeyCode::Tab, _, Mode::Hooks) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::Hooks) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::Hooks) => app.enter_hooks_full(),
+        (KeyCode::Esc, _, Mode::Hooks) => app.exit_hooks_mode(),
+        (KeyCode::Char('t'), _, Mode::Hooks) => app.toggle_hooks_group(),
+        (KeyCode::Char('g'), _, Mode::Hooks) => app.cycle_hooks_world(),
+        (KeyCode::Char('P'), _, Mode::Hooks) => app.open_hooks_action_menu(),
+        (KeyCode::F(5), _, Mode::Hooks) => app.refresh_hooks(),
+        (KeyCode::Char('i'), _, Mode::Hooks) => app.enter_ai_panel(),
+        (_, _, Mode::Hooks) => {}
+
+        (KeyCode::Up, m, Mode::HooksFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
+        (KeyCode::Down, m, Mode::HooksFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
+        (KeyCode::PageUp, _, Mode::HooksFull) => app.scroll_detail(10),
+        (KeyCode::PageDown, _, Mode::HooksFull) => app.scroll_detail(-10),
+        (KeyCode::Tab, _, Mode::HooksFull) => app.cycle_tab(),
+        (KeyCode::BackTab, _, Mode::HooksFull) => app.cycle_tab_back(),
+        (KeyCode::Enter, _, Mode::HooksFull) => app.exit_hooks_full(),
+        (KeyCode::Esc, _, Mode::HooksFull) => app.exit_hooks_full(),
+        (KeyCode::Char('g'), _, Mode::HooksFull) => app.scroll_detail_top(),
+        (KeyCode::Char('G'), _, Mode::HooksFull) => app.scroll_detail_bottom(),
+        (KeyCode::Char('i'), _, Mode::HooksFull) => app.enter_ai_panel(),
+        (_, _, Mode::HooksFull) => {}
+
         (KeyCode::Up, _, Mode::Services) => app.move_net_selection(-1),
         (KeyCode::Down, _, Mode::Services) => app.move_net_selection(1),
         (KeyCode::PageUp, _, Mode::Services) => app.move_net_selection(-10),
@@ -13359,11 +13738,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -13381,8 +13760,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     } };
 
@@ -13417,6 +13796,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Services | Mode::ServicesFull => st.mode_services,
         Mode::Storage | Mode::StorageFull => st.mode_storage,
         Mode::Capacity | Mode::CapacityFull => st.mode_capacity,
+        Mode::Hooks | Mode::HooksFull => st.mode_hooks,
     };
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -13497,6 +13877,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             draw_namespaces_table(f, app, ta);
         } else if draw_mode == Mode::Services {
             draw_net_tree(f, app, ta);
+        } else if draw_mode == Mode::Hooks {
+            draw_hooks_table(f, app, ta);
         } else if draw_mode == Mode::Storage {
             draw_storage_table(f, app, ta);
         } else if draw_mode == Mode::Capacity {
@@ -13504,7 +13886,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -13783,6 +14165,45 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             Span::styled(" P ", kbg), Span::raw(format!(" {}   ", st.k_ky_purge_short)),
         ],
         Mode::KyvernoFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+        ],
+        Mode::Hooks => {
+            // `g` names the next world to switch to; `t` (grouping) only means something in the
+            // admission world, where a configuration has webhooks to nest under it.
+            let world_label = match app.hook_world {
+                HookWorld::Admission => "conversion",
+                HookWorld::Conversion => "apiservices",
+                HookWorld::ApiService => "admission",
+            };
+            let mut spans = vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" ←→ ", kbg), Span::raw(format!(" {}   ", st.k_msg_scroll)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                footer_sep(),
+            ];
+            if app.hook_world == HookWorld::Admission {
+                spans.push(Span::styled(" t ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_hk_group)));
+            }
+            spans.push(Span::styled(" g ", kbg));
+            spans.push(Span::raw(format!(" {}   ", world_label)));
+            spans.push(Span::styled(" F5 ", kbg));
+            spans.push(Span::raw(format!(" {}   ", st.k_refresh)));
+            // The break-glass gesture only exists where there is a failurePolicy to flip.
+            if app.hook_world == HookWorld::Admission {
+                spans.push(footer_sep());
+                spans.push(Span::styled(" P ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_hk_policy)));
+            }
+            spans
+        }
+        Mode::HooksFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
             Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
@@ -17915,6 +18336,542 @@ fn netpol_engine_style(engine: NetPolEngine) -> Style {
 
 // NetworkPolicy table: native policies (with a real ingress/egress posture verdict) and any discovered
 // Cilium/Calico CRD policies (shown factually, no verdict). Cluster-scoped policies show "(cluster)".
+// --- hooks view: three tables off one inventory ---------------------------------------------
+
+fn hook_hint_style(level: crate::storage::HintLevel) -> Style {
+    use crate::storage::HintLevel as L;
+    match level {
+        L::Danger => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        L::Warn => Style::default().fg(Color::Yellow),
+        L::Info => Style::default().fg(DIM),
+    }
+}
+
+fn reach_style(reach: Reach) -> Style {
+    match reach {
+        Reach::Ready => Style::default().fg(Color::Green),
+        Reach::NoEndpoints | Reach::ServiceGone | Reach::NamespaceGone => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        Reach::NotOurs | Reach::Unchecked => Style::default().fg(DIM),
+    }
+}
+
+// The worst finding of a row, windowed when the row has focus so `←`/`→` can read past the edge.
+fn hooks_verdict_cell(
+    hints: &[crate::storage::Hint],
+    focused: bool,
+    msg_w: usize,
+    msg_scroll: usize,
+) -> Cell<'static> {
+    let Some(worst) = crate::hooks::worst_hint(hints) else {
+        return Cell::from("");
+    };
+    let line = Line::from(Span::styled(worst.text.clone(), hook_hint_style(worst.level)));
+    if focused {
+        Cell::from(line_window(&line, msg_scroll, msg_w))
+    } else {
+        Cell::from(line)
+    }
+}
+
+fn worst_len(hints: &[crate::storage::Hint]) -> usize {
+    crate::hooks::worst_hint(hints)
+        .map(|h| h.text.chars().count())
+        .unwrap_or(0)
+}
+
+// The title of whichever world is showing, plus the name of the next one, so `g` never has to be
+// guessed at. A loading or refused world says so instead of reading as an empty one.
+fn hooks_title(app: &App, st: &'static lang::Strings) -> String {
+    let (loading, error, counts, local) = {
+        let s = app.hooks_state.lock().expect("hooks poisoned");
+        (
+            s.loading,
+            s.error_for(app.hook_world).cloned(),
+            s.counts(app.hook_world),
+            s.local_apiservices,
+        )
+    };
+    let next = match app.hook_world {
+        HookWorld::Admission => "conversion",
+        HookWorld::Conversion => "apiservices",
+        HookWorld::ApiService => "admission",
+    };
+    if let Some(e) = error {
+        return format!("hooks ({}: {}) · [g] {}", st.ui_title_error, e, next);
+    }
+    if loading && app.hooks_rows.is_empty() {
+        return format!("hooks ({}) · [g] {}", st.ui_title_loading, next);
+    }
+    let body = match app.hook_world {
+        HookWorld::Admission => lang::fill(
+            st.hk_title_admission,
+            &[
+                ("hooks", &st.plural(counts.rows, st.hk_scope_hook, st.hk_scope_hooks)),
+                ("closed", &counts.fail_closed.to_string()),
+                ("broken", &counts.broken.to_string()),
+            ],
+        ),
+        HookWorld::Conversion => lang::fill(
+            st.hk_title_conversion,
+            &[
+                ("crds", &st.plural(counts.rows, st.hk_crd, st.hk_crds)),
+                ("broken", &counts.broken.to_string()),
+            ],
+        ),
+        HookWorld::ApiService => lang::fill(
+            st.hk_title_apiservice,
+            &[
+                ("agg", &st.plural(counts.rows, st.hk_aggregated_one, st.hk_aggregated)),
+                ("total", &(counts.rows + local).to_string()),
+                ("broken", &counts.broken.to_string()),
+            ],
+        ),
+    };
+    format!("{} · [g] {}", body, next)
+}
+
+// The fixed part of each world's layout, and the width left for the VERDICT column.
+//
+// Named rather than inlined because the right border is what they are for: every column, every
+// inter-column gap and the two cells of `highlight_symbol` have to be accounted for, and a test
+// holds these three to that. `Length(msg_w)` and not `Min`: a `Min` eats the cell of margin the
+// `+ 1` reserves and puts the text back on the border.
+const ADMISSION_FIXED: u16 = 4 + 6 + 4 + 7 + 12 + 6 + 5;
+const CONVERSION_FIXED: u16 = 12 + 16 + 9 + 18 + 7 + 6 + 5;
+const APISERVICE_FIXED: u16 = 9 + 18 + 7 + 6 + 16 + 6 + 5;
+
+// Hold the content-sized columns to what the frame actually has room for.
+//
+// `col_width` widens a column to fit its longest value, which is right on a wide terminal and
+// ruinous on a narrow one: three columns at their maximum leave the VERDICT nothing and push the
+// whole row past the border. The widest column gives a cell back first, and none goes under its
+// floor unless the floors themselves do not fit — at which point ratatui truncates and the border
+// still wins.
+fn shrink_to_fit(area_width: u16, fixed: u16, ncols: u16, elastic: &mut [u16], floors: &[u16]) {
+    let inner = area_width.saturating_sub(2);
+    // What is left once the fixed columns, the inter-column gaps, `highlight_symbol`, the cell of
+    // margin and one cell for the VERDICT are served.
+    let budget = inner.saturating_sub(fixed + ncols.saturating_sub(1) + HIGHLIGHT_W + 2);
+    loop {
+        let total: u16 = elastic.iter().sum();
+        if total <= budget {
+            return;
+        }
+        let widest = elastic
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| **w > floors[*i])
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i);
+        match widest {
+            Some(i) => elastic[i] -= 1,
+            None => return,
+        }
+    }
+}
+
+fn admission_msg_w(area_width: u16, config_w: u16, name_w: u16, backend_w: u16) -> usize {
+    let fixed = ADMISSION_FIXED + config_w + name_w + backend_w + HIGHLIGHT_W + 1;
+    flux_msg_width(area_width, fixed, 11)
+}
+
+fn conversion_msg_w(area_width: u16, crd_w: u16, group_w: u16) -> usize {
+    flux_msg_width(area_width, CONVERSION_FIXED + crd_w + group_w + HIGHLIGHT_W + 1, 10)
+}
+
+fn apiservice_msg_w(area_width: u16, name_w: u16, group_w: u16) -> usize {
+    flux_msg_width(area_width, APISERVICE_FIXED + name_w + group_w + HIGHLIGHT_W + 1, 10)
+}
+
+fn draw_hooks_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    match app.hook_world {
+        HookWorld::Admission => draw_admission_table(f, app, area),
+        HookWorld::Conversion => draw_conversion_table(f, app, area),
+        HookWorld::ApiService => draw_apiservices_table(f, app, area),
+    }
+}
+
+fn draw_admission_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let title = hooks_title(app, st);
+
+    let header_row = Row::new(vec![
+        Cell::from("KIND"), Cell::from("CONFIGURATION"), Cell::from("WEBHOOK"),
+        Cell::from("POLICY"), Cell::from("TMO"), Cell::from("BACKEND"), Cell::from("REACH"),
+        Cell::from("SCOPE"), Cell::from("CA"), Cell::from("AGE"), Cell::from("VERDICT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    // Identifiers elide in the middle: `validate.kyverno.svc-fail` and `validate.kyverno.svc-ignore`
+    // are told apart by their suffix, and cutting on the right makes every row read the same.
+    let config_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::Config(c) => c.name.as_str(),
+            HookRow::Admission(h) => h.config.as_str(),
+            _ => "",
+        }),
+        "CONFIGURATION",
+        14,
+        30,
+    );
+    let name_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::Admission(h) => h.name.as_str(),
+            _ => "",
+        }),
+        "WEBHOOK",
+        16,
+        32,
+    );
+    let backend_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::Admission(h) => h.name.as_str(),
+            _ => "",
+        }),
+        "BACKEND",
+        14,
+        26,
+    );
+
+    let mut elastic = [config_w, name_w, backend_w];
+    shrink_to_fit(area.width, ADMISSION_FIXED, 11, &mut elastic, &[14, 16, 14]);
+    let [config_w, name_w, backend_w] = elastic;
+
+    let selected = app.table_state.selected();
+    let msg_w = admission_msg_w(area.width, config_w, name_w, backend_w);
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.hooks_rows.get(i))
+            .map(|row| match row {
+                HookRow::Config(c) => worst_len(&c.hints),
+                HookRow::Admission(h) => worst_len(&h.hints),
+                _ => 0,
+            })
+            .map(|len| msg_max_offset(len, msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
+    let grouped = app.hook_group;
+
+    let rows: Vec<Row> = app
+        .hooks_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| {
+            let focused = selected == Some(vi);
+            match row {
+                HookRow::Config(c) => Row::new(vec![
+                    Cell::from(c.kind.label()).style(webhook_kind_style(c.kind)),
+                    Cell::from(elide_middle(&c.name, config_w as usize))
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(st.plural(c.hooks, st.hk_scope_hook, st.hk_scope_hooks))
+                        .style(Style::default().fg(DIM)),
+                    Cell::from(""),
+                    Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    hooks_verdict_cell(&c.hints, focused, msg_w, msg_scroll),
+                ]),
+                HookRow::Admission(h) => {
+                    // Under `t` the configuration is the parent row, so the child leaves that
+                    // column empty rather than repeating the name on every line.
+                    let config_cell = if grouped {
+                        Cell::from("")
+                    } else {
+                        Cell::from(elide_middle(&h.config, config_w as usize))
+                            .style(Style::default().fg(DIM))
+                    };
+                    let policy = if h.fail_closed { "Fail" } else { "Ignore" };
+                    let policy_style = if h.failure_policy_defaulted {
+                        // Inferred, not written: dimmed so "what the object says" stays legible.
+                        Style::default().fg(DIM)
+                    } else if h.fail_closed && h.reach.is_broken() {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else if h.fail_closed {
+                        Style::default()
+                    } else {
+                        Style::default().fg(DIM)
+                    };
+                    let timeout = match h.timeout_seconds {
+                        Some(t) => format!("{}s", t),
+                        None => "10s".to_string(),
+                    };
+                    let timeout_style = match h.timeout_seconds {
+                        Some(t) if t >= 20 && h.fail_closed => Style::default().fg(Color::Yellow),
+                        Some(_) => Style::default(),
+                        None => Style::default().fg(DIM),
+                    };
+                    let scope = h.scope_label(st);
+                    let scope_style = if h.rules.iter().any(|r| r.is_catch_all()) {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(DIM)
+                    };
+                    Row::new(vec![
+                        Cell::from(h.kind.label()).style(webhook_kind_style(h.kind)),
+                        config_cell,
+                        Cell::from(elide_middle(&h.name, name_w as usize))
+                            .style(Style::default().add_modifier(Modifier::BOLD)),
+                        Cell::from(policy).style(policy_style),
+                        Cell::from(timeout).style(timeout_style),
+                        Cell::from(elide_middle(&h.backend.short(), backend_w as usize)),
+                        Cell::from(h.reach.label()).style(reach_style(h.reach)),
+                        Cell::from(scope).style(scope_style),
+                        Cell::from(h.ca.label(st)).style(ca_style(&h.ca)),
+                        Cell::from(h.age.clone()).style(Style::default().fg(DIM)),
+                        hooks_verdict_cell(&h.hints, focused, msg_w, msg_scroll),
+                    ])
+                }
+                _ => Row::new(vec![Cell::from("")]),
+            }
+        })
+        .collect();
+
+    // Pinned to the width the verdict was windowed at: a `Min` here would eat the margin the
+    // `+1` above reserved and put the text back on the border.
+    let widths = [
+        Constraint::Length(4), Constraint::Length(config_w), Constraint::Length(name_w),
+        Constraint::Length(6), Constraint::Length(4), Constraint::Length(backend_w),
+        Constraint::Length(7), Constraint::Length(12), Constraint::Length(6),
+        Constraint::Length(5), Constraint::Length(msg_w as u16),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn webhook_kind_style(kind: WebhookKind) -> Style {
+    match kind {
+        WebhookKind::Validating => {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        }
+        WebhookKind::Mutating => {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        }
+    }
+}
+
+fn ca_style(ca: &CaBundle) -> Style {
+    match ca {
+        CaBundle::Absent { injector: Some(_) } | CaBundle::Opaque { .. } => {
+            Style::default().fg(DIM)
+        }
+        CaBundle::Absent { injector: None } => Style::default().fg(Color::Yellow),
+        CaBundle::Parsed { .. } => match ca.soonest() {
+            Some(c) if c.days_remaining <= 0 => {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            }
+            Some(c) if c.days_remaining <= 30 => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::Green),
+        },
+    }
+}
+
+fn draw_conversion_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let title = hooks_title(app, st);
+
+    let header_row = Row::new(vec![
+        Cell::from("CRD"), Cell::from("GROUP"), Cell::from("KIND"), Cell::from("SERVED"),
+        Cell::from("STORAGE"), Cell::from("BACKEND"), Cell::from("REACH"), Cell::from("CA"),
+        Cell::from("AGE"), Cell::from("VERDICT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let crd_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::Conversion(c) => c.name.as_str(),
+            _ => "",
+        }),
+        "CRD",
+        18,
+        38,
+    );
+    let group_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::Conversion(c) => c.group.as_str(),
+            _ => "",
+        }),
+        "GROUP",
+        10,
+        24,
+    );
+    let mut elastic = [crd_w, group_w];
+    shrink_to_fit(area.width, CONVERSION_FIXED, 10, &mut elastic, &[18, 10]);
+    let [crd_w, group_w] = elastic;
+
+    let selected = app.table_state.selected();
+    let msg_w = conversion_msg_w(area.width, crd_w, group_w);
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.hooks_rows.get(i))
+            .map(|row| match row {
+                HookRow::Conversion(c) => worst_len(&c.hints),
+                _ => 0,
+            })
+            .map(|len| msg_max_offset(len, msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
+
+    let rows: Vec<Row> = app
+        .hooks_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| match row {
+            HookRow::Conversion(c) => {
+                // The storage version is the question that decides whether what is already written
+                // can be read back, so it gets a column of its own rather than a legend.
+                let storage_style = if c.storage_version_served {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                };
+                Row::new(vec![
+                    Cell::from(elide_middle(&c.name, crd_w as usize))
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(elide_middle(&c.group, group_w as usize))
+                        .style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&c.kind, 12)),
+                    Cell::from(elide_middle(&c.served_label(), 16)).style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&c.storage_version, 9)).style(storage_style),
+                    Cell::from(elide_middle(&c.backend.short(), 18)),
+                    Cell::from(c.reach.label()).style(reach_style(c.reach)),
+                    Cell::from(c.ca.label(st)).style(ca_style(&c.ca)),
+                    Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    hooks_verdict_cell(&c.hints, selected == Some(vi), msg_w, msg_scroll),
+                ])
+            }
+            _ => Row::new(vec![Cell::from("")]),
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(crd_w), Constraint::Length(group_w), Constraint::Length(12),
+        Constraint::Length(16), Constraint::Length(9), Constraint::Length(18),
+        Constraint::Length(7), Constraint::Length(6), Constraint::Length(5),
+        Constraint::Length(msg_w as u16),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn draw_apiservices_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let title = hooks_title(app, st);
+
+    let header_row = Row::new(vec![
+        Cell::from("APISERVICE"), Cell::from("GROUP"), Cell::from("VERSION"), Cell::from("BACKEND"),
+        Cell::from("REACH"), Cell::from("AVAIL"), Cell::from("REASON"), Cell::from("CA"),
+        Cell::from("AGE"), Cell::from("VERDICT"),
+    ])
+    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let name_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::ApiService(a) => a.name.as_str(),
+            _ => "",
+        }),
+        "APISERVICE",
+        20,
+        38,
+    );
+    let group_w = col_width(
+        app.hooks_rows.iter().map(|r| match r {
+            HookRow::ApiService(a) => a.group.as_str(),
+            _ => "",
+        }),
+        "GROUP",
+        12,
+        26,
+    );
+    let mut elastic = [name_w, group_w];
+    shrink_to_fit(area.width, APISERVICE_FIXED, 10, &mut elastic, &[20, 12]);
+    let [name_w, group_w] = elastic;
+
+    let selected = app.table_state.selected();
+    let msg_w = apiservice_msg_w(area.width, name_w, group_w);
+    app.msg_scroll = app.msg_scroll.min(
+        selected
+            .and_then(|i| app.hooks_rows.get(i))
+            .map(|row| match row {
+                HookRow::ApiService(a) => worst_len(&a.hints),
+                _ => 0,
+            })
+            .map(|len| msg_max_offset(len, msg_w))
+            .unwrap_or(0),
+    );
+    let msg_scroll = app.msg_scroll;
+
+    let rows: Vec<Row> = app
+        .hooks_rows
+        .iter()
+        .enumerate()
+        .map(|(vi, row)| match row {
+            HookRow::ApiService(a) => {
+                let avail_style = match a.available.as_deref() {
+                    Some("True") => Style::default().fg(Color::Green),
+                    Some("False") => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    _ => Style::default().fg(DIM),
+                };
+                // `insecureSkipTLSVerify` replaces the CA column: there is no certificate check to
+                // report a date for, and that is the more useful thing to say.
+                let ca_cell = if a.insecure {
+                    Cell::from("insec").style(Style::default().fg(Color::Red))
+                } else {
+                    Cell::from(a.ca.label(st)).style(ca_style(&a.ca))
+                };
+                Row::new(vec![
+                    Cell::from(elide_middle(&a.name, name_w as usize))
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(elide_middle(&a.group, group_w as usize))
+                        .style(Style::default().fg(DIM)),
+                    Cell::from(elide_middle(&a.version, 9)),
+                    Cell::from(elide_middle(&a.backend.short(), 18)),
+                    Cell::from(a.reach.label()).style(reach_style(a.reach)),
+                    Cell::from(a.available_label().to_string()).style(avail_style),
+                    Cell::from(elide_middle(&a.reason, 16)).style(Style::default().fg(DIM)),
+                    ca_cell,
+                    Cell::from(a.age.clone()).style(Style::default().fg(DIM)),
+                    hooks_verdict_cell(&a.hints, selected == Some(vi), msg_w, msg_scroll),
+                ])
+            }
+            _ => Row::new(vec![Cell::from("")]),
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(name_w), Constraint::Length(group_w), Constraint::Length(9),
+        Constraint::Length(18), Constraint::Length(7), Constraint::Length(6),
+        Constraint::Length(16), Constraint::Length(6), Constraint::Length(5),
+        Constraint::Length(msg_w as u16),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
 fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let (loading, error, netpols_len, n_k8s, n_cil, n_cal) = {
         let s = app.network_state.lock().expect("network poisoned");
@@ -26161,6 +27118,346 @@ fn ns_label(ns: &str) -> &str {
 }
 
 
+// --- hooks view: the detail panel -------------------------------------------------------------
+
+// A section heading, so the four common blocks read the same in all three worlds.
+fn hook_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("── {} ", title),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn hook_field(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<26}", label), Style::default().fg(DIM)),
+        Span::raw(value),
+    ])
+}
+
+// Wrapped so one `Line` is one screen row: the scroll and the `/` search only agree that way.
+fn hook_wrapped(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_text(text, width.saturating_sub(2))
+        .into_iter()
+        .map(|l| Line::from(Span::styled(format!("  {}", l), style)))
+        .collect()
+}
+
+// Why the backend is in the state it is in, in the words of what was actually looked up. A backend
+// kdt could not query says exactly that, and never that it is down.
+fn hook_reach_lines(
+    backend: &Backend,
+    reach: Reach,
+    st: &'static lang::Strings,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![hook_section(st.hk_sec_reach)];
+    match backend {
+        Backend::Service { namespace, name, path, port } => {
+            out.push(hook_field("namespace", namespace.clone()));
+            out.push(hook_field("service", format!("{}:{}", name, port)));
+            out.push(hook_field("path", path.clone()));
+        }
+        Backend::Url { url } => out.push(hook_field("url", url.clone())),
+        Backend::Local => out.push(hook_field("service", "apiserver".to_string())),
+    }
+    let (ns, name) = backend.service().unwrap_or(("", ""));
+    let text = match reach {
+        Reach::Ready => st.hk_reach_ready.to_string(),
+        Reach::NoEndpoints => st.hk_reach_no_endpoints.to_string(),
+        Reach::ServiceGone => lang::fill(st.hk_reach_service_gone, &[("name", name), ("ns", ns)]),
+        Reach::NamespaceGone => lang::fill(st.hk_reach_namespace_gone, &[("ns", ns)]),
+        Reach::NotOurs => st.hk_reach_not_ours.to_string(),
+        Reach::Unchecked => st.hk_reach_unchecked.to_string(),
+    };
+    out.extend(hook_wrapped(&text, width, reach_style(reach)));
+    out
+}
+
+fn hook_ca_lines(ca: &CaBundle, st: &'static lang::Strings, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![hook_section("caBundle")];
+    match ca {
+        CaBundle::Absent { injector } => {
+            let text = match injector {
+                Some(injector) => lang::fill(st.hk_ca_injected, &[("injector", injector)]),
+                None => st.hk_ca_none.to_string(),
+            };
+            out.extend(hook_wrapped(&text, width, Style::default().fg(DIM)));
+        }
+        CaBundle::Opaque { bytes } => {
+            let text = lang::fill(st.hk_ca_unreadable, &[("n", &bytes.to_string())]);
+            out.extend(hook_wrapped(&text, width, Style::default().fg(Color::Yellow)));
+        }
+        CaBundle::Parsed { certs, .. } => {
+            for c in certs {
+                let style = if c.days_remaining <= 0 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if c.days_remaining <= 30 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                let issuer = if c.self_signed {
+                    st.hk_ca_self_signed.to_string()
+                } else {
+                    c.issuer_cn.clone()
+                };
+                let text = lang::fill(
+                    st.hk_ca_line,
+                    &[
+                        ("cn", &c.subject_cn),
+                        ("issuer", &issuer),
+                        ("date", &c.not_after),
+                        ("n", &c.days_remaining.to_string()),
+                    ],
+                );
+                out.extend(hook_wrapped(&text, width, style));
+            }
+        }
+    }
+    out
+}
+
+fn hook_findings_lines(
+    hints: &[crate::storage::Hint],
+    st: &'static lang::Strings,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if hints.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![hook_section(st.hk_sec_findings)];
+    // Worst first: the one that decides what to do about this row is the one to read.
+    let mut sorted: Vec<&crate::storage::Hint> = hints.iter().collect();
+    sorted.sort_by_key(|h| std::cmp::Reverse(h.level));
+    for h in sorted {
+        out.extend(hook_wrapped(&h.text, width, hook_hint_style(h.level)));
+    }
+    out
+}
+
+fn admission_detail_lines(
+    h: &AdmissionHook,
+    st: &'static lang::Strings,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![hook_section(st.hk_sec_identity)];
+    out.push(hook_field("kind", h.kind.api_kind().to_string()));
+    out.extend(hook_wrapped(
+        &lang::fill(
+            st.hk_detail_webhook,
+            &[("name", &h.name), ("i", &h.index.to_string()), ("config", &h.config)],
+        ),
+        width,
+        Style::default(),
+    ));
+    if let Some(owner) = crate::hooks::hook_owner(&h.config) {
+        out.extend(hook_wrapped(
+            &lang::fill(st.hk_detail_owner, &[("owner", owner)]),
+            width,
+            Style::default().fg(DIM),
+        ));
+    }
+    // What `Ctrl-D` would take with it. A named webhook is not an API object, so the gesture acts
+    // on the configuration — and the blast radius is every webhook it holds.
+    out.extend(hook_wrapped(
+        &lang::fill(
+            st.hk_detail_delete,
+            &[("config", &h.config), ("n", &h.siblings.to_string())],
+        ),
+        width,
+        Style::default().fg(Color::Yellow),
+    ));
+
+    out.extend(hook_reach_lines(&h.backend, h.reach, st, width));
+
+    out.push(hook_section(st.hk_sec_policy));
+    out.push(hook_field(
+        "failurePolicy",
+        format!(
+            "{}{}",
+            if h.fail_closed { "Fail" } else { "Ignore" },
+            if h.failure_policy_defaulted { " (default)" } else { "" }
+        ),
+    ));
+    out.push(hook_field(
+        "timeoutSeconds",
+        match h.timeout_seconds {
+            Some(t) => format!("{}", t),
+            None => "10 (default)".to_string(),
+        },
+    ));
+    out.push(hook_field("sideEffects", h.side_effects.clone()));
+    out.push(hook_field("matchPolicy", h.match_policy.clone()));
+    if let Some(p) = &h.reinvocation_policy {
+        out.push(hook_field("reinvocationPolicy", p.clone()));
+    }
+    out.push(hook_field("admissionReviewVersions", h.admission_review_versions.join(",")));
+    if h.match_conditions > 0 {
+        out.extend(hook_wrapped(
+            &lang::fill(st.hk_detail_match_conditions, &[("n", &h.match_conditions.to_string())]),
+            width,
+            Style::default().fg(DIM),
+        ));
+    }
+
+    out.push(hook_section(st.hk_sec_scope));
+    for rule in &h.rules {
+        let style = if rule.is_catch_all() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        out.extend(hook_wrapped(&rule.summary(), width, style));
+    }
+    for (label, sel) in [
+        ("namespaceSelector", &h.namespace_selector),
+        ("objectSelector", &h.object_selector),
+    ] {
+        let value = if sel.matches_everything { "*".to_string() } else { sel.summary.clone() };
+        out.push(hook_field(label, value));
+    }
+
+    out.extend(hook_ca_lines(&h.ca, st, width));
+    out.extend(hook_findings_lines(&h.hints, st, width));
+    out
+}
+
+fn conversion_detail_lines(
+    c: &ConversionHook,
+    st: &'static lang::Strings,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![hook_section(st.hk_sec_identity)];
+    out.push(hook_field("kind", "CustomResourceDefinition".to_string()));
+    out.push(hook_field("name", c.name.clone()));
+    out.push(hook_field("group", c.group.clone()));
+    out.push(hook_field("scope", c.scope.clone()));
+    out.push(hook_field("conversionReviewVersions", c.conversion_review_versions.join(",")));
+
+    out.extend(hook_reach_lines(&c.backend, c.reach, st, width));
+    // Naming the cost, because it is the one that surprises: a dead conversion webhook breaks
+    // reads, not just writes. Only when it is dead — on a healthy one the sentence is noise.
+    if c.reach.is_broken() {
+        out.extend(hook_wrapped(
+            &lang::fill(st.hk_conv_cost, &[("kind", &c.kind)]),
+            width,
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    out.push(hook_section(st.hk_sec_versions));
+    for v in &c.versions {
+        let mut marks: Vec<&str> = Vec::new();
+        if v.served {
+            marks.push("served");
+        }
+        if v.storage {
+            marks.push("storage");
+        }
+        if v.deprecated {
+            marks.push("deprecated");
+        }
+        let style = if v.storage && !v.served {
+            Style::default().fg(Color::Red)
+        } else if v.deprecated {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!("  {:<26}", v.name), style),
+            Span::styled(marks.join(", "), Style::default().fg(DIM)),
+        ]));
+    }
+
+    out.extend(hook_ca_lines(&c.ca, st, width));
+    out.extend(hook_findings_lines(&c.hints, st, width));
+    out
+}
+
+fn apiservice_detail_lines(
+    a: &ApiServiceHook,
+    st: &'static lang::Strings,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![hook_section(st.hk_sec_identity)];
+    out.push(hook_field("kind", "APIService".to_string()));
+    out.push(hook_field("group", a.group.clone()));
+    out.push(hook_field("version", a.version.clone()));
+    out.push(hook_field("groupPriorityMinimum", a.group_priority_minimum.to_string()));
+    out.push(hook_field("versionPriority", a.version_priority.to_string()));
+    out.push(hook_field("insecureSkipTLSVerify", a.insecure.to_string()));
+
+    out.extend(hook_reach_lines(&a.backend, a.reach, st, width));
+
+    out.push(hook_section("Available"));
+    out.push(hook_field("status", a.available_label().to_string()));
+    // The API server's own reason and message, verbatim: it knows why it gave up, and rewording it
+    // would lose the only lead there is.
+    if !a.reason.is_empty() {
+        out.push(hook_field("reason", a.reason.clone()));
+    }
+    if !a.message.is_empty() {
+        out.extend(hook_wrapped(&a.message, width, Style::default().fg(DIM)));
+    }
+    if a.available.as_deref() != Some("True") || a.reach.is_broken() {
+        out.extend(hook_wrapped(st.hk_apisvc_cost, width, Style::default().fg(Color::Yellow)));
+    }
+
+    out.extend(hook_ca_lines(&a.ca, st, width));
+    out.extend(hook_findings_lines(&a.hints, st, width));
+    out
+}
+
+fn draw_hooks_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let width = area.width.saturating_sub(4) as usize;
+
+    let (title, mut lines) = match app.table_state.selected().and_then(|i| app.hooks_rows.get(i)) {
+        Some(HookRow::Admission(h)) => (h.name.clone(), admission_detail_lines(h, st, width)),
+        Some(HookRow::Config(c)) => {
+            let mut lines = vec![hook_section(st.hk_sec_identity)];
+            lines.push(hook_field("kind", c.kind.api_kind().to_string()));
+            lines.push(hook_field("webhooks", c.hooks.to_string()));
+            if let Some(owner) = crate::hooks::hook_owner(&c.name) {
+                lines.extend(hook_wrapped(
+                    &lang::fill(st.hk_detail_owner, &[("owner", owner)]),
+                    width,
+                    Style::default().fg(DIM),
+                ));
+            }
+            lines.extend(hook_findings_lines(&c.hints, st, width));
+            (c.name.clone(), lines)
+        }
+        Some(HookRow::Conversion(c)) => (c.name.clone(), conversion_detail_lines(c, st, width)),
+        Some(HookRow::ApiService(a)) => (a.name.clone(), apiservice_detail_lines(a, st, width)),
+        None => (
+            st.hk_empty.to_string(),
+            vec![Line::from(Span::styled(st.hk_empty, Style::default().fg(DIM)))],
+        ),
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if app.hooks_detail_scroll > max_scroll {
+        app.hooks_detail_scroll = max_scroll;
+    }
+    app.hooks_detail_scroll = text_search_top(
+        app,
+        Mode::HooksFull,
+        &mut lines,
+        visible,
+        app.hooks_detail_scroll,
+        max_scroll,
+    );
+
+    let p = Paragraph::new(lines)
+        .scroll((app.hooks_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
 fn draw_kyverno_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(4) as usize;
     let (title, mut lines) = ky_health_lines(app);
@@ -27628,6 +28925,10 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_secrets_detail(f, app, area);
         return;
     }
+    if matches!(view_mode(app), Mode::Hooks | Mode::HooksFull) {
+        draw_hooks_detail(f, app, area);
+        return;
+    }
     let is_certs_mode = matches!(view_mode(app), Mode::Certs | Mode::CertsFull);
     if is_certs_mode {
         draw_certs_detail(f, app, area);
@@ -28903,10 +30204,44 @@ mod palette_tests {
     // be accepted and then do nothing, which is worse than a typo.
     #[test]
     fn the_cluster_scoped_views_refuse_one() {
-        for word in ["nodes", "capacity", "pv", "rancher", "argocd", "flux", "reflector", "kyverno"] {
+        for word in [
+            "nodes", "capacity", "pv", "rancher", "argocd", "flux", "reflector", "kyverno",
+            "hooks", "webhooks", "conversion", "apiservice",
+        ] {
             let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
             assert!(!command_takes_ns(cmd), "{word} -> {cmd} accepts a namespace it cannot apply");
         }
+    }
+
+    // `admission` was Kyverno's word before the hooks view existed, and on a cluster running Kyverno
+    // it is still what the word means. The longer `admissionwebhooks` is what reaches the new view —
+    // the same arrangement as `backup` staying velero's while `backupstoragelocation` reaches `bsl`.
+    #[test]
+    fn the_admission_word_still_belongs_to_kyverno() {
+        assert_eq!(resolve_command("admission"), Some("kyverno"));
+        assert_eq!(resolve_command("admissionwebhooks"), Some("hooks"));
+        assert_eq!(resolve_command("admissionwebhook"), Some("hooks"));
+        assert_eq!(command_name_suggestions("admission").first(), Some(&"kyverno"));
+    }
+
+    // Each world answers to its own name, so `:apiservice` opens on the APIServices instead of
+    // landing on admission and asking for a `g`.
+    #[test]
+    fn the_three_hook_words_land_on_their_own_world() {
+        for word in ["hooks", "webhook", "vwc", "mwc", "wh", "mutatingwebhookconfigurations"] {
+            assert_eq!(resolve_command(word), Some("hooks"), "{word}");
+        }
+        for word in ["conversion", "crdconversion", "convert"] {
+            assert_eq!(resolve_command(word), Some("conversion"), "{word}");
+        }
+        for word in ["apiservice", "apisvc", "aggregated", "agg"] {
+            assert_eq!(resolve_command(word), Some("apiservice"), "{word}");
+        }
+        // `crd` is deliberately not an alias: the view lists the CRDs that convert through a
+        // webhook, not the inventory of CRDs, and the word would promise the second.
+        assert_ne!(resolve_command("crd"), Some("conversion"));
+        // No other command starts with `h`, so the bare prefix resolves.
+        assert_eq!(resolve_command("h"), Some("hooks"));
     }
 
     // `all`, `*` and `0` are the three ways to say "every namespace" — the palette maps them to the
@@ -28917,6 +30252,195 @@ mod palette_tests {
         assert_eq!(ns_arg_to_opt("*"), None);
         assert_eq!(ns_arg_to_opt("0"), None);
         assert_eq!(ns_arg_to_opt("kube-system"), Some("kube-system".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod hooks_view_tests {
+    use super::*;
+    use crate::hooks::HooksState;
+
+    fn hook(kind: WebhookKind, config: &str, index: usize, name: &str) -> AdmissionHook {
+        AdmissionHook {
+            kind,
+            config: config.to_string(),
+            index,
+            siblings: 1,
+            name: name.to_string(),
+            backend: Backend::Service {
+                namespace: "ops".into(),
+                name: "hook-svc".into(),
+                path: "/validate".into(),
+                port: 443,
+            },
+            reach: Reach::Ready,
+            fail_closed: true,
+            failure_policy_defaulted: false,
+            timeout_seconds: Some(10),
+            side_effects: "None".into(),
+            match_policy: "Equivalent".into(),
+            reinvocation_policy: None,
+            admission_review_versions: vec!["v1".into()],
+            rules: Vec::new(),
+            namespace_selector: Default::default(),
+            object_selector: Default::default(),
+            match_conditions: 0,
+            ca: crate::hooks::CaBundle::Absent { injector: None },
+            hints: Vec::new(),
+            age: "1d".into(),
+            uid: format!("hooks|adm|{}/{}#{}", kind.label(), config, index),
+        }
+    }
+
+    fn config(kind: WebhookKind, name: &str, hooks: usize) -> AdmissionConfig {
+        AdmissionConfig {
+            kind,
+            name: name.to_string(),
+            hooks,
+            hints: Vec::new(),
+            age: "1d".into(),
+            uid: format!("hooks|cfg|{}/{}", kind.label(), name),
+        }
+    }
+
+    fn state() -> HooksState {
+        HooksState {
+            configs: vec![
+                config(WebhookKind::Validating, "kyverno-cfg", 2),
+                config(WebhookKind::Mutating, "inject-cfg", 1),
+            ],
+            admission: vec![
+                hook(WebhookKind::Validating, "kyverno-cfg", 0, "validate.kyverno.svc-fail"),
+                hook(WebhookKind::Validating, "kyverno-cfg", 1, "validate.kyverno.svc-ignore"),
+                hook(WebhookKind::Mutating, "inject-cfg", 0, "mutate.kyverno.svc-fail"),
+            ],
+            installed: true,
+            ..Default::default()
+        }
+    }
+
+    // A desync does not crash: it points the detail panel, and `Ctrl-D`, at the wrong object. So the
+    // rows and the records are checked to stand one for one, in every world and both groupings.
+    #[test]
+    fn the_snapshot_stays_index_aligned_with_the_rows_in_every_world() {
+        let st = state();
+        for world in [HookWorld::Admission, HookWorld::Conversion, HookWorld::ApiService] {
+            for group in [false, true] {
+                let rows = hook_rows_for(&st, world, group);
+                let recs: Vec<EventRecord> = rows.iter().map(synthetic_hook_record).collect();
+                assert_eq!(rows.len(), recs.len());
+                for (row, rec) in rows.iter().zip(&recs) {
+                    let uid = match row {
+                        HookRow::Config(c) => &c.uid,
+                        HookRow::Admission(h) => &h.uid,
+                        HookRow::Conversion(c) => &c.uid,
+                        HookRow::ApiService(a) => &a.uid,
+                    };
+                    assert_eq!(uid, &rec.uid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouping_puts_every_webhook_under_its_configuration_and_leaves_none_behind() {
+        let st = state();
+        let flat = hook_rows_for(&st, HookWorld::Admission, false);
+        assert_eq!(flat.len(), 3);
+        assert!(flat.iter().all(|r| matches!(r, HookRow::Admission(_))));
+
+        let grouped = hook_rows_for(&st, HookWorld::Admission, true);
+        // Two configurations plus their three webhooks, and each child right after its parent.
+        assert_eq!(grouped.len(), 5);
+        assert!(matches!(&grouped[0], HookRow::Config(c) if c.name == "kyverno-cfg"));
+        assert!(matches!(&grouped[1], HookRow::Admission(h) if h.config == "kyverno-cfg"));
+        assert!(matches!(&grouped[2], HookRow::Admission(h) if h.config == "kyverno-cfg"));
+        assert!(matches!(&grouped[3], HookRow::Config(c) if c.name == "inject-cfg"));
+        assert!(matches!(&grouped[4], HookRow::Admission(h) if h.config == "inject-cfg"));
+
+        let webhooks = grouped.iter().filter(|r| matches!(r, HookRow::Admission(_))).count();
+        assert_eq!(webhooks, flat.len());
+    }
+
+    // A validating and a mutating configuration can carry the same name; the grouping has to keep
+    // their webhooks apart.
+    #[test]
+    fn two_configurations_of_the_same_name_do_not_swap_their_webhooks() {
+        let st = HooksState {
+            configs: vec![
+                config(WebhookKind::Validating, "same", 1),
+                config(WebhookKind::Mutating, "same", 1),
+            ],
+            admission: vec![
+                hook(WebhookKind::Validating, "same", 0, "v"),
+                hook(WebhookKind::Mutating, "same", 0, "m"),
+            ],
+            installed: true,
+            ..Default::default()
+        };
+        let rows = hook_rows_for(&st, HookWorld::Admission, true);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[1], HookRow::Admission(h) if h.name == "v"));
+        assert!(matches!(&rows[3], HookRow::Admission(h) if h.name == "m"));
+    }
+
+    // The record a row hands to the shared panels designates the configuration, not the webhook:
+    // that is the object `y`, `e` and `Ctrl-D` can actually act on.
+    #[test]
+    fn an_admission_row_hands_the_panels_its_configuration() {
+        let rows = hook_rows_for(&state(), HookWorld::Admission, false);
+        let rec = synthetic_hook_record(&rows[0]);
+        assert_eq!(rec.kind, "ValidatingWebhookConfiguration");
+        assert_eq!(rec.name, "kyverno-cfg");
+        assert_eq!(rec.namespace, "");
+    }
+
+    // The right border, held to by arithmetic rather than by a screenshot: every column, every
+    // inter-column gap and the two cells of `highlight_symbol` have to fit inside the frame, at
+    // every terminal width and at both ends of each elastic column.
+    #[test]
+    fn the_columns_of_every_world_leave_the_right_border_alone() {
+        // 120 is the floor this view is dimensioned for: eleven columns do not fit 80 cells, and a
+        // formula that claimed they did would only hand the overflow to ratatui to truncate.
+        for width in [120u16, 132, 160, 196, 240] {
+            let inner = width.saturating_sub(2) as usize;
+            // Both ends of every elastic column: short names, and names long enough to ask for the
+            // maximum the column would ever take.
+            for wanted in [[14u16, 16, 14], [30, 32, 26]] {
+                let mut e = wanted;
+                shrink_to_fit(width, ADMISSION_FIXED, 11, &mut e, &[14, 16, 14]);
+                let msg_w = admission_msg_w(width, e[0], e[1], e[2]);
+                let used = (ADMISSION_FIXED + e[0] + e[1] + e[2] + HIGHLIGHT_W) as usize
+                    + msg_w
+                    + 10;
+                assert!(used <= inner, "admission {width} {wanted:?}: {used} > {inner}");
+            }
+            for wanted in [[18u16, 10], [38, 24]] {
+                let mut e = wanted;
+                shrink_to_fit(width, CONVERSION_FIXED, 10, &mut e, &[18, 10]);
+                let msg_w = conversion_msg_w(width, e[0], e[1]);
+                let used = (CONVERSION_FIXED + e[0] + e[1] + HIGHLIGHT_W) as usize + msg_w + 9;
+                assert!(used <= inner, "conversion {width} {wanted:?}: {used} > {inner}");
+            }
+            for wanted in [[20u16, 12], [38, 26]] {
+                let mut e = wanted;
+                shrink_to_fit(width, APISERVICE_FIXED, 10, &mut e, &[20, 12]);
+                let msg_w = apiservice_msg_w(width, e[0], e[1]);
+                let used = (APISERVICE_FIXED + e[0] + e[1] + HIGHLIGHT_W) as usize + msg_w + 9;
+                assert!(used <= inner, "apiservice {width} {wanted:?}: {used} > {inner}");
+            }
+        }
+    }
+
+    #[test]
+    fn cycling_g_three_times_returns_to_admission() {
+        let mut world = HookWorld::Admission;
+        world = world.next();
+        assert_eq!(world, HookWorld::Conversion);
+        world = world.next();
+        assert_eq!(world, HookWorld::ApiService);
+        world = world.next();
+        assert_eq!(world, HookWorld::Admission);
     }
 }
 

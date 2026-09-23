@@ -1,0 +1,47 @@
+# Une CRD qui confie sa conversion à un webhook mort : `kubectl get widgets` échouera, en lecture.
+# Aucun objet `Widget` n'est créé — la CRD suffit à la vue, et un CR irrécupérable ne servirait rien.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.kdt.test
+spec:
+  group: kdt.test
+  scope: Namespaced
+  names:
+    kind: Widget
+    plural: widgets
+    singular: widget
+  conversion:
+    strategy: Webhook
+    webhook:
+      conversionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          namespace: kdt-hooks-test
+          name: nobody-listens-here
+          path: /convert
+  versions:
+    - name: v1beta1
+      served: true
+      storage: false
+      deprecated: true
+      deprecationWarning: "kdt.test/v1beta1 Widget is deprecated; use kdt.test/v1"
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size: { type: string }
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size: { type: string }
