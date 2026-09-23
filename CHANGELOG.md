@@ -8,6 +8,26 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.1] — 2026-09-23
+
+- **fix(web)** — les tables de kdt-web **se taillent sur leur contenu** et cessent de déborder.
+  Chaque colonne portait jusqu'ici un plafond en caractères qu'elle prenait toujours, que le
+  contenu le remplisse ou non : une colonne `NS` de vingt caractères pour des namespaces qui en
+  font six, et une table plus large que l'écran dans presque toutes les vues depuis que le corps
+  est passé à 14 px. La table est désormais **une seule grille** dont chaque ligne reprend les
+  pistes (`subgrid`), ce qui permet enfin de mesurer une colonne sur le contenu de **toutes** les
+  lignes à la fois : elle prend la largeur de ce qu'elle montre, sans dépasser son plafond, et les
+  lignes restent alignées sur leur en-tête par construction.
+
+- **fix(web)** — la colonne de texte d'une table — message, détail, verdict, alertes —
+  **s'enroule sur deux lignes** au lieu d'élider dès qu'elle manque de place. C'est elle qui reçoit
+  la largeur restante ; au-delà de deux lignes, la suite se lit dans le panneau de détail.
+
+- **fix(web)** — une fenêtre trop étroite fait **défiler** la table plutôt que d'écraser toutes ses
+  colonnes en une suite d'ellipses. Chaque table déclare un plancher, calculé depuis son propre
+  gabarit ; passé ce plancher, les deux colonnes de gestes restent épinglées, ce pour quoi elles
+  l'ont toujours été.
+
 ## [2.0.0] — 2026-09-23
 
 Le majeur sort de sa série de pré-versions. Ce qu'il marque n'a pas changé depuis `beta.1` — le

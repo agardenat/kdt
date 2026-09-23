@@ -39,27 +39,27 @@ import type {
   HookReach,
   HooksPayload,
 } from "./types";
+import { cols } from "./table";
 
 type World = "admission" | "conversion" | "apiservice";
 
 /** `KIND CONFIGURATION WEBHOOK POLICY TMO BACKEND REACH SCOPE CA AGE VERDICT`, dans l'ordre du TUI. */
-/* Le verdict est une phrase, et `.tbl` est en `width: max-content` : une piste `1fr` s'y résoudrait
- * sur le contenu et étirerait la table bien au-delà de l'écran. Elle a donc un plafond, comme les
- * autres colonnes de texte. La phrase entière reste dans le `title` et dans le panneau de détail,
- * qui est l'endroit fait pour la lire. */
-const VERDICT = "minmax(220px,34ch)";
+/* Le verdict est une phrase : c'est lui qui prend la piste souple de la table et qui s'enroule sur
+ * deux lignes plutôt que d'élider. Au-delà, la phrase entière reste dans le `title` et dans le
+ * panneau de détail, qui est l'endroit fait pour la lire. */
+const VERDICT = "minmax(26ch,1fr)";
 
 const ADMISSION_COLUMNS =
-  "34px 52px minmax(140px,18ch) minmax(160px,22ch) 72px 56px minmax(150px,18ch) 76px" +
-  ` minmax(90px,10ch) 64px 52px ${VERDICT} 34px`;
+  "34px 52px fit-content(18ch) fit-content(22ch) 72px 56px fit-content(18ch) 76px" +
+  ` fit-content(10ch) 64px 52px ${VERDICT} 34px`;
 
 const CONVERSION_COLUMNS =
-  "34px minmax(170px,24ch) minmax(120px,16ch) minmax(100px,12ch) minmax(120px,14ch)" +
-  ` minmax(90px,9ch) minmax(150px,18ch) 76px 64px 52px ${VERDICT} 34px`;
+  "34px fit-content(24ch) fit-content(16ch) fit-content(12ch) fit-content(14ch)" +
+  ` fit-content(9ch) fit-content(18ch) 76px 64px 52px ${VERDICT} 34px`;
 
 const APISERVICE_COLUMNS =
-  "34px minmax(180px,26ch) minmax(130px,18ch) 84px minmax(150px,18ch) 76px 72px" +
-  ` minmax(120px,16ch) 64px 52px ${VERDICT} 34px`;
+  "34px fit-content(26ch) fit-content(18ch) 84px fit-content(18ch) 76px 72px" +
+  ` fit-content(16ch) 64px 52px ${VERDICT} 34px`;
 
 type Row = AdmissionHookRow | AdmissionConfigRow | ConversionHookRow | ApiServiceHookRow;
 
@@ -444,9 +444,9 @@ function HooksTable({
         : ["APISERVICE", "GROUP", "VERSION", "BACKEND", "REACH", "AVAIL", "REASON", "CA", "AGE", "VERDICT"];
 
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(columns)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: columns }}>
+        <div className="tr">
           <SelectionHead />
           {headers.map((h) => (
             <div key={h} className="cell">
@@ -461,7 +461,6 @@ function HooksTable({
           <div
             key={row.uid}
             className={`tr sev-${row.record.tone}`}
-            style={{ gridTemplateColumns: columns }}
             aria-selected={selected === row.uid}
             tabIndex={0}
             onClick={() => onSelect(row.uid)}
@@ -516,7 +515,7 @@ function Verdict({ hints }: { hints: HookHint[] }) {
   if (!w) return <div className="cell" />;
   const cls = w.level === "danger" ? "err" : w.level === "warn" ? "warn" : "dim";
   return (
-    <div className={`cell ${cls}`} title={w.text}>
+    <div className={`cell wrap ${cls}`} title={w.text}>
       {w.text}
     </div>
   );

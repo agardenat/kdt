@@ -14,23 +14,24 @@ import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
 import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
 import type { EventRecord, FluxCounts, FluxRow, InventoryItem, ReconcileScope } from "./types";
+import { cols } from "./table";
 
 /**
  * Les colonnes de l'arbre : mêmes colonnes, même ordre et mêmes proportions que le TUI.
  *
  * Côté Rust : RESOURCE dimensionnée sur son contenu (24 à 80 caractères), puis 10, 18, 6, et le
- * reste au message. Transposées en pistes de grille, avec la colonne RESOURCE en `fr` parce que
- * c'est elle qui porte l'indentation, et le message en second `fr` parce que c'est lui qui dit
- * pourquoi une ligne est rouge.
+ * reste au message. Ici RESOURCE se taille sur son contenu sous un plafond, parce que c'est elle
+ * qui porte l'indentation, et le message prend la piste souple — enroulé sur deux lignes — parce
+ * que c'est lui qui dit pourquoi une ligne est rouge.
  */
 const TREE_COLUMNS =
-  "34px minmax(280px,1.3fr) 104px minmax(120px,18ch) 52px minmax(200px,1.6fr) 34px";
+  "34px fit-content(52ch) 104px fit-content(18ch) 52px minmax(26ch,1fr) 34px";
 
 /** Les colonnes de la vue à plat, celles de `flux_table_parts`. La première piste (`34px`) porte
  * la case de sélection multiple, la dernière le hamburger de la ligne. */
 const LIST_COLUMNS =
-  "34px minmax(110px,16ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(120px,18ch) 52px" +
-  " minmax(200px,1.6fr) 34px";
+  "34px fit-content(16ch) fit-content(20ch) fit-content(36ch) 104px fit-content(18ch) 52px" +
+  " minmax(26ch,1fr) 34px";
 
 /** Une entrée du menu d'action, dans l'ordre et sous les mots du TUI. */
 interface Action {
@@ -328,11 +329,10 @@ export default function FluxView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(tree ? TREE_COLUMNS : LIST_COLUMNS)}>
             <div className="thead">
               <div
                 className="tr"
-                style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
               >
                 <SelectionHead />
                 {tree ? (
@@ -501,7 +501,6 @@ function ResourceLine({
   return (
     <div
       className={`tr flux-${row.row_tone}`}
-      style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -568,7 +567,7 @@ function ResourceLine({
         {row.revision}
       </div>
       <div className="cell num dim">{row.age}</div>
-      <div className="cell" title={row.message}>
+      <div className="cell wrap" title={row.message}>
         {row.no_prune && (
           <span className="badge prune" title={st.fluxNoPruneTitle}>
             ⊡ {st.fluxNoPrune}
@@ -624,7 +623,6 @@ function InventoryLine({
   return (
     <div
       className="tr flux-inv"
-      style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -645,7 +643,7 @@ function InventoryLine({
       </div>
       <div className="cell" />
       <div className="cell" />
-      <div className="cell dim" title={item.msg}>
+      <div className="cell wrap dim" title={item.msg}>
         {item.msg}
       </div>
       <div className="cell act">

@@ -21,13 +21,14 @@ import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
 import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type { ConfigMapRow, EventRecord, SecretFilter, SecretRow, SecretValue } from "./types";
+import { cols } from "./table";
 
 /** La première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
  * ligne. */
 const SECRET_COLUMNS =
-  "34px minmax(220px,1.4fr) minmax(120px,18ch) minmax(140px,20ch) 72px minmax(150px,1fr) 56px 34px";
+  "34px minmax(26ch,1fr) fit-content(18ch) fit-content(20ch) 72px fit-content(24ch) 56px 34px";
 const CM_COLUMNS =
-  "34px minmax(240px,1.6fr) minmax(120px,18ch) 64px 80px minmax(150px,1fr) 56px 34px";
+  "34px minmax(26ch,1fr) fit-content(18ch) 64px 80px fit-content(24ch) 56px 34px";
 
 type World = "secrets" | "configmaps";
 
@@ -331,9 +332,9 @@ export default function DataView({
             </div>
           </div>
         ) : world === "secrets" ? (
-          <div className="tbl">
+          <div className="tbl" style={cols(SECRET_COLUMNS)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: SECRET_COLUMNS }}>
+              <div className="tr">
                 <SelectionHead />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
@@ -368,9 +369,9 @@ export default function DataView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(CM_COLUMNS)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: CM_COLUMNS }}>
+              <div className="tr">
                 <SelectionHead />
                 <div className="cell">NAME</div>
                 <div className="cell">NAMESPACE</div>
@@ -448,7 +449,6 @@ function SecretLine({
   return (
     <div
       className={`tr sec-${s.expiry_tone ?? "plain"}`}
-      style={{ gridTemplateColumns: SECRET_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -508,7 +508,6 @@ function ConfigMapLine({
   return (
     <div
       className="tr"
-      style={{ gridTemplateColumns: CM_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}

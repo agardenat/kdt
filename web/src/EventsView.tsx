@@ -13,18 +13,20 @@ import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
 import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { recordIdentity } from "./record";
 import { age, toneLabel, type EventRecord } from "./types";
+import { cols } from "./table";
 
 /**
  * Les colonnes de la vue évènements : mêmes colonnes, même ordre et mêmes proportions que le TUI.
  *
  * Côté Rust les largeurs sont en caractères — 5, 4, 20, 14, 40, 22, 4, puis le reste pour le
- * message. Transposées ici en pistes de grille, avec un minimum pour que rien ne s'écrase et un
- * `fr` sur les deux colonnes qui méritent la place restante. La première (`34px`) porte la case de
- * sélection multiple, la dernière le hamburger de la ligne.
+ * message. Ici chaque colonne de texte se taille sur son contenu, plafonnée en `ch` : un cluster
+ * dont les namespaces font six lettres ne paie pas la colonne de vingt. MESSAGE garde la piste
+ * souple et s'enroule sur deux lignes. La première (`34px`) porte la case de sélection multiple,
+ * la dernière le hamburger de la ligne.
  */
 const COLUMNS =
-  "34px 52px 46px minmax(120px,20ch) minmax(96px,14ch) minmax(180px,1.4fr) minmax(150px,22ch)" +
-  " 40px minmax(240px,2fr) 34px";
+  "34px 52px fit-content(6ch) fit-content(20ch) fit-content(14ch) fit-content(36ch) fit-content(24ch)" +
+  " 40px minmax(24ch,1fr) 34px";
 
 /** Un évènement sans objet visé (kind/name vides) n'a rien pour `RowMenu`/la case à cocher. */
 function usable(r: EventRecord): boolean {
@@ -267,9 +269,9 @@ function EventTable({
   onToggleCheck: (key: string) => void;
 }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell num">AGE</div>
           <div className="cell">SEV</div>
@@ -289,7 +291,6 @@ function EventTable({
             <div
               key={key}
               className={`tr sev-${r.tone}`}
-              style={{ gridTemplateColumns: COLUMNS }}
               aria-selected={selected?.uid === r.uid}
               tabIndex={0}
               onClick={() => onSelect(r)}
@@ -315,7 +316,7 @@ function EventTable({
               <div className="cell id">{r.name}</div>
               <div className={`cell reason-${r.tone}`}>{r.reason}</div>
               <div className="cell num">x{r.count}</div>
-              <div className="cell">{r.message}</div>
+              <div className="cell wrap">{r.message}</div>
               <div className="cell act">
                 {usable(r) && (
                   <RowMenu

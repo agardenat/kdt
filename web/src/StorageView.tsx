@@ -31,16 +31,17 @@ import type {
   StoragePayload,
   StorageRow,
 } from "./types";
+import { cols } from "./table";
 
 /** `NAMESPACE NAME PHASE SIZE ACCESS CLASS VOLUME USED BY AGE`. La première piste (`34px`) porte
  * la case de sélection multiple, la dernière le hamburger de la ligne. */
 const CLAIM_COLUMNS =
-  "34px minmax(110px,18ch) minmax(150px,26ch) 84px 72px 72px minmax(150px,22ch)" +
-  " minmax(180px,1.2fr) minmax(140px,1fr) 52px 34px";
+  "34px fit-content(18ch) fit-content(26ch) 84px 72px 72px fit-content(22ch)" +
+  " fit-content(32ch) minmax(20ch,1fr) 52px 34px";
 
 /** `NAME KIND PHASE SIZE ACCESS RECLAIM CLAIM / PROVISIONER AGE`. */
 const VOLUME_COLUMNS =
-  "34px minmax(180px,1fr) 44px 84px 72px 72px 76px minmax(200px,1.4fr) 52px 34px";
+  "34px fit-content(30ch) fit-content(6ch) 84px 72px 72px 76px minmax(26ch,1fr) 52px 34px";
 
 type World = "claims" | "volumes";
 type Filter = "all" | "problems";
@@ -436,9 +437,9 @@ function ClaimTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(CLAIM_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: CLAIM_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">NAME</div>
@@ -457,7 +458,6 @@ function ClaimTable({
           <div
             key={c.uid}
             className={`tr sev-${c.record.tone}`}
-            style={{ gridTemplateColumns: CLAIM_COLUMNS }}
             aria-selected={selected === c.uid}
             tabIndex={0}
             onClick={() => onSelect(c.uid)}
@@ -477,7 +477,7 @@ function ClaimTable({
             <div className="cell dim">{c.access_modes}</div>
             <div className="cell mono dim">{c.storage_class ?? "—"}</div>
             <div className="cell mono dim">{c.volume_name ?? "—"}</div>
-            <div className={`cell ${c.mounted_by.length === 0 ? "dim" : ""}`}>
+            <div className={`cell wrap ${c.mounted_by.length === 0 ? "dim" : ""}`}>
               {c.mounted_by.length === 0
                 ? "—"
                 : c.mounted_by.length === 1
@@ -521,9 +521,9 @@ function VolumeTable({
   onToggle: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(VOLUME_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: VOLUME_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell">KIND</div>
@@ -547,7 +547,6 @@ function VolumeTable({
               {g.sc ? (
                 <div
                   className={`tr sto-class sev-${g.sc.record.tone}`}
-                  style={{ gridTemplateColumns: VOLUME_COLUMNS }}
                   aria-selected={selected === g.sc.uid}
                   tabIndex={0}
                   onClick={() => onSelect(g.sc!.uid)}
@@ -598,7 +597,7 @@ function VolumeTable({
                   </div>
                 </div>
               ) : (
-                <div className="tr sto-class" style={{ gridTemplateColumns: VOLUME_COLUMNS }}>
+                <div className="tr sto-class">
                   <div className="cell sel" />
                   <div className="cell id dim">
                     <span className="fold-gap">·</span>
@@ -620,7 +619,6 @@ function VolumeTable({
                   <div
                     key={v.uid}
                     className={`tr sto-volume sev-${v.record.tone}`}
-                    style={{ gridTemplateColumns: VOLUME_COLUMNS }}
                     aria-selected={selected === v.uid}
                     tabIndex={0}
                     onClick={() => onSelect(v.uid)}

@@ -34,12 +34,13 @@ import type {
   IdentUserRow,
   IdentityPayload,
 } from "./types";
+import { cols } from "./table";
 
 /** `NAME EMAIL PHASE GROUPS INVITE SESS AGE` — les colonnes du TUI, dans le même ordre. La
  * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
  * ligne. */
 const USER_COLUMNS =
-  "34px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 52px 34px";
+  "34px fit-content(20ch) fit-content(24ch) 84px minmax(20ch,1fr) 84px 52px 52px 34px";
 
 /**
  * Les mêmes, plus SRC avant l'âge.
@@ -48,14 +49,14 @@ const USER_COLUMNS =
  * que le TUI. Ailleurs ce serait une colonne de tirets prise sur celles qui distinguent.
  */
 const USER_COLUMNS_SOURCE =
-  "34px minmax(140px,20ch) minmax(160px,24ch) 84px minmax(160px,1fr) 84px 52px 56px 52px 34px";
+  "34px fit-content(20ch) fit-content(24ch) 84px minmax(20ch,1fr) 84px 52px 56px 52px 34px";
 
 /** `NAME MEM UNKNOWN RIGHTS DESCRIPTION AGE`. */
 const GROUP_COLUMNS =
-  "34px minmax(140px,20ch) 44px minmax(120px,20ch) 64px minmax(200px,1fr) 52px 34px";
+  "34px fit-content(20ch) 44px fit-content(20ch) 64px minmax(24ch,1fr) 52px 34px";
 
 const GROUP_COLUMNS_SOURCE =
-  "34px minmax(140px,20ch) 44px minmax(120px,20ch) 64px 56px minmax(200px,1fr) 52px 34px";
+  "34px fit-content(20ch) 44px fit-content(20ch) 64px 56px minmax(24ch,1fr) 52px 34px";
 
 type World = "users" | "groups";
 type Filter = "all" | "problems";
@@ -580,11 +581,10 @@ function UserTable({
   onToggleCheck: (key: string) => void;
 }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS)}>
       <div className="thead">
         <div
           className="tr"
-          style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
         >
           <SelectionHead />
           <div className="cell">NAME</div>
@@ -603,7 +603,6 @@ function UserTable({
           <div
             key={u.uid}
             className={`tr sev-${u.record.tone}`}
-            style={{ gridTemplateColumns: showSource ? USER_COLUMNS_SOURCE : USER_COLUMNS }}
             aria-selected={selected === u.uid}
             tabIndex={0}
             onClick={() => onSelect(u)}
@@ -620,7 +619,7 @@ function UserTable({
             <div className="cell dim">{u.email}</div>
             <div className={`cell ${u.phase_tone}`}>{u.phase_label}</div>
             {/* Les groupes décident de ce que le compte peut faire : la colonne prend le mou. */}
-            <div className={`cell ${u.member_of.length ? "" : "dim"}`}>
+            <div className={`cell wrap ${u.member_of.length ? "" : "dim"}`}>
               {u.member_of.length ? u.member_of.join(", ") : "—"}
             </div>
             <div className={`cell ${u.invitation_tone}`}>{u.invitation_label}</div>
@@ -698,11 +697,10 @@ function GroupTable({
   onToggleCheck: (key: string) => void;
 }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS)}>
       <div className="thead">
         <div
           className="tr"
-          style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
         >
           <SelectionHead />
           <div className="cell">NAME</div>
@@ -720,7 +718,6 @@ function GroupTable({
           <div
             key={g.uid}
             className={`tr sev-${g.record.tone}`}
-            style={{ gridTemplateColumns: showSource ? GROUP_COLUMNS_SOURCE : GROUP_COLUMNS }}
             aria-selected={selected === g.uid}
             tabIndex={0}
             onClick={() => onSelect(g)}
@@ -744,7 +741,7 @@ function GroupTable({
               {g.bindings.length ? g.bindings.length : "—"}
             </div>
             {showSource && <SourceCell source={g.source} st={st} />}
-            <div className="cell dim">{g.description}</div>
+            <div className="cell wrap dim">{g.description}</div>
             <div className="cell num dim">{g.age}</div>
             <div className="cell act">
               <RowMenu

@@ -28,13 +28,14 @@ import type {
   VelScheduleRow,
   VelWorld,
 } from "./types";
+import { cols } from "./table";
 
 /** Les colonnes du TUI : `NAMESPACE NAME KIND STATE INFO EXPIRE AGE ALERT`, dans le même ordre. La
  * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
  * ligne. */
 const COLUMNS =
-  "34px minmax(110px,16ch) minmax(240px,1.1fr) 76px minmax(120px,16ch) minmax(180px,24ch)" +
-  " 76px 56px minmax(200px,1.4fr) 34px";
+  "34px fit-content(16ch) fit-content(36ch) 76px fit-content(16ch) fit-content(24ch)" +
+  " 76px 56px minmax(24ch,1fr) 34px";
 
 /** Une ligne sans objet à elle (un `orphans` synthétique, une feuille de contenu sans
  * enregistrement) n'a pas de case ni de hamburger. */
@@ -449,9 +450,9 @@ export default function VeleroView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(COLUMNS)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+              <div className="tr">
                 <SelectionHead />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
@@ -654,7 +655,6 @@ function Line({
   return (
     <div
       className={`tr ${hintClass(row.hints)}`}
-      style={{ gridTemplateColumns: COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -717,7 +717,7 @@ function Line({
       </div>
       <div className="cell dim">{expireText(row)}</div>
       <div className="cell num dim">{"age" in row ? row.age : ""}</div>
-      <div className={`cell ${hintTone(row.hints)}`} title={row.hints.map((h) => h.text).join(" · ")}>
+      <div className={`cell wrap ${hintTone(row.hints)}`} title={row.hints.map((h) => h.text).join(" · ")}>
         {row.hints[0]?.text ?? ""}
       </div>
       <div className="cell act">
@@ -792,7 +792,6 @@ function ContentsRow({
   return (
     <div
       className="tr vel-contents"
-      style={{ gridTemplateColumns: COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}

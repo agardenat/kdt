@@ -16,12 +16,13 @@ import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
 import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type { EventRecord, NetPolRow, NetpolPayload } from "./types";
+import { cols } from "./table";
 
 /** `NAMESPACE NAME ENGINE TARGET TYPES INGRESS EGRESS AGE`, dans l'ordre du TUI. La première piste
  * (`34px`) porte la case de sélection multiple, la dernière le hamburger de la ligne. */
 const COLUMNS =
-  "34px minmax(110px,18ch) minmax(150px,24ch) 72px minmax(150px,1fr) minmax(96px,14ch)" +
-  " minmax(180px,1.6fr) minmax(170px,1.2fr) 52px 34px";
+  "34px fit-content(18ch) fit-content(24ch) 72px fit-content(26ch) fit-content(14ch)" +
+  " minmax(22ch,1fr) minmax(22ch,1fr) 52px 34px";
 
 export default function NetpolView({
   lang,
@@ -255,9 +256,9 @@ function PolicyTable({
   onToggleCheck: (key: string) => void;
 }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">NAME</div>
@@ -275,7 +276,6 @@ function PolicyTable({
           <div
             key={p.uid}
             className={`tr sev-${p.record.tone}`}
-            style={{ gridTemplateColumns: COLUMNS }}
             aria-selected={selected === p.uid}
             tabIndex={0}
             onClick={() => onSelect(p.uid)}
@@ -294,13 +294,13 @@ function PolicyTable({
             <div className="cell mono">{p.target}</div>
             <div className="cell dim">{p.types || "—"}</div>
             <div
-              className={`cell ${p.ingress_tone}`}
+              className={`cell wrap ${p.ingress_tone}`}
               title={p.ingress_effect === "unknown" ? st.netpolNoVerdict : undefined}
             >
               {p.ingress}
             </div>
             <div
-              className={`cell ${p.egress_tone}`}
+              className={`cell wrap ${p.egress_tone}`}
               title={p.egress_effect === "unknown" ? st.netpolNoVerdict : undefined}
             >
               {p.egress}

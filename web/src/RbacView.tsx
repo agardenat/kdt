@@ -27,17 +27,18 @@ import type {
   RbacSeverity,
   RbacSubjectRow,
 } from "./types";
+import { cols } from "./table";
 
 /** Les colonnes de la liste d'audit : `SEV SCOPE SUBJECT ROLE SOURCE RISK AGE`, celles du TUI. La
  * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
  * ligne. */
 const FLAT_COLUMNS =
-  "34px 84px minmax(140px,22ch) minmax(200px,1.2fr) minmax(200px,32ch) minmax(180px,30ch)" +
-  " minmax(120px,20ch) 56px 34px";
+  "34px 84px fit-content(22ch) minmax(24ch,1fr) fit-content(32ch) fit-content(30ch)" +
+  " fit-content(20ch) 56px 34px";
 
 /** Les colonnes des trois lectures en arbre : `NODE SEV SCOPE ORIGIN DETAIL AGE`. */
 const TREE_COLUMNS =
-  "34px minmax(300px,1.3fr) 84px minmax(120px,18ch) minmax(180px,28ch) minmax(200px,1.2fr) 56px" +
+  "34px fit-content(52ch) 84px fit-content(18ch) fit-content(28ch) minmax(24ch,1fr) 56px" +
   " 34px";
 
 /** Un `nsgroup`/`rule`/`subject-leaf` n'a pas d'objet à lui : son `record` porte un kind/name vides,
@@ -302,9 +303,9 @@ export default function RbacView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(columns)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: columns }}>
+              <div className="tr">
                 <SelectionHead />
                 {orient === "flat" ? (
                   <>
@@ -336,7 +337,6 @@ export default function RbacView({
                   key={row.uid}
                   row={row}
                   orient={orient}
-                  columns={columns}
                   lang={lang}
                   st={st}
                   collapsed={collapsed.has(row.uid)}
@@ -378,7 +378,6 @@ export default function RbacView({
 function Line({
   row,
   orient,
-  columns,
   lang,
   st,
   collapsed,
@@ -392,7 +391,6 @@ function Line({
 }: {
   row: RbacRow;
   orient: RbacOrient;
-  columns: string;
   lang: Lang;
   st: Strings;
   collapsed: boolean;
@@ -406,7 +404,6 @@ function Line({
 }) {
   const common = {
     className: `tr ${rowClass(row)}`,
-    style: { gridTemplateColumns: columns },
     "aria-selected": selected,
     tabIndex: 0,
     onClick: onSelect,
@@ -563,7 +560,7 @@ function TreeCells({ row, st }: { row: RbacRow; st: Strings }) {
           >
             {row.sa?.exists ? row.sa.provenance_label : ""}
           </div>
-          <div className="cell dim">
+          <div className="cell wrap dim">
             {row.missing ? (
               <span className="err">{st.rbacSaMissing}</span>
             ) : (
@@ -588,7 +585,7 @@ function TreeCells({ row, st }: { row: RbacRow; st: Strings }) {
           <div className={`cell ${provClass(row.provenance)}`} title={row.provenance_label}>
             {row.provenance_label}
           </div>
-          <div className={`cell sev-${row.severity}`} title={row.risk_tags}>
+          <div className={`cell wrap sev-${row.severity}`} title={row.risk_tags}>
             {row.risk_top}
           </div>
           <div className="cell num dim">{row.age}</div>
@@ -605,7 +602,7 @@ function TreeCells({ row, st }: { row: RbacRow; st: Strings }) {
           <div className={`cell ${provClass(row.provenance)}`} title={row.provenance_label}>
             {row.provenance_label}
           </div>
-          <div className={`cell ${row.is_unbound ? "dim" : `sev-${row.severity}`}`}>
+          <div className={`cell wrap ${row.is_unbound ? "dim" : `sev-${row.severity}`}`}>
             {roleDetail(row, st)}
           </div>
           <div className="cell num dim">{row.age}</div>
@@ -617,7 +614,7 @@ function TreeCells({ row, st }: { row: RbacRow; st: Strings }) {
           <div className="cell" />
           <div className="cell dim">ns:{row.namespace}</div>
           <div className="cell" />
-          <div className="cell dim">{st.rbacNBindings.replace("{n}", String(row.bindings))}</div>
+          <div className="cell wrap dim">{st.rbacNBindings.replace("{n}", String(row.bindings))}</div>
           <div className="cell" />
         </>
       );
@@ -627,7 +624,7 @@ function TreeCells({ row, st }: { row: RbacRow; st: Strings }) {
           <div className="cell" />
           <div className="cell" />
           <div className="cell" />
-          <div className="cell">
+          <div className="cell wrap">
             <span className="dim">res </span>
             {row.resources} <span className="dim">grp </span>
             {row.api_groups}

@@ -17,6 +17,7 @@ import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
 import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
+import { cols } from "./table";
 
 /**
  * Les quatorze colonnes du TUI, dans le même ordre :
@@ -26,15 +27,16 @@ import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from ".
  * throttlé contre sa limite ou un pod qui a réservé dix fois ce qu'il consomme. Ils restent
  * étroits — quatre chiffres et un `%` — pour laisser NAME porter l'indentation des trois niveaux.
  *
- * La table déborde horizontalement sur un écran étroit ; `.tbl` est déjà en `width: max-content`
- * dans un conteneur qui défile, donc rien ne s'écrase.
+ * La table tient dans la largeur : les colonnes se taillent sur leur contenu et NAME, qui porte
+ * l'indentation des trois niveaux, prend le mou. Sur un écran vraiment étroit les colonnes de
+ * texte élident plutôt que de pousser la table hors champ.
  *
  * La première piste (`34px`) porte la case de sélection multiple et la dernière le hamburger de la
  * ligne, ni l'une ni l'autre mesurée sur le contenu.
  */
 const COLUMNS =
-  "34px minmax(110px,16ch) minmax(240px,1.5fr) 78px minmax(104px,13ch) 46px 62px 72px" +
-  " 60px 60px 60px 60px minmax(110px,14ch) minmax(120px,16ch) 52px 34px";
+  "34px fit-content(16ch) minmax(28ch,1fr) 78px fit-content(13ch) 46px 62px 72px" +
+  " 60px 60px 60px 60px fit-content(14ch) fit-content(16ch) 52px 34px";
 
 /**
  * Ce que consomme un workload : la somme de ses pods.
@@ -323,9 +325,9 @@ export default function WorkloadsView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(COLUMNS)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: COLUMNS }}>
+              <div className="tr">
                 <SelectionHead />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
@@ -472,7 +474,6 @@ function WorkloadLine({
   return (
     <div
       className="tr wl-workload"
-      style={{ gridTemplateColumns: COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -636,7 +637,6 @@ function PodLine({
   return (
     <div
       className={`tr wl-${p.row_tone}`}
-      style={{ gridTemplateColumns: COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -715,7 +715,6 @@ function ContainerLine({
   return (
     <div
       className="tr wl-container"
-      style={{ gridTemplateColumns: COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}

@@ -29,22 +29,24 @@ import type {
   EventRecord,
   ProducedSecret,
 } from "./types";
+import { cols } from "./table";
 
 /**
  * Les colonnes de l'arbre : celles du TUI, dans le même ordre.
  *
  * Côté Rust : RESOURCE dimensionnée sur son contenu (28 à 72 caractères), puis 10, 28, 8, 6, et le
- * reste au message. RESOURCE est en `fr` parce que c'est elle qui porte l'indentation de la lignée,
- * et MESSAGE en second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge. La première
- * piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la ligne.
+ * reste au message. Ici RESOURCE se taille aussi sur son contenu — c'est elle qui porte
+ * l'indentation de la lignée — sous un plafond de 52 caractères, et MESSAGE prend la piste souple
+ * parce que c'est lui qui dit pourquoi une ligne est rouge. La première piste (`34px`) porte la
+ * case de sélection multiple, la dernière le hamburger de la ligne.
  */
 const TREE_COLUMNS =
-  "34px minmax(280px,1.3fr) 104px minmax(180px,28ch) 76px 52px minmax(200px,1.4fr) 34px";
+  "34px fit-content(52ch) 104px fit-content(28ch) 76px 52px minmax(24ch,1fr) 34px";
 
 /** Les colonnes de la vue à plat : `KIND NAMESPACE NAME READY TARGET EXPIRE AGE MESSAGE`. */
 const LIST_COLUMNS =
-  "34px minmax(110px,14ch) minmax(120px,20ch) minmax(160px,1fr) 104px minmax(180px,28ch) 76px 52px" +
-  " minmax(200px,1.4fr) 34px";
+  "34px fit-content(14ch) fit-content(20ch) fit-content(36ch) 104px fit-content(28ch) 76px 52px" +
+  " minmax(24ch,1fr) 34px";
 
 export default function CertsView({
   lang,
@@ -416,11 +418,10 @@ export default function CertsView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(tree ? TREE_COLUMNS : LIST_COLUMNS)}>
             <div className="thead">
               <div
                 className="tr"
-                style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
               >
                 <SelectionHead />
                 {tree ? (
@@ -581,7 +582,6 @@ function ResourceLine({
   return (
     <div
       className={`tr cert-${row.ready}`}
-      style={{ gridTemplateColumns: tree ? TREE_COLUMNS : LIST_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -634,7 +634,7 @@ function ResourceLine({
       </div>
       <Expiry days={row.days_remaining} tone={row.expiry_tone} st={st} />
       <div className="cell num dim">{row.age}</div>
-      <div className={`cell ${row.ready === "failed" ? "err" : "dim"}`} title={row.message}>
+      <div className={`cell wrap ${row.ready === "failed" ? "err" : "dim"}`} title={row.message}>
         {row.message}
       </div>
       <div className="cell act">
@@ -678,7 +678,6 @@ function SecretLine({
   return (
     <div
       className="tr cert-leaf"
-      style={{ gridTemplateColumns: TREE_COLUMNS }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}

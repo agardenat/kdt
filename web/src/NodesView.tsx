@@ -35,11 +35,12 @@ import type {
   UsageBucket,
   UsageRatio,
 } from "./types";
+import { cols } from "./table";
 
 /** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
  * case de sélection multiple, la dernière le hamburger de la ligne. */
 const NODE_COLUMNS =
-  "34px minmax(200px,1fr) 64px minmax(120px,18ch) minmax(100px,13ch) 56px 62px 62px 62px 62px 62px 62px 56px minmax(150px,1fr) 34px";
+  "34px fit-content(30ch) 64px fit-content(18ch) fit-content(13ch) 56px 62px 62px 62px 62px 62px 62px 56px minmax(18ch,1fr) 34px";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -47,17 +48,16 @@ const NODE_COLUMNS =
  * Les six colonnes de quantité portent le même gabarit — `1500m`, `3.9Gi` — donc la même largeur :
  * en donner moins à « use » qu'à « req » couperait la mémoire en plein milieu.
  *
- * Aucune piste ne se mesure sur le contenu : une dernière colonne en `max-content` prend une
- * largeur différente selon la ligne, et c'est la piste souple d'avant elle qui paie la différence
- * — les colonnes se décalent alors d'une ligne à l'autre.
+ * Les colonnes de texte se mesurent sur le contenu de toute la table — la grille est unique, les
+ * lignes y sont des `subgrid` — et restent donc à la même place d'une ligne à l'autre.
  *
- * Une seule piste est souple, et c'est la dernière. `POD` bornée avale sinon toute la largeur d'un
+ * Une seule piste est souple, et c'est la dernière. `POD` étirée avale sinon toute la largeur d'un
  * écran large, et le nom du pod se retrouve seul à gauche d'un vide qui le sépare du container
  * qu'il porte. Le mou se pose au bout de la ligne, où il ne sépare rien.
  */
 const USAGE_COLUMNS =
-  "18px minmax(110px,18ch) minmax(180px,42ch) minmax(140px,22ch)" +
-  " 78px 78px 78px 78px 78px 78px 28px 44px minmax(200px,1fr)";
+  "18px fit-content(18ch) fit-content(42ch) fit-content(22ch)" +
+  " 78px 78px 78px 78px 78px 78px 28px 44px minmax(20ch,1fr)";
 
 type World = "nodes" | "usage";
 
@@ -512,9 +512,9 @@ function NodeTable({
   onToggleCheck: (key: string) => void;
 }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(NODE_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell">READY</div>
@@ -539,7 +539,6 @@ function NodeTable({
           <div
             key={n.uid}
             className={`tr sev-${n.record.tone}`}
-            style={{ gridTemplateColumns: NODE_COLUMNS }}
             aria-selected={selected === n.uid}
             tabIndex={0}
             onClick={() => onSelect(n.uid)}
@@ -568,7 +567,7 @@ function NodeTable({
             <Pct pct={n.disk_pct} tone={n.disk_pct_tone} title={n.disk_error ?? undefined} />
             {/* La liste vient du serveur, `Cordoned` en tête quand il y en a un : c'est le seul de
                 la liste qui soit un geste, et c'est celui qu'on cherche. */}
-            <div className={`cell ${n.alerts.length > 0 ? "tone-err" : "dim"}`}>
+            <div className={`cell wrap ${n.alerts.length > 0 ? "tone-err" : "dim"}`}>
               {n.alerts.length > 0 ? n.alerts.join(", ") : "—"}
             </div>
             <div className="cell act">
@@ -653,9 +652,9 @@ function Qty({ text, tone }: { text: string | null; tone?: string }) {
 
 function UsageTable({ rows, st }: { rows: NodeUsageRow[]; st: Strings }) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(USAGE_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: USAGE_COLUMNS }}>
+        <div className="tr">
           <div className="cell" />
           <div className="cell">NS</div>
           <div className="cell">POD</div>
@@ -678,7 +677,6 @@ function UsageTable({ rows, st }: { rows: NodeUsageRow[]; st: Strings }) {
           <div
             key={r.uid}
             className={`tr${r.is_system ? " nd-system" : ""}`}
-            style={{ gridTemplateColumns: USAGE_COLUMNS }}
           >
             {/* Le marqueur des containers de la plateforme, comme le `·` du TUI : ils restent en
                 dernier au tri, et ce point dit pourquoi. */}
@@ -696,7 +694,7 @@ function UsageTable({ rows, st }: { rows: NodeUsageRow[]; st: Strings }) {
             <Qty text={r.mem_use_text} tone={r.mem_use_tone} />
             <div className={`cell num tone-${r.ready ? "ok" : "err"}`}>{r.ready ? "Y" : "N"}</div>
             <div className={`cell num tone-${r.restarts_tone}`}>{r.restarts}</div>
-            <div className={`cell tone-${r.issues_tone}`}>
+            <div className={`cell wrap tone-${r.issues_tone}`}>
               {r.issues.map((i) => i.tag).join(",") || "—"}
             </div>
           </div>

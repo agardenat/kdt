@@ -29,6 +29,7 @@ import type {
   EventRecord,
   Hint,
 } from "./types";
+import { cols } from "./table";
 
 /**
  * `NODE CPU RESERVED MEM RESERVED CPU USED MEM USED PODS IF LOST`, dans l'ordre du TUI.
@@ -39,13 +40,13 @@ import type {
  * ligne.
  */
 const NODE_COLUMNS =
-  "34px minmax(150px,1fr) minmax(150px,19ch) minmax(150px,19ch) minmax(150px,19ch)" +
-  " minmax(150px,19ch) 84px minmax(130px,15ch) 34px";
+  "34px fit-content(34ch) fit-content(19ch) fit-content(19ch) fit-content(19ch)" +
+  " fit-content(19ch) 84px minmax(18ch,1fr) 34px";
 
 /** `NAMESPACE KIND NAME PODS CPU REQ→USED MEM REQ→USED QOS FINDING`. */
 const WORKLOAD_COLUMNS =
-  "34px minmax(110px,18ch) minmax(90px,12ch) minmax(150px,26ch) 56px minmax(140px,18ch)" +
-  " minmax(140px,18ch) 104px minmax(180px,1.4fr) 34px";
+  "34px fit-content(18ch) fit-content(12ch) fit-content(30ch) 56px fit-content(18ch)" +
+  " fit-content(18ch) 104px minmax(22ch,1fr) 34px";
 
 /**
  * `NAMESPACE QUOTA RESOURCE USED LIMIT %`.
@@ -54,8 +55,8 @@ const WORKLOAD_COLUMNS =
  * comme les deux `Min` du TUI : rien d'autre ici ne mérite de s'étirer.
  */
 const QUOTA_COLUMNS =
-  "34px minmax(110px,20ch) minmax(150px,1fr) minmax(160px,1.2fr) minmax(90px,14ch)" +
-  " minmax(90px,14ch) 64px 34px";
+  "34px fit-content(20ch) fit-content(28ch) minmax(20ch,1fr) fit-content(14ch)" +
+  " fit-content(14ch) 64px 34px";
 
 type World = "nodes" | "workloads" | "quotas";
 type Filter = "all" | "problems";
@@ -419,9 +420,9 @@ function NodeTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(NODE_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: NODE_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NODE</div>
           <div className="cell num">CPU RESERVED</div>
@@ -438,7 +439,6 @@ function NodeTable({
           <div
             key={n.uid}
             className={`tr sev-${n.record.tone}`}
-            style={{ gridTemplateColumns: NODE_COLUMNS }}
             aria-selected={selected === n.uid}
             tabIndex={0}
             onClick={() => onSelect(n.uid)}
@@ -468,7 +468,7 @@ function NodeTable({
             >
               {n.pod_capacity > 0 ? `${n.pods}/${n.pod_capacity}` : n.pods}
             </div>
-            <div className={`cell ${n.loss.tone}`}>{n.loss.short}</div>
+            <div className={`cell wrap ${n.loss.tone}`}>{n.loss.short}</div>
             <div className="cell act">
               <RowMenu
                 record={n.record}
@@ -501,9 +501,9 @@ function WorkloadTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(WORKLOAD_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: WORKLOAD_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">KIND</div>
@@ -521,7 +521,6 @@ function WorkloadTable({
           <div
             key={w.uid}
             className={`tr sev-${w.record.tone}`}
-            style={{ gridTemplateColumns: WORKLOAD_COLUMNS }}
             aria-selected={selected === w.uid}
             tabIndex={0}
             onClick={() => onSelect(w.uid)}
@@ -547,7 +546,7 @@ function WorkloadTable({
               {w.mem_use_text ? `${w.mem_req_text} → ${w.mem_use_text}` : w.mem_req_text}
             </div>
             <div className={`cell qos-${w.qos}`}>{w.qos_label}</div>
-            <div className={`cell ${w.record.tone === "ok" ? "dim" : w.record.tone}`}>
+            <div className={`cell wrap ${w.record.tone === "ok" ? "dim" : w.record.tone}`}>
               {w.finding}
             </div>
             <div className="cell act">
@@ -582,9 +581,9 @@ function QuotaTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(QUOTA_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: QUOTA_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">NAMESPACE</div>
           <div className="cell">QUOTA</div>
@@ -604,7 +603,6 @@ function QuotaTable({
             <div
               key={q.uid}
               className={`tr sev-${q.record.tone}`}
-              style={{ gridTemplateColumns: QUOTA_COLUMNS }}
               aria-selected={selected === q.uid}
               tabIndex={0}
               onClick={() => onSelect(q.uid)}

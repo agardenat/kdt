@@ -292,16 +292,35 @@ button, input { font: inherit; color: inherit; }
 .body-overlay .ov-label { font-size: var(--fs-base); font-weight: 600; color: var(--fg); }
 
 /* ---------------------------------------------------------------- tableau */
-.tbl { min-width: 100%; width: max-content; font-size: var(--fs-base); }
-/* La graisse est fixée sur la grille, et les lignes qui veulent du gras le posent sur leurs
-   cellules. Le `ch` d'une fonte variable se mesure sur la graisse en vigueur : une ligne mise en
-   gras sur la `.tr` recalculerait ses propres pistes — 4,5 % de plus par colonne — et se
-   décalerait de l'en-tête comme de ses voisines. La règle se voit à l'œil sur une table large. */
-.tr { display: grid; align-items: center; column-gap: .9rem; padding: 0 .85rem; font-weight: 400; }
-/* La typographie de l'en-tête se pose sur les cellules, jamais sur la ligne.
-   Les gabarits de colonnes sont écrits en `ch`, et un `ch` se mesure sur la police de la grille :
-   une ligne d'en-tête en `--fs-micro` donnerait des colonnes plus étroites que le corps en
-   `--fs-base`, et toute la table se décalerait entre son en-tête et ses lignes. */
+/* La table est **une seule grille**, et chaque ligne s'y raccroche en `subgrid` : les pistes sont
+   donc mesurées sur toutes les lignes à la fois, ce qu'aucune grille par ligne ne sait faire.
+   C'est ce qui permet enfin de tailler une colonne sur son contenu (`fit-content`) sans que deux
+   lignes voisines tombent à des places différentes — l'alignement ne se règle plus, il est
+   structurel.
+   Le gabarit arrive en `--cols` sur la table (et non en `grid-template-columns` sur chaque ligne),
+   parce que c'est la table qui possède désormais les pistes. */
+.tbl {
+  display: grid; grid-template-columns: var(--cols); width: 100%;
+  font-size: var(--fs-base);
+}
+/* `.thead`/`.tbody` ne sont plus que des groupes logiques : leurs boîtes disparaissent pour que
+   les lignes soient des enfants directs de la grille. Les sélecteurs `.tbody .tr` continuent de
+   viser le DOM, qui lui n'a pas bougé. */
+.thead, .tbody { display: contents; }
+/* Un regroupement de lignes (la classe de stockage et ses volumes) n'est qu'un nœud du DOM : lui
+   aussi s'efface, sinon il deviendrait une case de la grille et tasserait ses lignes en colonne 1. */
+.tbody .grp { display: contents; }
+/* La graisse reste posée sur les cellules et non sur la ligne : les `ch` d'un gabarit se mesurent
+   sur la police de `.tbl`, et une ligne en gras qui élargirait sa propre grille n'a plus lieu
+   d'être — mais la règle garde les lignes accordées entre elles. */
+.tr {
+  display: grid; grid-template-columns: subgrid; grid-column: 1 / -1;
+  align-items: center; column-gap: .9rem; padding: 0 .85rem; font-weight: 400;
+}
+/* La typographie de l'en-tête se pose sur les cellules, jamais sur la ligne : les `ch` du gabarit
+   se résolvent sur la police de `.tbl`, et un `--fs-micro` posé sur la ligne donnerait des pistes
+   plus étroites que ce que le corps demande. L'en-tête compte en revanche dans le `fit-content`
+   d'une colonne : une colonne n'est jamais plus étroite que son propre titre. */
 .thead .tr {
   position: sticky; top: 0; z-index: 5; background: var(--bg); height: 32px;
   border-bottom: 1px solid var(--line); color: var(--dim);
@@ -318,7 +337,8 @@ button, input { font: inherit; color: inherit; }
    restaient de chaque côté collaient les lignes entre elles. C'est l'écart de respiration qui
    sépare cette table de celle de Rancher, autant que le corps lui-même. */
 .tbody .tr {
-  height: 34px; border-bottom: 1px solid var(--line-soft); cursor: pointer;
+  min-height: 34px; padding: .25rem .85rem;
+  border-bottom: 1px solid var(--line-soft); cursor: pointer;
   border-left: 2px solid transparent;
   --row-bg: var(--bg); background: var(--row-bg);
 }
@@ -326,7 +346,17 @@ button, input { font: inherit; color: inherit; }
 .tbody .tr[aria-selected="true"] { --row-bg: var(--row-sel); border-left-color: var(--accent); }
 .tbody .tr.sev-warn { border-left-color: color-mix(in srgb, var(--warn) 70%, transparent); }
 .tbody .tr.sev-err { border-left-color: color-mix(in srgb, var(--err) 70%, transparent); }
-.cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `min-width: 0` est ce qui autorise une piste à devenir plus étroite que son texte : sans lui la
+   contribution minimale de la cellule est son mot le plus long, et une fenêtre trop étroite fait
+   déborder la table au lieu d'élider. */
+.cell { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* La colonne souple d'une table — message, détail, raison — s'enroule sur deux lignes plutôt que
+   d'élider. C'est le seul endroit où une ligne a le droit de grandir, et elle s'arrête à deux :
+   au-delà, la suite se lit dans le panneau de détail, pas dans la table. */
+.cell.wrap {
+  white-space: normal; overflow-wrap: anywhere; line-height: 1.3;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
 .cell.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
 .cell.mono { font-family: var(--mono); }
 .cell.id { font-family: var(--mono); font-weight: 500; }

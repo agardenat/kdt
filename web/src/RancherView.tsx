@@ -33,24 +33,25 @@ import type {
   RanchTokenRow,
   RanchUserRow,
 } from "./types";
+import { cols } from "./table";
 
 /** `RANCHER ID IDENTITY LOGIN PROVIDER GLOBAL ROLE GRP ACC TOK REFRESH STATE AGE`. La première
  * piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la ligne. */
 const USER_COLUMNS =
-  "34px minmax(110px,16ch) minmax(180px,26ch) minmax(90px,16ch) 104px minmax(140px,1fr)" +
+  "34px fit-content(16ch) fit-content(26ch) fit-content(16ch) 104px minmax(18ch,1fr)" +
   " 40px 40px 40px 64px 76px 48px 34px";
 
 /** `SCOPE TARGET SUBJECT TYPE PROVIDER ROLE AGE`. */
 const BINDING_COLUMNS =
-  "34px 72px minmax(90px,16ch) minmax(180px,28ch) 56px 116px minmax(160px,1fr) 48px 34px";
+  "34px 72px fit-content(16ch) fit-content(28ch) 56px 116px minmax(20ch,1fr) 48px 34px";
 
 /** `PROJECT ID CLUSTER NS MEMBERS OWNERS QUOTA AGE`. */
 const PROJECT_COLUMNS =
-  "34px minmax(130px,20ch) 88px 96px 44px 68px minmax(160px,1fr) minmax(140px,26ch) 48px 34px";
+  "34px fit-content(20ch) 88px 96px 44px 68px minmax(20ch,1fr) fit-content(26ch) 48px 34px";
 
 /** `TOKEN USER PROVIDER KIND SCOPE TTL STATE AGE`. */
 const TOKEN_COLUMNS =
-  "34px minmax(180px,32ch) minmax(160px,1fr) 116px 104px 96px 76px 76px 48px 34px";
+  "34px fit-content(32ch) minmax(20ch,1fr) 116px 104px 96px 76px 76px 48px 34px";
 
 type World = "users" | "access" | "projects" | "tokens";
 type Filter = "all" | "problems";
@@ -517,9 +518,9 @@ function UserTable({
   onRun: (request: Record<string, unknown>) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(USER_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: USER_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">RANCHER ID</div>
           <div className="cell">IDENTITY</div>
@@ -542,7 +543,6 @@ function UserTable({
             uid={u.uid}
             tone={u.record.tone}
             selected={selected}
-            columns={USER_COLUMNS}
             onSelect={onSelect}
             checked={checked.has(u.uid)}
             onToggleCheck={() => onToggleCheck(u.uid)}
@@ -611,9 +611,9 @@ function BindingTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(BINDING_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: BINDING_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">SCOPE</div>
           <div className="cell">TARGET</div>
@@ -632,7 +632,6 @@ function BindingTable({
             uid={b.uid}
             tone={b.record.tone}
             selected={selected}
-            columns={BINDING_COLUMNS}
             onSelect={onSelect}
             checked={checked.has(b.uid)}
             onToggleCheck={() => onToggleCheck(b.uid)}
@@ -683,9 +682,9 @@ function ProjectTable({
   onSelect: (uid: string) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(PROJECT_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: PROJECT_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">PROJECT</div>
           <div className="cell">ID</div>
@@ -705,7 +704,6 @@ function ProjectTable({
             uid={p.uid}
             tone={p.record.tone}
             selected={selected}
-            columns={PROJECT_COLUMNS}
             onSelect={onSelect}
             checked={checked.has(p.uid)}
             onToggleCheck={() => onToggleCheck(p.uid)}
@@ -764,9 +762,9 @@ function TokenTable({
   onRun: (request: Record<string, unknown>) => void;
 } & WorldTableProps) {
   return (
-    <div className="tbl">
+    <div className="tbl" style={cols(TOKEN_COLUMNS)}>
       <div className="thead">
-        <div className="tr" style={{ gridTemplateColumns: TOKEN_COLUMNS }}>
+        <div className="tr">
           <SelectionHead />
           <div className="cell">TOKEN</div>
           <div className="cell">USER</div>
@@ -786,7 +784,6 @@ function TokenTable({
             uid={s.uid}
             tone={s.record.tone}
             selected={selected}
-            columns={TOKEN_COLUMNS}
             onSelect={onSelect}
             checked={checked.has(s.uid)}
             onToggleCheck={() => onToggleCheck(s.uid)}
@@ -835,7 +832,6 @@ function TokenTable({
             uid={t.uid}
             tone={t.record.tone}
             selected={selected}
-            columns={TOKEN_COLUMNS}
             onSelect={onSelect}
             checked={checked.has(t.uid)}
             onToggleCheck={() => onToggleCheck(t.uid)}
@@ -889,7 +885,6 @@ function Row({
   uid,
   tone,
   selected,
-  columns,
   className,
   onSelect,
   checked,
@@ -901,7 +896,6 @@ function Row({
   uid: string;
   tone: string;
   selected: string | null;
-  columns: string;
   className?: string;
   onSelect: (uid: string) => void;
   checked: boolean;
@@ -914,7 +908,6 @@ function Row({
   return (
     <div
       className={`tr sev-${tone}${className ? ` ${className}` : ""}`}
-      style={{ gridTemplateColumns: columns }}
       aria-selected={selected === uid}
       tabIndex={0}
       onClick={() => onSelect(uid)}

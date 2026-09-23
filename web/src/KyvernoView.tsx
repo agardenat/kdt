@@ -29,21 +29,23 @@ import type {
   KyvernoPayload,
   KyViolationRow,
 } from "./types";
+import { cols } from "./table";
 
 /**
  * Les colonnes de l'axe par policy : celles du TUI, dans le même ordre.
  *
  * Côté Rust : RESOURCE dimensionnée sur son contenu (30 à 64 caractères), puis 9, 11, 26, et le
- * reste au détail. RESOURCE est en `fr` parce que c'est elle qui porte l'indentation, et DETAIL en
- * second `fr` parce que c'est lui qui dit pourquoi une ligne est rouge. La première piste (`34px`)
- * porte la case de sélection multiple, la dernière le hamburger de la ligne.
+ * reste au détail. Ici RESOURCE se taille sur son contenu sous un plafond, parce que c'est elle
+ * qui porte l'indentation, et DETAIL prend la piste souple parce que c'est lui qui dit pourquoi
+ * une ligne est rouge. La première piste (`34px`) porte la case de sélection multiple, la dernière
+ * le hamburger de la ligne.
  */
 const POLICY_COLUMNS =
-  "34px minmax(300px,1.3fr) 92px minmax(104px,12ch) minmax(180px,26ch) minmax(220px,1.5fr) 34px";
+  "34px fit-content(52ch) 92px fit-content(12ch) fit-content(26ch) minmax(26ch,1fr) 34px";
 
 /** Les colonnes de l'axe par ressource : `RESOURCE RESULT POLICY/RULE MESSAGE`. */
 const RESOURCE_COLUMNS =
-  "34px minmax(300px,1.2fr) minmax(90px,10ch) minmax(220px,34ch) minmax(220px,1.6fr) 34px";
+  "34px fit-content(52ch) fit-content(10ch) fit-content(34ch) minmax(26ch,1fr) 34px";
 
 /** Une ligne synthétique (`rule`/`violation`/`namespace`) n'a pas d'objet à elle : son `record` porte
  * un kind/name vides, même garde que partout ailleurs. */
@@ -393,9 +395,9 @@ export default function KyvernoView({
             </div>
           </div>
         ) : (
-          <div className="tbl">
+          <div className="tbl" style={cols(columns)}>
             <div className="thead">
-              <div className="tr" style={{ gridTemplateColumns: columns }}>
+              <div className="tr">
                 <SelectionHead />
                 <div className="cell">RESOURCE</div>
                 {axis === "policy" ? (
@@ -421,7 +423,6 @@ export default function KyvernoView({
                   key={row.uid}
                   row={row}
                   axis={axis}
-                  columns={columns}
                   lang={lang}
                   st={st}
                   collapsed={collapsed.has(row.uid)}
@@ -544,7 +545,6 @@ function HealthBand({ payload, st }: { payload: KyvernoPayload; st: Strings }) {
 function Line({
   row,
   axis,
-  columns,
   lang,
   st,
   collapsed,
@@ -558,7 +558,6 @@ function Line({
 }: {
   row: KyRow;
   axis: "policy" | "resource";
-  columns: string;
   lang: Lang;
   st: Strings;
   collapsed: boolean;
@@ -574,7 +573,6 @@ function Line({
   return (
     <div
       className={`tr ${rowClass(row)}`}
-      style={{ gridTemplateColumns: columns }}
       aria-selected={selected}
       tabIndex={0}
       onClick={onSelect}
@@ -686,7 +684,7 @@ function PolicyCells({ row, st }: { row: KyRow; st: Strings }) {
           <div className="cell dim" title={row.scope}>
             {row.scope}
           </div>
-          <div className="cell" title={row.ready_message || row.title}>
+          <div className="cell wrap" title={row.ready_message || row.title}>
             {row.ready_message ? (
               <span className="err">{row.ready_message}</span>
             ) : total(row.counts) === 0 ? (
@@ -707,7 +705,7 @@ function PolicyCells({ row, st }: { row: KyRow; st: Strings }) {
           <div className="cell info" title={row.match_summary}>
             {row.match_summary}
           </div>
-          <div className="cell" title={row.message}>
+          <div className="cell wrap" title={row.message}>
             {total(row.counts) === 0 ? <span className="dim">{row.message}</span> : row.summary}
           </div>
         </>
@@ -718,7 +716,7 @@ function PolicyCells({ row, st }: { row: KyRow; st: Strings }) {
           <div className="cell">{row.result_label}</div>
           <div className="cell dim">{row.kind}</div>
           <div className="cell dim">{row.severity}</div>
-          <div className="cell" title={row.message}>
+          <div className="cell wrap" title={row.message}>
             {row.message}
           </div>
         </>
@@ -731,7 +729,7 @@ function PolicyCells({ row, st }: { row: KyRow; st: Strings }) {
           <div className="cell dim" title={row.match_summary}>
             {row.match_summary}
           </div>
-          <div className="cell dim">
+          <div className="cell wrap dim">
             {row.rules.length === 0 ? st.kyAllRules : row.rules.join(", ")}
           </div>
         </>
@@ -757,7 +755,7 @@ function ResourceCells({ row }: { row: KyRow }) {
         <div className="cell info" title={`${row.policy}/${row.rule}`}>
           {row.policy}/{row.rule}
         </div>
-        <div className="cell" title={row.message}>
+        <div className="cell wrap" title={row.message}>
           {row.message}
         </div>
       </>
