@@ -8,6 +8,15 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.0.2] — 2026-09-24
+
+- **fix(hooks)** — dans la vue `:hooks` du TUI, les touches que la barre du bas annonce
+  **répondent enfin** : `y` (YAML), `e` (édition), `h` (touch), `Ctrl-D` (suppression), `c`
+  (copie du panneau de détail), `/` (recherche) et `:` (palette). Sur une ligne de webhook
+  d'admission elles visent sa configuration Validating ou Mutating, sur une ligne de conversion
+  la CRD, sur une ligne `apiservices` l'APIService. `Shift` + flèches fait aussi défiler le
+  panneau du haut, comme dans les autres vues.
+
 ## [2.0.1] — 2026-09-23
 
 - **fix(web)** — les tables de kdt-web **se taillent sur leur contenu** et cessent de déborder.
