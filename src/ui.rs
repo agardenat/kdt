@@ -2930,7 +2930,9 @@ impl App {
             | Mode::Rancher
             | Mode::RancherFull
             | Mode::Argo
-            | Mode::ArgoFull => {
+            | Mode::ArgoFull
+            | Mode::Hooks
+            | Mode::HooksFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -3868,6 +3870,7 @@ impl App {
                 | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
                 | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull
                 | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull
+                | Mode::Hooks | Mode::HooksFull
         ) && !self.top_panel_collapsed()
     }
 
@@ -12773,13 +12776,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.enter_search();
         }
 
@@ -12802,12 +12805,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.open_edit_view();
         }
 
@@ -12820,12 +12823,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
             app.open_delete_view();
         }
 
@@ -12888,7 +12891,7 @@ fn handle_event(app: &mut App, ev: Event) {
 
         // Copy the active detail zone (Logs/Status/Related, or node status) wherever that panel is
         // shown — same affordance as the AI/diagnostic views, just on the split detail panel.
-        (KeyCode::Char('c'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Pods | Mode::PodsFull | Mode::Flux | Mode::FluxFull) => app.copy_detail_view(),
+        (KeyCode::Char('c'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Pods | Mode::PodsFull | Mode::Flux | Mode::FluxFull | Mode::Hooks | Mode::HooksFull) => app.copy_detail_view(),
 
         (KeyCode::Up, m, Mode::DetailFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(1),
         (KeyCode::Down, m, Mode::DetailFull) if !m.contains(KeyModifiers::SHIFT) => app.scroll_detail(-1),
