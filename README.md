@@ -121,7 +121,16 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Stockage, côté volumes (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacité, côté nœuds |
 | `quota [ns]` | `quotas`, `rq`, `resourcequota` | Capacité, côté quotas |
+| `ctx [contexte]` | `context`, `cluster`, `kubectx` | Changer de contexte kubeconfig (voir ci-dessous) |
 | `quit` | `q` | Quitter |
+
+`:ctx` sans argument liste les contextes du kubeconfig (`KUBECONFIG` fusionné comme kubectl) ; la
+complétion cherche le texte tapé n'importe où dans le nom, ce qui permet de viser un ARN EKS par sa
+fin. Le contexte choisi passe par l'écran de connexion du démarrage, la session en cours restant
+intacte derrière : `q` y revient, `Entrée` entre quand même dans un cluster injoignable. Une fois
+le changement fait, kdt repart sur la vue évènements de tous les namespaces du nouveau cluster ;
+les port-forwards ouverts sont fermés. Le kubeconfig lui-même n'est pas modifié (le contexte
+courant de kubectl reste le même), et `E` (shell) vise le contexte affiché.
 
 ## Raccourcis
 

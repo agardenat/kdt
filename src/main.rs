@@ -75,16 +75,32 @@ async fn main() -> Result<()> {
     }
 
     let (client, api_url) = kdt::build_client(args.context.as_deref()).await?;
-
     let ns = if args.all_namespaces { None } else { args.namespace.clone() };
+    let app = new_app(client, api_url, args.context.clone(), ns, args.buffer_size, file_config);
+
+    // A namespace belongs to the cluster it was typed for: the next context opens on all of them.
+    // The config file is read again because `L` writes the language to it during the session.
+    let buffer_size = args.buffer_size;
+    ui::run(app, move |sw| {
+        new_app(sw.client, sw.api_url, Some(sw.context), None, buffer_size, config::load())
+    })
+    .await
+}
+
+fn new_app(
+    client: kube::Client,
+    api_url: String,
+    context: Option<String>,
+    ns: Option<String>,
+    buffer_size: usize,
+    file_config: config::FileConfig,
+) -> ui::App {
     let ns_label = match &ns { Some(n) => n.clone(), None => "all".to_string() };
-    let (ctx_label, cluster_label) = kdt::resolve_context_labels(args.context.as_deref());
+    let (ctx_label, cluster_label) = kdt::resolve_context_labels(context.as_deref());
     let buffer = events::new_buffer();
     let log_state = events::new_log_state();
     let status_state = events::new_status_state();
-    let watcher = events::spawn_watcher(client.clone(), ns, buffer.clone(), args.buffer_size);
-
+    let watcher = events::spawn_watcher(client.clone(), ns, buffer.clone(), buffer_size);
     let ai_state = ai::new_ai_state();
-    let app = ui::App::new(buffer, ns_label, ctx_label, cluster_label, api_url, client, log_state, status_state, ai_state, watcher, args.buffer_size, file_config, args.context.clone());
-    ui::run(app).await
+    ui::App::new(buffer, ns_label, ctx_label, cluster_label, api_url, client, log_state, status_state, ai_state, watcher, buffer_size, file_config, context)
 }

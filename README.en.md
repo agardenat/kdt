@@ -120,7 +120,16 @@ the RBAC view).
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Storage, volume side (SC → PV) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacity, node side |
 | `quota [ns]` | `quotas`, `rq`, `resourcequota` | Capacity, quota side |
+| `ctx [context]` | `context`, `cluster`, `kubectx` | Switch kubeconfig context (see below) |
 | `quit` | `q` | Quit |
+
+`:ctx` without an argument lists the kubeconfig's contexts (`KUBECONFIG` merged the way kubectl
+does); completion matches the typed text anywhere in the name, so an EKS ARN can be picked by its
+end. The chosen context goes through the startup connection screen while the current session stays
+intact behind it: `q` goes back to it, `Enter` goes in even if the cluster is unreachable. Once
+switched, kdt starts over on the events view of all namespaces of the new cluster; open
+port-forwards are closed. The kubeconfig itself is not modified (kubectl's current context stays the
+same), and `E` (shell) targets the context on screen.
 
 ## Keys
 

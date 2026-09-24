@@ -118,3 +118,12 @@ pub fn resolve_context_labels(explicit: Option<&str>) -> (String, String) {
         .unwrap_or_else(|| ctx_name.clone());
     (ctx_name, cluster)
 }
+
+/// Les contextes que le kubeconfig déclare, dans son ordre — `KUBECONFIG` fusionné comme le fait
+/// kubectl. Vide si rien n'est lisible : le TUI n'a alors rien à proposer, sans que ce soit une
+/// erreur (un pod dans le cluster n'a pas de kubeconfig du tout).
+pub fn kube_contexts() -> Vec<String> {
+    kube::config::Kubeconfig::read()
+        .map(|k| k.contexts.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default()
+}

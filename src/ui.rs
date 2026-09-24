@@ -1408,6 +1408,8 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // The port-forward inventory, reachable from anywhere: a forward outlives the view it was
     // started from, so the way to it cannot be inside that view only.
     ("forward", &["pf", "portforward", "port-forward", "forwards", "tunnel", "tunnels"]),
+    // Another kubeconfig context: its argument is a context name, not a namespace.
+    ("ctx", &["context", "contexts", "contexte", "cluster", "clusters", "kubectx"]),
     ("quit", &["q"]),
 ];
 
@@ -1486,6 +1488,19 @@ fn command_takes_ns(cmd: &str) -> bool {
             | "medusa"
             | "reaper"
     )
+}
+
+// Contexts matching a `:ctx` argument. Substring, not prefix: an EKS context is an ARN whose telling
+// part is its end. The exact name goes first, or Enter would run a longer one that contains it.
+fn context_suggestions<'a>(contexts: &'a [String], typed: &str) -> Vec<&'a str> {
+    let q = typed.trim().to_lowercase();
+    let mut hits: Vec<&str> = contexts
+        .iter()
+        .map(String::as_str)
+        .filter(|c| c.to_lowercase().contains(&q))
+        .collect();
+    hits.sort_by_key(|c| c.to_lowercase() != q);
+    hits
 }
 
 // Map a namespace argument to a watcher scope: `all`/`*`/`0`/empty mean "all namespaces".
@@ -1904,6 +1919,20 @@ pub struct App {
     // The `--context` kdt was started with, passed on to `kubectl exec` so the shell lands in the
     // cluster on screen rather than in whatever the kubeconfig currently points at.
     kube_context: Option<String>,
+    // The kubeconfig's contexts, for the `:ctx` completion. Re-read each time the palette opens, so
+    // a context added from another shell shows up without restarting.
+    kube_contexts: Vec<String>,
+    // Set by `:ctx <name>`: honoured by the run loop, which has to hand the terminal to the startup
+    // screen before this session can be replaced by one on the other cluster.
+    pending_context: Option<String>,
+    cluster_info_handle: Option<JoinHandle<()>>,
+}
+
+/// A context the startup screen has vouched for: what `run` needs to build the next session.
+pub struct Switch {
+    pub context: String,
+    pub client: kube::Client,
+    pub api_url: String,
 }
 
 impl App {
@@ -2192,20 +2221,80 @@ impl App {
             node_op_status: new_reconcile_status(),
             pending_exec: None,
             kube_context,
+            kube_contexts: crate::kube_contexts(),
+            pending_context: None,
+            cluster_info_handle: None,
         }
     }
 
-    fn spawn_cluster_info_refresh(&self) {
+    // Every loop this session left running against its cluster. The process used to be the only
+    // thing that ended them; once a session can be replaced by another, a forgotten one keeps
+    // polling the old cluster behind the new one's back.
+    fn shutdown(&mut self) {
+        self.watcher_handle.abort();
+        let handles = [
+            &mut self.cluster_info_handle,
+            &mut self.node_refresh_handle,
+            &mut self.flux_logs_handle,
+            &mut self.flux_refresh_handle,
+            &mut self.pods_refresh_handle,
+            &mut self.net_refresh_handle,
+            &mut self.hooks_refresh_handle,
+            &mut self.sto_refresh_handle,
+            &mut self.cap_refresh_handle,
+            &mut self.rbac_refresh_handle,
+            &mut self.vuln_refresh_handle,
+            &mut self.secrets_refresh_handle,
+            &mut self.certs_refresh_handle,
+            &mut self.ky_refresh_handle,
+            &mut self.vel_refresh_handle,
+            &mut self.k8c_refresh_handle,
+            &mut self.argo_refresh_handle,
+            &mut self.ranch_refresh_handle,
+            &mut self.ident_refresh_handle,
+            &mut self.refl_refresh_handle,
+            &mut self.configmaps_refresh_handle,
+            &mut self.namespaces_refresh_handle,
+        ];
+        for h in handles {
+            if let Some(h) = h.take() { h.abort(); }
+        }
+        portfwd::stop_all(&self.forwards);
+        self.close_edit_view();
+    }
+
+    // `:ctx` with a name: resolved against the kubeconfig here, so a typo is answered in the
+    // palette's own toast instead of a failed startup screen.
+    fn request_context(&mut self, arg: &str) {
+        let st = lang::t(self.ai_language);
+        let found = self
+            .kube_contexts
+            .iter()
+            .find(|c| c.as_str() == arg)
+            .or_else(|| self.kube_contexts.iter().find(|c| c.eq_ignore_ascii_case(arg)))
+            .cloned();
+        let msg = match found {
+            None => lang::fill(st.msg_ctx_unknown, &[("ctx", arg)]),
+            Some(c) if c == self.context_label => lang::fill(st.msg_ctx_same, &[("ctx", &c)]),
+            Some(c) => {
+                self.pending_context = Some(c);
+                return;
+            }
+        };
+        self.clipboard_status = Some((std::time::Instant::now(), msg));
+    }
+
+    fn spawn_cluster_info_refresh(&mut self) {
         let client = self.client.clone();
         let state = self.cluster_info.clone();
-        tokio::spawn(async move {
+        self.cluster_info_handle = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(20));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 fetch_cluster_info(client.clone(), state.clone()).await;
             }
-        });
+        }));
     }
 
 
@@ -4125,6 +4214,7 @@ impl App {
         self.command_input.clear();
         self.command_cursor = 0;
         self.mode = Mode::Command;
+        self.kube_contexts = crate::kube_contexts();
         // Prefetch namespaces so the `<ns>` argument of every namespaced command autocompletes.
         let client = self.client.clone();
         let state = self.ns_pick_state.clone();
@@ -4144,6 +4234,9 @@ impl App {
             }
         } else if c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == '.' {
             self.command_input.push(c.to_ascii_lowercase());
+        } else if matches!(c, '_' | '@' | ':') && self.command_input.contains(' ') {
+            // Context names are not DNS labels: `user@cluster`, `arn:aws:eks:…`, `kind_dev`.
+            self.command_input.push(c);
         }
         // Typing narrows the list, so any prior selection is stale.
         self.command_cursor = 0;
@@ -4172,6 +4265,12 @@ impl App {
             None => command_name_suggestions(input).into_iter().map(String::from).collect(),
             Some((cmd, rest)) => {
                 let Some(name) = resolve_command(cmd) else { return Vec::new(); };
+                if name == "ctx" {
+                    return context_suggestions(&self.kube_contexts, rest)
+                        .into_iter()
+                        .map(|c| format!("{} {}", name, c))
+                        .collect();
+                }
                 if !command_takes_ns(name) { return Vec::new(); }
                 let partial = rest.trim().to_lowercase();
                 let s = self.ns_pick_state.lock().expect("ns list poisoned");
@@ -4372,7 +4471,7 @@ impl App {
             .map(|a| ns_arg_to_opt(a));
         // A namespace typed at a view that cannot narrow to one used to be dropped in silence,
         // which reads exactly like a scope that was applied. Say so instead.
-        if ns_arg.is_none() && arg.is_some_and(|a| !a.is_empty()) {
+        if cmd != "ctx" && ns_arg.is_none() && arg.as_ref().is_some_and(|a| !a.is_empty()) {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
                 lang::fill(lang::t(self.ai_language).msg_cmd_no_ns_arg, &[("cmd", cmd)]),
@@ -4380,6 +4479,18 @@ impl App {
         }
         match cmd {
             "quit" => self.should_quit = true,
+            "ctx" => match arg.filter(|a| !a.is_empty()) {
+                Some(a) => {
+                    self.mode = origin;
+                    self.request_context(&a);
+                }
+                // Without a name the palette stays open on the list of contexts to pick from.
+                None => {
+                    self.command_input = "ctx ".to_string();
+                    self.command_cursor = 0;
+                    self.mode = Mode::Command;
+                }
+            },
             // An overlay, not a view: the mode it was called from keeps refreshing underneath.
             "forward" => {
                 self.mode = origin;
@@ -12255,7 +12366,10 @@ impl App {
 
 }
 
-pub async fn run(mut app: App) -> Result<()> {
+/// Runs sessions until the user quits. `:ctx` ends a session with a [`Switch`]; `rebuild` turns it
+/// into the next one, built from scratch the way `main` built the first — no view state belongs to
+/// the new cluster, and resetting a few hundred fields by hand would miss one.
+pub async fn run(mut app: App, rebuild: impl Fn(Switch) -> App) -> Result<()> {
     let mut terminal = ratatui::init();
     // The startup screen runs on the same terminal as the UI: leaving and re-entering the alternate
     // screen between the two would flash the shell. It returns as soon as the cluster answers, so a
@@ -12265,6 +12379,7 @@ pub async fn run(mut app: App) -> Result<()> {
         cluster: &app.cluster_label,
         namespace: &app.namespace_label,
         server: &app.api_url,
+        stay: None,
     };
     let outcome = crate::splash::run(&mut terminal, app.client.clone(), target).await;
     match outcome {
@@ -12278,18 +12393,24 @@ pub async fn run(mut app: App) -> Result<()> {
             return Err(e);
         }
     }
-    app.spawn_cluster_info_refresh();
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = loop {
+        app.spawn_cluster_info_refresh();
+        match run_loop(&mut terminal, &mut app).await {
+            Ok(Some(switch)) => {
+                app.shutdown();
+                app = rebuild(switch);
+            }
+            other => break other.map(|_| ()),
+        }
+    };
+    app.shutdown();
     ratatui::restore();
-    // Quitting with the edit panel open (`q`, Ctrl-C) must not leave the document behind: it is a
-    // faithful copy of the object, Secret payload included.
-    app.close_edit_view();
     result
 }
 
 // Main loop: refresh live snapshots, draw, then await the next input/tick/Ctrl-C. The 250ms ticker
 // drives periodic redraws so async results and live event flow appear without keypresses.
-async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Option<Switch>> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let mut visible_rows: usize = 20;
@@ -12418,6 +12539,47 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             app.exec_returned(&target, outcome);
             continue;
         }
+        // The startup screen checks the other cluster while this session is still whole: `q` there
+        // comes back to it instead of leaving kdt, and only a context that answered (or that the
+        // user chose to enter anyway) replaces it.
+        if let Some(ctx) = app.pending_context.take() {
+            let st = lang::t(app.ai_language);
+            match crate::build_client(Some(&ctx)).await {
+                Err(e) => {
+                    let err = e.to_string();
+                    app.clipboard_status = Some((
+                        std::time::Instant::now(),
+                        lang::fill(st.msg_ctx_failed, &[("ctx", &ctx), ("err", &err)]),
+                    ));
+                }
+                Ok((client, api_url)) => {
+                    drop(events);
+                    let (ctx_label, cluster_label) = crate::resolve_context_labels(Some(&ctx));
+                    let target = crate::splash::Target {
+                        context: &ctx_label,
+                        cluster: &cluster_label,
+                        namespace: "all",
+                        server: &api_url,
+                        stay: Some(&app.context_label),
+                    };
+                    let outcome = crate::splash::run(terminal, client.clone(), target).await?;
+                    events = EventStream::new();
+                    match outcome {
+                        crate::splash::Outcome::Ready => {
+                            portfwd::stop_all(&app.forwards);
+                            return Ok(Some(Switch { context: ctx, client, api_url }));
+                        }
+                        crate::splash::Outcome::Aborted => {
+                            app.clipboard_status = Some((
+                                std::time::Instant::now(),
+                                lang::fill(st.msg_ctx_stayed, &[("ctx", &app.context_label)]),
+                            ));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         terminal.draw(|f| visible_rows = draw(f, app))?;
         if app.should_quit { break; }
         tokio::select! {
@@ -12433,7 +12595,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     // The tasks would die with the process anyway; closing the sockets here means they are gone
     // before the terminal comes back, rather than while it is being repainted.
     portfwd::stop_all(&app.forwards);
-    Ok(())
+    Ok(None)
 }
 
 // Give the terminal back to the shell for the duration of `run`: leave the alternate screen so the
@@ -28718,7 +28880,9 @@ fn draw_search_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
 fn draw_command_popup(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let suggestions = app.command_suggestions();
 
-    let popup_w = 56.min(area.width.saturating_sub(2)).max(20);
+    // Context names run long (EKS ARNs): the popup grows to show them whole when the screen allows.
+    let longest = suggestions.iter().map(|s| s.chars().count() + 6).max().unwrap_or(0) as u16;
+    let popup_w = 56.max(longest).min(area.width.saturating_sub(2)).max(20);
     let popup_h = 4 + suggestions.len().min(6) as u16;
     let popup_area = centered_rect(popup_w, popup_h, area);
     f.render_widget(Clear, popup_area);
@@ -30149,6 +30313,19 @@ mod popup_tests {
 #[cfg(test)]
 mod palette_tests {
     use super::*;
+
+    #[test]
+    fn a_context_is_found_by_any_part_of_its_name_exact_name_first() {
+        let ctxs: Vec<String> = ["dev-2", "arn:aws:eks:eu-west-3:123:cluster/Prod", "dev", "hz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(context_suggestions(&ctxs, "dev"), vec!["dev", "dev-2"]);
+        assert_eq!(context_suggestions(&ctxs, "prod"), vec!["arn:aws:eks:eu-west-3:123:cluster/Prod"]);
+        assert_eq!(context_suggestions(&ctxs, "").len(), 4);
+        assert_eq!(resolve_command("context"), Some("ctx"));
+        assert!(!command_takes_ns("ctx"));
+    }
 
     // Enter runs the highlighted suggestion, so the first entry *is* what a typed word does. A word
     // that is one command's exact alias must never be beaten by another whose alias merely starts

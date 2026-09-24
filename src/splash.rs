@@ -45,6 +45,9 @@ pub struct Target<'a> {
     pub cluster: &'a str,
     pub namespace: &'a str,
     pub server: &'a str,
+    /// The context kdt is already on, when this screen checks a `:ctx` switch rather than a start:
+    /// `q` then means staying there, not leaving kdt.
+    pub stay: Option<&'a str>,
 }
 
 // A reachability check, not a capability check: `/version` needs no RBAC, so a failure here is a
@@ -172,15 +175,22 @@ fn draw(f: &mut ratatui::Frame, state: &Probe, target: &Target<'_>) {
         }
     }
 
+    let leave = match target.stay {
+        Some(ctx) => lang::fill(st.splash_stay, &[("ctx", ctx)]),
+        None => match state {
+            Probe::Running(_) => st.splash_abort.to_string(),
+            Probe::Failed(_) => st.k_quit.to_string(),
+        },
+    };
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             match state {
-                Probe::Running(_) => format!("q  {}", st.splash_abort),
+                Probe::Running(_) => format!("q  {}", leave),
                 Probe::Failed(_) => format!(
                     "r  {}    Enter  {}    q  {}",
-                    st.splash_retry, st.splash_continue, st.k_quit
+                    st.splash_retry, st.splash_continue, leave
                 ),
             },
             Style::default().fg(Color::DarkGray),
