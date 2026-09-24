@@ -8,6 +8,15 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.1.0] — 2026-09-24
+
+- **feat(ctx)** — `:ctx` change de contexte kubeconfig **sans quitter kdt**. Sans argument, la
+  palette liste les contextes ; la complétion cherche le texte tapé n'importe où dans le nom (un
+  ARN EKS se vise par sa fin). Le nouveau contexte passe par l'écran de connexion, la session en
+  cours restant intacte derrière : `q` y revient, `Entrée` entre quand même dans un cluster
+  injoignable. kdt repart ensuite sur la vue évènements, tous namespaces ; les port-forwards
+  ouverts sont fermés et le kubeconfig n'est pas modifié.
+
 ## [2.0.2] — 2026-09-24
 
 - **fix(hooks)** — dans la vue `:hooks` du TUI, les touches que la barre du bas annonce
