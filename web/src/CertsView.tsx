@@ -16,7 +16,14 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import {
+  RowCheckbox,
+  SelectionBar,
+  SelectionHead,
+  TreeCheckbox,
+  useMultiSelect,
+  type Owner,
+} from "./selection";
 import { visibleRows } from "./tree";
 import type {
   CertActionTarget,
@@ -37,11 +44,10 @@ import { cols } from "./table";
  * Côté Rust : RESOURCE dimensionnée sur son contenu (28 à 72 caractères), puis 10, 28, 8, 6, et le
  * reste au message. Ici RESOURCE se taille aussi sur son contenu — c'est elle qui porte
  * l'indentation de la lignée — sous un plafond de 52 caractères, et MESSAGE prend la piste souple
- * parce que c'est lui qui dit pourquoi une ligne est rouge. La première piste (`34px`) porte la
- * case de sélection multiple, la dernière le hamburger de la ligne.
+ * parce que c'est lui qui dit pourquoi une ligne est rouge. La case de sélection n'a pas de piste :
+ * elle suit l'indentation dans RESOURCE. La dernière piste porte le hamburger de la ligne.
  */
-const TREE_COLUMNS =
-  "34px fit-content(52ch) 104px fit-content(28ch) 76px 52px minmax(24ch,1fr) 34px";
+const TREE_COLUMNS = "fit-content(52ch) 104px fit-content(28ch) 76px 52px minmax(24ch,1fr) 34px";
 
 /** Les colonnes de la vue à plat : `KIND NAMESPACE NAME READY TARGET EXPIRE AGE MESSAGE`. */
 const LIST_COLUMNS =
@@ -89,7 +95,6 @@ export default function CertsView({
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
-  const { checked, toggle, clear, setAll } = useMultiSelect();
   const [bulkOpen, setBulkOpen] = useState(false);
 
   // La portée est un namespace, comme pour les autres vues qui listent. Elle ne coupe pas la
@@ -120,8 +125,11 @@ export default function CertsView({
 
   useToastTimeout(toast, setToast);
 
-  const rows = payload?.rows ?? [];
+  const rows = useMemo(() => payload?.rows ?? [], [payload]);
   const needle = query.trim().toLowerCase();
+  const owners = useMemo(() => certOwners(rows), [rows]);
+  const { checked, shown: shownChecked, partial, coveredBy, toggle, clear, setAll } =
+    useMultiSelect(owners);
 
   /**
    * L'atterrissage d'un saut depuis la vue Secrets.
@@ -355,7 +363,8 @@ export default function CertsView({
           </button>
           <SelectionBar
             keys={shown.map((r) => r.uid)}
-            checked={checked}
+            checked={shownChecked}
+            count={checked.size}
             onSetAll={setAll}
             onClear={clear}
             onBulkDelete={() => setBulkOpen(true)}
@@ -423,7 +432,7 @@ export default function CertsView({
               <div
                 className="tr"
               >
-                <SelectionHead />
+                {!tree && <SelectionHead />}
                 {tree ? (
                   <div className="cell">RESOURCE</div>
                 ) : (
@@ -464,6 +473,8 @@ export default function CertsView({
                     onFold={() => setToggled((p) => ({ ...p, [row.uid]: !collapsed.has(row.uid) }))}
                     onRun={run}
                     checked={checked.has(row.uid)}
+                    partial={partial.has(row.uid)}
+                    covered={coveredBy(row.uid)}
                     onToggleCheck={() => toggle(row.uid)}
                   />
                 ) : (
@@ -515,6 +526,32 @@ export default function CertsView({
   );
 }
 
+/**
+ * Les possessions de la chaîne : Certificate → CertificateRequest → Order → Challenge.
+ *
+ * Sous un Certificate, kdt accroche chaque étage par ses `ownerReferences` (`parent_map` de
+ * `certmanager.rs`) : un enfant d'un de ces trois kinds est donc possédé, et part avec lui. L'Issuer
+ * au-dessus d'un Certificate n'est qu'une référence (`spec.issuerRef`), et la feuille Secret n'est
+ * pas possédée — cert-manager ne pose son `ownerReference` qu'avec
+ * `--enable-certificate-owner-ref` : ni l'un ni l'autre ne cascade.
+ */
+function certOwners(rows: CertRow[]): Map<string, Owner> {
+  const OWNING = new Set(["Certificate", "CertificateRequest", "Order"]);
+  const out = new Map<string, Owner>();
+  rows.forEach((row, i) => {
+    if (row.row !== "resource" || row.depth === 0) return;
+    for (let k = i - 1; k >= 0; k -= 1) {
+      const up = rows[k];
+      if (up.depth >= row.depth) continue;
+      if (up.row === "resource" && OWNING.has(up.kind)) {
+        out.set(row.uid, { key: up.uid, label: `${up.kind_short} ${up.name}` });
+      }
+      return;
+    }
+  });
+  return out;
+}
+
 /** Le Certificate au-dessus d'une feuille Secret : la ligne qui la précède immédiatement. */
 function certOfSecret(rows: CertRow[], uid: string): string | null {
   const at = rows.findIndex((r) => r.uid === uid);
@@ -546,6 +583,8 @@ function ResourceLine({
   onFold,
   onRun,
   checked,
+  partial,
+  covered,
   onToggleCheck,
 }: {
   row: CertResourceRow;
@@ -560,6 +599,8 @@ function ResourceLine({
   onFold: () => void;
   onRun: (action: () => Promise<{ message: string }>) => void;
   checked: boolean;
+  partial: boolean;
+  covered: Owner | undefined;
   onToggleCheck: () => void;
 }) {
   // La relance n'a de sens que sur le Certificate lui-même : proposer « renouveler » depuis un
@@ -593,7 +634,15 @@ function ResourceLine({
         }
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      {!tree && (
+        <RowCheckbox
+          checked={checked}
+          covered={covered}
+          onToggle={onToggleCheck}
+          label={st.selectRow}
+          st={st}
+        />
+      )}
       {tree ? (
         <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
           {row.has_children ? (
@@ -611,6 +660,14 @@ function ResourceLine({
           ) : (
             <span className="fold-gap" />
           )}
+          <TreeCheckbox
+            checked={checked}
+            partial={partial}
+            covered={covered}
+            onToggle={onToggleCheck}
+            label={st.selectRow}
+            st={st}
+          />
           <span className="kind">{row.kind_short}</span> {row.name}
           <Keystores formats={row.keystore_formats} />
         </div>
@@ -685,9 +742,9 @@ function SecretLine({
         if (e.key === "Enter") onSelect();
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         <span className="fold-gap">→</span>
+        <TreeCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} st={st} />
         <span className="kind">Secret</span> {row.name}
       </div>
       <div className="cell">

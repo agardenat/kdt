@@ -20,7 +20,13 @@ import * as api from "./api";
 import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import {
+  RowCheckbox,
+  SelectionBar,
+  SelectionHead,
+  TreeCheckbox,
+  useMultiSelect,
+} from "./selection";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import type {
   EventRecord,
@@ -39,9 +45,11 @@ const CLAIM_COLUMNS =
   "34px fit-content(18ch) fit-content(26ch) 84px 72px 72px fit-content(22ch)" +
   " fit-content(32ch) minmax(20ch,1fr) 52px 34px";
 
-/** `NAME KIND PHASE SIZE ACCESS RECLAIM CLAIM / PROVISIONER AGE`. */
+/** `NAME KIND PHASE SIZE ACCESS RECLAIM CLAIM / PROVISIONER AGE`. Les volumes se rangent sous leur
+ * StorageClass : c'est un arbre, et la case suit l'indentation dans NAME au lieu d'avoir sa piste.
+ * Pas de cascade — une StorageClass ne possède pas les PV qu'elle a provisionnés. */
 const VOLUME_COLUMNS =
-  "34px fit-content(30ch) fit-content(6ch) 84px 72px 72px 76px minmax(26ch,1fr) 52px 34px";
+  "fit-content(30ch) fit-content(6ch) 84px 72px 72px 76px minmax(26ch,1fr) 52px 34px";
 
 type World = "claims" | "volumes";
 type Filter = "all" | "problems";
@@ -524,7 +532,6 @@ function VolumeTable({
     <div className="tbl" style={cols(VOLUME_COLUMNS)}>
       <div className="thead">
         <div className="tr">
-          <SelectionHead />
           <div className="cell">NAME</div>
           <div className="cell">KIND</div>
           <div className="cell">PHASE</div>
@@ -554,11 +561,6 @@ function VolumeTable({
                     if (e.key === "Enter") onSelect(g.sc!.uid);
                   }}
                 >
-                  <RowCheckbox
-                    checked={checked.has(g.sc.uid)}
-                    onToggle={() => onToggleCheck(g.sc!.uid)}
-                    label={st.selectRow}
-                  />
                   <div className="cell id">
                     <button
                       className="fold"
@@ -571,6 +573,12 @@ function VolumeTable({
                     >
                       {g.volumes.length === 0 ? "·" : folded ? "▸" : "▾"}
                     </button>
+                    <TreeCheckbox
+                      checked={checked.has(g.sc.uid)}
+                      onToggle={() => onToggleCheck(g.sc!.uid)}
+                      label={st.selectRow}
+                      st={st}
+                    />
                     {g.sc.name}
                     {g.sc.is_default && <span className="badge-default">{st.stoDefault}</span>}
                     {/* Combien de volumes elle provisionne, à côté d'elle : la colonne SIZE mesure
@@ -598,9 +606,9 @@ function VolumeTable({
                 </div>
               ) : (
                 <div className="tr sto-class">
-                  <div className="cell sel" />
                   <div className="cell id dim">
                     <span className="fold-gap">·</span>
+                    <TreeCheckbox checked={false} label={st.selectRow} st={st} />
                     {st.stoNoClass}
                     <span className="grp-count">{g.volumes.length}</span>
                   </div>
@@ -626,12 +634,16 @@ function VolumeTable({
                       if (e.key === "Enter") onSelect(v.uid);
                     }}
                   >
-                    <RowCheckbox
-                      checked={checked.has(v.uid)}
-                      onToggle={() => onToggleCheck(v.uid)}
-                      label={st.selectRow}
-                    />
-                    <div className="cell id nested">{v.name}</div>
+                    <div className="cell id nested">
+                      <span className="fold-gap" />
+                      <TreeCheckbox
+                        checked={checked.has(v.uid)}
+                        onToggle={() => onToggleCheck(v.uid)}
+                        label={st.selectRow}
+                        st={st}
+                      />
+                      {v.name}
+                    </div>
                     <div className="cell mono dim">PV</div>
                     <div className={`cell ${v.phase_tone}`}>{v.phase}</div>
                     <div className="cell num">{v.capacity}</div>

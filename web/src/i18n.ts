@@ -255,6 +255,7 @@ export interface Strings {
   rowMenu: string;
   selectRow: string;
   selectAll: string;
+  selectCovered: string;
   bulkCount: string;
   bulkClear: string;
   bulkActions: string;
@@ -995,6 +996,7 @@ const FR: Strings = {
   rowMenu: "Actions",
   selectRow: "Sélectionner",
   selectAll: "Tout sélectionner",
+  selectCovered: "Part avec {owner} — décocher {owner} pour le retirer",
   bulkCount: "{n} sélectionné(s)",
   bulkClear: "Effacer la sélection",
   bulkActions: "Actions groupées",
@@ -1768,6 +1770,7 @@ const EN: Strings = {
   rowMenu: "Actions",
   selectRow: "Select",
   selectAll: "Select all",
+  selectCovered: "Goes with {owner} — uncheck {owner} to leave it out",
   bulkCount: "{n} selected",
   bulkClear: "Clear selection",
   bulkActions: "Bulk actions",

@@ -15,7 +15,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import { SelectionBar, TreeCheckbox, useMultiSelect } from "./selection";
 import type {
   EventRecord,
   VelBackupRow,
@@ -31,10 +31,12 @@ import type {
 import { cols } from "./table";
 
 /** Les colonnes du TUI : `NAMESPACE NAME KIND STATE INFO EXPIRE AGE ALERT`, dans le même ordre. La
- * première piste (`34px`) porte la case de sélection multiple, la dernière le hamburger de la
+ * case de sélection n'a pas de piste : la vue est un arbre, elle suit l'indentation dans NAME. Et
+ * pas de cascade — supprimer une Schedule garde ses backups, et ce qui se liste sous un backup est
+ * ce qu'il a capturé, pas des objets qu'il possède. La dernière piste porte le hamburger de la
  * ligne. */
 const COLUMNS =
-  "34px fit-content(16ch) fit-content(36ch) 76px fit-content(16ch) fit-content(24ch)" +
+  "fit-content(16ch) fit-content(36ch) 76px fit-content(16ch) fit-content(24ch)" +
   " 76px 56px minmax(24ch,1fr) 34px";
 
 /** Une ligne sans objet à elle (un `orphans` synthétique, une feuille de contenu sans
@@ -453,7 +455,6 @@ export default function VeleroView({
           <div className="tbl" style={cols(COLUMNS)}>
             <div className="thead">
               <div className="tr">
-                <SelectionHead />
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">KIND</div>
@@ -666,11 +667,6 @@ function Line({
         }
       }}
     >
-      {rowUsable ? (
-        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
-      ) : (
-        <div className="cell sel" />
-      )}
       <div className="cell mono dim">{"namespace" in row ? row.namespace : ""}</div>
       <div className="cell id" style={{ paddingLeft: `${indent}rem` }}>
         {foldable ? (
@@ -688,6 +684,12 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
+        <TreeCheckbox
+          checked={checked}
+          onToggle={rowUsable ? onToggleCheck : undefined}
+          label={st.selectRow}
+          st={st}
+        />
         {row.name}
         {/* L'équivalent des touches `+`/`-` du TUI. Le contenu se télécharge depuis le stockage
             objet : il n'est jamais dans la liste. */}
@@ -803,11 +805,6 @@ function ContentsRow({
         }
       }}
     >
-      {rowUsable ? (
-        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
-      ) : (
-        <div className="cell sel" />
-      )}
       {/* La colonne NAMESPACE reste vide : ailleurs dans cette table elle nomme le namespace de
           l'objet velero, et un namespace capturé posé là se lirait comme la même chose. */}
       <div className="cell" />
@@ -827,6 +824,12 @@ function ContentsRow({
         ) : (
           <span className="fold-gap" />
         )}
+        <TreeCheckbox
+          checked={checked}
+          onToggle={rowUsable ? onToggleCheck : undefined}
+          label={st.selectRow}
+          st={st}
+        />
         {entry.label}
       </div>
       <div className="cell dim">{entry.kind}</div>

@@ -734,7 +734,17 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 
 .cell.sel { display: flex; align-items: center; justify-content: center; gap: .25rem; }
 .cell.sel input[type="checkbox"] { margin: 0; cursor: pointer; }
+.cell.sel input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .55; }
 .cell.act { display: flex; align-items: center; justify-content: center; }
+/* La case d'une ligne d'arbre, dans la cellule du nom entre le pli et le libellé : elle suit
+   l'indentation au lieu de rester dans une colonne à gauche de tout. Largeur fixe, qu'elle porte
+   une case ou non, pour la même raison que `.fold-gap` : les noms d'une profondeur s'alignent. */
+.tree-sel {
+  display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;
+  width: 1.1rem; margin-right: .35rem; flex: none;
+}
+.tree-sel input[type="checkbox"] { margin: 0; cursor: pointer; }
+.tree-sel input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .55; }
 
 /* Les deux colonnes qui portent des gestes et non de la donnée — la case à cocher en tête de ligne,
    le hamburger en fin de ligne — restent à l'écran quand la table est plus large que lui : une
@@ -1306,7 +1316,7 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 /* La classe est le parent, le volume est ce qu'elle provisionne : l'indentation dit la
    filiation, et la classe garde la graisse d'une racine. */
 .tbody .tr.sto-class .cell.id { font-weight: 600; }
-.tbody .tr.sto-volume .cell.id.nested { padding-left: 1.5rem; color: var(--fg); }
+.tbody .tr.sto-volume .cell.id.nested { padding-left: 1.15rem; color: var(--fg); }
 .badge-default {
   font-size: var(--fs-micro); padding: 0 .3rem; border-radius: 3px; margin-left: .4rem;
   background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);

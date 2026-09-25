@@ -15,7 +15,15 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import {
+  RowCheckbox,
+  SelectionBar,
+  SelectionHead,
+  TreeCheckbox,
+  useMultiSelect,
+  withoutSelTrack,
+  type Owner,
+} from "./selection";
 import type { ContainerRow, EventRecord, PodRow, UsagePct, WorkloadRow } from "./types";
 import { cols } from "./table";
 
@@ -32,7 +40,8 @@ import { cols } from "./table";
  * texte élident plutôt que de pousser la table hors champ.
  *
  * La première piste (`34px`) porte la case de sélection multiple et la dernière le hamburger de la
- * ligne, ni l'une ni l'autre mesurée sur le contenu.
+ * ligne, ni l'une ni l'autre mesurée sur le contenu. Groupée, la vue est un arbre et la case passe
+ * dans la cellule NAME (`withoutSelTrack`) ; seule la liste des pods à plat garde sa colonne.
  */
 const COLUMNS =
   "34px fit-content(16ch) minmax(28ch,1fr) 78px fit-content(13ch) 46px 62px 72px" +
@@ -95,7 +104,6 @@ export default function WorkloadsView({
   const [tab, setTab] = useState<PanelTab>("status");
   const [toast, setToast] = useState<Toast>(null);
   const [busy, setBusy] = useState(false);
-  const { checked, toggle: toggleChecked, clear, setAll } = useMultiSelect();
   const [bulkOpen, setBulkOpen] = useState(false);
 
   // La vue est dans la portée, contrairement à l'arbre Flux : elle liste des objets indépendants,
@@ -190,6 +198,29 @@ export default function WorkloadsView({
     return out;
   }, [workloads, pods]);
 
+  // Un pod est possédé par son workload (Deployment → ReplicaSet → Pod, résolu par kdt dans
+  // `group`) : supprimer le workload l'emporte, en `Background` comme `kubectl delete`. C'est la
+  // seule vue où la sélection descend d'une branche à ses feuilles, et elle le fait dans les deux
+  // mondes — la possession ne dépend pas de l'affichage.
+  const owners = useMemo(() => {
+    const byUid = new Map(workloads.map((w) => [w.uid, w]));
+    const out = new Map<string, Owner>();
+    for (const p of pods) {
+      const w = p.group === null ? undefined : byUid.get(p.group);
+      if (w) out.set(p.uid, { key: w.uid, label: `${w.kind} ${w.name}` });
+    }
+    return out;
+  }, [workloads, pods]);
+  const {
+    checked,
+    shown: shownChecked,
+    partial,
+    coveredBy,
+    toggle: toggleChecked,
+    clear,
+    setAll,
+  } = useMultiSelect(owners);
+
   /** Ce que « tout sélectionner » couvre : les lignes adressables **affichées**, containers exclus. */
   const selectableKeys = useMemo(
     () => rows.filter((entry) => entry.level !== "container").map((entry) => entry.row.uid),
@@ -270,7 +301,8 @@ export default function WorkloadsView({
           {busy && <span>{st.wlWorking}</span>}
           <SelectionBar
             keys={selectableKeys}
-            checked={checked}
+            checked={shownChecked}
+            count={checked.size}
             onSetAll={setAll}
             onClear={clear}
             onBulkDelete={() => setBulkOpen(true)}
@@ -325,10 +357,10 @@ export default function WorkloadsView({
             </div>
           </div>
         ) : (
-          <div className="tbl" style={cols(COLUMNS)}>
+          <div className="tbl" style={cols(grouped ? withoutSelTrack(COLUMNS) : COLUMNS)}>
             <div className="thead">
               <div className="tr">
-                <SelectionHead />
+                {!grouped && <SelectionHead />}
                 <div className="cell">NAMESPACE</div>
                 <div className="cell">NAME</div>
                 <div className="cell">READY</div>
@@ -376,6 +408,7 @@ export default function WorkloadsView({
                     onRun={run}
                     onNeedsAuth={onNeedsAuth}
                     checked={checked.has(entry.row.uid)}
+                    partial={partial.has(entry.row.uid)}
                     onToggleCheck={() => toggleChecked(entry.row.uid)}
                   />
                 ) : entry.level === "pod" ? (
@@ -384,6 +417,7 @@ export default function WorkloadsView({
                     p={entry.row}
                     st={st}
                     lang={lang}
+                    tree={grouped}
                     indent={entry.indent}
                     expanded={expanded.has(entry.row.uid)}
                     selected={selected === entry.row.uid}
@@ -397,12 +431,14 @@ export default function WorkloadsView({
                     onNeedsAuth={onNeedsAuth}
                     onToggle={() => toggle(entry.row.uid)}
                     checked={checked.has(entry.row.uid)}
+                    covered={coveredBy(entry.row.uid)}
                     onToggleCheck={() => toggleChecked(entry.row.uid)}
                   />
                 ) : (
                   <ContainerLine
                     key={entry.row.uid}
                     c={entry.row}
+                    tree={grouped}
                     lang={lang}
                     st={st}
                     selected={selected === entry.row.uid}
@@ -457,6 +493,7 @@ function WorkloadLine({
   onRun,
   onNeedsAuth,
   checked,
+  partial,
   onToggleCheck,
 }: {
   w: WorkloadRow;
@@ -469,6 +506,7 @@ function WorkloadLine({
   onRun: (action: () => Promise<{ message: string }>) => void;
   onNeedsAuth: (message: string) => void;
   checked: boolean;
+  partial: boolean;
   onToggleCheck: () => void;
 }) {
   return (
@@ -481,9 +519,18 @@ function WorkloadLine({
         if (e.key === "Enter") onSelect();
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
       <div className="cell mono dim">{w.namespace}</div>
       <div className="cell id">
+        {/* Pas de pli sur un workload — ses pods sont toujours listés — mais la place du pli, pour
+            que sa case s'aligne sur celle d'un pod orphelin, racine comme lui. */}
+        <span className="fold-gap" />
+        <TreeCheckbox
+          checked={checked}
+          partial={partial}
+          onToggle={onToggleCheck}
+          label={st.selectRow}
+          st={st}
+        />
         <span className="kind">{w.kind}</span> {w.name}
       </div>
       <div className="cell mono">{w.ready_label}</div>
@@ -611,6 +658,7 @@ function PodLine({
   p,
   lang,
   st,
+  tree,
   indent,
   expanded,
   selected,
@@ -619,11 +667,13 @@ function PodLine({
   onNeedsAuth,
   onToggle,
   checked,
+  covered,
   onToggleCheck,
 }: {
   p: PodRow;
   lang: Lang;
   st: Strings;
+  tree: boolean;
   indent: boolean;
   expanded: boolean;
   selected: boolean;
@@ -632,6 +682,7 @@ function PodLine({
   onNeedsAuth: (message: string) => void;
   onToggle: () => void;
   checked: boolean;
+  covered: Owner | undefined;
   onToggleCheck: () => void;
 }) {
   return (
@@ -648,7 +699,15 @@ function PodLine({
         }
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      {!tree && (
+        <RowCheckbox
+          checked={checked}
+          covered={covered}
+          onToggle={onToggleCheck}
+          label={st.selectRow}
+          st={st}
+        />
+      )}
       {/* Un pod n'a pas sa propre colonne NAMESPACE — celle de son workload au-dessus suffit —
           mais la piste existe dans `COLUMNS` : sans cellule vide ici, toute la ligne se décale
           d'une colonne vers la gauche (préexistant à ce changement, remarqué en y posant la case
@@ -669,6 +728,15 @@ function PodLine({
           </button>
         ) : (
           <span className="fold-gap" />
+        )}
+        {tree && (
+          <TreeCheckbox
+            checked={checked}
+            covered={covered}
+            onToggle={onToggleCheck}
+            label={st.selectRow}
+            st={st}
+          />
         )}
         {p.name}
       </div>
@@ -697,6 +765,7 @@ function PodLine({
 
 function ContainerLine({
   c,
+  tree,
   lang,
   st,
   selected,
@@ -705,6 +774,7 @@ function ContainerLine({
   onNeedsAuth,
 }: {
   c: ContainerRow;
+  tree: boolean;
   lang: Lang;
   st: Strings;
   selected: boolean;
@@ -724,7 +794,7 @@ function ContainerLine({
     >
       {/* Pas de case : un container n'est pas un objet à supprimer, son `record` est celui de son
           pod. Le menu, lui, reste — il nomme le pod qu'il vise dans son en-tête. */}
-      <div className="cell sel" />
+      {!tree && <div className="cell sel" />}
       <div className="cell" />
       <div className="cell id" style={{ paddingLeft: "2.6rem" }}>
         <span className={`gl ${c.tone}`}>{c.ready ? "✓" : "✗"}</span>

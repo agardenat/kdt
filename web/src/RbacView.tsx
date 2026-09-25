@@ -14,7 +14,13 @@ import { ApiError, NeedsAuth } from "./api";
 import type { Lang, Strings } from "./i18n";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import {
+  RowCheckbox,
+  SelectionBar,
+  SelectionHead,
+  TreeCheckbox,
+  useMultiSelect,
+} from "./selection";
 import { visibleRows } from "./tree";
 import type {
   RbacBindingRow,
@@ -36,10 +42,11 @@ const FLAT_COLUMNS =
   "34px 84px fit-content(22ch) minmax(24ch,1fr) fit-content(32ch) fit-content(30ch)" +
   " fit-content(20ch) 56px 34px";
 
-/** Les colonnes des trois lectures en arbre : `NODE SEV SCOPE ORIGIN DETAIL AGE`. */
+/** Les colonnes des trois lectures en arbre : `NODE SEV SCOPE ORIGIN DETAIL AGE`. La case de
+ * sélection n'y a pas de piste : elle suit l'indentation dans NODE. Et pas de cascade — un même
+ * rôle revient sous chaque liaison qui le cite, cocher un sujet ne coche pas ce qu'on lui a donné. */
 const TREE_COLUMNS =
-  "34px fit-content(52ch) 84px fit-content(18ch) fit-content(28ch) minmax(24ch,1fr) 56px" +
-  " 34px";
+  "fit-content(52ch) 84px fit-content(18ch) fit-content(28ch) minmax(24ch,1fr) 56px 34px";
 
 /** Un `nsgroup`/`rule`/`subject-leaf` n'a pas d'objet à lui : son `record` porte un kind/name vides,
  * même garde que partout ailleurs pour décider d'une case et d'un hamburger. */
@@ -306,7 +313,7 @@ export default function RbacView({
           <div className="tbl" style={cols(columns)}>
             <div className="thead">
               <div className="tr">
-                <SelectionHead />
+                {orient === "flat" && <SelectionHead />}
                 {orient === "flat" ? (
                   <>
                     <div className="cell">SEV</div>
@@ -457,7 +464,6 @@ function Line({
 
   return (
     <div {...common}>
-      {checkbox}
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         {row.has_children ? (
           <button
@@ -474,6 +480,12 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
+        <TreeCheckbox
+          checked={checked}
+          onToggle={rowUsable ? onToggleCheck : undefined}
+          label={st.selectRow}
+          st={st}
+        />
         <Label row={row} st={st} />
       </div>
       <TreeCells row={row} st={st} />

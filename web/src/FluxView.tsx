@@ -11,7 +11,13 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import {
+  RowCheckbox,
+  SelectionBar,
+  SelectionHead,
+  TreeCheckbox,
+  useMultiSelect,
+} from "./selection";
 import { filterTree, hiddenUnder, revealed, visibleRows, type Hidden } from "./tree";
 import type { EventRecord, FluxCounts, FluxRow, InventoryItem, ReconcileScope } from "./types";
 import { cols } from "./table";
@@ -23,9 +29,12 @@ import { cols } from "./table";
  * reste au message. Ici RESOURCE se taille sur son contenu sous un plafond, parce que c'est elle
  * qui porte l'indentation, et le message prend la piste souple — enroulé sur deux lignes — parce
  * que c'est lui qui dit pourquoi une ligne est rouge.
+ *
+ * Pas de piste pour la case de sélection : dans l'arbre, elle suit l'indentation dans RESOURCE. Et
+ * pas de cascade — les arêtes sont des dépendances (`dependsOn`, `sourceRef`), cocher une source ne
+ * coche pas ce qui la lit.
  */
-const TREE_COLUMNS =
-  "34px fit-content(52ch) 104px fit-content(18ch) 52px minmax(26ch,1fr) 34px";
+const TREE_COLUMNS = "fit-content(52ch) 104px fit-content(18ch) 52px minmax(26ch,1fr) 34px";
 
 /** Les colonnes de la vue à plat, celles de `flux_table_parts`. La première piste (`34px`) porte
  * la case de sélection multiple, la dernière le hamburger de la ligne. */
@@ -334,7 +343,7 @@ export default function FluxView({
               <div
                 className="tr"
               >
-                <SelectionHead />
+                {!tree && <SelectionHead />}
                 {tree ? (
                   <div className="cell">RESOURCE</div>
                 ) : (
@@ -512,7 +521,7 @@ function ResourceLine({
         }
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      {!tree && <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />}
       {tree ? (
         <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
           {row.has_children ? (
@@ -530,6 +539,7 @@ function ResourceLine({
           ) : (
             <span className="fold-gap" />
           )}
+          <TreeCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} st={st} />
           <span className="kind">{row.kind}</span> {row.name}
           {/* L'équivalent des touches `+`/`-` du TUI. Un `⊞` seul se devine mal sur une page :
               la pastille porte le mot, et le compte une fois l'inventaire ouvert. */}
@@ -630,12 +640,15 @@ function InventoryLine({
         if (e.key === "Enter") onSelect();
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
+      {!tree && <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />}
       <div
         className={`cell id ${item.tone}`}
         style={{ paddingLeft: `${depth * 1.15}rem`, gridColumn: tree ? undefined : "2 / 5" }}
       >
         <span className="fold-gap">{glyph}</span>
+        {tree && (
+          <TreeCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} st={st} />
+        )}
         <span className="kind">{item.kind}</span> {nsname}
       </div>
       <div className="cell">

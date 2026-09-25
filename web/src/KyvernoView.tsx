@@ -18,7 +18,7 @@ import type { Lang, Strings } from "./i18n";
 import { ToastLine, useToastTimeout, type Toast } from "./toast";
 import { InspectPanel, PanelToggle, Splitter, ViewBody, type PanelTab } from "./panel";
 import { BulkDeletePane, RowMenu, type ObjectTab } from "./objects";
-import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./selection";
+import { SelectionBar, TreeCheckbox, useMultiSelect } from "./selection";
 import { visibleRows } from "./tree";
 import type {
   KyCounts,
@@ -37,15 +37,15 @@ import { cols } from "./table";
  * Côté Rust : RESOURCE dimensionnée sur son contenu (30 à 64 caractères), puis 9, 11, 26, et le
  * reste au détail. Ici RESOURCE se taille sur son contenu sous un plafond, parce que c'est elle
  * qui porte l'indentation, et DETAIL prend la piste souple parce que c'est lui qui dit pourquoi
- * une ligne est rouge. La première piste (`34px`) porte la case de sélection multiple, la dernière
- * le hamburger de la ligne.
+ * une ligne est rouge. La case de sélection n'a pas de piste : les deux axes sont des arbres, elle
+ * suit l'indentation dans RESOURCE. La dernière piste porte le hamburger de la ligne.
  */
 const POLICY_COLUMNS =
-  "34px fit-content(52ch) 92px fit-content(12ch) fit-content(26ch) minmax(26ch,1fr) 34px";
+  "fit-content(52ch) 92px fit-content(12ch) fit-content(26ch) minmax(26ch,1fr) 34px";
 
 /** Les colonnes de l'axe par ressource : `RESOURCE RESULT POLICY/RULE MESSAGE`. */
 const RESOURCE_COLUMNS =
-  "34px fit-content(52ch) fit-content(10ch) fit-content(34ch) minmax(26ch,1fr) 34px";
+  "fit-content(52ch) fit-content(10ch) fit-content(34ch) minmax(26ch,1fr) 34px";
 
 /** Une ligne synthétique (`rule`/`violation`/`namespace`) n'a pas d'objet à elle : son `record` porte
  * un kind/name vides, même garde que partout ailleurs. */
@@ -398,7 +398,6 @@ export default function KyvernoView({
           <div className="tbl" style={cols(columns)}>
             <div className="thead">
               <div className="tr">
-                <SelectionHead />
                 <div className="cell">RESOURCE</div>
                 {axis === "policy" ? (
                   <>
@@ -584,11 +583,6 @@ function Line({
         }
       }}
     >
-      {rowUsable ? (
-        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} />
-      ) : (
-        <div className="cell sel" />
-      )}
       <div className="cell id" style={{ paddingLeft: `${row.depth * 1.15}rem` }}>
         {row.has_children ? (
           <button
@@ -605,6 +599,12 @@ function Line({
         ) : (
           <span className="fold-gap" />
         )}
+        <TreeCheckbox
+          checked={checked}
+          onToggle={rowUsable ? onToggleCheck : undefined}
+          label={st.selectRow}
+          st={st}
+        />
         <Label row={row} axis={axis} />
       </div>
       {axis === "policy" ? <PolicyCells row={row} st={st} /> : <ResourceCells row={row} />}
