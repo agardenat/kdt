@@ -8,6 +8,21 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.2.0] — 2026-09-25
+
+- **feat(web)** — dans les vues en arbre de kdt-web (Workloads groupé, Flux, RBAC, Certs,
+  Kyverno, Velero, Storage/Volumes), la case de sélection se pose **juste devant l'objet**, après
+  son pli, et suit l'indentation au lieu de rester dans une colonne à gauche de tout. Les tables
+  plates gardent leur colonne ; une vue qui bascule entre arbre et liste suit le mode affiché.
+
+- **feat(web)** — cocher une branche coche ses feuilles **quand la suppression du parent les
+  emporte** : un workload et ses pods, un Certificate et sa chaîne CertificateRequest → Order →
+  Challenge. Les enfants s'affichent cochés et grisés, et seul le parent part à la suppression
+  groupée — le compte de la barre dit ce qui sera réellement supprimé. Cocher tous les pods ne
+  coche pas leur workload, qui passe seulement en indéterminé. Les arbres de références — Flux,
+  RBAC, Issuer → Certificate, StorageClass → PV, Schedule → Backup — ne cascadent pas : y cocher
+  une branche ne coche qu'elle.
+
 ## [2.1.0] — 2026-09-24
 
 - **feat(ctx)** — `:ctx` change de contexte kubeconfig **sans quitter kdt**. Sans argument, la
