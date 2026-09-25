@@ -340,13 +340,9 @@ fn build_secret_info(
     let data_keys: Vec<String> = data.iter().map(|(k, _)| k.clone()).collect();
 
     let (tls, tls_error) = if type_ == TLS_TYPE {
-        let crt = sec.data.as_ref().and_then(|d| d.get(CRT_KEY)).map(|b| b.0.as_slice());
-        let ca = sec.data.as_ref().and_then(|d| d.get(CA_KEY)).map(|b| b.0.as_slice());
-        match crt {
-            Some(bytes) => match parse_tls_cert(bytes, ca) {
-                Ok(c) => (Some(c), None),
-                Err(e) => (None, Some(e)),
-            },
+        match leaf_cert(sec) {
+            Some(Ok(c)) => (Some(c), None),
+            Some(Err(e)) => (None, Some(e)),
             None => (
                 None,
                 Some(crate::lang::fill(
@@ -379,6 +375,14 @@ fn build_secret_info(
         ingress_refs: ingress_map.get(&key).cloned().unwrap_or_default(),
         cert_manager: cm_map.get(&key).cloned(),
     }
+}
+
+// The leaf certificate a Secret carries in `tls.crt`, `None` when the key is absent. The type is not
+// looked at: an ingress controller reads the key, and an `Opaque` secret holding one is served too.
+pub(crate) fn leaf_cert(sec: &Secret) -> Option<Result<TlsCert, String>> {
+    let data = sec.data.as_ref()?;
+    let crt = data.get(CRT_KEY)?;
+    Some(parse_tls_cert(&crt.0, data.get(CA_KEY).map(|b| b.0.as_slice())))
 }
 
 // Discover cert-manager Certificates and index them by the secret they target (spec.secretName).

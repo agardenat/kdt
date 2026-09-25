@@ -11,20 +11,30 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::Service;
+use futures::StreamExt;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::api::{Api, ListParams};
 use kube::Client;
 
-use crate::events::format_age;
+use crate::events::{format_age, LineColor};
+use crate::lang::{fill, Strings};
 use crate::netpol::{list_netpols, NetPolResource};
+use crate::secrets::TlsCert;
 
 // The standard label EndpointSlices carry to point back at the Service they belong to.
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 // Annotation marking the cluster's default IngressClass.
 const DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
+// How long a read TLS secret is trusted before being read again. The list refreshes every 5 s and a
+// certificate does not change that often; a secret that is missing or unreadable is re-read sooner,
+// so the fix shows up while the user is still looking.
+const TLS_CERT_TTL: Duration = Duration::from_secs(60);
+const TLS_PROBLEM_TTL: Duration = Duration::from_secs(15);
+const TLS_READ_CONCURRENCY: usize = 8;
 
 // A Service row (parent in the grouped Services view, or a flat row when grouping is off).
 #[derive(Debug, Clone)]
@@ -80,10 +90,101 @@ pub struct IngressResource {
     pub class: Option<String>,
     pub hosts: String,
     pub rules: String,
-    pub tls: bool,
+    pub tls: Vec<IngressTls>,
     pub address: String,
     pub age: String,
     pub uid: String,
+}
+
+// One `spec.tls[]` entry: the Secret the controller serves for these hosts, and what it holds.
+#[derive(Debug, Clone)]
+pub struct IngressTls {
+    pub secret: Option<String>,
+    pub hosts: Vec<String>,
+    pub state: TlsSecretState,
+}
+
+// What the Secret named by a `spec.tls[]` entry holds, as read from the cluster.
+#[derive(Debug, Clone)]
+pub enum TlsSecretState {
+    // The entry names no secret: the controller answers these hosts with its default certificate.
+    Default,
+    // Not read (RBAC refusal, API error): nothing is claimed about it.
+    Unchecked(String),
+    Missing,
+    // The secret exists but has no `tls.crt`.
+    NoCert,
+    Unreadable(String),
+    Cert(Box<TlsCert>),
+}
+
+impl IngressTls {
+    // Hosts of the entry that no DNS SAN of the served certificate matches. Empty unless a
+    // certificate was read: an unread one proves nothing either way.
+    pub fn uncovered_hosts(&self) -> Vec<&str> {
+        let TlsSecretState::Cert(c) = &self.state else { return Vec::new() };
+        self.hosts
+            .iter()
+            .filter(|h| !c.sans.iter().any(|san| san_matches(san, h)))
+            .map(|h| h.as_str())
+            .collect()
+    }
+
+    pub fn tone(&self) -> LineColor {
+        match &self.state {
+            TlsSecretState::Default | TlsSecretState::Unchecked(_) => LineColor::Dim,
+            TlsSecretState::Missing | TlsSecretState::NoCert | TlsSecretState::Unreadable(_) => LineColor::Err,
+            TlsSecretState::Cert(c) => {
+                if self.uncovered_hosts().is_empty() {
+                    c.expiry.tone()
+                } else {
+                    worse(c.expiry.tone(), LineColor::Warn)
+                }
+            }
+        }
+    }
+
+    // What the TLS column shows for this entry.
+    pub fn label(&self, st: &Strings) -> String {
+        self.secret.clone().unwrap_or_else(|| st.ing_tls_default_short.to_string())
+    }
+}
+
+// A DNS SAN matches a host exactly (case-insensitively), or as a wildcard covering exactly one
+// leftmost label: `*.example.com` covers `a.example.com`, not `example.com` nor `a.b.example.com`.
+fn san_matches(san: &str, host: &str) -> bool {
+    if san.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    match (san.strip_prefix("*."), host.split_once('.')) {
+        (Some(suffix), Some((label, rest))) => !label.is_empty() && label != "*" && rest.eq_ignore_ascii_case(suffix),
+        _ => false,
+    }
+}
+
+fn tone_rank(c: LineColor) -> u8 {
+    match c {
+        LineColor::Err => 3,
+        LineColor::Warn => 2,
+        LineColor::Ok => 1,
+        LineColor::Plain | LineColor::Info | LineColor::Dim => 0,
+    }
+}
+
+pub fn worse(a: LineColor, b: LineColor) -> LineColor {
+    if tone_rank(b) > tone_rank(a) { b } else { a }
+}
+
+impl IngressResource {
+    // The worst tone across the TLS entries; `None` for a plain-HTTP Ingress.
+    pub fn tls_tone(&self) -> Option<LineColor> {
+        self.tls.iter().map(IngressTls::tone).reduce(worse)
+    }
+
+    // The first Secret named in `spec.tls`, where `s` lands.
+    pub fn first_tls_secret(&self) -> Option<&str> {
+        self.tls.iter().find_map(|t| t.secret.as_deref())
+    }
 }
 
 // An IngressClass row (cluster-scoped): the controller that serves it and whether it is the default.
@@ -103,6 +204,8 @@ pub struct NetworkState {
     pub ingresses: Vec<IngressResource>,
     pub ingress_classes: Vec<IngressClassResource>,
     pub netpols: Vec<NetPolResource>,
+    // TLS secrets already read, keyed by (namespace, name), with the time of the read.
+    pub tls_cache: HashMap<(String, String), (Instant, TlsSecretState)>,
     pub error: Option<String>,
     // Error listing native NetworkPolicies; kept apart from `error` so the netpol world shows its own
     // failure without blanking the Services/Ingress worlds (and vice versa).
@@ -146,7 +249,8 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
         }
     };
 
-    let ingresses = list_ingresses(&client, &namespace).await.unwrap_or_default();
+    let mut ingresses = list_ingresses(&client, &namespace).await.unwrap_or_default();
+    resolve_tls(&client, &mut ingresses, &state).await;
     let ingress_classes = list_ingress_classes(&client).await.unwrap_or_default();
     let (netpols, netpol_error) = list_netpols(&client, &namespace).await;
 
@@ -344,6 +448,150 @@ fn service_ports(s: &Service) -> String {
         .join(",")
 }
 
+// Fill the state of every `spec.tls[]` entry, reading only the secrets whose cached read is stale.
+// The cache is pruned to what is still referenced, so a deleted Ingress does not keep its secret.
+async fn resolve_tls(client: &Client, ingresses: &mut [IngressResource], state: &SharedNetwork) {
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for i in ingresses.iter() {
+        for t in &i.tls {
+            if let Some(sn) = &t.secret {
+                let key = (i.namespace.clone(), sn.clone());
+                if !wanted.contains(&key) {
+                    wanted.push(key);
+                }
+            }
+        }
+    }
+    let mut cache = {
+        let s = state.lock().expect("network poisoned");
+        s.tls_cache.clone()
+    };
+    cache.retain(|k, _| wanted.contains(k));
+    let stale: Vec<(String, String)> = wanted
+        .into_iter()
+        .filter(|k| match cache.get(k) {
+            Some((at, TlsSecretState::Cert(_))) => at.elapsed() >= TLS_CERT_TTL,
+            Some((at, _)) => at.elapsed() >= TLS_PROBLEM_TTL,
+            None => true,
+        })
+        .collect();
+    let read: Vec<((String, String), TlsSecretState)> = futures::stream::iter(stale)
+        .map(|(ns, name)| async move {
+            let st = read_tls_secret(client, &ns, &name).await;
+            ((ns, name), st)
+        })
+        .buffer_unordered(TLS_READ_CONCURRENCY)
+        .collect()
+        .await;
+    let now = Instant::now();
+    for (k, st) in read {
+        cache.insert(k, (now, st));
+    }
+    for i in ingresses.iter_mut() {
+        for t in i.tls.iter_mut() {
+            if let Some(sn) = &t.secret {
+                if let Some((_, st)) = cache.get(&(i.namespace.clone(), sn.clone())) {
+                    t.state = st.clone();
+                }
+            }
+        }
+    }
+    state.lock().expect("network poisoned").tls_cache = cache;
+}
+
+pub async fn read_tls_secret(client: &Client, namespace: &str, name: &str) -> TlsSecretState {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    match api.get(name).await {
+        Ok(sec) => match crate::secrets::leaf_cert(&sec) {
+            None => TlsSecretState::NoCert,
+            Some(Ok(c)) => TlsSecretState::Cert(Box::new(c)),
+            Some(Err(e)) => TlsSecretState::Unreadable(e),
+        },
+        Err(kube::Error::Api(e)) if e.code == 404 => TlsSecretState::Missing,
+        Err(e) => TlsSecretState::Unchecked(crate::edit::api_error_text(e)),
+    }
+}
+
+// The Status tab of an Ingress: its class and address, then each TLS entry with the Secret behind
+// it, read now rather than taken from the list's cache.
+pub async fn ingress_status_lines(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    st: &'static Strings,
+) -> Result<Vec<(LineColor, String)>, String> {
+    let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+    let ing = api.get(name).await.map_err(|e| e.to_string())?;
+    let mut res = ingress_resource(&ing);
+    for t in res.tls.iter_mut() {
+        if let Some(sn) = &t.secret {
+            t.state = read_tls_secret(client, namespace, sn).await;
+        }
+    }
+    let mut out: Vec<(LineColor, String)> = vec![(LineColor::Info, format!("Ingress {}/{}", namespace, name))];
+    if let Some(t) = &ing.metadata.creation_timestamp {
+        out.push((LineColor::Dim, format!("Created: {}", t.0)));
+    }
+    if let Some(c) = &res.class {
+        out.push((LineColor::Plain, format!("ingressClassName: {}", c)));
+    }
+    if !res.address.is_empty() {
+        out.push((LineColor::Plain, format!("address: {}", res.address)));
+    }
+    out.extend(format_ingress_tls(&res.tls, st));
+    Ok(out)
+}
+
+pub fn format_ingress_tls(tls: &[IngressTls], st: &Strings) -> Vec<(LineColor, String)> {
+    let mut out: Vec<(LineColor, String)> = vec![(LineColor::Plain, String::new())];
+    if tls.is_empty() {
+        out.push((LineColor::Dim, st.ing_tls_none.to_string()));
+        return out;
+    }
+    out.push((LineColor::Info, format!("TLS ({})", tls.len())));
+    for t in tls {
+        let head = match &t.secret {
+            Some(sn) => format!("▸ Secret {}", sn),
+            None => format!("▸ {}", st.ing_tls_default_short),
+        };
+        let head = if t.hosts.is_empty() {
+            head
+        } else {
+            format!("{} → {}", head, t.hosts.join(", "))
+        };
+        out.push((t.tone(), head));
+        let sub = |s: String| format!("  └ {}", s);
+        match &t.state {
+            TlsSecretState::Default => out.push((LineColor::Dim, sub(st.ing_tls_default.to_string()))),
+            TlsSecretState::Unchecked(e) => out.push((LineColor::Dim, sub(fill(st.ing_tls_unchecked, &[("err", e)])))),
+            TlsSecretState::Missing => out.push((LineColor::Err, sub(st.ing_tls_missing.to_string()))),
+            TlsSecretState::NoCert => out.push((
+                LineColor::Err,
+                sub(fill(st.sec_crt_key_missing, &[("key", "tls.crt")])),
+            )),
+            TlsSecretState::Unreadable(e) => out.push((LineColor::Err, sub(e.clone()))),
+            TlsSecretState::Cert(c) => {
+                let issuer = if c.self_signed {
+                    fill(st.sec_self_signed, &[("issuer", &c.issuer_cn)])
+                } else {
+                    c.issuer_cn.clone()
+                };
+                out.push((LineColor::Plain, sub(format!("CN {} · {}", c.subject_cn, issuer))));
+                let expiry = if c.days_remaining < 0 {
+                    fill(st.sec_expired_since, &[("date", &c.not_after), ("n", &(-c.days_remaining).to_string())])
+                } else {
+                    fill(st.sec_days_left, &[("date", &c.not_after), ("n", &c.days_remaining.to_string())])
+                };
+                out.push((c.expiry.tone(), sub(format!("{} {}", st.sec_lbl_expires_on, expiry))));
+                for h in t.uncovered_hosts() {
+                    out.push((LineColor::Warn, sub(fill(st.ing_tls_host_uncovered, &[("host", h)]))));
+                }
+            }
+        }
+    }
+    out
+}
+
 async fn list_ingresses(
     client: &Client,
     namespace: &Option<String>,
@@ -400,7 +648,23 @@ fn ingress_resource(i: &Ingress) -> IngressResource {
             }
         }
     }
-    let tls = spec.and_then(|s| s.tls.as_ref()).map(|t| !t.is_empty()).unwrap_or(false);
+    let tls: Vec<IngressTls> = spec
+        .and_then(|s| s.tls.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let secret = t.secret_name.clone().filter(|s| !s.is_empty());
+            IngressTls {
+                state: if secret.is_some() {
+                    TlsSecretState::Unchecked(String::new())
+                } else {
+                    TlsSecretState::Default
+                },
+                secret,
+                hosts: t.hosts.clone().unwrap_or_default(),
+            }
+        })
+        .collect();
     let address = i
         .status
         .as_ref()
@@ -469,5 +733,115 @@ fn ingress_class_resource(c: &IngressClass) -> IngressClassResource {
         controller,
         is_default,
         age,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::{EN, FR};
+    use crate::secrets::Expiry;
+
+    fn cert(sans: &[&str], days: i64) -> TlsSecretState {
+        TlsSecretState::Cert(Box::new(TlsCert {
+            subject_cn: "a.example.com".into(),
+            issuer_cn: "R11".into(),
+            self_signed: false,
+            is_ca: false,
+            sans: sans.iter().map(|s| s.to_string()).collect(),
+            not_before: "2026-01-01".into(),
+            not_after: "2026-12-01".into(),
+            days_remaining: days,
+            expiry: Expiry::from_days(days),
+            serial: String::new(),
+            key_algo: "EC".into(),
+            ca_bundle: None,
+        }))
+    }
+
+    fn entry(secret: Option<&str>, hosts: &[&str], state: TlsSecretState) -> IngressTls {
+        IngressTls {
+            secret: secret.map(|s| s.to_string()),
+            hosts: hosts.iter().map(|s| s.to_string()).collect(),
+            state,
+        }
+    }
+
+    #[test]
+    fn wildcard_san_covers_exactly_one_label() {
+        assert!(san_matches("*.example.com", "a.example.com"));
+        assert!(san_matches("*.Example.com", "A.example.COM"));
+        assert!(!san_matches("*.example.com", "example.com"));
+        assert!(!san_matches("*.example.com", "a.b.example.com"));
+        assert!(san_matches("*.example.com", "*.example.com"));
+        assert!(san_matches("a.example.com", "a.example.com"));
+    }
+
+    #[test]
+    fn a_host_outside_the_sans_lowers_a_healthy_cert_to_warn() {
+        let ok = entry(Some("t"), &["a.example.com"], cert(&["a.example.com"], 80));
+        assert_eq!(ok.tone(), LineColor::Ok);
+        assert!(ok.uncovered_hosts().is_empty());
+        let off = entry(Some("t"), &["a.example.com", "b.other.com"], cert(&["*.example.com"], 80));
+        assert_eq!(off.uncovered_hosts(), vec!["b.other.com"]);
+        assert_eq!(off.tone(), LineColor::Warn);
+        let expired = entry(Some("t"), &["b.other.com"], cert(&["a.example.com"], -3));
+        assert_eq!(expired.tone(), LineColor::Err);
+    }
+
+    #[test]
+    fn only_a_read_secret_gets_a_verdict() {
+        assert_eq!(entry(Some("t"), &[], TlsSecretState::Missing).tone(), LineColor::Err);
+        assert_eq!(entry(Some("t"), &[], TlsSecretState::NoCert).tone(), LineColor::Err);
+        assert_eq!(entry(Some("t"), &[], TlsSecretState::Unchecked("forbidden".into())).tone(), LineColor::Dim);
+        assert_eq!(entry(None, &["a"], TlsSecretState::Default).tone(), LineColor::Dim);
+        let unread = entry(Some("t"), &["zzz"], TlsSecretState::Unchecked(String::new()));
+        assert!(unread.uncovered_hosts().is_empty());
+    }
+
+    #[test]
+    fn the_worst_entry_colours_the_ingress() {
+        let mut ing = IngressResource {
+            namespace: "ns".into(),
+            name: "web".into(),
+            class: None,
+            hosts: String::new(),
+            rules: String::new(),
+            tls: Vec::new(),
+            address: String::new(),
+            age: String::new(),
+            uid: String::new(),
+        };
+        assert_eq!(ing.tls_tone(), None);
+        assert_eq!(ing.first_tls_secret(), None);
+        ing.tls = vec![
+            entry(None, &["x"], TlsSecretState::Default),
+            entry(Some("good"), &["a.example.com"], cert(&["a.example.com"], 80)),
+            entry(Some("gone"), &["b.example.com"], TlsSecretState::Missing),
+        ];
+        assert_eq!(ing.tls_tone(), Some(LineColor::Err));
+        assert_eq!(ing.first_tls_secret(), Some("good"));
+    }
+
+    #[test]
+    fn detail_names_each_secret_and_what_it_holds() {
+        let tls = vec![
+            entry(Some("web-tls"), &["a.example.com", "b.other.com"], cert(&["a.example.com"], 80)),
+            entry(Some("gone-tls"), &["c.example.com"], TlsSecretState::Missing),
+            entry(None, &["d.example.com"], TlsSecretState::Default),
+        ];
+        for st in [&FR, &EN] {
+            let lines = format_ingress_tls(&tls, st);
+            let text: Vec<&str> = lines.iter().map(|(_, t)| t.as_str()).collect();
+            assert!(text.contains(&"TLS (3)"));
+            assert!(text.contains(&"▸ Secret web-tls → a.example.com, b.other.com"));
+            assert!(text.contains(&"▸ Secret gone-tls → c.example.com"));
+            let uncovered = format!("  └ {}", fill(st.ing_tls_host_uncovered, &[("host", "b.other.com")]));
+            assert!(lines.contains(&(LineColor::Warn, uncovered)));
+            assert!(lines.contains(&(LineColor::Err, format!("  └ {}", st.ing_tls_missing))));
+            assert!(text.contains(&format!("▸ {} → d.example.com", st.ing_tls_default_short).as_str()));
+        }
+        let none = format_ingress_tls(&[], &EN);
+        assert_eq!(none.last().map(|(_, t)| t.as_str()), Some(EN.ing_tls_none));
     }
 }

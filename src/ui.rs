@@ -1747,6 +1747,8 @@ pub struct App {
     pub vuln_refresh_handle: Option<JoinHandle<()>>,
     pub secrets_state: SharedSecrets,
     pub secrets_cursor: usize,
+    // Landing target of a jump from another view, consumed once the fresh list has come back.
+    secrets_pending_select: Option<(String, String)>,
     pub secrets_offset: usize,
     secrets_filter: SecretFilter,
     secrets_reveal: SecretReveal,
@@ -2109,6 +2111,7 @@ impl App {
             vuln_refresh_handle: None,
             secrets_state: new_secrets_state(),
             secrets_cursor: 0,
+            secrets_pending_select: None,
             secrets_offset: 0,
             secrets_filter: SecretFilter::All,
             secrets_reveal: SecretReveal::Hidden,
@@ -6692,6 +6695,7 @@ impl App {
     }
 
     fn exit_secrets_mode(&mut self) {
+        self.secrets_pending_select = None;
         self.stop_secrets_auto_refresh();
         self.mode = Mode::Selection;
         self.reset_to_follow();
@@ -7090,23 +7094,55 @@ impl App {
             return;
         };
         self.stop_certs_auto_refresh();
-        self.enter_secrets_mode();
-        // Land on the secret if it is already listed; otherwise the cursor stays put and the user
-        // still gets the view they asked for.
-        if let Some(pos) = self
-            .secret_rows()
-            .iter()
-            .position(|s| s.namespace == ns && s.name == name)
-        {
-            self.secrets_cursor = pos;
-        } else {
+        self.open_secret(ns, name);
+    }
+
+    // `s` on an Ingress row: the Secret its first `spec.tls[]` entry serves.
+    fn net_open_tls_secret(&mut self) {
+        let target = match self.table_state.selected().and_then(|i| self.net_rows.get(i)) {
+            Some(NetRow::Ingress(i)) => i.first_tls_secret().map(|sn| (i.namespace.clone(), sn.to_string())),
+            _ => return,
+        };
+        let Some((ns, name)) = target else {
             self.clipboard_status = Some((
                 std::time::Instant::now(),
-                lang::fill(
-                    lang::t(self.ai_language).msg_secret_not_loaded,
-                    &[("ns", &ns), ("name", &name)],
-                ),
+                lang::t(self.ai_language).msg_no_tls_secret.to_string(),
             ));
+            return;
+        };
+        self.stop_network_auto_refresh();
+        self.clear_status_state();
+        self.open_secret(ns, name);
+    }
+
+    // Hand off to the Secrets view on one secret, where the X.509 decoding, the reveal and the per-key
+    // copy already live. The landing waits for the list that `enter_secrets_mode` asks for: the one in
+    // memory may be from another scope, or not there at all on a first visit. The filter goes back to
+    // everything, since the jump names one object and a filter could hide it.
+    fn open_secret(&mut self, ns: String, name: String) {
+        self.secrets_filter = SecretFilter::All;
+        self.enter_secrets_mode();
+        self.secrets_pending_select = Some((ns, name));
+        self.settle_secrets_pending_select();
+    }
+
+    fn settle_secrets_pending_select(&mut self) {
+        let Some((ns, name)) = self.secrets_pending_select.clone() else { return };
+        if self.secrets_state.lock().expect("secrets poisoned").loading {
+            return;
+        }
+        self.secrets_pending_select = None;
+        match self.secret_rows().iter().position(|s| s.namespace == ns && s.name == name) {
+            Some(pos) => self.secrets_cursor = pos,
+            None => {
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    lang::fill(
+                        lang::t(self.ai_language).msg_secret_not_listed,
+                        &[("ns", &ns), ("name", &name)],
+                    ),
+                ));
+            }
         }
     }
 
@@ -12449,6 +12485,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
         if matches!(app.mode, Mode::Services | Mode::ServicesFull) {
             app.refresh_net_snapshot();
         }
+        if matches!(app.mode, Mode::Secrets | Mode::SecretsFull) {
+            app.settle_secrets_pending_select();
+        }
         // Forwards report from their own tasks, whatever view is showing.
         app.drain_forward_events();
         if matches!(app.mode, Mode::Storage | Mode::StorageFull) {
@@ -13473,6 +13512,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('t'), _, Mode::Services) => app.toggle_network_group(),
         (KeyCode::Char('g'), _, Mode::Services) => app.cycle_network_world(),
         (KeyCode::Char('f'), _, Mode::Services) => app.open_pf_view(),
+        (KeyCode::Char('s'), _, Mode::Services) if app.net_world == NetWorld::Ingress => app.net_open_tls_secret(),
         (KeyCode::Char('F'), _, Mode::Services | Mode::ServicesFull) => app.open_forwards_view(),
         (KeyCode::F(5), _, Mode::Services) => app.refresh_network(),
         (KeyCode::Char('i'), _, Mode::Services) => app.enter_ai_panel(),
@@ -14447,6 +14487,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 spans.push(footer_sep());
                 spans.push(Span::styled(" f ", kbg));
                 spans.push(Span::raw(format!(" {}   ", st.k_forward)));
+            }
+            if app.net_world == NetWorld::Ingress {
+                spans.push(footer_sep());
+                spans.push(Span::styled(" s ", kbg));
+                spans.push(Span::raw(format!(" {}   ", st.k_goto_secret)));
             }
             if portfwd::count(&app.forwards) > 0 {
                 spans.push(Span::styled(" F ", kbg));
@@ -17753,7 +17798,7 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
         NetRow::Ingress(i) => EventRecord {
             uid: format!("net|{}", i.uid),
             time: now,
-            severity: Severity::Normal,
+            severity: if i.tls_tone() == Some(LineColor::Err) { Severity::Warning } else { Severity::Normal },
             reason: "Ingress".to_string(),
             api_version: "networking.k8s.io/v1".to_string(),
             kind: "Ingress".to_string(),
@@ -17763,7 +17808,11 @@ fn synthetic_net_record(row: &NetRow) -> EventRecord {
                 "class={} hosts={} tls={} {}",
                 i.class.clone().unwrap_or_else(|| "—".to_string()),
                 i.hosts,
-                i.tls,
+                if i.tls.is_empty() {
+                    "—".to_string()
+                } else {
+                    i.tls.iter().map(|t| t.label(lang::active())).collect::<Vec<_>>().join(",")
+                },
                 i.rules
             ),
             component: String::new(),
@@ -18379,6 +18428,34 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
+// Widest the TLS column of the Ingress table gets before eliding the secret names.
+const ING_TLS_COL_MAX: u16 = 32;
+const ING_NAME_FLOOR: u16 = 14;
+const ING_TLS_FLOOR: u16 = 12;
+const ING_ROUTES_MIN: u16 = 20;
+// NAMESPACE, CLASS/CTRL, HOSTS, ADDRESS, AGE, the seven gaps between eight columns, and the two
+// borders plus `> `.
+const ING_FIXED_W: u16 = 14 + 20 + 24 + 18 + 5 + 7 + 4;
+
+// Widths of the three elastic columns of the Ingress table — NAME, TLS, and ROUTES as a `Min` — so
+// that they add up to the table and the layout never has to cut into them itself: the names are then
+// elided in the middle, at the width they really get. The floors come first, then what is left goes
+// to TLS, then to NAME, and ROUTES takes the rest.
+fn ingress_elastic_widths(width: u16, name_want: u16, tls_want: u16) -> (u16, u16, u16) {
+    let mut left = width.saturating_sub(ING_FIXED_W);
+    let mut name = name_want.min(ING_NAME_FLOOR).min(left);
+    left -= name;
+    let mut tls = tls_want.min(ING_TLS_FLOOR).min(left);
+    left -= tls;
+    let routes = ING_ROUTES_MIN.min(left);
+    left -= routes;
+    let grow = (tls_want - tls).min(left);
+    tls += grow;
+    left -= grow;
+    name += (name_want - name).min(left);
+    (name, tls, routes)
+}
+
 // Ingress table: each Ingress row, grouped under its IngressClass (with the serving controller) when
 // `t` grouping is on.
 fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -18412,6 +18489,31 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let ing_indent = if app.net_group { "    " } else { "" };
     let blank = || Cell::from("");
+    let st = lang::t(app.ai_language);
+    let tls_text = |i: &IngressResource| -> String {
+        i.tls.iter().map(|t| t.label(st)).collect::<Vec<_>>().join(",")
+    };
+    let tls_texts: Vec<String> = src
+        .iter()
+        .filter_map(|r| match r {
+            NetRow::Ingress(i) => Some(tls_text(i)),
+            _ => None,
+        })
+        .collect();
+    let names: Vec<String> = src
+        .iter()
+        .map(|r| match r {
+            NetRow::IngressClass(c) if c.is_default => format!("▾ {} (default)", c.name),
+            NetRow::IngressClass(c) => format!("▾ {}", c.name),
+            NetRow::Ingress(i) => format!("{}{}", ing_indent, i.name),
+            _ => String::new(),
+        })
+        .collect();
+    let (name_w, tls_w, routes_min) = ingress_elastic_widths(
+        area.width,
+        col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40),
+        col_width(tls_texts.iter().map(|s| s.as_str()), "TLS", 3, ING_TLS_COL_MAX),
+    );
     let rows: Vec<Row> = src
         .iter()
         .map(|row| match row {
@@ -18423,14 +18525,34 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 };
                 Row::new(vec![
                     blank(),
-                    Cell::from(name).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Cell::from(elide_middle(&name, name_w as usize))
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Cell::from(c.controller.clone()).style(Style::default().fg(DIM)),
                     blank(), blank(), blank(), blank(),
                     Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
                 ])
             }
             NetRow::Ingress(i) => {
-                let (tls_txt, tls_color) = if i.tls { ("TLS", Color::Green) } else { ("—", DIM) };
+                // Each secret in the tone of what it holds; past the column width, the joined names
+                // are elided in the middle and take the worst tone of the lot.
+                let tls_cell = if i.tls.is_empty() {
+                    Cell::from("—").style(Style::default().fg(DIM))
+                } else {
+                    let text = tls_text(i);
+                    if text.chars().count() <= tls_w as usize {
+                        let mut spans: Vec<Span> = Vec::new();
+                        for (n, t) in i.tls.iter().enumerate() {
+                            if n > 0 {
+                                spans.push(Span::styled(",", Style::default().fg(DIM)));
+                            }
+                            spans.push(Span::styled(t.label(st), line_color_to_style(t.tone())));
+                        }
+                        Cell::from(Line::from(spans))
+                    } else {
+                        let tone = i.tls_tone().unwrap_or(LineColor::Dim);
+                        Cell::from(elide_middle(&text, tls_w as usize)).style(line_color_to_style(tone))
+                    }
+                };
                 // When grouped under their class, ingresses don't repeat the class column.
                 let class_cell = if app.net_group {
                     blank()
@@ -18440,11 +18562,11 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 };
                 Row::new(vec![
                     Cell::from(i.namespace.clone()).style(Style::default().fg(DIM)),
-                    Cell::from(format!("{}{}", ing_indent, i.name)),
+                    Cell::from(elide_middle(&format!("{}{}", ing_indent, i.name), name_w as usize)),
                     class_cell,
                     Cell::from(i.hosts.clone()),
                     Cell::from(i.rules.clone()).style(Style::default().fg(DIM)),
-                    Cell::from(tls_txt).style(Style::default().fg(tls_color)),
+                    tls_cell,
                     Cell::from(i.address.clone()).style(Style::default().fg(DIM)),
                     Cell::from(i.age.clone()).style(Style::default().fg(DIM)),
                 ])
@@ -18453,18 +18575,9 @@ fn draw_ingress_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let names: Vec<String> = src
-        .iter()
-        .map(|r| match r {
-            NetRow::IngressClass(c) => format!("▾ {}", c.name),
-            NetRow::Ingress(i) => format!("{}{}", ing_indent, i.name),
-            _ => String::new(),
-        })
-        .collect();
-    let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40);
     let widths = [
         Constraint::Length(14), Constraint::Length(name_w), Constraint::Length(20),
-        Constraint::Length(24), Constraint::Min(20), Constraint::Length(4),
+        Constraint::Length(24), Constraint::Min(routes_min), Constraint::Length(tls_w),
         Constraint::Length(18), Constraint::Length(5),
     ];
 
@@ -32782,5 +32895,26 @@ mod argo_view_tests {
             wrapped_panel_rows(&lines, 58) > lines.len(),
             "a panel whose hints wrap is taller than its line count"
         );
+    }
+}
+
+#[cfg(test)]
+mod ingress_widths {
+    use super::*;
+
+    #[test]
+    fn elastic_columns_never_exceed_the_table() {
+        for width in [60u16, 90, 110, 130, 138, 160, 200, 240] {
+            let (name, tls, routes) = ingress_elastic_widths(width, 37, 29);
+            assert!(ING_FIXED_W + name + tls + routes <= width.max(ING_FIXED_W), "width {width}");
+        }
+    }
+
+    #[test]
+    fn floors_first_then_tls_then_name() {
+        assert_eq!(ingress_elastic_widths(130, 37, 29), (14, 12, 12));
+        assert_eq!(ingress_elastic_widths(160, 37, 29), (19, 29, 20));
+        assert_eq!(ingress_elastic_widths(240, 37, 29), (37, 29, 20));
+        assert_eq!(ingress_elastic_widths(200, 10, 3), (10, 3, 20));
     }
 }

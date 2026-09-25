@@ -665,6 +665,8 @@ async fn status_lines(
             }
             Err(e) => Err(e.to_string()),
         }
+    } else if kind == "Ingress" && api_version == "networking.k8s.io/v1" {
+        crate::svc::ingress_status_lines(&client, namespace, name, crate::lang::active()).await
     } else {
         fetch_dynamic(client, api_version, kind, namespace, name).await
     }

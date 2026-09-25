@@ -172,7 +172,7 @@ courant de kubectl reste le même), et `E` (shell) vise le contexte affiché.
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (inviter, fermer les sessions, désactiver/réactiver, appartenance, créer, copier le subject) · dans l'overlay d'invitation : `l` copier le lien, `c` copier le code |
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
-| Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `n`/`0` namespace |
+| Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `s` Secret TLS de l'Ingress · `n`/`0` namespace |
 | Hooks | `g` admission → conversion → apiservices · `t` webhooks sous leur configuration (admission) · `←`/`→` lire le verdict qui déborde · `P` basculer `failurePolicy` |
 | Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
@@ -508,6 +508,12 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   `policyTypes` et l'effet par direction : `Deny` (direction gouvernée, aucune règle n'autorise),
   `AllowAll` (`from`/`to` vide), `Selective` (pairs explicites), `Unaffected` (direction hors
   `policyTypes`). Les CRD Cilium et Calico sont listées telles quelles, sans verdict.
+  - La colonne `TLS` d'un Ingress nomme le Secret de chaque entrée `spec.tls[]`, `(défaut)` pour
+    une entrée sans `secretName`. Chaque Secret est lu (60 s de cache, 15 s s'il manque) et coloré
+    selon ce qu'il porte : échéance du certificat de `tls.crt`, Secret absent, clé `tls.crt`
+    manquante ou illisible, host de l'entrée absent des SAN. Un Secret que le RBAC refuse de lire
+    reste gris, sans verdict. Le panneau Status détaille chaque entrée ; `s` ouvre la vue Secrets
+    sur le premier Secret référencé.
 - **Hooks** (`:hooks`, `:conversion`, `:apiservice`) — trois mondes par `g`, un seul appel pour les
   trois : les webhooks d'admission, les CRD en `spec.conversion.strategy: Webhook`, et les APIService
   agrégées. Le point commun est le service backing, résolu jusqu'à ses EndpointSlices : le namespace

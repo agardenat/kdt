@@ -171,7 +171,7 @@ same), and `E` (shell) targets the context on screen.
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, close the sessions, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
 | RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
-| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `n`/`0` namespace |
+| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `s` the Ingress TLS Secret · `n`/`0` namespace |
 | Hooks | `g` admission → conversion → apiservices · `t` webhooks under their configuration (admission) · `←`/`→` read the verdict past the edge · `P` flip `failurePolicy` |
 | Storage | `g` claims ↔ volumes · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
@@ -505,6 +505,12 @@ shows the query and its effect (`/coredns  (3)`).
   `policyTypes` and the effect per direction: `Deny` (direction governed, no rule allows anything),
   `AllowAll` (empty `from`/`to`), `Selective` (explicit peers), `Unaffected` (direction not in
   `policyTypes`). Cilium and Calico CRDs are listed as they are, with no verdict.
+  - An Ingress's `TLS` column names the Secret of each `spec.tls[]` entry, `(default)` for an
+    entry without `secretName`. Each Secret is read (60 s cache, 15 s when missing) and coloured
+    by what it holds: expiry of the `tls.crt` certificate, missing Secret, missing or unreadable
+    `tls.crt` key, entry host outside the SANs. A Secret RBAC refuses to read stays grey, with no
+    verdict. The Status panel details each entry; `s` opens the Secrets view on the first
+    referenced Secret.
 - **Hooks** (`:hooks`, `:conversion`, `:apiservice`) — three worlds through `g`, off one call: the
   admission webhooks, the CRDs in `spec.conversion.strategy: Webhook`, and the aggregated
   APIServices. What they share is the backing service, resolved down to its EndpointSlices: does the
