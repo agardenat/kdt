@@ -2010,6 +2010,117 @@ export interface StoragePayload {
   mounts_known: boolean;
 }
 
+// --- Vue réseau : Services et Ingress ------------------------------------------------------------
+
+/** Un port de la spec d'un Service. `target` est le `targetPort` tel qu'écrit : numéro ou nom. */
+export interface SvcPortSpec {
+  name: string | null;
+  port: number;
+  protocol: string;
+  target: string;
+}
+
+/** Un endpoint d'une EndpointSlice : le pod qui sert, presque toujours. */
+export interface EndpointRow {
+  uid: string;
+  service_namespace: string;
+  service_name: string;
+  target_name: string;
+  /** `Pod` le plus souvent ; `Address` pour une adresse nue, sans objet derrière. */
+  target_kind: string;
+  address: string;
+  node: string;
+  ready: boolean;
+  ready_label: string;
+  ready_tone: LineTone;
+  /** Faux pour une adresse nue : ni case ni hamburger, il n'y a pas d'objet sur quoi agir. */
+  addressable: boolean;
+  record: EventRecord;
+}
+
+export interface ServiceRow {
+  uid: string;
+  namespace: string;
+  name: string;
+  type_: string;
+  cluster_ip: string;
+  external_ip: string;
+  /** `port[:nodePort]/protocol`, joints par des virgules, comme `kubectl get svc`. */
+  ports: string;
+  port_specs: SvcPortSpec[];
+  /** Un alias DNS : rien derrière dans le cluster, donc aucun endpoint attendu. */
+  external_name: boolean;
+  endpoints_ready: number;
+  endpoints_total: number;
+  /** `ready/total`, `—` pour un ExternalName, `?` quand les EndpointSlices n'ont pas été lues. */
+  endpoints_label: string;
+  endpoints_tone: LineTone;
+  endpoints: EndpointRow[];
+  age: string;
+  record: EventRecord;
+}
+
+export interface ServicesPayload {
+  services: ServiceRow[];
+  endpoints_total: number;
+  /** Refus sur les EndpointSlices : les Services sont là, leurs endpoints non. */
+  endpoints_error: string | null;
+}
+
+/** Ce que tient le Secret nommé par une entrée `spec.tls[]`, tel que kdt l'a lu. */
+export type TlsSecretState =
+  | { kind: "default" }
+  | { kind: "unchecked"; detail: string }
+  | { kind: "missing" }
+  | { kind: "nocert" }
+  | { kind: "unreadable"; detail: string }
+  | { kind: "cert"; detail: unknown };
+
+export interface IngressTlsEntry {
+  secret: string | null;
+  hosts: string[];
+  state: TlsSecretState;
+  /** Le nom du Secret, ou « (défaut) » pour une entrée sans `secretName`. */
+  label: string;
+  tone: LineTone;
+}
+
+export interface IngressRow {
+  uid: string;
+  namespace: string;
+  name: string;
+  class: string | null;
+  hosts: string;
+  /** `host/path → service:port`, joints par `  ·  `. */
+  rules: string;
+  tls: IngressTlsEntry[];
+  /** Le pire ton des entrées TLS ; `null` pour un Ingress en HTTP seul. */
+  tls_tone: LineTone | null;
+  /** Le Secret qu'ouvre « voir le Secret », comme le `s` du TUI. */
+  first_tls_secret: string | null;
+  /** Le détail TLS que l'onglet Status du TUI rédige, ligne à ligne, déjà teinté. */
+  tls_lines: Array<{ tone: LineTone; text: string }>;
+  address: string;
+  age: string;
+  record: EventRecord;
+}
+
+export interface IngressClassRow {
+  uid: string;
+  name: string;
+  controller: string;
+  is_default: boolean;
+  age: string;
+  record: EventRecord;
+}
+
+export interface IngressPayload {
+  ingresses: IngressRow[];
+  classes: IngressClassRow[];
+  /** Les IngressClass sont cluster-scoped : un refus laisse les Ingress sans leur classe. */
+  classes_error: string | null;
+}
+
 // --- Vue network policies -----------------------------------------------------------------------
 
 /** Le controller qui possède une politique. */

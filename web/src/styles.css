@@ -1331,6 +1331,19 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 :root:not([data-theme="light"]) .cell.engine-cilium,
 :root[data-theme="dark"] .cell.engine-cilium { color: #d08ce0; }
 
+/* Vue réseau : le Service (ou l'IngressClass) est le parent, ses endpoints (ou ses Ingress) sont
+   ce qu'il range — la même filiation que classe et volume du stockage. */
+.tbody .tr.net-parent .cell.id { font-weight: 600; }
+.tbody .tr.net-child .cell.id.nested { padding-left: 1.15rem; color: var(--fg); }
+.cell.net-count { font-weight: 600; }
+/* Chaque Secret TLS dans le ton de ce qu'il tient : plusieurs tons dans une seule cellule. */
+.cell .net-tls.ok { color: var(--ok); }
+.cell .net-tls.warn { color: var(--warn); }
+.cell .net-tls.err { color: var(--err); font-weight: 600; }
+.cell .net-tls.dim { color: var(--dim); }
+/* Ports et routes : une entrée par ligne dans le panneau de détail. */
+.keys-row .v.net-lines { white-space: pre-line; }
+
 /* Combien de volumes une classe provisionne, posé à côté de son nom : la colonne SIZE mesure des
    octets, et y écrire un compte le ferait lire comme une taille. */
 .grp-count {

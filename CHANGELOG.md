@@ -8,6 +8,21 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [Non publié]
+
+- **feat(web)** — la vue NetPol de kdt-web devient la vue **Réseau**, avec les trois mondes du TUI :
+  Services, Ingress, policies. Services : `TYPE`, `CLUSTER-IP`, `EXTERNAL-IP`, `PORTS`,
+  `ENDPOINTS` prêts/total, et une case pour ranger sous chaque Service les pods de ses
+  EndpointSlices, prêts ou non. Ingress : classe, hosts, routes, Secrets TLS colorés selon ce
+  qu'ils portent, une case pour ranger les Ingress sous leur IngressClass, et « voir le Secret »
+  vers la vue Secrets. Le détail d'un Ingress reprend le bloc TLS du panneau Status du TUI. Les
+  Secrets TLS sont relus à chaque rafraîchissement (une minute), sans cache partagé entre comptes.
+  Le port-forward reste propre au TUI.
+
+- **fix(services)** — la colonne `ENDPOINTS` ne peint plus en rouge un `0/0` qui n'en est pas un :
+  un Service `ExternalName` affiche `—`, et des EndpointSlices illisibles (refus RBAC) affichent
+  `?`, en gris, au lieu d'un Service sans backend.
+
 ## [2.3.0] — 2026-09-25
 
 - **feat(ingress)** — la colonne `TLS` de la vue Ingress nomme le **Secret** de chaque entrée

@@ -667,6 +667,24 @@ export interface Strings {
   netpolNoVerdict: string;
   netpolTarget: string;
 
+  // --- Vue réseau : les mondes Services et Ingress. Les verdicts (ENDPOINTS, ton d'un Secret TLS)
+  // et le détail TLS arrivent du serveur ; ne se traduit ici que le chrome.
+  netSvcEmpty: string;
+  netIngEmpty: string;
+  netSvcGroup: string;
+  netSvcGroupHelp: string;
+  netIngGroup: string;
+  netIngGroupHelp: string;
+  netNoClass: string;
+  netDefault: string;
+  netEndpointsUnknown: string;
+  netClassesUnknown: string;
+  netOpenSecret: string;
+  netOpenSecretHelp: string;
+  netSelectTls: string;
+  netNoEndpoint: string;
+  netRoutes: string;
+
   // --- Vue hooks : admission, conversion, APIService agrégées.
   // Les constats et les verdicts arrivent traduits du serveur ; le front ne traduit que son
   // propre chrome. Le jargon k8s (failurePolicy, caBundle, sideEffects) reste tel quel.
@@ -1447,6 +1465,24 @@ const FR: Strings = {
     "Ce moteur n'a pas de verdict de posture : sa sémantique par défaut n'est pas celle du natif, et l'affirmer serait deviner.",
   netpolTarget: "cible",
 
+  netSvcEmpty: "Aucun Service dans cette portée.",
+  netIngEmpty: "Aucun Ingress dans cette portée.",
+  netSvcGroup: "avec leurs endpoints",
+  netSvcGroupHelp: "Range sous chaque Service les pods de ses EndpointSlices, prêts ou non.",
+  netIngGroup: "par IngressClass",
+  netIngGroupHelp:
+    "Range les Ingress sous la classe qu'ils nomment ; la ligne de classe porte son controller.",
+  netNoClass: "(sans classe connue)",
+  netDefault: "défaut",
+  netEndpointsUnknown: "EndpointSlices non lues ({err}) : la colonne ENDPOINTS ne dit rien",
+  netClassesUnknown: "IngressClass non lues ({err}) : les Ingress s'affichent sans leur classe",
+  netOpenSecret: "voir le Secret",
+  netOpenSecretHelp:
+    "Ouvre dans la vue Secrets le premier Secret TLS de l'Ingress sélectionné : le certificat y est décodé.",
+  netSelectTls: "Sélectionner un Ingress qui nomme un Secret TLS",
+  netNoEndpoint: "aucun endpoint",
+  netRoutes: "routes",
+
   // --- Vue hooks ---
   hooksEmpty: "Aucun hook dans ce monde.",
   hooksScopeless: "Les webhooks, les CRD et les APIService sont cluster-scoped : la portée ne les réduit pas.",
@@ -2214,6 +2250,24 @@ const EN: Strings = {
   netpolNoVerdict:
     "This engine gets no posture verdict: its default semantics are not the native ones, and asserting them would be guessing.",
   netpolTarget: "target",
+
+  netSvcEmpty: "No Service in this scope.",
+  netIngEmpty: "No Ingress in this scope.",
+  netSvcGroup: "with their endpoints",
+  netSvcGroupHelp: "Lists under each Service the pods of its EndpointSlices, ready or not.",
+  netIngGroup: "by IngressClass",
+  netIngGroupHelp:
+    "Lists the Ingresses under the class they name; the class row carries its controller.",
+  netNoClass: "(no known class)",
+  netDefault: "default",
+  netEndpointsUnknown: "EndpointSlices not read ({err}): the ENDPOINTS column says nothing",
+  netClassesUnknown: "IngressClasses not read ({err}): the Ingresses are shown without their class",
+  netOpenSecret: "show Secret",
+  netOpenSecretHelp:
+    "Opens the first TLS Secret of the selected Ingress in the Secrets view, where the certificate is decoded.",
+  netSelectTls: "Select an Ingress that names a TLS Secret",
+  netNoEndpoint: "no endpoint",
+  netRoutes: "routes",
 
   // --- Vue hooks ---
   hooksEmpty: "No hook in this world.",

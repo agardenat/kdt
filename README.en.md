@@ -711,10 +711,17 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Fifteen views are
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Sixteen views are
 live — events, workloads, nodes, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates,
-RBAC, Kyverno, identity, Rancher, network policies, diagnostic — along with the five gestures that
+RBAC, Kyverno, identity, Rancher, network, hooks, diagnostic — along with the five gestures that
 apply to any object: YAML, edit, touch, delete, AI analysis.
+
+**The Network view** carries the three worlds of the TUI network view: Services (and their
+endpoints), Ingress (and their IngressClasses), policies. A checkbox lists the endpoints under their
+Service or the Ingresses under their class, like `t`. The `ENDPOINTS` column shows `?` when the
+EndpointSlices cannot be read, and `—` for an `ExternalName` Service. The `TLS` column and the
+Ingress detail carry the state of each TLS Secret, and "show Secret" opens the Secrets view on it,
+like `s`. Port-forwarding (`f`/`F`) stays TUI-only.
 
 **The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age,
 the seven `CPU req/lim/use`, `MEM req/lim/use` and `DISK` rates and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six

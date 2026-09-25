@@ -20,7 +20,7 @@ use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::api::{Api, ListParams};
 use kube::Client;
 
-use crate::events::{format_age, LineColor};
+use crate::events::{format_age, EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
 use crate::netpol::{list_netpols, NetPolResource};
 use crate::secrets::TlsCert;
@@ -37,7 +37,7 @@ const TLS_PROBLEM_TTL: Duration = Duration::from_secs(15);
 const TLS_READ_CONCURRENCY: usize = 8;
 
 // A Service row (parent in the grouped Services view, or a flat row when grouping is off).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ServiceResource {
     pub namespace: String,
     pub name: String,
@@ -59,7 +59,7 @@ pub struct ServiceResource {
 }
 
 // One port of a Service spec, as the port-forward popup reads it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SvcPortSpec {
     pub name: Option<String>,
     pub port: i32,
@@ -69,7 +69,7 @@ pub struct SvcPortSpec {
 }
 
 // One backing endpoint of a Service (typically a Pod), nested under its Service row when grouping is on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EndpointRow {
     // Which Service this endpoint backs (used to nest it under the right parent row).
     pub service_namespace: String,
@@ -83,7 +83,7 @@ pub struct EndpointRow {
 }
 
 // An Ingress row: hosts and host/path → service:port routes flattened to display strings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IngressResource {
     pub namespace: String,
     pub name: String,
@@ -97,7 +97,7 @@ pub struct IngressResource {
 }
 
 // One `spec.tls[]` entry: the Secret the controller serves for these hosts, and what it holds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IngressTls {
     pub secret: Option<String>,
     pub hosts: Vec<String>,
@@ -105,7 +105,10 @@ pub struct IngressTls {
 }
 
 // What the Secret named by a `spec.tls[]` entry holds, as read from the cluster.
-#[derive(Debug, Clone)]
+// Serialised as `{"kind": "missing"}`, `{"kind": "cert", "detail": {…}}`: kdt-web paints the state
+// the TUI computed instead of guessing it back from a label.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "lowercase")]
 pub enum TlsSecretState {
     // The entry names no secret: the controller answers these hosts with its default certificate.
     Default,
@@ -188,7 +191,7 @@ impl IngressResource {
 }
 
 // An IngressClass row (cluster-scoped): the controller that serves it and whether it is the default.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IngressClassResource {
     pub name: String,
     pub controller: String,
@@ -204,9 +207,9 @@ pub struct NetworkState {
     pub ingresses: Vec<IngressResource>,
     pub ingress_classes: Vec<IngressClassResource>,
     pub netpols: Vec<NetPolResource>,
-    // TLS secrets already read, keyed by (namespace, name), with the time of the read.
-    pub tls_cache: HashMap<(String, String), (Instant, TlsSecretState)>,
+    pub tls_cache: TlsCache,
     pub error: Option<String>,
+    pub endpoints_error: Option<String>,
     // Error listing native NetworkPolicies; kept apart from `error` so the netpol world shows its own
     // failure without blanking the Services/Ingress worlds (and vice versa).
     pub netpol_error: Option<String>,
@@ -224,6 +227,96 @@ pub fn endpoint_belongs_to(e: &EndpointRow, s: &ServiceResource) -> bool {
     e.service_namespace == s.namespace && e.service_name == s.name
 }
 
+impl ServiceResource {
+    // The ENDPOINTS cell. An ExternalName Service is a DNS alias and has no endpoints by design, and
+    // unread EndpointSlices say nothing either way: neither gets a count that would read as zero.
+    pub fn endpoints_label(&self, known: bool) -> String {
+        if self.external_name {
+            "—".to_string()
+        } else if !known {
+            "?".to_string()
+        } else {
+            format!("{}/{}", self.endpoints_ready, self.endpoints_total)
+        }
+    }
+
+    pub fn endpoints_tone(&self, known: bool) -> LineColor {
+        if self.external_name || !known {
+            LineColor::Dim
+        } else if self.endpoints_total == 0 {
+            LineColor::Err
+        } else if self.endpoints_ready < self.endpoints_total {
+            LineColor::Warn
+        } else {
+            LineColor::Ok
+        }
+    }
+}
+
+impl EndpointRow {
+    pub fn ready_label(&self) -> &'static str {
+        if self.ready { "✓ ready" } else { "✗ notready" }
+    }
+
+    pub fn ready_tone(&self) -> LineColor {
+        if self.ready { LineColor::Ok } else { LineColor::Err }
+    }
+
+    // An endpoint with a `targetRef` stands for a real object (a Pod, almost always); one without is
+    // a bare address, which no generic gesture can act on.
+    pub fn addressable(&self) -> bool {
+        self.target_kind != "Address"
+    }
+}
+
+// TLS secrets already read, keyed by (namespace, name), with the time of the read.
+pub type TlsCache = HashMap<(String, String), (Instant, TlsSecretState)>;
+
+pub struct ServicesInventory {
+    pub services: Vec<ServiceResource>,
+    pub endpoints: Vec<EndpointRow>,
+    // Listing EndpointSlices failed: the Services are still listed, but their ENDPOINTS say nothing.
+    pub endpoints_error: Option<String>,
+}
+
+// Every Service of `namespace` (None = all namespaces) with the endpoints discovered from its
+// EndpointSlices. Only the Services themselves are a hard dependency.
+pub async fn services_inventory(client: &Client, namespace: &Option<String>) -> Result<ServicesInventory, String> {
+    // Endpoints are enrichment (the ready/total column and the nested rows): if listing EndpointSlices
+    // fails — e.g. the role can't read discovery.k8s.io — degrade to no endpoints rather than blanking
+    // the whole Services list, which only needs the Services themselves.
+    let (endpoints, ep_summary, endpoints_error) = match list_endpoints(client, namespace).await {
+        Ok((rows, summary)) => (rows, summary, None),
+        Err(e) => (Vec::new(), EndpointSummary::new(), Some(e)),
+    };
+    let services = list_services(client, namespace, &ep_summary).await?;
+    Ok(ServicesInventory { services, endpoints, endpoints_error })
+}
+
+pub struct IngressInventory {
+    pub ingresses: Vec<IngressResource>,
+    pub classes: Vec<IngressClassResource>,
+    // IngressClasses are cluster-scoped: a namespaced role often cannot list them, and the ingresses
+    // are then shown without their class rows rather than not at all.
+    pub classes_error: Option<String>,
+}
+
+// Every Ingress of `namespace` with the state of each TLS Secret it names, plus the (cluster-wide)
+// IngressClasses. `cache` spares the secrets read recently; pass an empty one to read them all.
+pub async fn ingress_inventory(
+    client: &Client,
+    namespace: &Option<String>,
+    cache: &mut TlsCache,
+) -> Result<IngressInventory, String> {
+    let mut ingresses = list_ingresses(client, namespace).await?;
+    resolve_tls(client, &mut ingresses, cache).await;
+    let (classes, classes_error) = match list_ingress_classes(client).await {
+        Ok(v) => (v, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    Ok(IngressInventory { ingresses, classes, classes_error })
+}
+
 // List every Service + its backing endpoints, plus every Ingress and (cluster-scoped) IngressClass
 // in `namespace` (None = all namespaces). One fetch feeds both worlds so the UI toggles without a
 // reload; IngressClasses are always cluster-wide regardless of the namespace scope.
@@ -234,12 +327,7 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
         s.error = None;
     }
 
-    // Endpoints are enrichment (the ready/total column and the nested rows): if listing EndpointSlices
-    // fails — e.g. the role can't read discovery.k8s.io — degrade to no endpoints rather than blanking
-    // the whole Services list, which only needs the Services themselves.
-    let (endpoints, ep_summary) = list_endpoints(&client, &namespace).await.unwrap_or_default();
-
-    let services = match list_services(&client, &namespace, &ep_summary).await {
+    let svc = match services_inventory(&client, &namespace).await {
         Ok(v) => v,
         Err(e) => {
             let mut s = state.lock().expect("network poisoned");
@@ -249,20 +337,109 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
         }
     };
 
-    let mut ingresses = list_ingresses(&client, &namespace).await.unwrap_or_default();
-    resolve_tls(&client, &mut ingresses, &state).await;
-    let ingress_classes = list_ingress_classes(&client).await.unwrap_or_default();
+    let mut cache = state.lock().expect("network poisoned").tls_cache.clone();
+    let ing = ingress_inventory(&client, &namespace, &mut cache).await.unwrap_or(IngressInventory {
+        ingresses: Vec::new(),
+        classes: Vec::new(),
+        classes_error: None,
+    });
     let (netpols, netpol_error) = list_netpols(&client, &namespace).await;
 
     let mut s = state.lock().expect("network poisoned");
     s.loading = false;
     s.error = None;
-    s.services = services;
-    s.endpoints = endpoints;
-    s.ingresses = ingresses;
-    s.ingress_classes = ingress_classes;
+    s.services = svc.services;
+    s.endpoints = svc.endpoints;
+    s.endpoints_error = svc.endpoints_error;
+    s.ingresses = ing.ingresses;
+    s.ingress_classes = ing.classes;
+    s.tls_cache = cache;
     s.netpols = netpols;
     s.netpol_error = netpol_error;
+}
+
+// The EventRecord each network row stands for, so the shared Status/Related tabs and the generic
+// gestures act on the real apiVersion/kind/namespace/name. An endpoint stands for its backing Pod,
+// so selecting one yields that pod's status/related/logs just like in the pods view.
+pub fn service_record(s: &ServiceResource) -> EventRecord {
+    EventRecord {
+        uid: format!("net|{}", s.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "Service".to_string(),
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        namespace: s.namespace.clone(),
+        name: s.name.clone(),
+        message: format!(
+            "{} clusterIP={} extIP={} ports={} endpoints={}/{}",
+            s.type_, s.cluster_ip, s.external_ip, s.ports, s.endpoints_ready, s.endpoints_total
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn endpoint_record(e: &EndpointRow) -> EventRecord {
+    EventRecord {
+        uid: format!("net|{}", e.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: if e.ready { Severity::Normal } else { Severity::Warning },
+        reason: if e.ready { "Ready".to_string() } else { "NotReady".to_string() },
+        api_version: "v1".to_string(),
+        kind: e.target_kind.clone(),
+        namespace: e.service_namespace.clone(),
+        name: e.target_name.clone(),
+        message: format!("address={} node={} ready={}", e.address, e.node, e.ready),
+        component: String::new(),
+        host: e.node.clone(),
+        count: 1,
+    }
+}
+
+pub fn ingress_record(i: &IngressResource, st: &Strings) -> EventRecord {
+    EventRecord {
+        uid: format!("net|{}", i.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: if i.tls_tone() == Some(LineColor::Err) { Severity::Warning } else { Severity::Normal },
+        reason: "Ingress".to_string(),
+        api_version: "networking.k8s.io/v1".to_string(),
+        kind: "Ingress".to_string(),
+        namespace: i.namespace.clone(),
+        name: i.name.clone(),
+        message: format!(
+            "class={} hosts={} tls={} {}",
+            i.class.clone().unwrap_or_else(|| "—".to_string()),
+            i.hosts,
+            if i.tls.is_empty() {
+                "—".to_string()
+            } else {
+                i.tls.iter().map(|t| t.label(st)).collect::<Vec<_>>().join(",")
+            },
+            i.rules
+        ),
+        component: String::new(),
+        host: i.address.clone(),
+        count: 1,
+    }
+}
+
+pub fn ingress_class_record(c: &IngressClassResource) -> EventRecord {
+    EventRecord {
+        uid: format!("net|{}", c.uid),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: Severity::Normal,
+        reason: "IngressClass".to_string(),
+        api_version: "networking.k8s.io/v1".to_string(),
+        kind: "IngressClass".to_string(),
+        namespace: String::new(),
+        name: c.name.clone(),
+        message: format!("controller={}{}", c.controller, if c.is_default { " (default)" } else { "" }),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
 }
 
 // (ready, total) endpoint counts keyed by (namespace, service name).
@@ -450,7 +627,7 @@ fn service_ports(s: &Service) -> String {
 
 // Fill the state of every `spec.tls[]` entry, reading only the secrets whose cached read is stale.
 // The cache is pruned to what is still referenced, so a deleted Ingress does not keep its secret.
-async fn resolve_tls(client: &Client, ingresses: &mut [IngressResource], state: &SharedNetwork) {
+async fn resolve_tls(client: &Client, ingresses: &mut [IngressResource], cache: &mut TlsCache) {
     let mut wanted: Vec<(String, String)> = Vec::new();
     for i in ingresses.iter() {
         for t in &i.tls {
@@ -462,10 +639,6 @@ async fn resolve_tls(client: &Client, ingresses: &mut [IngressResource], state: 
             }
         }
     }
-    let mut cache = {
-        let s = state.lock().expect("network poisoned");
-        s.tls_cache.clone()
-    };
     cache.retain(|k, _| wanted.contains(k));
     let stale: Vec<(String, String)> = wanted
         .into_iter()
@@ -496,7 +669,6 @@ async fn resolve_tls(client: &Client, ingresses: &mut [IngressResource], state: 
             }
         }
     }
-    state.lock().expect("network poisoned").tls_cache = cache;
 }
 
 pub async fn read_tls_secret(client: &Client, namespace: &str, name: &str) -> TlsSecretState {

@@ -17762,77 +17762,11 @@ fn synthetic_workload_record(w: &WorkloadResource) -> EventRecord {
 // apiVersion/kind/namespace/name. Endpoint rows expose themselves as their backing Pod, so selecting
 // one yields that pod's status/related/logs just like in the pods view.
 fn synthetic_net_record(row: &NetRow) -> EventRecord {
-    let now = k8s_openapi::jiff::Timestamp::now();
     match row {
-        NetRow::Service(s) => EventRecord {
-            uid: format!("net|{}", s.uid),
-            time: now,
-            severity: Severity::Normal,
-            reason: "Service".to_string(),
-            api_version: "v1".to_string(),
-            kind: "Service".to_string(),
-            namespace: s.namespace.clone(),
-            name: s.name.clone(),
-            message: format!(
-                "{} clusterIP={} extIP={} ports={} endpoints={}/{}",
-                s.type_, s.cluster_ip, s.external_ip, s.ports, s.endpoints_ready, s.endpoints_total
-            ),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
-        NetRow::Endpoint(e) => EventRecord {
-            uid: format!("net|{}", e.uid),
-            time: now,
-            severity: if e.ready { Severity::Normal } else { Severity::Warning },
-            reason: if e.ready { "Ready".to_string() } else { "NotReady".to_string() },
-            api_version: "v1".to_string(),
-            kind: if e.target_kind == "Pod" { "Pod".to_string() } else { e.target_kind.clone() },
-            namespace: e.service_namespace.clone(),
-            name: e.target_name.clone(),
-            message: format!("address={} node={} ready={}", e.address, e.node, e.ready),
-            component: String::new(),
-            host: e.node.clone(),
-            count: 1,
-        },
-        NetRow::Ingress(i) => EventRecord {
-            uid: format!("net|{}", i.uid),
-            time: now,
-            severity: if i.tls_tone() == Some(LineColor::Err) { Severity::Warning } else { Severity::Normal },
-            reason: "Ingress".to_string(),
-            api_version: "networking.k8s.io/v1".to_string(),
-            kind: "Ingress".to_string(),
-            namespace: i.namespace.clone(),
-            name: i.name.clone(),
-            message: format!(
-                "class={} hosts={} tls={} {}",
-                i.class.clone().unwrap_or_else(|| "—".to_string()),
-                i.hosts,
-                if i.tls.is_empty() {
-                    "—".to_string()
-                } else {
-                    i.tls.iter().map(|t| t.label(lang::active())).collect::<Vec<_>>().join(",")
-                },
-                i.rules
-            ),
-            component: String::new(),
-            host: i.address.clone(),
-            count: 1,
-        },
-        NetRow::IngressClass(c) => EventRecord {
-            uid: format!("net|{}", c.uid),
-            time: now,
-            severity: Severity::Normal,
-            reason: "IngressClass".to_string(),
-            api_version: "networking.k8s.io/v1".to_string(),
-            kind: "IngressClass".to_string(),
-            namespace: String::new(),
-            name: c.name.clone(),
-            message: format!("controller={}{}", c.controller, if c.is_default { " (default)" } else { "" }),
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        },
+        NetRow::Service(s) => crate::svc::service_record(s),
+        NetRow::Endpoint(e) => crate::svc::endpoint_record(e),
+        NetRow::Ingress(i) => crate::svc::ingress_record(i, lang::active()),
+        NetRow::IngressClass(c) => crate::svc::ingress_class_record(c),
         NetRow::NetPol(p) => crate::netpol::netpol_record(p),
     }
 }
@@ -18292,9 +18226,9 @@ fn pf_state_label(state: &PfState, st: &lang::Strings) -> (String, Color) {
 
 // Services table: each Service row, with its backing endpoints nested under it when `t` grouping is on.
 fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let (loading, error, n_svc, n_ep) = {
+    let (loading, error, n_svc, n_ep, endpoints_known) = {
         let s = app.network_state.lock().expect("network poisoned");
-        (s.loading, s.error.clone(), s.services.len(), s.endpoints.len())
+        (s.loading, s.error.clone(), s.services.len(), s.endpoints.len(), s.endpoints_error.is_none())
     };
     let src = &app.net_rows;
 
@@ -18363,14 +18297,8 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|row| match row {
             NetRow::Service(s) => {
-                let endpoints = format!("{}/{}", s.endpoints_ready, s.endpoints_total);
-                let ep_color = if s.endpoints_total == 0 {
-                    Color::Red
-                } else if s.endpoints_ready < s.endpoints_total {
-                    Color::Yellow
-                } else {
-                    Color::Green
-                };
+                let endpoints = s.endpoints_label(endpoints_known);
+                let ep_style = line_color_to_style(s.endpoints_tone(endpoints_known)).add_modifier(Modifier::BOLD);
                 let prefix = if app.net_group { "▾ " } else { "" };
                 let (fwd_txt, fwd_color) = forward_cell(
                     forwarded.get(&(s.namespace.clone(), s.name.clone())).map(Vec::as_slice).unwrap_or(&[]),
@@ -18384,17 +18312,12 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(s.external_ip.clone()).style(Style::default().fg(DIM)),
                     Cell::from(s.ports.clone()).style(Style::default().fg(DIM)),
                     Cell::from(fwd_txt).style(Style::default().fg(fwd_color).add_modifier(Modifier::BOLD)),
-                    Cell::from(endpoints).style(Style::default().fg(ep_color).add_modifier(Modifier::BOLD)),
+                    Cell::from(endpoints).style(ep_style),
                     blank(),
                     Cell::from(s.age.clone()).style(Style::default().fg(DIM)),
                 ])
             }
             NetRow::Endpoint(e) => {
-                let (ready_txt, ready_color) = if e.ready {
-                    ("✓ ready", Color::Green)
-                } else {
-                    ("✗ notready", Color::Red)
-                };
                 Row::new(vec![
                     blank(),
                     Cell::from(format!("{}{}", ep_indent, e.target_name)),
@@ -18403,7 +18326,7 @@ fn draw_services_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     blank(),
                     blank(),
                     blank(),
-                    Cell::from(ready_txt).style(Style::default().fg(ready_color)),
+                    Cell::from(e.ready_label()).style(line_color_to_style(e.ready_tone())),
                     Cell::from(elide_middle(&e.node, node_w as usize)).style(Style::default().fg(DIM)),
                     blank(),
                 ])

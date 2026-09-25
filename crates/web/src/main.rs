@@ -27,6 +27,7 @@ mod portal;
 mod rbac;
 mod rancher;
 mod netpol;
+mod network;
 mod nodes;
 mod session;
 mod storage;
@@ -227,6 +228,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/capacity", get(capacity::list))
         .route("/api/v1/storage", get(storage::list))
         .route("/api/v1/netpol", get(netpol::list))
+        // Les deux autres mondes de la vue réseau. Deux routes et non une : chaque monde ne lit que
+        // ce qu'il montre, et le monde Ingress relit ses Secrets TLS à chaque appel.
+        .route("/api/v1/services", get(network::services))
+        .route("/api/v1/ingress", get(network::ingress))
         // Les hooks que l'apiserver appelle : admission, conversion, APIService agrégées. Un seul
         // appel rend les trois mondes, parce qu'un seul fetch les lit et qu'un même Service en
         // backe souvent plusieurs.

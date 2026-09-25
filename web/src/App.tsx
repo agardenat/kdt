@@ -13,7 +13,7 @@ import FluxView from "./FluxView";
 import HooksView from "./HooksView";
 import IdentityView from "./IdentityView";
 import KyvernoView from "./KyvernoView";
-import NetpolView from "./NetpolView";
+import NetworkView from "./NetworkView";
 import NodesView from "./NodesView";
 import RbacView from "./RbacView";
 import StorageView from "./StorageView";
@@ -36,7 +36,7 @@ type ViewId =
   | "capacity"
   | "nodes"
   | "storage"
-  | "netpol"
+  | "network"
   | "hooks"
   | "data"
   | "certs"
@@ -79,7 +79,8 @@ const VIEWS: Array<{
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
-  { id: "netpol", label: "NetPol", key: "p", ready: true },
+  // Les trois mondes de la vue réseau de kdt : Services, Ingress, policies.
+  { id: "network", label: "Network", key: "p", ready: true },
   // Les quatre kinds sont natifs de tout apiserver : pas de `needs`, la vue répond partout.
   { id: "hooks", label: "Hooks", key: "h", ready: true },
   { id: "diagnostic", label: "Diagnostic", key: "d", ready: true },
@@ -336,7 +337,7 @@ export default function App() {
     // namespace.
     view === "capacity" ||
     view === "storage" ||
-    view === "netpol";
+    view === "network";
   const scopelessReason =
     view === "nodes"
       ? st.ndScopeless
@@ -610,8 +611,8 @@ export default function App() {
               onPanelOpen={setPanelOpen}
               onNeedsAuth={onNeedsAuth}
             />
-          ) : view === "netpol" ? (
-            <NetpolView
+          ) : view === "network" ? (
+            <NetworkView
               lang={lang}
               st={st}
               query={query}
@@ -621,6 +622,11 @@ export default function App() {
               panelOpen={panelOpen}
               onPanelOpen={setPanelOpen}
               onNeedsAuth={onNeedsAuth}
+              // Le `s` du TUI sur un Ingress : la vue Secrets décode le certificat qu'il sert.
+              onOpenSecret={(namespace, name) => {
+                setFocusSecret({ namespace, name });
+                setView("data");
+              }}
             />
           ) : view === "rbac" ? (
             <RbacView

@@ -36,6 +36,8 @@ import type {
   KyvernoPayload,
   HooksPayload,
   NetpolPayload,
+  IngressPayload,
+  ServicesPayload,
   NodesPayload,
   NodeUsagePayload,
   NodeUsageSort,
@@ -630,6 +632,23 @@ export function storage(namespace: string, lang: Lang): Promise<StoragePayload> 
   const params = new URLSearchParams({ lang });
   if (namespace) params.set("ns", namespace);
   return get<StoragePayload>(`/api/v1/storage?${params.toString()}`);
+}
+
+/** Les Services de la portée, chacun avec les endpoints de ses EndpointSlices. */
+export function services(namespace: string): Promise<ServicesPayload> {
+  const query = namespace ? `?ns=${encodeURIComponent(namespace)}` : "";
+  return get<ServicesPayload>(`/api/v1/services${query}`);
+}
+
+/**
+ * Les Ingress de la portée, l'état de chaque Secret TLS qu'ils nomment, et les IngressClass.
+ *
+ * La langue voyage parce que le détail TLS est rédigé côté serveur, par le même code que le TUI.
+ */
+export function ingress(namespace: string, lang: Lang): Promise<IngressPayload> {
+  const params = new URLSearchParams({ lang });
+  if (namespace) params.set("ns", namespace);
+  return get<IngressPayload>(`/api/v1/ingress?${params.toString()}`);
 }
 
 /**
