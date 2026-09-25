@@ -8,6 +8,27 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.3.0] — 2026-09-25
+
+- **feat(ingress)** — la colonne `TLS` de la vue Ingress nomme le **Secret** de chaque entrée
+  `spec.tls[]` au lieu d'un simple `TLS`, et `(défaut)` pour une entrée sans `secretName`. Chaque
+  Secret est lu et coloré selon ce qu'il porte : échéance du certificat de `tls.crt` (mêmes paliers
+  que la vue Secrets), Secret absent, clé `tls.crt` manquante ou certificat illisible, host de
+  l'entrée absent des SAN (un wildcard ne couvre qu'un niveau). Un Secret que le RBAC refuse de lire
+  reste gris, sans verdict. Les lectures sont gardées 60 s (15 s pour un Secret en défaut), la liste
+  se rafraîchissant toutes les 5 s.
+
+- **feat(ingress)** — le panneau Status d'un Ingress détaille chaque entrée TLS : Secret et hosts,
+  CN et émetteur, échéance, hosts hors SAN, ou la raison pour laquelle rien n'a pu être lu. Il sert
+  aussi aux événements d'Ingress de la vue principale.
+
+- **feat(ingress)** — `s` ouvre la vue Secrets sur le premier Secret référencé par l'Ingress. Le
+  curseur s'y pose une fois la liste rechargée ; `s` depuis la vue Certs profite du même mécanisme
+  et ne rate plus sa cible à la première visite de la vue Secrets.
+
+- **fix(ingress)** — NAME, TLS et ROUTES se partagent la place que laissent les colonnes fixes, et
+  les noms trop longs sont élidés au milieu au lieu d'être coupés en fin de colonne.
+
 ## [2.2.0] — 2026-09-25
 
 - **feat(web)** — dans les vues en arbre de kdt-web (Workloads groupé, Flux, RBAC, Certs,
