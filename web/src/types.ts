@@ -2688,3 +2688,302 @@ export interface DiagDone {
   /** Le diagnostic mis à plat, tel qu'il part au modèle en tête des sections. */
   ai_text: string;
 }
+
+// --- Vue k8ssandra --------------------------------------------------------------------------------
+
+/**
+ * Les trois questions de la vue, sur une seule lecture : le ring est-il sain, qu'est-ce qui est
+ * restaurable, quelle maintenance tourne ou a tourné.
+ */
+export type K8cWorld = "cluster" | "backups" | "ops";
+
+export interface K8cHint {
+  level: "info" | "warn" | "danger";
+  text: string;
+}
+
+/** Une opération que la ligne offre. Le libellé et la description sont rédigés par kdt. */
+export interface K8cActionItem {
+  id: string;
+  label: string;
+  desc: string;
+}
+
+/** D'où vient la lecture `l` d'une ligne : un container de pod, ou le pod d'un Job `nodetool`. */
+export type K8cLogTarget =
+  | { kind: "container"; namespace: string; pod: string; container: "cassandra" | "medusa" }
+  | { kind: "nodetool"; namespace: string; job: string };
+
+interface K8cRowBase {
+  uid: string;
+  name: string;
+  namespace: string;
+  depth: number;
+  foldable: boolean;
+  /** Le pli de départ, décidé par kdt : les schedules s'ouvrent pliés. */
+  fold_default: boolean;
+  has_problem: boolean;
+  kind_label: string;
+  state: string;
+  state_tone: LineTone;
+  info: string;
+  /** La durée d'un run, `—` quand rien n'a commencé. */
+  span: string;
+  /** Secondes epoch, 0 quand la ligne n'a pas de date. */
+  created: number;
+  hints: K8cHint[];
+  actions: K8cActionItem[];
+  actions_note: string | null;
+  log_target: K8cLogTarget | null;
+  record: EventRecord;
+}
+
+export interface K8cRingFacts {
+  state: string;
+  alive: boolean;
+  status_code: string;
+  load_bytes: number | null;
+  tokens: number;
+  schema: string;
+  ip: string;
+}
+
+export interface K8cMedusaConfig {
+  provider: string;
+  bucket: string;
+  prefix: string;
+  region: string;
+  secret: string;
+  max_backup_age: number | null;
+  max_backup_count: number | null;
+  concurrent_transfers: number | null;
+}
+
+export interface K8cClusterRow extends K8cRowBase {
+  row: "cluster";
+  server_type: string;
+  server_version: string;
+  auth: boolean | null;
+  medusa: K8cMedusaConfig | null;
+  reaper_enabled: boolean;
+  stargate_enabled: boolean;
+  datacenters: string[];
+  conditions: [string, string][];
+  error: string;
+}
+
+export interface K8cDatacenterRow extends K8cRowBase {
+  row: "datacenter";
+  cluster_name: string;
+  server_type: string;
+  server_version: string;
+  size: number;
+  racks: string[];
+  stopped: boolean;
+  progress: string;
+  conditions: [string, string][];
+  node_statuses: [string, string][];
+  declared_storage: string;
+  storage_class: string;
+}
+
+export interface K8cNodeRow extends K8cRowBase {
+  row: "node";
+  cluster: string;
+  datacenter: string;
+  rack: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  node_name: string;
+  pod_ip: string;
+  host_id: string;
+  host_id_stale: boolean;
+  node_state: string;
+  /** `null` quand l'API de management n'a pas répondu : inconnu, pas down. */
+  ring: K8cRingFacts | null;
+  claims: [string, string][];
+  load_text: string;
+}
+
+export interface K8cScheduleRow extends K8cRowBase {
+  row: "schedule";
+  datacenter: string;
+  backup_type: string;
+  cron: string;
+  disabled: boolean;
+  last_execution: number | null;
+  next_schedule: number | null;
+  runs: string[];
+}
+
+export interface K8cJobRow extends K8cRowBase {
+  row: "job";
+  datacenter: string;
+  backup_type: string;
+  start: number | null;
+  finish: number | null;
+  finished: string[];
+  failed: string[];
+  in_progress: string[];
+  expected: number | null;
+  in_catalogue: boolean;
+  coverage: string;
+  running: boolean;
+  complete: boolean | null;
+}
+
+export interface K8cBackupRow extends K8cRowBase {
+  row: "backup";
+  datacenter: string;
+  backup_type: string;
+  start: number | null;
+  finish: number | null;
+  total_nodes: number | null;
+  finished_nodes: number | null;
+  total_size: number | null;
+  status: string;
+  complete: boolean | null;
+}
+
+export interface K8cRestoreRow extends K8cRowBase {
+  row: "restore";
+  datacenter: string;
+  backup: string;
+  start: number | null;
+  finish: number | null;
+  datacenter_stopped: number | null;
+  restore_key: string;
+  restore_prepared: boolean;
+  failed: string[];
+  in_progress: string[];
+}
+
+export interface K8cTaskRow extends K8cRowBase {
+  row: "task";
+  datacenter: string;
+  operation: string;
+  start: number | null;
+  finish: number | null;
+  finished: string[];
+  failed: string[];
+  in_progress: string[];
+}
+
+export interface K8cCassTaskRow extends K8cRowBase {
+  row: "ctask";
+  datacenter: string;
+  commands: string[];
+  start: number | null;
+  finish: number | null;
+  active: number;
+  succeeded: number;
+  failed: number;
+}
+
+export interface K8cNodetoolRow extends K8cRowBase {
+  row: "nodetool";
+  command: string;
+  target: string;
+  line: string;
+  start: number | null;
+  finish: number | null;
+  active: number;
+  succeeded: number;
+  failed: number;
+  reason: string;
+}
+
+export interface K8cReaperRow extends K8cRowBase {
+  row: "reaper";
+  datacenter: string;
+  progress: string;
+  ready: boolean;
+  ui_secret: string;
+  service: string;
+}
+
+/** Un en-tête de section : le catalogue, les runs sans schedule, les restaurations. */
+export interface K8cGroupRow extends K8cRowBase {
+  row: "group";
+  group: string;
+  count: number;
+}
+
+export type K8cRow =
+  | K8cClusterRow
+  | K8cDatacenterRow
+  | K8cNodeRow
+  | K8cScheduleRow
+  | K8cJobRow
+  | K8cBackupRow
+  | K8cRestoreRow
+  | K8cTaskRow
+  | K8cCassTaskRow
+  | K8cNodetoolRow
+  | K8cReaperRow
+  | K8cGroupRow;
+
+export interface K8ssandraPayload {
+  rows: K8cRow[];
+  counts: {
+    clusters: number;
+    datacenters: number;
+    nodes: number;
+    schedules: number;
+    jobs: number;
+    backups: number;
+    restores: number;
+    ops: number;
+    problems: number;
+  };
+  /** Quand s'est terminée la dernière sauvegarde qui couvre tous les nodes, en secondes epoch. */
+  last_restorable: number | null;
+  /** Faux quand aucune API de management n'a répondu : les colonnes du ring sont inconnues. */
+  ring_known: boolean;
+  cluster_hints: K8cHint[];
+  installed: boolean;
+  error: string | null;
+}
+
+/** Des lignes de log, ou la raison pour laquelle il n'y en a pas. */
+export interface K8cLinesPayload {
+  lines: string[];
+  error: string | null;
+}
+
+export interface K8cMetricsPayload {
+  pools?: { name: string; active: number; pending: number; blocked: number; pressured: boolean }[];
+  dropped?: { kind: string; count: number }[];
+  pending_compactions?: number | null;
+  completed_compactions?: number | null;
+  bytes_compacted?: string | null;
+  /** Les sessions de streaming actives, en paires telles que le node les rapporte. */
+  streams: [string, string][][];
+  error: string | null;
+}
+
+export interface K8cSnapshotTag {
+  tag: string;
+  keyspaces: string[];
+  tables: number;
+  /** Ce qu'effacer le tag rendrait réellement. `≥` quand une taille n'a pas pu être lue. */
+  reclaimable: string;
+  /** Ce que le tag pèse, liens encore partagés avec les SSTables vivantes compris. */
+  on_disk: string;
+  created: number | null;
+  /** Pourquoi le tag mérite un regard, quand son préfixe le dit. */
+  origin: string | null;
+}
+
+export interface K8cSnapshotsPayload {
+  tags: K8cSnapshotTag[];
+  total?: string;
+  partial?: boolean;
+  error: string | null;
+}
+
+export interface K8cRepairsPayload {
+  rows: { keyspace: string; tables: string; state: string; interval: string }[];
+  error: string | null;
+}

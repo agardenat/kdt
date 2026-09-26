@@ -1223,6 +1223,17 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
   font-family: var(--mono); font-size: var(--fs-xs);
 }
 .vel-band.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.vel-band.err { color: var(--err); background: color-mix(in srgb, var(--err) 8%, transparent); }
+.vel-band.info { color: var(--muted); }
+
+/* k8ssandra : un parent (cluster, datacenter, schedule, section) se lit comme un repère, et les
+   lectures à la demande d'une ligne ont leurs boutons sous ses faits. */
+.tbody .tr.k8c-parent .cell.id { font-weight: 600; }
+.k8c-reads { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .6rem; }
+.k8c-reads .inv-pill[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.k8c-snap { margin: 0 0 .55rem; font-size: var(--fs-sm); line-height: 1.45; }
+.k8c-snap .dim { color: var(--dim); }
+.k8c-snap .warn { color: var(--warn); }
 
 /* Le formulaire de restauration : un formulaire, pas une confirmation, donc il lui faut de la
    place — les listes de namespaces et de kinds défilent chez elles. */

@@ -18,6 +18,7 @@ import NodesView from "./NodesView";
 import RbacView from "./RbacView";
 import StorageView from "./StorageView";
 import VeleroView from "./VeleroView";
+import K8ssandraView from "./K8ssandraView";
 import RancherView from "./RancherView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
@@ -45,6 +46,7 @@ type ViewId =
   | "kyverno"
   | "rbac"
   | "velero"
+  | "k8ssandra"
   | "diagnostic";
 
 /**
@@ -68,6 +70,9 @@ const VIEWS: Array<{
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
   { id: "argocd", label: "Argo CD", key: "a", needs: "argocd" },
   { id: "velero", label: "Velero", key: "v", ready: true, needs: "velero" },
+  // Les trois commandes du TUI (`:k8ssandra`, `:medusa`, `:reaper`) sont les trois mondes d'une
+  // seule vue : le ring, les sauvegardes Medusa, les opérations dont Reaper.
+  { id: "k8ssandra", label: "K8ssandra", key: "m", ready: true, needs: "k8ssandra" },
   { id: "nodes", label: "Nodes", key: "n", ready: true },
   { id: "capacity", label: "Capacity", key: "c", ready: true },
   { id: "storage", label: "Storage", key: "s", ready: true },
@@ -331,6 +336,7 @@ export default function App() {
     view === "certs" ||
     view === "rbac" ||
     view === "velero" ||
+    view === "k8ssandra" ||
     // Les trois vues de constat sont dans la portée, avec une nuance qu'elles disent elles-mêmes :
     // les nodes et les StorageClass sont cluster-scoped, donc la portée ne les réduit pas — elle
     // réduit les workloads, les quotas, les claims et les policies, qui sont bien des objets d'un
@@ -555,6 +561,18 @@ export default function App() {
             />
           ) : view === "velero" ? (
             <VeleroView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "k8ssandra" ? (
+            <K8ssandraView
               lang={lang}
               st={st}
               query={query}

@@ -718,108 +718,11 @@ use crate::velero::{
 };
 
 use crate::k8ssandra::{
-    apply_k8c_write, fetch_k8ssandra, fetch_k8c_logs, fetch_k8c_metrics, fetch_k8c_repairs,
-    fetch_k8c_snapshots, format_load, new_k8c_panel,
-    new_k8c_state, CassTask, K8cCluster, K8cDatacenter, K8cNode, K8cWrite, MedBackup, MedJob,
-    MedRestore, MedSchedule, MedTask, PanelKind, ReaperRec, SharedK8c, SharedK8cPanel,
+    apply_k8c_write, build_k8c_rows, fetch_k8ssandra, fetch_k8c_logs, fetch_k8c_metrics,
+    fetch_k8c_repairs, fetch_k8c_snapshots, format_load, k8c_row_record, new_k8c_panel,
+    new_k8c_state, K8cAction, K8cRow, K8cWorld, K8cWrite, LogTarget, PanelKind, SharedK8c,
+    SharedK8cPanel,
 };
-use crate::nodetool::NtJob;
-
-// The three questions the k8ssandra view answers, cycled with `g` off a single fetch: is the ring
-// healthy (Cluster), is anything restorable (Backups), and what maintenance is running or has run
-// (Ops). Backups is where the view earns its keep, so `:medusa` opens straight on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum K8cWorld {
-    Cluster,
-    Backups,
-    Ops,
-}
-
-// One visual row of the k8ssandra view, index-aligned with `App::snapshot` like every other tree
-// view here. The records that carry hint vectors are boxed: this vector holds one line per visible
-// row, and a datacenter is several times the size of a task row.
-#[derive(Debug, Clone)]
-enum K8cRow {
-    Cluster(Box<K8cCluster>),
-    Datacenter(Box<K8cDatacenter>),
-    Node(Box<K8cNode>),
-    Schedule(Box<MedSchedule>),
-    Job(Box<MedJob>),
-    Backup(Box<MedBackup>),
-    Restore(Box<MedRestore>),
-    Task(Box<MedTask>),
-    CassTask(Box<CassTask>),
-    // A `nodetool` Job kdt started: a Job, not a CRD, and the only row here whose object this view
-    // wrote from scratch.
-    Nodetool(Box<NtJob>),
-    Reaper(Box<ReaperRec>),
-    // Parent rows for what hangs off no schedule: the Medusa catalogue itself, the runs whose
-    // schedule is gone, and the restores. They group, they are not objects.
-    Group { key: &'static str, namespace: String, label: String, count: usize },
-}
-
-impl K8cRow {
-    fn hints(&self) -> &[crate::storage::Hint] {
-        match self {
-            K8cRow::Cluster(c) => &c.hints,
-            K8cRow::Datacenter(d) => &d.hints,
-            K8cRow::Node(n) => &n.hints,
-            K8cRow::Schedule(s) => &s.hints,
-            K8cRow::Job(j) => &j.hints,
-            K8cRow::Backup(b) => &b.hints,
-            K8cRow::Restore(r) => &r.hints,
-            K8cRow::Task(t) => &t.hints,
-            K8cRow::CassTask(t) => &t.hints,
-            K8cRow::Nodetool(j) => &j.hints,
-            K8cRow::Reaper(r) => &r.hints,
-            K8cRow::Group { .. } => &[],
-        }
-    }
-
-    fn uid(&self) -> String {
-        match self {
-            K8cRow::Cluster(c) => c.uid.clone(),
-            K8cRow::Datacenter(d) => d.uid.clone(),
-            K8cRow::Node(n) => n.uid.clone(),
-            K8cRow::Schedule(s) => s.uid.clone(),
-            K8cRow::Job(j) => j.uid.clone(),
-            K8cRow::Backup(b) => b.uid.clone(),
-            K8cRow::Restore(r) => r.uid.clone(),
-            K8cRow::Task(t) => t.uid.clone(),
-            K8cRow::CassTask(t) => t.uid.clone(),
-            K8cRow::Nodetool(j) => j.uid.clone(),
-            K8cRow::Reaper(r) => r.uid.clone(),
-            K8cRow::Group { key, namespace, .. } => format!("k8c|group|{namespace}|{key}"),
-        }
-    }
-
-    fn namespace(&self) -> &str {
-        match self {
-            K8cRow::Cluster(c) => &c.namespace,
-            K8cRow::Datacenter(d) => &d.namespace,
-            K8cRow::Node(n) => &n.namespace,
-            K8cRow::Schedule(s) => &s.namespace,
-            K8cRow::Job(j) => &j.namespace,
-            K8cRow::Backup(b) => &b.namespace,
-            K8cRow::Restore(r) => &r.namespace,
-            K8cRow::Task(t) => &t.namespace,
-            K8cRow::CassTask(t) => &t.namespace,
-            K8cRow::Nodetool(j) => &j.namespace,
-            K8cRow::Reaper(r) => &r.namespace,
-            K8cRow::Group { namespace, .. } => namespace,
-        }
-    }
-
-    // The fold key of a row that has children, `None` for a leaf.
-    fn fold_key(&self) -> Option<String> {
-        match self {
-            K8cRow::Cluster(_) | K8cRow::Datacenter(_) | K8cRow::Schedule(_)
-            | K8cRow::Group { .. } => Some(self.uid()),
-            _ => None,
-        }
-    }
-
-}
 
 // The three ways to look at reflector's work (`g`). Sources is the tree everything hangs from;
 // Mirrors flattens the copies so one can scan versions side by side; Orphans isolates the copies no
@@ -1282,23 +1185,13 @@ fn vel_keep_ancestors(rows: &[VelRow], keep: &mut [bool]) {
     }
 }
 
-// Indentation depth of a k8ssandra row, and the same ancestor-keeping rule the velero view uses:
-// a node that matches `/sts-3` keeps the datacenter and cluster above it, or the hit lands in a
-// table with nothing to read it against.
-fn k8c_depth(row: &K8cRow) -> usize {
-    match row {
-        K8cRow::Cluster(_) | K8cRow::Schedule(_) | K8cRow::Group { .. } => 0,
-        K8cRow::Reaper(_) | K8cRow::CassTask(_) | K8cRow::Task(_) | K8cRow::Nodetool(_) => 0,
-        K8cRow::Datacenter(_) | K8cRow::Job(_) | K8cRow::Backup(_) | K8cRow::Restore(_) => 1,
-        K8cRow::Node(_) => 2,
-    }
-}
-
+// The same ancestor-keeping rule the velero view uses: a node that matches `/sts-3` keeps the
+// datacenter and cluster above it, or the hit lands in a table with nothing to read it against.
 fn k8c_keep_ancestors(rows: &[K8cRow], keep: &mut [bool]) {
     const DEPTHS: usize = 3;
     let mut last_at: [Option<usize>; DEPTHS] = [None; DEPTHS];
     for (i, row) in rows.iter().enumerate() {
-        let d = k8c_depth(row).min(DEPTHS - 1);
+        let d = row.depth().min(DEPTHS - 1);
         if keep.get(i).copied().unwrap_or(false) {
             for ancestor in last_at.iter().take(d).flatten() {
                 keep[*ancestor] = true;
@@ -8179,164 +8072,17 @@ impl App {
         }
         let st = lang::t(self.ai_language);
         let ns_filter = self.current_ns_opt();
-        let ns_ok = |ns: &str| ns_filter.as_deref().is_none_or(|f| f == ns);
-        let mut rows: Vec<K8cRow> = Vec::new();
-        let mut recs: Vec<EventRecord> = Vec::new();
         let problems_only = self.k8c_filter == StoFilter::Problems;
-        let worse = |hints: &[crate::storage::Hint]| {
-            hints.iter().any(|h| h.level >= StoHintLevel::Warn)
-        };
-
-        match self.k8c_world {
-            K8cWorld::Cluster => {
-                for c in s.clusters.iter().filter(|c| ns_ok(&c.namespace)) {
-                    let dcs: Vec<&K8cDatacenter> = s
-                        .datacenters
-                        .iter()
-                        .filter(|d| d.namespace == c.namespace)
-                        .collect();
-                    // The Problems filter never hides a cluster above a failing datacenter:
-                    // dropping it would strand the datacenter and lose the context one came for.
-                    let keep = !problems_only
-                        || worse(&c.hints)
-                        || dcs.iter().any(|d| worse(&d.hints))
-                        || s.nodes
-                            .iter()
-                            .any(|n| n.namespace == c.namespace && worse(&n.hints));
-                    if !keep { continue; }
-                    recs.push(synthetic_k8c_cluster_record(c, dcs.len(), st));
-                    rows.push(K8cRow::Cluster(Box::new(c.clone())));
-                    if self.k8c_collapsed.contains(&c.uid) { continue; }
-                    for d in dcs {
-                        let nodes: Vec<&K8cNode> = s
-                            .nodes
-                            .iter()
-                            .filter(|n| n.namespace == d.namespace && n.datacenter == d.name)
-                            .collect();
-                        if problems_only
-                            && !worse(&d.hints)
-                            && !nodes.iter().any(|n| worse(&n.hints))
-                        {
-                            continue;
-                        }
-                        recs.push(synthetic_k8c_dc_record(d, nodes.len(), st));
-                        rows.push(K8cRow::Datacenter(Box::new(d.clone())));
-                        if self.k8c_collapsed.contains(&d.uid) { continue; }
-                        for n in nodes {
-                            if problems_only && !worse(&n.hints) { continue; }
-                            recs.push(synthetic_k8c_node_record(n, st));
-                            rows.push(K8cRow::Node(Box::new(n.clone())));
-                        }
-                    }
-                }
-            }
-            K8cWorld::Backups => {
-                for sched in s.schedules.iter().filter(|x| ns_ok(&x.namespace)) {
-                    let runs: Vec<&MedJob> = sched
-                        .runs
-                        .iter()
-                        .filter_map(|uid| s.jobs.iter().find(|j| &j.uid == uid))
-                        .collect();
-                    let keep = !problems_only
-                        || worse(&sched.hints)
-                        || runs.iter().any(|j| worse(&j.hints));
-                    if !keep { continue; }
-                    recs.push(synthetic_k8c_sched_record(sched, runs.len(), st));
-                    rows.push(K8cRow::Schedule(Box::new(sched.clone())));
-                    // Runs start folded: a fortnight of nightly runs under each schedule buries the
-                    // catalogue and the restores, which is the rest of the answer.
-                    if self.k8c_collapsed.contains(&sched.uid) { continue; }
-                    for j in runs {
-                        if problems_only && !worse(&j.hints) { continue; }
-                        recs.push(synthetic_k8c_job_record(j, st));
-                        rows.push(K8cRow::Job(Box::new(j.clone())));
-                    }
-                }
-
-                // Runs no schedule claims: fired by hand, or by a schedule since deleted. They would
-                // otherwise simply not be in the view.
-                let claimed: std::collections::HashSet<&str> = s
-                    .schedules
-                    .iter()
-                    .flat_map(|x| x.runs.iter().map(String::as_str))
-                    .collect();
-                let orphans: Vec<&MedJob> = s
-                    .jobs
-                    .iter()
-                    .filter(|j| ns_ok(&j.namespace) && !claimed.contains(j.uid.as_str()))
-                    .filter(|j| !problems_only || worse(&j.hints))
-                    .collect();
-                self.push_k8c_group(
-                    "runs",
-                    st.k8c_grp_orphan_runs,
-                    orphans.len(),
-                    &orphans,
-                    &mut rows,
-                    &mut recs,
-                    st,
-                    |j| K8cRow::Job(Box::new((*j).clone())),
-                    synthetic_k8c_job_record,
-                );
-
-                let catalogue: Vec<&MedBackup> = s
-                    .backups
-                    .iter()
-                    .filter(|b| ns_ok(&b.namespace))
-                    .filter(|b| !problems_only || worse(&b.hints))
-                    .collect();
-                self.push_k8c_group(
-                    "catalogue",
-                    st.k8c_grp_catalogue,
-                    catalogue.len(),
-                    &catalogue,
-                    &mut rows,
-                    &mut recs,
-                    st,
-                    |b| K8cRow::Backup(Box::new((*b).clone())),
-                    synthetic_k8c_backup_record,
-                );
-
-                let restores: Vec<&MedRestore> = s
-                    .restores
-                    .iter()
-                    .filter(|r| ns_ok(&r.namespace))
-                    .filter(|r| !problems_only || worse(&r.hints))
-                    .collect();
-                self.push_k8c_group(
-                    "restores",
-                    st.k8c_grp_restores,
-                    restores.len(),
-                    &restores,
-                    &mut rows,
-                    &mut recs,
-                    st,
-                    |r| K8cRow::Restore(Box::new((*r).clone())),
-                    synthetic_k8c_restore_record,
-                );
-            }
-            K8cWorld::Ops => {
-                for j in s.nodetool_jobs.iter().filter(|j| ns_ok(&j.namespace)) {
-                    if problems_only && !worse(&j.hints) { continue; }
-                    recs.push(synthetic_k8c_nodetool_record(j, st));
-                    rows.push(K8cRow::Nodetool(Box::new(j.clone())));
-                }
-                for r in s.reapers.iter().filter(|r| ns_ok(&r.namespace)) {
-                    if problems_only && !worse(&r.hints) { continue; }
-                    recs.push(synthetic_k8c_reaper_record(r, st));
-                    rows.push(K8cRow::Reaper(Box::new(r.clone())));
-                }
-                for t in s.cass_tasks.iter().filter(|t| ns_ok(&t.namespace)) {
-                    if problems_only && !worse(&t.hints) { continue; }
-                    recs.push(synthetic_k8c_ctask_record(t, st));
-                    rows.push(K8cRow::CassTask(Box::new(t.clone())));
-                }
-                for t in s.tasks.iter().filter(|t| ns_ok(&t.namespace)) {
-                    if problems_only && !worse(&t.hints) { continue; }
-                    recs.push(synthetic_k8c_task_record(t, st));
-                    rows.push(K8cRow::Task(Box::new(t.clone())));
-                }
-            }
-        }
+        let rows = build_k8c_rows(
+            &s,
+            self.k8c_world,
+            problems_only,
+            ns_filter.as_deref(),
+            &self.k8c_collapsed,
+            st,
+        );
+        let now = now_secs();
+        let recs: Vec<EventRecord> = rows.iter().map(|r| k8c_row_record(r, &s, st, now)).collect();
 
         self.k8c_rows = rows;
         let prev_uid = self
@@ -8383,167 +8129,32 @@ impl App {
         self.k8c_sync_panel();
     }
 
-    // A heading over a flat list, plus the list itself when unfolded. Three of the Backups world's
-    // sections have this shape, and inlining it three times is how they drift apart.
-    #[allow(clippy::too_many_arguments)]
-    fn push_k8c_group<T>(
-        &self,
-        key: &'static str,
-        label: &'static str,
-        count: usize,
-        items: &[&T],
-        rows: &mut Vec<K8cRow>,
-        recs: &mut Vec<EventRecord>,
-        st: &'static Strings,
-        to_row: impl Fn(&T) -> K8cRow,
-        to_rec: impl Fn(&T, &'static Strings) -> EventRecord,
-    ) {
-        if items.is_empty() { return; }
-        // A heading carries no namespace: it stands for a section of the view, not for anything on
-        // the cluster, and the namespace filter has already been applied to what it collects.
-        let row = K8cRow::Group {
-            key,
-            namespace: String::new(),
-            label: label.to_string(),
-            count,
-        };
-        let uid = row.uid();
-        recs.push(synthetic_k8c_group_record(&uid, label, count, st));
-        rows.push(row);
-        if self.k8c_collapsed.contains(&uid) { return; }
-        for item in items {
-            recs.push(to_rec(item, st));
-            rows.push(to_row(item));
-        }
-    }
-
     // The operations available on the row under the cursor. A row with none says so rather than
     // opening an empty menu — the same rule the velero and reflector views follow.
     fn open_k8c_action_menu(&mut self) {
         let st = lang::t(self.ai_language);
-        let mut note: Option<String> = None;
-        let mut nt_target: Option<(String, String, String)> = None;
-        let items: Vec<ActionItem> = match self.k8c_selected() {
-            // Named, not described: "with this schedule's datacenter and type" tells the reader
-            // nothing they can check. What they are about to write is a datacenter and a backup
-            // type, so those are what the line shows — including when the type is the CRD's default
-            // because the schedule sets none.
-            Some(K8cRow::Schedule(s)) => {
-                let (backup_type, defaulted) = crate::k8ssandra::effective_backup_type(&s.backup_type);
-                let desc = lang::fill(
-                    if defaulted {
-                        st.desc_k8c_backup_now_default
-                    } else {
-                        st.desc_k8c_backup_now
-                    },
-                    &[("dc", &s.datacenter), ("type", backup_type)],
-                );
-                vec![ActionItem {
-                    label: st.k_k8c_backup_now,
-                    desc,
-                    action: MenuAction::K8cBackupNow,
-                }]
+        let Some(row) = self.k8c_selected() else { return };
+        let items: Vec<ActionItem> = row
+            .actions()
+            .into_iter()
+            .map(|action| ActionItem {
+                label: action.label(st),
+                desc: action.desc(row, st),
+                action: match action {
+                    K8cAction::BackupNow => MenuAction::K8cBackupNow,
+                    K8cAction::Restore => MenuAction::K8cRestore,
+                    K8cAction::MedusaTask(op) => MenuAction::K8cMedusaTask(op),
+                    K8cAction::CassandraTask(cmd) => MenuAction::K8cCassandraTask(cmd),
+                    K8cAction::Nodetool => MenuAction::K8cNodetool,
+                },
+            })
+            .collect();
+        let note = row.actions_note(st);
+        let nt_target = match row {
+            K8cRow::Node(n) if !n.datacenter.is_empty() => {
+                Some((n.namespace.clone(), n.name.clone(), n.datacenter.clone()))
             }
-            // Restoring is only offered from a capture that covered every node. A partial one would
-            // be replayed as if it were whole, which is the failure mode this whole view exists to
-            // make visible — offering it here would undo that.
-            Some(K8cRow::Backup(b)) => {
-                if b.complete == Some(true) {
-                    note = Some(st.k8c_note_restore.to_string());
-                    vec![ActionItem {
-                        label: st.k_k8c_restore,
-                        desc: st.desc_k8c_restore.to_string(),
-                        action: MenuAction::K8cRestore,
-                    }]
-                } else {
-                    Vec::new()
-                }
-            }
-            Some(K8cRow::Job(j)) => {
-                if j.complete() == Some(true) {
-                    note = Some(st.k8c_note_restore.to_string());
-                    vec![ActionItem {
-                        label: st.k_k8c_restore,
-                        desc: st.desc_k8c_restore.to_string(),
-                        action: MenuAction::K8cRestore,
-                    }]
-                } else {
-                    Vec::new()
-                }
-            }
-            // Everything cass-operator and Medusa can be asked to do against a whole datacenter.
-            //
-            // The command list is deliberately short. `CassandraTask.spec.jobs[].command` is a free
-            // string in the CRD — no enum — so an unknown value produces a task that is accepted and
-            // never runs. Only the commands the CRD's own `args` documentation attests are offered
-            // (`keyspace_name` for the sstable ones, `pod_name`/`rack` for the restart), and each
-            // task lands in the Ops world where its active/succeeded/failed counters are visible.
-            Some(K8cRow::Datacenter(_)) => {
-                note = Some(st.k8c_note_datacenter.to_string());
-                vec![
-                    ActionItem {
-                        label: st.k_k8c_purge,
-                        desc: st.desc_k8c_purge.to_string(),
-                        action: MenuAction::K8cMedusaTask("purge"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_sync,
-                        desc: st.desc_k8c_sync.to_string(),
-                        action: MenuAction::K8cMedusaTask("sync"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_cleanup,
-                        desc: st.desc_k8c_cleanup.to_string(),
-                        action: MenuAction::K8cCassandraTask("cleanup"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_upgradesstables,
-                        desc: st.desc_k8c_upgradesstables.to_string(),
-                        action: MenuAction::K8cCassandraTask("upgradesstables"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_compaction,
-                        desc: st.desc_k8c_compaction.to_string(),
-                        action: MenuAction::K8cCassandraTask("compaction"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_scrub,
-                        desc: st.desc_k8c_scrub.to_string(),
-                        action: MenuAction::K8cCassandraTask("scrub"),
-                    },
-                    ActionItem {
-                        label: st.k_k8c_restart,
-                        desc: st.desc_k8c_restart.to_string(),
-                        action: MenuAction::K8cCassandraTask("restart"),
-                    },
-                ]
-            }
-            // Re-running a finished maintenance task is the one thing worth doing from its row: a
-            // `sync` is how the catalogue catches up after a run the operator never recorded.
-            // A node is a host, which is exactly what `nodetool -h` wants and what no other row
-            // here is. The command itself is typed: this entry opens the line, it does not run one.
-            Some(K8cRow::Node(n)) if !n.datacenter.is_empty() => {
-                note = Some(lang::fill(st.k8c_nodetool_target, &[("pod", &n.name)]));
-                nt_target = Some((n.namespace.clone(), n.name.clone(), n.datacenter.clone()));
-                vec![ActionItem {
-                    label: st.k_k8c_nodetool,
-                    desc: st.desc_k8c_nodetool.to_string(),
-                    action: MenuAction::K8cNodetool,
-                }]
-            }
-            Some(K8cRow::Task(t)) if !t.operation.is_empty() => {
-                let op: &'static str = if t.operation == "purge" { "purge" } else { "sync" };
-                vec![ActionItem {
-                    label: if op == "purge" { st.k_k8c_purge } else { st.k_k8c_sync },
-                    desc: if op == "purge" {
-                        st.desc_k8c_purge.to_string()
-                    } else {
-                        st.desc_k8c_sync.to_string()
-                    },
-                    action: MenuAction::K8cMedusaTask(op),
-                }]
-            }
-            _ => Vec::new(),
+            _ => None,
         };
         if items.is_empty() {
             self.clipboard_status =
@@ -8562,66 +8173,12 @@ impl App {
         });
     }
 
-    // The datacenter a row belongs to, which every write here is addressed to. A row that names no
-    // datacenter has no write available, so this returning `None` cancels the action.
-    fn k8c_write_target(&self) -> Option<(String, String)> {
-        let row = self.k8c_selected()?;
-        let dc = match row {
-            K8cRow::Datacenter(d) => d.name.clone(),
-            K8cRow::Schedule(s) => s.datacenter.clone(),
-            K8cRow::Job(j) => j.datacenter.clone(),
-            K8cRow::Backup(b) => b.datacenter.clone(),
-            K8cRow::Restore(r) => r.datacenter.clone(),
-            K8cRow::Task(t) => t.datacenter.clone(),
-            _ => return None,
-        };
-        if dc.is_empty() { return None; }
-        Some((row.namespace().to_string(), dc))
-    }
-
-    fn k8c_backup_now(&mut self) {
+    // Every write here is decided by the row under the cursor: the row builds the object, so a
+    // write it does not offer cannot be made from it.
+    fn k8c_write(&mut self, action: K8cAction) {
         let st = lang::t(self.ai_language);
-        let Some(K8cRow::Schedule(sched)) = self.k8c_selected() else { return };
-        let write = K8cWrite::BackupNow {
-            namespace: sched.namespace.clone(),
-            datacenter: sched.datacenter.clone(),
-            backup_type: sched.backup_type.clone(),
-            prefix: sched.name.clone(),
-        };
-        self.k8c_run_write(write, st.msg_k8c_backup_started, st.msg_k8c_write_failed);
-    }
-
-    fn k8c_restore(&mut self) {
-        let st = lang::t(self.ai_language);
-        let (namespace, datacenter, backup) = match self.k8c_selected() {
-            Some(K8cRow::Backup(b)) => (b.namespace.clone(), b.datacenter.clone(), b.name.clone()),
-            Some(K8cRow::Job(j)) => (j.namespace.clone(), j.datacenter.clone(), j.name.clone()),
-            _ => return,
-        };
-        let write = K8cWrite::Restore { namespace, datacenter, backup };
-        self.k8c_run_write(write, st.msg_k8c_restore_started, st.msg_k8c_write_failed);
-    }
-
-    fn k8c_medusa_task(&mut self, operation: &str) {
-        let st = lang::t(self.ai_language);
-        let Some((namespace, datacenter)) = self.k8c_write_target() else { return };
-        let write = K8cWrite::Task {
-            namespace,
-            datacenter,
-            operation: operation.to_string(),
-        };
-        self.k8c_run_write(write, st.msg_k8c_task_started, st.msg_k8c_write_failed);
-    }
-
-    fn k8c_cassandra_task(&mut self, command: &str) {
-        let st = lang::t(self.ai_language);
-        let Some((namespace, datacenter)) = self.k8c_write_target() else { return };
-        let write = K8cWrite::CassandraTask {
-            namespace,
-            datacenter,
-            command: command.to_string(),
-        };
-        self.k8c_run_write(write, st.msg_k8c_task_started, st.msg_k8c_write_failed);
+        let Some(write) = self.k8c_selected().and_then(|row| row.write_for(action)) else { return };
+        self.k8c_run_write(write, action.started_message(st), st.msg_k8c_write_failed);
     }
 
     // `x`: run a `nodetool` command against the node under the cursor. Only a node row: the command
@@ -8694,7 +8251,7 @@ impl App {
         self.refresh_k8c_snapshot();
         tokio::spawn(async move {
             let message =
-                match crate::nodetool::run(client.clone(), namespace, pod, datacenter, command).await
+                match crate::nodetool::run(client.clone(), namespace, pod, datacenter, command, st).await
                 {
                     Ok((name, warnings)) => {
                         // The uid `NtJob` will carry, so the row can be found the moment it lands.
@@ -8747,43 +8304,31 @@ impl App {
     // never in the Cassandra log, and picking the wrong container is picking the wrong answer.
     fn k8c_toggle_log(&mut self) {
         let st = lang::t(self.ai_language);
-        // A `nodetool` Job answers with the log of a pod it does not name: the pod is found from the
-        // Job, which is why this row does not go through the container path below.
-        if let Some(K8cRow::Nodetool(j)) = self.k8c_selected() {
-            let (namespace, job) = (j.namespace.clone(), j.name.clone());
-            let key = format!("nodetool|{namespace}/{job}");
-            if !self.k8c_open_panel(&key) { return; }
-            let client = self.client.clone();
-            let state = self.k8c_panel.clone();
-            tokio::spawn(async move {
-                crate::nodetool::fetch_output(client, namespace, job, key, state).await;
-            });
-            return;
-        }
-        let target = match self.k8c_selected() {
-            Some(K8cRow::Node(n)) => {
-                Some((n.namespace.clone(), n.name.clone(), "cassandra".to_string()))
-            }
-            Some(K8cRow::Job(j)) => k8c_medusa_pod(&j.failed, &j.in_progress, &j.finished)
-                .map(|pod| (j.namespace.clone(), pod, "medusa".to_string())),
-            Some(K8cRow::Restore(r)) => k8c_medusa_pod(&r.failed, &r.in_progress, &[])
-                .map(|pod| (r.namespace.clone(), pod, "medusa".to_string())),
-            Some(K8cRow::Task(t)) => k8c_medusa_pod(&t.failed, &t.in_progress, &t.finished)
-                .map(|pod| (t.namespace.clone(), pod, "medusa".to_string())),
-            _ => None,
-        };
-        let Some((namespace, pod, container)) = target else {
+        let Some(target) = self.k8c_selected().and_then(K8cRow::log_target) else {
             self.clipboard_status =
                 Some((std::time::Instant::now(), st.k8c_no_log.to_string()));
             return;
         };
-        let key = format!("log|{namespace}/{pod}/{container}");
-        if !self.k8c_open_panel(&key) { return; }
         let client = self.client.clone();
         let state = self.k8c_panel.clone();
-        tokio::spawn(async move {
-            fetch_k8c_logs(client, namespace, pod, container, key, state).await;
-        });
+        match target {
+            // A `nodetool` Job answers with the log of a pod it does not name: the pod is found
+            // from the Job.
+            LogTarget::Nodetool { namespace, job } => {
+                let key = format!("nodetool|{namespace}/{job}");
+                if !self.k8c_open_panel(&key) { return; }
+                tokio::spawn(async move {
+                    crate::nodetool::fetch_output(client, namespace, job, key, state).await;
+                });
+            }
+            LogTarget::Container { namespace, pod, container } => {
+                let key = format!("log|{namespace}/{pod}/{container}");
+                if !self.k8c_open_panel(&key) { return; }
+                tokio::spawn(async move {
+                    fetch_k8c_logs(client, namespace, pod, container, key, state).await;
+                });
+            }
+        }
     }
 
     // `m`: `nodetool tpstats` and `nodetool compactionstats` for the node under the cursor, read
@@ -11824,10 +11369,12 @@ impl App {
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
             Some(MenuAction::KyPurgeRequests) => self.ky_purge_requests(),
             Some(MenuAction::HookFailurePolicy(to)) => self.set_hook_failure_policy(to),
-            Some(MenuAction::K8cBackupNow) => self.k8c_backup_now(),
-            Some(MenuAction::K8cRestore) => self.k8c_restore(),
-            Some(MenuAction::K8cMedusaTask(op)) => self.k8c_medusa_task(op),
-            Some(MenuAction::K8cCassandraTask(cmd)) => self.k8c_cassandra_task(cmd),
+            Some(MenuAction::K8cBackupNow) => self.k8c_write(K8cAction::BackupNow),
+            Some(MenuAction::K8cRestore) => self.k8c_write(K8cAction::Restore),
+            Some(MenuAction::K8cMedusaTask(op)) => self.k8c_write(K8cAction::MedusaTask(op)),
+            Some(MenuAction::K8cCassandraTask(cmd)) => {
+                self.k8c_write(K8cAction::CassandraTask(cmd))
+            }
             Some(MenuAction::ScaleDelta(d)) => self.pods_scale(d),
             Some(MenuAction::ScaleZero) => self.pods_scale_zero(),
             Some(MenuAction::NodeCordon(v)) => self.node_cordon(v),
@@ -11882,12 +11429,10 @@ impl App {
         let free_text = matches!(action, Some(MenuAction::RanchSetSetting));
         let Some(buf) = menu.input.as_mut() else { return };
         let (ok, max) = if nodetool {
-            // A whitelist rather than "anything printable": the words become `args` of a process,
-            // never a shell line, and nothing outside this set has a meaning to `nodetool`. It also
-            // keeps `$(` — the form the kubelet expands — out of what the user can type.
+            // The whitelist lives with the Job it protects: kdt-web checks a whole line against it.
             (
-                c.is_ascii_alphanumeric() || " -_.,:/=+*@".contains(c),
-                200,
+                crate::nodetool::command_char_allowed(c),
+                crate::nodetool::COMMAND_MAX,
             )
         } else if free_text {
             (c.is_ascii_alphanumeric(), 16)
@@ -21572,350 +21117,6 @@ fn ranch_detail_lines(
 
 
 
-// --- K8ssandra records ----------------------------------------------------------------------------
-
-// The GVK a row carries is what `y`, `e` and `Ctrl-D` act on, so each record is stamped with the
-// real API version of its object rather than with one group for the whole view: a MedusaBackup and
-// a CassandraDatacenter live in different groups and resolve through different discovery entries.
-#[allow(clippy::too_many_arguments)]
-fn k8c_record(
-    uid: &str,
-    api_version: &str,
-    kind: &str,
-    namespace: &str,
-    name: &str,
-    reason: &str,
-    message: String,
-    hints: &[crate::storage::Hint],
-) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: crate::storage::hints_severity(hints),
-        reason: reason.to_string(),
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
-        namespace: namespace.to_string(),
-        name: name.to_string(),
-        message,
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_k8c_cluster_record(
-    c: &K8cCluster,
-    dcs: usize,
-    st: &'static Strings,
-) -> EventRecord {
-    let version = if c.server_version.is_empty() { "?" } else { &c.server_version };
-    let server = if c.server_type.is_empty() { "cassandra" } else { &c.server_type };
-    k8c_record(
-        &c.uid,
-        "k8ssandra.io/v1alpha1",
-        "K8ssandraCluster",
-        &c.namespace,
-        &c.name,
-        "Cluster",
-        lang::fill(
-            st.k8c_msg_cluster,
-            &[("server", server), ("version", version), ("n", &dcs.to_string())],
-        ),
-        &c.hints,
-    )
-}
-
-fn synthetic_k8c_dc_record(d: &K8cDatacenter, nodes: usize, st: &'static Strings) -> EventRecord {
-    k8c_record(
-        &d.uid,
-        "cassandra.datastax.com/v1beta1",
-        "CassandraDatacenter",
-        &d.namespace,
-        &d.name,
-        if d.progress.is_empty() { "Datacenter" } else { &d.progress },
-        lang::fill(
-            st.k8c_msg_dc,
-            &[
-                ("nodes", &nodes.to_string()),
-                ("size", &d.size.to_string()),
-                ("storage", if d.declared_storage.is_empty() { "?" } else { &d.declared_storage }),
-            ],
-        ),
-        &d.hints,
-    )
-}
-
-fn synthetic_k8c_node_record(n: &K8cNode, st: &'static Strings) -> EventRecord {
-    // The ring's own word for the node when it answered, the pod phase when it did not. Never a
-    // fabricated "UN": an unread ring is unknown, not up.
-    let state = match &n.ring {
-        Some(r) => r.status_code.clone(),
-        None => st.k8c_unknown.to_string(),
-    };
-    let load = n
-        .ring
-        .as_ref()
-        .and_then(|r| r.load_bytes)
-        .map(format_load)
-        .unwrap_or_else(|| "—".to_string());
-    k8c_record(
-        &n.uid,
-        "v1",
-        "Pod",
-        &n.namespace,
-        &n.name,
-        &state,
-        lang::fill(
-            st.k8c_msg_node,
-            &[("rack", if n.rack.is_empty() { "—" } else { &n.rack }), ("load", &load)],
-        ),
-        &n.hints,
-    )
-}
-
-fn synthetic_k8c_sched_record(s: &MedSchedule, runs: usize, st: &'static Strings) -> EventRecord {
-    let last = match s.last_execution {
-        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now_secs()))]),
-        None => st.k8c_never.to_string(),
-    };
-    k8c_record(
-        &s.uid,
-        "medusa.k8ssandra.io/v1alpha1",
-        "MedusaBackupSchedule",
-        &s.namespace,
-        &s.name,
-        if s.backup_type.is_empty() { "Schedule" } else { &s.backup_type },
-        lang::fill(
-            st.k8c_msg_sched,
-            &[("cron", &s.cron), ("last", &last), ("n", &runs.to_string())],
-        ),
-        &s.hints,
-    )
-}
-
-fn synthetic_k8c_job_record(j: &MedJob, st: &'static Strings) -> EventRecord {
-    // The outcome as coverage, not as a phase: "6/6" and "0/6" are the whole story, and Medusa
-    // never writes either of them anywhere.
-    let total = j
-        .expected
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let reason = match j.complete() {
-        _ if j.running() => st.k8c_state_running,
-        Some(true) => st.k8c_state_complete,
-        Some(false) => st.k8c_state_failed,
-        None => st.k8c_unknown,
-    };
-    k8c_record(
-        &j.uid,
-        "medusa.k8ssandra.io/v1alpha1",
-        "MedusaBackupJob",
-        &j.namespace,
-        &j.name,
-        reason,
-        lang::fill(
-            st.k8c_msg_job,
-            &[
-                ("ok", &j.finished.len().to_string()),
-                ("total", &total),
-                ("ko", &j.failed.len().to_string()),
-                ("type", if j.backup_type.is_empty() { "—" } else { &j.backup_type }),
-                ("dur", &k8c_span_text(j.start, j.finish)),
-            ],
-        ),
-        &j.hints,
-    )
-}
-
-fn synthetic_k8c_backup_record(b: &MedBackup, st: &'static Strings) -> EventRecord {
-    let reason = match b.complete {
-        Some(true) => st.k8c_state_complete,
-        Some(false) => st.k8c_state_failed,
-        None => st.k8c_unknown,
-    };
-    let finished = match b.finish {
-        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now_secs()))]),
-        None => st.k8c_never.to_string(),
-    };
-    k8c_record(
-        &b.uid,
-        "medusa.k8ssandra.io/v1alpha1",
-        "MedusaBackup",
-        &b.namespace,
-        &b.name,
-        reason,
-        lang::fill(
-            st.k8c_msg_backup,
-            &[
-                ("type", if b.backup_type.is_empty() { "—" } else { &b.backup_type }),
-                ("finished", &finished),
-            ],
-        ),
-        &b.hints,
-    )
-}
-
-fn synthetic_k8c_restore_record(r: &MedRestore, st: &'static Strings) -> EventRecord {
-    let reason = if !r.failed.is_empty() {
-        st.k8c_state_failed
-    } else if r.finish.is_some() {
-        st.k8c_state_complete
-    } else {
-        st.k8c_state_running
-    };
-    k8c_record(
-        &r.uid,
-        "medusa.k8ssandra.io/v1alpha1",
-        "MedusaRestoreJob",
-        &r.namespace,
-        &r.name,
-        reason,
-        lang::fill(st.k8c_msg_restore, &[("backup", &r.backup)]),
-        &r.hints,
-    )
-}
-
-fn synthetic_k8c_task_record(t: &MedTask, st: &'static Strings) -> EventRecord {
-    let reason = if !t.failed.is_empty() {
-        st.k8c_state_failed
-    } else if t.finish.is_some() {
-        st.k8c_state_complete
-    } else {
-        st.k8c_state_running
-    };
-    k8c_record(
-        &t.uid,
-        "medusa.k8ssandra.io/v1alpha1",
-        "MedusaTask",
-        &t.namespace,
-        &t.name,
-        reason,
-        lang::fill(
-            st.k8c_msg_task,
-            &[
-                ("op", if t.operation.is_empty() { "—" } else { &t.operation }),
-                ("n", &t.finished.len().to_string()),
-                ("dur", &k8c_span_text(t.start, t.finish)),
-            ],
-        ),
-        &t.hints,
-    )
-}
-
-fn synthetic_k8c_ctask_record(t: &CassTask, st: &'static Strings) -> EventRecord {
-    let reason = if t.failed > 0 {
-        st.k8c_state_failed
-    } else if t.active > 0 {
-        st.k8c_state_running
-    } else if t.finish.is_some() {
-        st.k8c_state_complete
-    } else {
-        st.k8c_state_pending
-    };
-    k8c_record(
-        &t.uid,
-        "control.k8ssandra.io/v1alpha1",
-        "CassandraTask",
-        &t.namespace,
-        &t.name,
-        reason,
-        lang::fill(
-            st.k8c_msg_ctask,
-            &[
-                ("cmd", &t.commands.join(", ")),
-                ("ok", &t.succeeded.to_string()),
-                ("ko", &t.failed.to_string()),
-                ("dur", &k8c_span_text(t.start, t.finish)),
-            ],
-        ),
-        &t.hints,
-    )
-}
-
-// `batch/v1 Job` for real: this is the row where `y` and `Ctrl-D` act on the object kdt created,
-// which is how a finished command is read back and thrown away.
-fn synthetic_k8c_nodetool_record(j: &NtJob, st: &'static Strings) -> EventRecord {
-    let reason = if j.failed > 0 {
-        st.k8c_state_failed
-    } else if j.running() {
-        st.k8c_state_running
-    } else if j.succeeded > 0 {
-        st.k8c_state_complete
-    } else {
-        st.k8c_state_pending
-    };
-    k8c_record(
-        &j.uid,
-        "batch/v1",
-        "Job",
-        &j.namespace,
-        &j.name,
-        reason,
-        lang::fill(
-            st.k8c_msg_nodetool,
-            &[
-                ("cmd", if j.command.is_empty() { "—" } else { &j.command }),
-                ("pod", if j.target.is_empty() { "—" } else { &j.target }),
-                ("dur", &k8c_span_text(j.start, j.finish)),
-            ],
-        ),
-        &j.hints,
-    )
-}
-
-fn synthetic_k8c_reaper_record(r: &ReaperRec, st: &'static Strings) -> EventRecord {
-    k8c_record(
-        &r.uid,
-        "reaper.k8ssandra.io/v1alpha1",
-        "Reaper",
-        &r.namespace,
-        &r.name,
-        if r.progress.is_empty() { st.k8c_unknown } else { &r.progress },
-        lang::fill(
-            st.k8c_msg_reaper,
-            &[("dc", if r.datacenter.is_empty() { "—" } else { &r.datacenter })],
-        ),
-        &r.hints,
-    )
-}
-
-// A section heading. It stands for no object, so it carries no kind: `y`, `e` and `Ctrl-D`
-// correctly find nothing to act on — the same contract as the velero orphan header.
-fn synthetic_k8c_group_record(
-    uid: &str,
-    label: &str,
-    count: usize,
-    st: &'static Strings,
-) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: Severity::Normal,
-        reason: "Group".to_string(),
-        api_version: String::new(),
-        kind: String::new(),
-        namespace: String::new(),
-        name: label.to_string(),
-        message: st.plural(count, st.k8c_objects_one, st.k8c_objects_many),
-        component: "k8ssandra".to_string(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn now_secs() -> i64 {
     k8s_openapi::jiff::Timestamp::now().as_second()
 }
@@ -22648,233 +21849,15 @@ fn refl_status_cell(status: TargetStatus, st: &'static Strings) -> Cell<'static>
 // when. The last column is a fixed length, never `Min`, so the right border holds at every width.
 // --- K8ssandra view rendering ---------------------------------------------------------------------
 
-// The short label a row shows in the KIND column. The full kind is in the detail panel and in `y`;
-// here it only has to tell the rows apart.
-fn k8c_kind_label(row: &K8cRow, st: &'static Strings) -> &'static str {
-    match row {
-        K8cRow::Cluster(_) => "cluster",
-        K8cRow::Datacenter(_) => "dc",
-        K8cRow::Node(_) => "node",
-        K8cRow::Schedule(_) => "schedule",
-        K8cRow::Job(_) => "run",
-        K8cRow::Backup(_) => "backup",
-        K8cRow::Restore(_) => "restore",
-        K8cRow::Task(_) => "task",
-        K8cRow::CassTask(_) => "cass-task",
-        K8cRow::Nodetool(_) => "nodetool",
-        K8cRow::Reaper(_) => "reaper",
-        K8cRow::Group { .. } => st.k8c_kind_group,
-    }
-}
-
-// The state cell, coloured by what the state costs. A run that covered every node is green, one that
-// covered some is red rather than orange: a partial capture restores as if it were whole, which is
-// worse than an outright failure that nobody would restore from.
+// The state cell, painted with the tone the row's state carries. The one local nuance is the
+// orange of a Reaper that is not ready: a warning, but not the yellow of a failing object.
 fn k8c_state_cell(row: &K8cRow, st: &'static Strings) -> Cell<'static> {
-    let (text, color) = match row {
-        K8cRow::Cluster(c) => (
-            if c.error.is_empty() || c.error == "None" { st.k8c_state_ok } else { st.k8c_state_failed },
-            if c.error.is_empty() || c.error == "None" { Color::Green } else { Color::Red },
-        ),
-        K8cRow::Datacenter(d) => {
-            if d.stopped {
-                (st.k8c_state_stopped, Color::Red)
-            } else if d.ready() {
-                (st.k8c_state_ready, Color::Green)
-            } else {
-                (st.k8c_state_not_ready, Color::Red)
-            }
-        }
-        K8cRow::Node(n) => {
-            // The ring's word when it answered, the pod's readiness when it did not. An unread ring
-            // is dim and unknown, never a green UN we did not observe.
-            return match &n.ring {
-                Some(r) => Cell::from(r.status_code.clone()).style(Style::default().fg(
-                    if r.alive && r.state == "NORMAL" { Color::Green } else { Color::Red },
-                )),
-                None => Cell::from(st.k8c_unknown).style(Style::default().fg(DIM)),
-            };
-        }
-        K8cRow::Schedule(s) => {
-            if s.disabled {
-                (st.k8c_state_disabled, DIM)
-            } else {
-                (st.k8c_state_enabled, Color::Green)
-            }
-        }
-        K8cRow::Job(j) => match j.complete() {
-            _ if j.running() => (st.k8c_state_running, Color::Cyan),
-            Some(true) => (st.k8c_state_complete, Color::Green),
-            Some(false) => (st.k8c_state_failed, Color::Red),
-            None => (st.k8c_unknown, DIM),
-        },
-        K8cRow::Backup(b) => match b.complete {
-            Some(true) => (st.k8c_state_complete, Color::Green),
-            Some(false) => (st.k8c_state_failed, Color::Red),
-            None => (st.k8c_unknown, DIM),
-        },
-        K8cRow::Restore(r) => {
-            if !r.failed.is_empty() {
-                (st.k8c_state_failed, Color::Red)
-            } else if r.finish.is_some() {
-                (st.k8c_state_complete, Color::Green)
-            } else {
-                (st.k8c_state_running, Color::Cyan)
-            }
-        }
-        K8cRow::Task(t) => {
-            if !t.failed.is_empty() {
-                (st.k8c_state_failed, Color::Red)
-            } else if t.finish.is_some() {
-                (st.k8c_state_complete, Color::Green)
-            } else {
-                (st.k8c_state_running, Color::Cyan)
-            }
-        }
-        K8cRow::CassTask(t) => {
-            if t.failed > 0 {
-                (st.k8c_state_failed, Color::Red)
-            } else if t.active > 0 {
-                (st.k8c_state_running, Color::Cyan)
-            } else if t.finish.is_some() {
-                (st.k8c_state_complete, Color::Green)
-            } else {
-                (st.k8c_state_pending, DIM)
-            }
-        }
-        K8cRow::Nodetool(j) => {
-            // A `nodetool` that came back non-zero is red, and a Job with no pod yet is pending
-            // rather than running: the command has not reached the node.
-            if j.failed > 0 {
-                (st.k8c_state_failed, Color::Red)
-            } else if j.running() {
-                (st.k8c_state_running, Color::Cyan)
-            } else if j.succeeded > 0 {
-                (st.k8c_state_complete, Color::Green)
-            } else {
-                (st.k8c_state_pending, DIM)
-            }
-        }
-        K8cRow::Reaper(r) => {
-            if r.ready {
-                (st.k8c_state_ready, Color::Green)
-            } else {
-                (st.k8c_state_not_ready, Color::Rgb(255, 140, 0))
-            }
-        }
-        K8cRow::Group { .. } => ("", DIM),
+    let (text, tone) = row.state(st);
+    let color = match tone {
+        LineColor::Warn => Color::Rgb(255, 140, 0),
+        other => line_color(other),
     };
     Cell::from(text).style(Style::default().fg(color))
-}
-
-// The one number each row owes at a glance. For a run that is its coverage — the fact Medusa never
-// writes down anywhere and the whole reason this view exists.
-fn k8c_info_text(row: &K8cRow, st: &'static Strings) -> String {
-    let now = now_secs();
-    match row {
-        K8cRow::Cluster(c) => {
-            let version = if c.server_version.is_empty() { "?" } else { &c.server_version };
-            match &c.medusa {
-                Some(m) => format!("{version} · {}", m.bucket),
-                None => format!("{version} · {}", st.k8c_no_medusa_short),
-            }
-        }
-        K8cRow::Datacenter(d) => format!(
-            "{}/{} · {}",
-            d.node_statuses.len(),
-            d.size,
-            if d.declared_storage.is_empty() { "—" } else { &d.declared_storage }
-        ),
-        K8cRow::Node(n) => {
-            let load = n
-                .ring
-                .as_ref()
-                .and_then(|r| r.load_bytes)
-                .map(format_load)
-                .unwrap_or_else(|| "—".to_string());
-            format!("{} · {load}", if n.rack.is_empty() { "—" } else { &n.rack })
-        }
-        K8cRow::Schedule(s) => s.cron.clone(),
-        K8cRow::Job(j) => {
-            let total = j.expected.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-            format!("{}/{total}", j.finished.len())
-        }
-        K8cRow::Backup(b) => match b.finish {
-            Some(t) => crate::velero::age_of(t, now),
-            None => st.k8c_never.to_string(),
-        },
-        K8cRow::Restore(r) => r.backup.clone(),
-        K8cRow::Task(t) => t.operation.clone(),
-        K8cRow::CassTask(t) => t.commands.join(", "),
-        K8cRow::Nodetool(j) => {
-            if j.command.is_empty() { "—".to_string() } else { j.command.clone() }
-        }
-        K8cRow::Reaper(r) => r.datacenter.clone(),
-        K8cRow::Group { count, .. } => st.plural(*count, st.k8c_objects_one, st.k8c_objects_many),
-    }
-}
-
-// La durée d'une ligne, quand la ligne en a une. Un run, une tâche, une restauration, un
-// `nodetool` : tout ce qui commence et finit. Un cluster, un datacenter ou un node n'en ont pas —
-// ils durent — et un schedule non plus : ce qui dure chez lui, ce sont ses runs.
-//
-// La règle est dans `k8ssandra::span_of` : pas de `startTime`, pas de durée, et sans `finishTime`
-// elle court jusqu'à maintenant. Ici on ne fait que la mettre en forme.
-// La durée d'un couple `(start, finish)`, pour les enregistrements synthétiques. Un run qui n'a
-// pas commencé n'a pas de durée, et c'est un tiret qui le dit — pas un `0s` qui se lirait comme
-// « instantané ».
-fn k8c_span_text(start: Option<i64>, finish: Option<i64>) -> String {
-    crate::k8ssandra::span_of(start, finish, now_secs())
-        .map(crate::k8ssandra::format_run_span)
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn k8c_duration_text(row: &K8cRow) -> String {
-    let now = now_secs();
-    let span = match row {
-        K8cRow::Job(j) => crate::k8ssandra::span_of(j.start, j.finish, now),
-        K8cRow::Backup(b) => crate::k8ssandra::span_of(b.start, b.finish, now),
-        K8cRow::Restore(r) => crate::k8ssandra::span_of(r.start, r.finish, now),
-        K8cRow::Task(t) => crate::k8ssandra::span_of(t.start, t.finish, now),
-        K8cRow::CassTask(t) => crate::k8ssandra::span_of(t.start, t.finish, now),
-        K8cRow::Nodetool(j) => crate::k8ssandra::span_of(j.start, j.finish, now),
-        _ => None,
-    };
-    span.map(crate::k8ssandra::format_run_span).unwrap_or_else(|| "—".to_string())
-}
-
-fn k8c_row_created(row: &K8cRow) -> i64 {
-    match row {
-        K8cRow::Cluster(c) => c.created,
-        K8cRow::Datacenter(d) => d.created,
-        K8cRow::Node(n) => n.created,
-        K8cRow::Schedule(s) => s.last_execution.unwrap_or(0),
-        K8cRow::Job(j) => j.created,
-        K8cRow::Backup(b) => b.created,
-        K8cRow::Restore(r) => r.created,
-        K8cRow::Task(t) => t.created,
-        K8cRow::CassTask(t) => t.created,
-        K8cRow::Nodetool(j) => j.created,
-        K8cRow::Reaper(r) => r.created,
-        K8cRow::Group { .. } => 0,
-    }
-}
-
-fn k8c_row_name(row: &K8cRow) -> String {
-    match row {
-        K8cRow::Cluster(c) => c.name.clone(),
-        K8cRow::Datacenter(d) => d.name.clone(),
-        K8cRow::Node(n) => n.name.clone(),
-        K8cRow::Schedule(s) => s.name.clone(),
-        K8cRow::Job(j) => j.name.clone(),
-        K8cRow::Backup(b) => b.name.clone(),
-        K8cRow::Restore(r) => r.name.clone(),
-        K8cRow::Task(t) => t.name.clone(),
-        K8cRow::CassTask(t) => t.name.clone(),
-        K8cRow::Nodetool(j) => j.name.clone(),
-        K8cRow::Reaper(r) => r.name.clone(),
-        K8cRow::Group { label, .. } => label.clone(),
-    }
 }
 
 // The name exactly as it is drawn — marker and indentation included. `col_width` measures this, not
@@ -22884,8 +21867,8 @@ fn k8c_row_names(app: &App) -> Vec<String> {
     app.k8c_rows
         .iter()
         .map(|row| {
-            let name = k8c_row_name(row);
-            let indent = "  ".repeat(k8c_depth(row));
+            let name = row.name();
+            let indent = "  ".repeat(row.depth());
             match row.fold_key() {
                 Some(key) => {
                     let marker = if app.k8c_collapsed.contains(&key) { "▸" } else { "▾" };
@@ -22895,14 +21878,6 @@ fn k8c_row_names(app: &App) -> Vec<String> {
             }
         })
         .collect()
-}
-
-fn k8c_medusa_pod(failed: &[String], in_progress: &[String], finished: &[String]) -> Option<String> {
-    failed
-        .first()
-        .or_else(|| in_progress.first())
-        .or_else(|| finished.first())
-        .cloned()
 }
 
 fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -22949,6 +21924,7 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let names = k8c_row_names(app);
+    let now = now_secs();
     let alert = |hints: &[crate::storage::Hint]| match hints.first() {
         Some(h) => Cell::from(h.text.clone())
             .style(Style::default().fg(sto_hint_color(std::slice::from_ref(h)).unwrap_or(DIM))),
@@ -22967,7 +21943,7 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 }
                 None => Style::default(),
             };
-            let created = k8c_row_created(row);
+            let created = row.created();
             let age = if created > 0 {
                 crate::velero::age_of(created, now_secs())
             } else {
@@ -22976,12 +21952,12 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(row.namespace().to_string()).style(Style::default().fg(DIM)),
                 Cell::from(drawn_name.clone()).style(name_style),
-                Cell::from(k8c_kind_label(row, st)).style(Style::default().fg(DIM)),
+                Cell::from(row.kind_label(st)).style(Style::default().fg(DIM)),
                 k8c_state_cell(row, st),
-                Cell::from(k8c_info_text(row, st)),
+                Cell::from(row.info(st, now)),
                 // La durée d'un run se lit à côté de son état : « complete » ne dit pas si la
                 // fenêtre de sauvegarde a tenu, et « running » ne dit pas depuis quand.
-                Cell::from(k8c_duration_text(row)).style(Style::default().fg(DIM)),
+                Cell::from(row.span_text(now)).style(Style::default().fg(DIM)),
                 Cell::from(age).style(Style::default().fg(DIM)),
                 alert(row.hints()),
             ])
@@ -22989,7 +21965,7 @@ fn draw_k8ssandra_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .collect();
 
     let ns_values: Vec<String> = app.k8c_rows.iter().map(|r| r.namespace().to_string()).collect();
-    let info_values: Vec<String> = app.k8c_rows.iter().map(|r| k8c_info_text(r, st)).collect();
+    let info_values: Vec<String> = app.k8c_rows.iter().map(|r| r.info(st, now)).collect();
     let ns_w = col_width(ns_values.iter().map(|s| s.as_str()), "NAMESPACE", 9, 24);
     let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 52);
     let info_w = col_width(info_values.iter().map(|s| s.as_str()), "INFO", 6, 22);
@@ -23618,17 +22594,10 @@ fn push_k8c_panel(app: &App, lines: &mut Vec<Line<'static>>, st: &'static String
             }
             // Only the pools with something in flight, plus a handful of context: a node has ~40
             // thread pools and 35 of them are permanently at zero.
-            let busy: Vec<&crate::mgmtapi::ThreadPool> =
-                m.pools.iter().filter(|p| p.pending > 0.0 || p.active > 0.0 || p.blocked > 0.0).collect();
-            let shown: Vec<&crate::mgmtapi::ThreadPool> = if busy.is_empty() {
-                m.pools.iter().take(6).collect()
-            } else {
-                busy
-            };
-            for p in shown {
+            for p in m.pools_to_show() {
                 // The three numbers `nodetool tpstats` is read for: what is running, what is queued
                 // behind it, and what the pool has had to block on.
-                let style = if p.pending > 0.0 || p.blocked > 0.0 {
+                let style = if p.pressured() {
                     Style::default().fg(Color::Rgb(255, 140, 0))
                 } else {
                     Style::default()
@@ -23750,11 +22719,7 @@ fn k8c_snapshot_lines(
     }
     // A size that could not be read makes the sum a floor, and it is shown as one rather than as a
     // total that is quietly short of a few files.
-    let sized = |bytes: Option<f64>, partial: bool| match bytes {
-        Some(b) if partial => format!("≥ {}", format_load(b)),
-        Some(b) => format_load(b),
-        None => "—".to_string(),
-    };
+    let sized = crate::k8ssandra::sized_text;
     for tag in tags {
         lines.push(Line::from(Span::raw(format!("  {}", tag.tag))));
         // The two sizes side by side, because they answer two different questions and one of them
@@ -23783,13 +22748,7 @@ fn k8c_snapshot_lines(
         // Only the prefixes their authors write themselves. A TRUNCATE or a DROP leaves data nobody
         // asked to keep and nothing will ever clear it; a Medusa tag should have been cleared by the
         // run that took it. What is *after* the prefix is a free-form name and says nothing.
-        let origin = match tag.origin() {
-            crate::k8ssandra::SnapOrigin::Truncate => Some(st.k8c_snap_origin_truncate),
-            crate::k8ssandra::SnapOrigin::Drop => Some(st.k8c_snap_origin_drop),
-            crate::k8ssandra::SnapOrigin::Medusa => Some(st.k8c_snap_origin_medusa),
-            crate::k8ssandra::SnapOrigin::Named => None,
-        };
-        if let Some(text) = origin {
+        if let Some(text) = crate::k8ssandra::snapshot_origin_text(tag, st) {
             lines.push(Line::from(Span::styled(
                 format!("    {text}"),
                 Style::default().fg(Color::Rgb(255, 140, 0)),

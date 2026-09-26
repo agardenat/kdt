@@ -53,6 +53,12 @@ import type {
   VelLogPayload,
   VelRestoreRequest,
   VelWorld,
+  K8cLinesPayload,
+  K8cMetricsPayload,
+  K8cRepairsPayload,
+  K8cSnapshotsPayload,
+  K8cWorld,
+  K8ssandraPayload,
   IssuedToken,
   ObjectYaml,
   RancherPayload,
@@ -606,6 +612,70 @@ export function veleroWrite(
   lang: Lang,
 ): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/velero/write", { ...request, lang });
+}
+
+/**
+ * L'inventaire k8ssandra de la portée, pour un monde.
+ *
+ * Le monde et le filtre partent au serveur : quels runs pendent de quel schedule, le seau des
+ * orphelins et le parent gardé au-dessus d'un enfant en échec sont des règles de kdt.
+ */
+export function k8ssandra(
+  namespace: string,
+  world: K8cWorld,
+  problems: boolean,
+  lang: Lang,
+): Promise<K8ssandraPayload> {
+  const params = new URLSearchParams({ world, problems: String(problems), lang });
+  if (namespace) params.set("ns", namespace);
+  return get<K8ssandraPayload>(`/api/v1/k8ssandra?${params.toString()}`);
+}
+
+/** Le log d'un container de pod Cassandra : `cassandra` pour un node, `medusa` pour un run. */
+export function k8ssandraLog(namespace: string, pod: string, container: string): Promise<K8cLinesPayload> {
+  const params = new URLSearchParams({ namespace, pod, container });
+  return get<K8cLinesPayload>(`/api/v1/k8ssandra/log?${params.toString()}`);
+}
+
+/** La sortie d'un Job `nodetool`, qui est le log de son pod. */
+export function k8ssandraOutput(namespace: string, job: string, lang: Lang): Promise<K8cLinesPayload> {
+  const params = new URLSearchParams({ namespace, job, lang });
+  return get<K8cLinesPayload>(`/api/v1/k8ssandra/output?${params.toString()}`);
+}
+
+/** `tpstats`, `compactionstats` et `netstats` d'un node, par l'API de management. */
+export function k8ssandraMetrics(namespace: string, pod: string): Promise<K8cMetricsPayload> {
+  const params = new URLSearchParams({ namespace, pod });
+  return get<K8cMetricsPayload>(`/api/v1/k8ssandra/metrics?${params.toString()}`);
+}
+
+/** Les snapshots d'un node, un par tag. */
+export function k8ssandraSnapshots(namespace: string, pod: string, lang: Lang): Promise<K8cSnapshotsPayload> {
+  const params = new URLSearchParams({ namespace, pod, lang });
+  return get<K8cSnapshotsPayload>(`/api/v1/k8ssandra/snapshots?${params.toString()}`);
+}
+
+/** Les réparations planifiées d'un Reaper. Le serveur relit l'objet : seul son nom part d'ici. */
+export function k8ssandraRepairs(namespace: string, name: string, lang: Lang): Promise<K8cRepairsPayload> {
+  const params = new URLSearchParams({ namespace, name, lang });
+  return get<K8cRepairsPayload>(`/api/v1/k8ssandra/repairs?${params.toString()}`);
+}
+
+/**
+ * Une écriture k8ssandra.
+ *
+ * Le navigateur ne nomme que la ligne et l'action : le serveur relit l'inventaire, vérifie que la
+ * ligne offre bien cette action, et c'est la ligne qui bâtit l'objet. `focus` est l'uid de la ligne
+ * qu'un `nodetool` fera apparaître.
+ */
+export function k8ssandraWrite(
+  request: { uid: string; action: string; command?: string; confirm_name?: string },
+  lang: Lang,
+): Promise<{ message: string; focus: string | null }> {
+  return send<{ message: string; focus: string | null }>("/api/v1/k8ssandra/write", {
+    ...request,
+    lang,
+  });
 }
 
 /**

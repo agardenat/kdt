@@ -711,10 +711,22 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Sixteen views are
-live — events, workloads, nodes, Flux, Velero, capacity, storage, Secrets/ConfigMaps, certificates,
-RBAC, Kyverno, identity, Rancher, network, hooks, diagnostic — along with the five gestures that
-apply to any object: YAML, edit, touch, delete, AI analysis.
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Seventeen views
+are live — events, workloads, nodes, Flux, Velero, K8ssandra, capacity, storage, Secrets/ConfigMaps,
+certificates, RBAC, Kyverno, identity, Rancher, network, hooks, diagnostic — along with the five
+gestures that apply to any object: YAML, edit, touch, delete, AI analysis.
+
+**The K8ssandra view** carries the three worlds of `:k8ssandra` / `:medusa` / `:reaper`: the ring
+(clusters, datacenters, nodes), Medusa backups (schedules and their runs, runs with no schedule,
+catalogue, restores), operations (`nodetool` Jobs, Reaper, cass-operator and Medusa tasks). The bar
+shows the age of the last backup covering every node, and cluster-wide findings get their own line
+below it. The top panel opens on demand what `l`, `m` and `S` open in the TUI: the log of the
+container that explains the row (`cassandra` or `medusa`), a node's `tpstats`/`compactionstats`/
+`netstats` and snapshots, a Reaper's repairs, a `nodetool` Job's output. A row's menu carries the
+TUI writes: run a backup from a schedule, restore a complete backup (the backup name is typed again;
+a restore stops the datacenter), Medusa and cass-operator tasks on a datacenter, `nodetool` on a
+node. The server reads the row again before writing and the row builds the object; the `nodetool`
+command is checked there against the same character list as the TUI.
 
 **The Network view** carries the three worlds of the TUI network view: Services (and their
 endpoints), Ingress (and their IngressClasses), policies. A checkbox lists the endpoints under their

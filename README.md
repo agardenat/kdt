@@ -720,10 +720,23 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Seize vues
-répondent — évènements, workloads, nodes, Flux, Velero, capacité, stockage, Secrets/ConfigMaps,
-certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks, diagnostic — avec les cinq gestes
-qui portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-sept vues
+répondent — évènements, workloads, nodes, Flux, Velero, K8ssandra, capacité, stockage,
+Secrets/ConfigMaps, certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks, diagnostic — avec
+les cinq gestes qui portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
+
+**La vue K8ssandra** porte les trois mondes de `:k8ssandra` / `:medusa` / `:reaper` : le ring
+(clusters, datacenters, nodes), les sauvegardes Medusa (schedules et leurs runs, runs sans schedule,
+catalogue, restaurations), les opérations (Jobs `nodetool`, Reaper, tâches cass-operator et Medusa).
+La barre donne l'âge de la dernière sauvegarde qui couvre tous les nodes, et les constats qui valent
+pour tout le cluster ont leur ligne sous la barre. Le panneau du haut ouvre à la demande ce que `l`,
+`m` et `S` ouvrent dans le TUI : le log du container qui explique la ligne (`cassandra` ou `medusa`),
+`tpstats`/`compactionstats`/`netstats` et les snapshots d'un node, les repairs d'un Reaper, la sortie
+d'un Job `nodetool`. Le menu d'une ligne reprend les écritures du TUI : lancer un run depuis un
+schedule, restaurer une sauvegarde complète (le nom du backup se retape, la restauration arrête le
+datacenter), tâches Medusa et cass-operator sur un datacenter, `nodetool` sur un node. Le serveur
+relit la ligne avant d'écrire et c'est elle qui bâtit l'objet ; la commande `nodetool` y est
+revérifiée contre la même liste de caractères que le TUI.
 
 **La vue Réseau** porte les trois mondes de la vue réseau du TUI : Services (et leurs endpoints),
 Ingress (et leurs IngressClass), policies. Une case range les endpoints sous leur Service ou les

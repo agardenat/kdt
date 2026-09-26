@@ -291,7 +291,7 @@ fn parse_instant(raw: &str) -> Option<i64> {
 // --- Metrics ------------------------------------------------------------------------------------
 
 /// One thread pool line of `nodetool tpstats`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ThreadPool {
     pub name: String,
     pub kind: String,
@@ -303,7 +303,7 @@ pub struct ThreadPool {
 }
 
 /// What `nodetool tpstats` and `nodetool compactionstats` report, for a single node.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct NodeMetrics {
     pub pools: Vec<ThreadPool>,
     // Only the message types actually dropped: a list of ~30 zeroes is noise, and the reader is
@@ -312,6 +312,32 @@ pub struct NodeMetrics {
     pub pending_compactions: Option<f64>,
     pub completed_compactions: Option<f64>,
     pub bytes_compacted: Option<f64>,
+}
+
+impl ThreadPool {
+    /// Work queued behind the running tasks, or tasks the pool has had to block: the two numbers
+    /// `nodetool tpstats` is read for.
+    pub fn pressured(&self) -> bool {
+        self.pending > 0.0 || self.blocked > 0.0
+    }
+}
+
+impl NodeMetrics {
+    /// The pools worth a line. A node has ~40 thread pools and 35 of them sit at zero forever, so
+    /// only the ones with something in flight are shown — or, when nothing is, a handful for
+    /// context, so that an idle node does not read as an unread one.
+    pub fn pools_to_show(&self) -> Vec<&ThreadPool> {
+        let busy: Vec<&ThreadPool> = self
+            .pools
+            .iter()
+            .filter(|p| p.pending > 0.0 || p.active > 0.0 || p.blocked > 0.0)
+            .collect();
+        if busy.is_empty() {
+            self.pools.iter().take(6).collect()
+        } else {
+            busy
+        }
+    }
 }
 
 // The families worth keeping out of the exposition. The endpoint answers with ~29 000 lines, most

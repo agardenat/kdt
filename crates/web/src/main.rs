@@ -27,6 +27,7 @@ mod portal;
 mod rbac;
 mod rancher;
 mod netpol;
+mod k8ssandra;
 mod network;
 mod nodes;
 mod session;
@@ -216,6 +217,17 @@ async fn main() -> Result<()> {
         // Les quatre écritures — lancer un run, mettre en pause, restaurer, supprimer — sous une
         // seule route : elles ne se distinguent que par l'action nommée dans le corps.
         .route("/api/v1/velero/write", post(velero::write))
+        .route("/api/v1/k8ssandra", get(k8ssandra::list))
+        // Les lectures à la demande de la vue : aucune n'est dans la liste, chacune coûte au node
+        // ou au pod qu'elle interroge, et le TUI ne les relit jamais au ticker.
+        .route("/api/v1/k8ssandra/log", get(k8ssandra::log))
+        .route("/api/v1/k8ssandra/output", get(k8ssandra::output))
+        .route("/api/v1/k8ssandra/metrics", get(k8ssandra::metrics))
+        .route("/api/v1/k8ssandra/snapshots", get(k8ssandra::snapshots))
+        .route("/api/v1/k8ssandra/repairs", get(k8ssandra::repairs))
+        // Toutes les écritures sous une route : la ligne et l'action sont nommées dans le corps, et
+        // c'est la ligne relue qui bâtit l'objet.
+        .route("/api/v1/k8ssandra/write", post(k8ssandra::write))
         .route("/api/v1/rbac", get(rbac::list))
         .route("/api/v1/rancher", get(rancher::list))
         .route("/api/v1/rancher/write", post(rancher::write))

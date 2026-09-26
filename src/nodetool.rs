@@ -112,6 +112,33 @@ impl Plan {
     }
 }
 
+/// The longest command line accepted.
+pub const COMMAND_MAX: usize = 200;
+
+/// Whether a character may appear in a typed command.
+///
+/// A whitelist rather than "anything printable": the words become `args` of a process, never a
+/// shell line, and nothing outside this set has a meaning to `nodetool`. It also keeps `$(` — the
+/// form the kubelet expands — out of what anyone can type.
+pub fn command_char_allowed(c: char) -> bool {
+    c.is_ascii_alphanumeric() || " -_.,:/=+*@".contains(c)
+}
+
+/// A typed command, checked against the same whitelist the TUI enforces key by key, and split.
+///
+/// The TUI never lets a refused character into the buffer; a line that arrives whole — from a web
+/// request — has to be checked as a whole, or the whitelist is only a property of one keyboard.
+pub fn validate_command(raw: &str, st: &'static Strings) -> Result<Vec<String>, String> {
+    if raw.len() > COMMAND_MAX || !raw.chars().all(command_char_allowed) {
+        return Err(st.nt_invalid_command.to_string());
+    }
+    let command = split_command(raw);
+    if command.is_empty() {
+        return Err(st.nt_empty_command.to_string());
+    }
+    Ok(command)
+}
+
 /// Split a typed command into an argument vector. Whitespace only: there is no shell here, so there
 /// is nothing for quotes to protect, and pretending to honour them would be a lie about how the
 /// words reach `nodetool`.
@@ -380,8 +407,8 @@ pub async fn run(
     pod_name: String,
     datacenter: String,
     command: Vec<String>,
+    st: &'static Strings,
 ) -> Result<(String, Vec<String>), String> {
-    let st = lang::active();
     if command.is_empty() {
         return Err(st.nt_empty_command.to_string());
     }
@@ -424,7 +451,7 @@ pub async fn run(
 // --- What the view lists back -----------------------------------------------------------------------
 
 /// One `nodetool` Job, as the Ops world shows it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct NtJob {
     pub uid: String,
     pub namespace: String,
@@ -534,6 +561,55 @@ const OUTPUT_TAIL: i64 = 500;
 
 /// The Job's output, which is the log of its pod. A Job whose pod has not started yet is a distinct
 /// answer from a Job with no output: one is early, the other has nothing to say.
+pub async fn output(
+    client: &Client,
+    namespace: &str,
+    job: &str,
+    st: &'static Strings,
+) -> Result<Vec<String>, String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    // `job-name` is the label the Job controller puts on the pods it creates; it is how the pod is
+    // found without reading the Job's own selector, which carries a generated uid.
+    let list = pods
+        .list(&ListParams::default().labels(&format!("job-name={job}")))
+        .await
+        .map_err(crate::edit::api_error_text)?;
+    // The newest pod: `backoffLimit: 0` means there is normally exactly one, but a node failure can
+    // leave an older, evicted one behind.
+    let Some(pod) = list.items.into_iter().max_by_key(|p| {
+        p.metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.as_second())
+            .unwrap_or(0)
+    }) else {
+        return Err(st.nt_no_pod_yet.to_string());
+    };
+    // The phase of the pod the output came from, kept so that an empty log can say which kind of
+    // empty it is: a command still running has printed nothing *yet*.
+    let phase = pod.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+    let name = pod.metadata.name.unwrap_or_default();
+    let params = kube::api::LogParams {
+        container: Some("nodetool".to_string()),
+        tail_lines: Some(OUTPUT_TAIL),
+        ..kube::api::LogParams::default()
+    };
+    let text = pods.logs(&name, &params).await.map_err(crate::edit::api_error_text)?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    Ok(if !lines.is_empty() {
+        lines
+    } else if phase == "Pending" {
+        vec![st.nt_no_pod_yet.to_string()]
+    } else if phase == "Running" {
+        // `nodetool` prints at the end of most of its work, so a running Job with an empty log is
+        // the normal state of a compaction, not a Job that answered nothing.
+        vec![st.nt_running_no_output.to_string()]
+    } else {
+        vec![st.nt_no_output.to_string()]
+    })
+}
+
+/// [`output`], deposited in the panel the TUI redraws from.
 pub async fn fetch_output(
     client: Client,
     namespace: String,
@@ -552,67 +628,14 @@ pub async fn fetch_output(
             ..K8cPanel::default()
         };
     }
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
-    // `job-name` is the label the Job controller puts on the pods it creates; it is how the pod is
-    // found without reading the Job's own selector, which carries a generated uid.
-    let found = pods
-        .list(&ListParams::default().labels(&format!("job-name={job}")))
-        .await;
-    // The phase of the pod the output came from, kept so that an empty log can say which kind of
-    // empty it is: a command still running has printed nothing *yet*.
-    let mut phase = String::new();
-    let result = match found {
-        Err(e) => Err(crate::edit::api_error_text(e)),
-        Ok(list) => {
-            // The newest pod: `backoffLimit: 0` means there is normally exactly one, but a node
-            // failure can leave an older, evicted one behind.
-            let pod = list
-                .items
-                .into_iter()
-                .max_by_key(|p| {
-                    p.metadata
-                        .creation_timestamp
-                        .as_ref()
-                        .map(|t| t.0.as_second())
-                        .unwrap_or(0)
-                })
-                .map(|p| {
-                    phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
-                    p.metadata.name.unwrap_or_default()
-                });
-            match pod {
-                None => Err(st.nt_no_pod_yet.to_string()),
-                Some(pod) => {
-                    let params = kube::api::LogParams {
-                        container: Some("nodetool".to_string()),
-                        tail_lines: Some(OUTPUT_TAIL),
-                        ..kube::api::LogParams::default()
-                    };
-                    pods.logs(&pod, &params).await.map_err(crate::edit::api_error_text)
-                }
-            }
-        }
-    };
+    let result = output(&client, &namespace, &job, st).await;
     let mut s = state.lock().expect("k8ssandra panel poisoned");
     if s.key != key {
         return;
     }
     s.loading = false;
     match result {
-        Ok(text) => {
-            let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            s.lines = if !lines.is_empty() {
-                lines
-            } else if phase == "Pending" {
-                vec![st.nt_no_pod_yet.to_string()]
-            } else if phase == "Running" {
-                // `nodetool` prints at the end of most of its work, so a running Job with an empty
-                // log is the normal state of a compaction, not a Job that answered nothing.
-                vec![st.nt_running_no_output.to_string()]
-            } else {
-                vec![st.nt_no_output.to_string()]
-            };
-        }
+        Ok(lines) => s.lines = lines,
         Err(e) => s.error = Some(e),
     }
 }
@@ -876,5 +899,18 @@ mod tests {
         ];
         assert_eq!(opt_value(&opts, JMX_SSL_OPT).as_deref(), Some("true"));
         assert_eq!(opt_value(&opts, JMX_AUTH_OPT), None);
+    }
+
+    // The TUI refuses a character key by key; a line that arrives whole is checked whole.
+    #[test]
+    fn a_whole_line_is_checked_against_the_whitelist() {
+        assert_eq!(
+            validate_command("tablestats system_auth.roles -H", &FR),
+            Ok(vec!["tablestats".to_string(), "system_auth.roles".to_string(), "-H".to_string()])
+        );
+        assert!(validate_command("status; rm -rf /", &FR).is_err());
+        assert!(validate_command("status $(CASS_PASS)", &FR).is_err());
+        assert!(validate_command("   ", &FR).is_err());
+        assert!(validate_command(&"a".repeat(COMMAND_MAX + 1), &FR).is_err());
     }
 }

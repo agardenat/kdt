@@ -581,6 +581,69 @@ export interface Strings {
   velLblAccess: string;
   velLblValidated: string;
   velLblRepoType: string;
+  k8cCluster: string;
+  k8cBackups: string;
+  k8cOps: string;
+  k8cEmpty: string;
+  k8cNotInstalled: string;
+  k8cDetail: string;
+  k8cFold: string;
+  k8cRpo: string;
+  k8cRpoHelp: string;
+  k8cNoRestorable: string;
+  k8cRingUnread: string;
+  k8cRingUnreadHelp: string;
+  k8cProblems: string;
+  k8cNoAction: string;
+  k8cRestoreRetype: string;
+  k8cNodetoolPrompt: string;
+  k8cNodetoolRun: string;
+  k8cNodetoolInvalid: string;
+  k8cNodetoolHelp: string;
+  k8cReadings: string;
+  k8cReadLog: string;
+  k8cReadOutput: string;
+  k8cReadMetrics: string;
+  k8cReadSnapshots: string;
+  k8cReadRepairs: string;
+  k8cReadReload: string;
+  k8cReadClose: string;
+  k8cReadLoading: string;
+  k8cReadEmpty: string;
+  k8cPools: string;
+  k8cDropped: string;
+  k8cCompactions: string;
+  k8cStreams: string;
+  k8cNoStreams: string;
+  k8cSnapshots: string;
+  k8cNoSnapshots: string;
+  k8cSnapReclaimable: string;
+  k8cSnapShared: string;
+  k8cSnapTables: string;
+  k8cSnapNoDate: string;
+  k8cSnapTotal: string;
+  k8cSnapPartial: string;
+  k8cRepairs: string;
+  k8cLblMedusa: string;
+  k8cLblConditions: string;
+  k8cLblRing: string;
+  k8cLblVolumes: string;
+  k8cLblRuns: string;
+  k8cLblCoverage: string;
+  k8cLblDuration: string;
+  k8cLblExpected: string;
+  k8cLblFinished: string;
+  k8cLblFailed: string;
+  k8cLblInProgress: string;
+  k8cLblCatalogued: string;
+  k8cLblService: string;
+  k8cLblObjects: string;
+  k8cRingNotRead: string;
+  k8cNoMedusa: string;
+  k8cUnknown: string;
+  k8cNever: string;
+  k8cAgo: string;
+  k8cIn: string;
   velLblMaintenance: string;
   velLblRestores: string;
   velLblFailedVolumes: string;
@@ -1379,6 +1442,69 @@ const FR: Strings = {
   velLblAccess: "accès",
   velLblValidated: "validé",
   velLblRepoType: "type",
+  k8cCluster: "cluster",
+  k8cBackups: "sauvegardes",
+  k8cOps: "opérations",
+  k8cEmpty: "Aucun objet k8ssandra dans cette portée",
+  k8cNotInstalled: "k8ssandra-operator n'est pas installé sur ce cluster",
+  k8cDetail: "K8ssandra",
+  k8cFold: "déplier / replier",
+  k8cRpo: "dernière sauvegarde couvrant tous les nodes",
+  k8cRpoHelp: "Un run partiel compte comme un échec : il se restaure comme s'il était entier.",
+  k8cNoRestorable: "aucune sauvegarde restaurable",
+  k8cRingUnread: "ring non lu",
+  k8cRingUnreadHelp: "Aucune management API n'a répondu : les colonnes du ring sont inconnues, pas vides.",
+  k8cProblems: "à regarder",
+  k8cNoAction: "Rien à lancer depuis cette ligne.",
+  k8cRestoreRetype: "Retapez le nom du backup pour confirmer :",
+  k8cNodetoolPrompt: "commande, sans « nodetool »",
+  k8cNodetoolRun: "Lancer",
+  k8cNodetoolInvalid: "Seuls les lettres, chiffres, espaces et « -_.,:/=+*@ » sont admis.",
+  k8cNodetoolHelp: "Lancé dans un Job qui survit à la session ; sa sortie se lit sur sa ligne, dans les opérations.",
+  k8cReadings: "lectures",
+  k8cReadLog: "log",
+  k8cReadOutput: "sortie",
+  k8cReadMetrics: "tpstats · compactions · streams",
+  k8cReadSnapshots: "snapshots",
+  k8cReadRepairs: "repairs",
+  k8cReadReload: "relire",
+  k8cReadClose: "fermer",
+  k8cReadLoading: "chargement…",
+  k8cReadEmpty: "rien à afficher",
+  k8cPools: "Thread pools (tpstats)",
+  k8cDropped: "Messages perdus",
+  k8cCompactions: "Compactions (compactionstats)",
+  k8cStreams: "Streams (netstats)",
+  k8cNoStreams: "aucun stream en cours",
+  k8cSnapshots: "Snapshots (listsnapshots)",
+  k8cNoSnapshots: "aucun snapshot sur ce node",
+  k8cSnapReclaimable: "récupérable",
+  k8cSnapShared: "sur disque, liens partagés compris",
+  k8cSnapTables: "tables",
+  k8cSnapNoDate: "date non reportée par ce node",
+  k8cSnapTotal: "récupérable en effaçant tout (les liens encore partagés ne rendent rien)",
+  k8cSnapPartial: "au moins un fichier n'a pas pu être mesuré : les tailles sont des planchers",
+  k8cRepairs: "Repairs planifiés (reaper)",
+  k8cLblMedusa: "Medusa",
+  k8cLblConditions: "Conditions",
+  k8cLblRing: "Ring",
+  k8cLblVolumes: "Volumes",
+  k8cLblRuns: "runs",
+  k8cLblCoverage: "couverture",
+  k8cLblDuration: "durée",
+  k8cLblExpected: "nodes attendus",
+  k8cLblFinished: "terminés",
+  k8cLblFailed: "en échec",
+  k8cLblInProgress: "en cours",
+  k8cLblCatalogued: "au catalogue",
+  k8cLblService: "service",
+  k8cLblObjects: "objets",
+  k8cRingNotRead: "management API injoignable — état non lu",
+  k8cNoMedusa: "sans medusa",
+  k8cUnknown: "inconnu",
+  k8cNever: "jamais",
+  k8cAgo: "il y a {age}",
+  k8cIn: "dans {age}",
   velLblMaintenance: "maintenance",
   velLblRestores: "restaurations",
   velLblFailedVolumes: "volumes en échec",
@@ -2167,6 +2293,69 @@ const EN: Strings = {
   velLblAccess: "access",
   velLblValidated: "validated",
   velLblRepoType: "type",
+  k8cCluster: "cluster",
+  k8cBackups: "backups",
+  k8cOps: "operations",
+  k8cEmpty: "No k8ssandra object in this scope",
+  k8cNotInstalled: "k8ssandra-operator is not installed on this cluster",
+  k8cDetail: "K8ssandra",
+  k8cFold: "expand / collapse",
+  k8cRpo: "last backup covering every node",
+  k8cRpoHelp: "A partial run counts as a failure: it restores as if it were whole.",
+  k8cNoRestorable: "no restorable backup",
+  k8cRingUnread: "ring not read",
+  k8cRingUnreadHelp: "No management API answered: the ring columns are unknown, not empty.",
+  k8cProblems: "to look at",
+  k8cNoAction: "Nothing to run from this row.",
+  k8cRestoreRetype: "Type the backup name to confirm:",
+  k8cNodetoolPrompt: "command, without \"nodetool\"",
+  k8cNodetoolRun: "Run",
+  k8cNodetoolInvalid: "Only letters, digits, spaces and \"-_.,:/=+*@\" are accepted.",
+  k8cNodetoolHelp: "Run in a Job that outlives the session; its output is read on its row, under operations.",
+  k8cReadings: "readings",
+  k8cReadLog: "log",
+  k8cReadOutput: "output",
+  k8cReadMetrics: "tpstats · compactions · streams",
+  k8cReadSnapshots: "snapshots",
+  k8cReadRepairs: "repairs",
+  k8cReadReload: "reload",
+  k8cReadClose: "close",
+  k8cReadLoading: "loading…",
+  k8cReadEmpty: "nothing to show",
+  k8cPools: "Thread pools (tpstats)",
+  k8cDropped: "Dropped messages",
+  k8cCompactions: "Compactions (compactionstats)",
+  k8cStreams: "Streams (netstats)",
+  k8cNoStreams: "no stream in progress",
+  k8cSnapshots: "Snapshots (listsnapshots)",
+  k8cNoSnapshots: "no snapshot on this node",
+  k8cSnapReclaimable: "reclaimable",
+  k8cSnapShared: "on disk, shared links included",
+  k8cSnapTables: "tables",
+  k8cSnapNoDate: "date not reported by this node",
+  k8cSnapTotal: "reclaimable by clearing everything (links still shared give nothing back)",
+  k8cSnapPartial: "at least one file could not be measured: sizes are floors",
+  k8cRepairs: "Scheduled repairs (reaper)",
+  k8cLblMedusa: "Medusa",
+  k8cLblConditions: "Conditions",
+  k8cLblRing: "Ring",
+  k8cLblVolumes: "Volumes",
+  k8cLblRuns: "runs",
+  k8cLblCoverage: "coverage",
+  k8cLblDuration: "duration",
+  k8cLblExpected: "expected nodes",
+  k8cLblFinished: "finished",
+  k8cLblFailed: "failed",
+  k8cLblInProgress: "in progress",
+  k8cLblCatalogued: "in catalogue",
+  k8cLblService: "service",
+  k8cLblObjects: "objects",
+  k8cRingNotRead: "management API unreachable — state not read",
+  k8cNoMedusa: "no medusa",
+  k8cUnknown: "unknown",
+  k8cNever: "never",
+  k8cAgo: "{age} ago",
+  k8cIn: "in {age}",
   velLblMaintenance: "maintenance",
   velLblRestores: "restores",
   velLblFailedVolumes: "failed volumes",

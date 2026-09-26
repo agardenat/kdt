@@ -10,6 +10,21 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 
 ## [Non publié]
 
+- **feat(web)** — la vue **K8ssandra** rejoint kdt-web, avec les trois mondes du TUI : ring,
+  sauvegardes Medusa, opérations. Mêmes colonnes (`NAMESPACE NAME KIND STATE INFO DUR AGE ALERT`),
+  mêmes verdicts : un run partiel est un échec, l'âge de la dernière sauvegarde qui couvre tous les
+  nodes est dans la barre, et les constats du cluster (aucune sauvegarde restaurable, schémas
+  divergents, ring non lu) ont leur ligne. Le panneau du haut ouvre à la demande le log du container
+  qui explique la ligne, `tpstats`/`compactionstats`/`netstats` et les snapshots d'un node, les
+  repairs d'un Reaper et la sortie d'un Job `nodetool`. Le menu d'une ligne porte les écritures du
+  TUI — run immédiat, restauration d'une sauvegarde complète (nom du backup à retaper), tâches Medusa
+  et cass-operator, `nodetool` — relues et bâties côté serveur à partir de la ligne.
+
+- **refactor(k8ssandra)** — le modèle de lignes de la vue (`K8cRow`, `build_k8c_rows`), ses états,
+  ses actions et ses enregistrements quittent `ui.rs` pour `kdt::k8ssandra` : le TUI et kdt-web
+  parcourent le même arbre. La liste blanche de la saisie `nodetool` vit avec le Job qu'elle protège
+  et se vérifie aussi sur une ligne entière.
+
 - **feat(web)** — la vue NetPol de kdt-web devient la vue **Réseau**, avec les trois mondes du TUI :
   Services, Ingress, policies. Services : `TYPE`, `CLUSTER-IP`, `EXTERNAL-IP`, `PORTS`,
   `ENDPOINTS` prêts/total, et une case pour ranger sous chaque Service les pods de ses
