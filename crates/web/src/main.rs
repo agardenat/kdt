@@ -12,6 +12,7 @@ mod ai;
 mod api;
 mod auth;
 mod capacity;
+mod argocd;
 mod certs;
 mod cluster;
 mod config;
@@ -231,6 +232,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/rbac", get(rbac::list))
         .route("/api/v1/rancher", get(rancher::list))
         .route("/api/v1/rancher/write", post(rancher::write))
+        .route("/api/v1/argocd", get(argocd::list))
+        // Les trois écritures du TUI sur une Application — refresh, sync, terminate —, rien sur un
+        // set, un project ou un Secret de dépôt : ceux-là se changent là où ils sont déclarés.
+        .route("/api/v1/argocd/write", post(argocd::write))
         .route("/api/v1/kyverno", get(kyverno::list))
         // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
         // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.

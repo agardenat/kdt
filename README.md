@@ -720,10 +720,19 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-sept vues
-répondent — évènements, workloads, nodes, Flux, Velero, K8ssandra, capacité, stockage,
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-huit vues
+répondent — évènements, workloads, nodes, Flux, Argo CD, Velero, K8ssandra, capacité, stockage,
 Secrets/ConfigMaps, certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks, diagnostic — avec
 les cinq gestes qui portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
+
+**La vue Argo CD** porte les quatre mondes de `:argocd` / `:appsets` / `:appprojects` /
+`:argorepos` : Applications, ApplicationSets, AppProjects, dépôts et clusters enregistrés (des
+`Secret` étiquetés, que la ligne désigne comme tels). Mêmes colonnes et mêmes verdicts que le TUI :
+`sync Unknown` en rouge et son health en gris, `automated.enabled: false` lu comme une politique
+manuelle. L'installation — namespace découvert par `argocd-cm`, URL, période de comparaison,
+namespaces honorés, composants — a sa ligne sous la barre, ses constats aussi. Le menu d'une
+Application reprend les écritures de `r` : refresh, hard refresh, sync, sync + prune, et terminate
+pendant une opération ; chacune se confirme, et le serveur relit la phase avant un terminate.
 
 **La vue K8ssandra** porte les trois mondes de `:k8ssandra` / `:medusa` / `:reaper` : le ring
 (clusters, datacenters, nodes), les sauvegardes Medusa (schedules et leurs runs, runs sans schedule,

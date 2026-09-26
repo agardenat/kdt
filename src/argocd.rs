@@ -44,7 +44,7 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
 
-use crate::events::format_age;
+use crate::events::{format_age, hint_record, EventRecord, LineColor};
 use crate::lang::{fill, Strings};
 
 pub use crate::storage::{Hint, HintLevel};
@@ -106,7 +106,7 @@ const IN_CLUSTER_NAME: &str = "in-cluster";
 
 /// One `status.conditions` entry, kept verbatim: Argo CD's condition *types* are the vocabulary an
 /// operator searches the docs with, so they are never rewritten into prose.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoCondition {
     pub kind: String,
     pub message: String,
@@ -124,7 +124,7 @@ impl ArgoCondition {
 }
 
 /// One source of an Application, whether it came from `spec.source` or from `spec.sources`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoSource {
     pub repo_url: String,
     /// The directory inside the repo, for a git source.
@@ -163,7 +163,7 @@ impl ArgoSource {
 }
 
 /// One resource Argo CD tracks for an Application, as `status.resources` reports it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoResource {
     pub group: String,
     pub kind: String,
@@ -192,7 +192,7 @@ impl ArgoResource {
 }
 
 /// One entry of `status.history` — a revision that was actually deployed, with when.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoDeploy {
     pub revision: String,
     pub deployed_at: String,
@@ -200,7 +200,7 @@ pub struct ArgoDeploy {
 }
 
 /// An Argo CD `Application`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoApp {
     pub namespace: String,
     pub name: String,
@@ -277,7 +277,7 @@ impl ArgoApp {
 }
 
 /// An Argo CD `ApplicationSet`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoAppSet {
     pub namespace: String,
     pub name: String,
@@ -301,7 +301,7 @@ pub struct ArgoAppSet {
 }
 
 /// One `spec.roles` entry of an AppProject: a token-or-group scoped set of policies.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoRole {
     pub name: String,
     pub groups: Vec<String>,
@@ -311,7 +311,7 @@ pub struct ArgoRole {
 }
 
 /// An Argo CD `AppProject`: what a set of Applications is allowed to deploy, from where, to where.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoProject {
     pub namespace: String,
     pub name: String,
@@ -339,13 +339,15 @@ pub struct ArgoProject {
 }
 
 /// Which kind of Secret an endpoint row came from.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EndpointKind {
     Cluster,
     #[default]
     Repo,
     /// A credentials *template*: it holds no url of its own to deploy from, it lends its
     /// authentication to every repository whose url starts with its prefix.
+    #[serde(rename = "creds")]
     RepoCreds,
 }
 
@@ -361,7 +363,7 @@ impl EndpointKind {
 
 /// A registered repository, credentials template or cluster. Built from the Secret's *addressing*
 /// keys and from which credential keys exist — never from what those keys hold.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoEndpoint {
     pub kind: EndpointKind,
     pub namespace: String,
@@ -392,7 +394,7 @@ pub struct ArgoEndpoint {
 }
 
 /// One Argo CD component, as its Deployment/StatefulSet reports it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoComponent {
     pub name: String,
     pub ready: i32,
@@ -402,7 +404,7 @@ pub struct ArgoComponent {
 }
 
 /// The installation itself, as the view's headline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoServer {
     /// The `argoproj.io` CRDs are served here.
     pub present: bool,
@@ -424,7 +426,7 @@ pub struct ArgoServer {
 
 // --- State ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArgoState {
     pub server: ArgoServer,
     pub apps: Vec<ArgoApp>,
@@ -474,7 +476,15 @@ pub async fn fetch_argocd(client: Client, state: SharedArgo) {
         s.loading = true;
         s.error = None;
     }
+    let next = argocd_inventory(&client, st).await;
+    *state.lock().expect("argocd poisoned") = next;
+}
 
+/// The whole view, returned rather than deposited in a shared state: kdt-web answers a request with
+/// it, the TUI's `fetch_argocd` is only the layer that stores it. The strings are a parameter because
+/// a server answering several people has no process-wide language.
+pub async fn argocd_inventory(client: &Client, st: &'static Strings) -> ArgoState {
+    let client = client.clone();
     let kinds = [KIND_APP, KIND_APPSET, KIND_PROJECT];
     let probes = kinds.iter().map(|kind| {
         let client = client.clone();
@@ -489,13 +499,11 @@ pub async fn fetch_argocd(client: Client, state: SharedArgo) {
     let resolved: Vec<_> = futures::future::join_all(probes).await.into_iter().flatten().collect();
 
     if resolved.is_empty() {
-        let mut s = state.lock().expect("argocd poisoned");
-        *s = ArgoState {
+        return ArgoState {
             loading: false,
             error: Some(st.argo_absent.to_string()),
             ..ArgoState::default()
         };
-        return;
     }
 
     let lists = resolved.iter().map(|(kind, ar)| {
@@ -534,7 +542,7 @@ pub async fn fetch_argocd(client: Client, state: SharedArgo) {
         next.error = Some(e);
     }
     next.loading = false;
-    *state.lock().expect("argocd poisoned") = next;
+    next
 }
 
 /// The Secrets Argo CD uses as repositories, credential templates and clusters. Listed by label so
@@ -1605,6 +1613,294 @@ fn ns_matches(pattern: &str, ns: &str) -> bool {
         Some(prefix) => ns.starts_with(prefix),
         None => pattern == ns,
     }
+}
+
+// --- Verdicts ------------------------------------------------------------------------------------
+//
+// What each cell of the four tables says about the cluster, decided once for both interfaces: the
+// TUI paints these tones, kdt-web serialises them. Neither re-derives them.
+
+/// Green means "compared and equal", and nothing else. `Unknown` is the one that has to stand out:
+/// it is the state a reader mistakes for "probably fine".
+pub fn sync_tone(sync: &str) -> LineColor {
+    match sync {
+        "Synced" => LineColor::Ok,
+        "OutOfSync" => LineColor::Warn,
+        "Unknown" => LineColor::Err,
+        _ => LineColor::Dim,
+    }
+}
+
+/// A finished operation is background; one in flight, one being stopped and one that failed are not.
+pub fn phase_tone(phase: &str) -> LineColor {
+    match phase {
+        "Running" => LineColor::Info,
+        "Terminating" => LineColor::Warn,
+        "Failed" | "Error" => LineColor::Err,
+        _ => LineColor::Dim,
+    }
+}
+
+impl ArgoApp {
+    /// The health of an app whose comparison is broken is a memory, not a measurement: it is dim
+    /// whatever it says, so a stale `Healthy` never reads as a green light.
+    pub fn health_tone(&self) -> LineColor {
+        if self.comparison_broken() {
+            return LineColor::Dim;
+        }
+        match self.health.as_str() {
+            "Healthy" => LineColor::Ok,
+            "Progressing" => LineColor::Info,
+            "Degraded" => LineColor::Err,
+            "Missing" | "Suspended" => LineColor::Warn,
+            _ => LineColor::Dim,
+        }
+    }
+
+    /// Auto-sync is the norm on most installs, so it reads as background; a manual policy is the
+    /// exception and is the one that gets a colour.
+    pub fn policy_tone(&self) -> LineColor {
+        if self.auto { LineColor::Dim } else { LineColor::Warn }
+    }
+
+    /// `cluster/namespace`, the way the DESTINATION column and the search both read it.
+    pub fn destination_label(&self) -> String {
+        format!("{}/{}", self.dest_label, self.dest_namespace)
+    }
+
+    /// The OPERATION cell: the last phase and how long ago, or a dash when none ever ran.
+    pub fn operation_label(&self) -> String {
+        if self.op_phase.is_empty() {
+            "—".to_string()
+        } else if self.op_age.is_empty() {
+            self.op_phase.clone()
+        } else {
+            format!("{} {}", self.op_phase, self.op_age)
+        }
+    }
+
+    /// What a sync would move to, named before it runs: an app whose revision is a branch and an app
+    /// pinned to a tag do not mean the same thing by "sync".
+    pub fn sync_target(&self) -> String {
+        self.sources
+            .first()
+            .map(|s| s.target_revision.clone())
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// Only the resources that are not in the expected state: a list of forty Synced/Healthy rows is
+    /// exactly the noise the detail panel exists to remove.
+    pub fn resources_off(&self) -> impl Iterator<Item = &ArgoResource> {
+        self.resources.iter().filter(|r| r.is_off())
+    }
+}
+
+impl ArgoResource {
+    pub fn is_off(&self) -> bool {
+        self.sync == "OutOfSync" || matches!(self.health.as_str(), "Degraded" | "Missing")
+    }
+
+    /// What is wrong with it, in Argo CD's own words: the sync status, the health, the pending prune.
+    pub fn marks(&self) -> Vec<String> {
+        let mut marks: Vec<String> = Vec::new();
+        if !self.sync.is_empty() && self.sync != "Synced" {
+            marks.push(self.sync.clone());
+        }
+        if !self.health.is_empty() && self.health != "Healthy" {
+            marks.push(self.health.clone());
+        }
+        if self.requires_pruning {
+            marks.push("prune".to_string());
+        }
+        marks
+    }
+}
+
+impl ArgoAppSet {
+    /// `ErrorOccurred=True` is the one condition that means the set stopped generating.
+    pub fn errored(&self) -> bool {
+        self.conditions.iter().any(|c| c.kind == "ErrorOccurred" && c.status == "True")
+    }
+
+    /// The STATE cell.
+    pub fn state(&self) -> (&'static str, LineColor) {
+        if self.errored() {
+            ("ErrorOccurred", LineColor::Err)
+        } else {
+            ("ok", LineColor::Ok)
+        }
+    }
+
+    /// `applicationsSync` as it behaves: unset means full sync of the generated Applications.
+    pub fn policy_label(&self) -> String {
+        if self.apps_sync.is_empty() { "sync".to_string() } else { self.apps_sync.clone() }
+    }
+}
+
+impl ArgoProject {
+    /// Roles granting a verb that writes.
+    pub fn writers(&self) -> usize {
+        self.roles.iter().filter(|r| r.writes).count()
+    }
+
+    /// A `*` is not a count: a project that allows every repository is shown as allowing everything,
+    /// because that is the fact one comes here to check.
+    pub fn repos_cell(&self) -> (String, LineColor) {
+        if self.open_sources {
+            ("*".to_string(), LineColor::Warn)
+        } else {
+            (self.source_repos.len().to_string(), LineColor::Plain)
+        }
+    }
+
+    pub fn destinations_cell(&self) -> (String, LineColor) {
+        if self.open_destinations {
+            ("*/*".to_string(), LineColor::Warn)
+        } else {
+            (self.destinations.len().to_string(), LineColor::Plain)
+        }
+    }
+
+    /// A role that can sync or delete is not the same object as a read-only one, and the role count
+    /// alone does not say which it is.
+    pub fn roles_cell(&self) -> (String, LineColor) {
+        let writers = self.writers();
+        if self.roles.is_empty() {
+            ("·".to_string(), LineColor::Dim)
+        } else if writers > 0 {
+            (format!("{} ({}w)", self.roles.len(), writers), LineColor::Info)
+        } else {
+            (self.roles.len().to_string(), LineColor::Plain)
+        }
+    }
+}
+
+impl ArgoEndpoint {
+    /// A cluster restricted to a few namespaces behaves nothing like an unrestricted one, and the
+    /// difference is invisible in the Argo CD UI. For a repository the cell says whether it is OCI.
+    pub fn scope_cell(&self) -> (String, LineColor) {
+        match (self.kind, self.namespaces.is_empty()) {
+            (EndpointKind::Cluster, false) => {
+                (format!("{} ns", self.namespaces.len()), LineColor::Warn)
+            }
+            (EndpointKind::Cluster, true) => ("all".to_string(), LineColor::Dim),
+            _ if self.oci => ("oci".to_string(), LineColor::Info),
+            _ => ("·".to_string(), LineColor::Dim),
+        }
+    }
+
+    pub fn auth_tone(&self) -> LineColor {
+        if self.auth == "none" { LineColor::Warn } else { LineColor::Dim }
+    }
+}
+
+impl ArgoComponent {
+    /// The same threshold as the server hint it feeds: none ready is down, fewer than asked is
+    /// degraded.
+    pub fn tone(&self) -> LineColor {
+        if self.ready >= self.desired {
+            LineColor::Ok
+        } else if self.ready == 0 {
+            LineColor::Err
+        } else {
+            LineColor::Warn
+        }
+    }
+}
+
+impl ArgoState {
+    pub fn endpoints_of(&self, kind: EndpointKind) -> usize {
+        self.endpoints.iter().filter(|e| e.kind == kind).count()
+    }
+}
+
+/// The Argo CD install as every title names it: what it is and where, so an empty list reads as
+/// "nothing is declared" rather than as "nothing was read". A rebuilt image labels itself with its
+/// branch, and a branch shown where a version goes reads as one: only a version number reaches it.
+pub fn install_label(server: &ArgoServer, st: &'static Strings) -> String {
+    if !server.present {
+        return st.argo_absent.to_string();
+    }
+    let ns = if server.namespace.is_empty() { "?" } else { server.namespace.as_str() };
+    if looks_like_a_version(&server.version) {
+        fill(st.argo_install, &[("version", &server.version), ("ns", ns)])
+    } else {
+        fill(st.argo_install_plain, &[("ns", ns)])
+    }
+}
+
+// --- Records -------------------------------------------------------------------------------------
+//
+// Each row stands in for its real object through apiVersion/kind/name, so the shared gestures (YAML,
+// edit, touch, delete, the AI panel) and the search work on it with no code of their own.
+
+/// The message is what the AI panel and the search read, so it carries the two words that decide
+/// everything — sync and health — plus where the app deploys and what it deploys from. The search
+/// then finds an Application from a repository url or from a destination namespace, which is how
+/// one arrives here from a ticket.
+pub fn app_record(a: &ArgoApp, st: &'static Strings) -> EventRecord {
+    let mut parts = vec![format!("{} / {}", a.sync, a.health)];
+    parts.push(format!("{}={}", st.argo_lbl_project, a.project));
+    parts.push(format!("{} {}/{}", st.argo_lbl_destination, a.dest_label, a.dest_namespace));
+    for s in &a.sources {
+        parts.push(s.label());
+    }
+    if !a.op_phase.is_empty() {
+        parts.push(format!("{} {}", st.argo_lbl_operation, a.op_phase));
+    }
+    hint_record(
+        &a.uid,
+        API_ARGO,
+        KIND_APP,
+        &a.namespace,
+        &a.name,
+        if a.sync.is_empty() { "Application" } else { &a.sync },
+        parts.join(" · "),
+        &a.hints,
+    )
+}
+
+pub fn set_record(s: &ArgoAppSet, st: &'static Strings) -> EventRecord {
+    let message = format!(
+        "{} {} · {} {}",
+        st.argo_lbl_generators,
+        if s.generators.is_empty() { "—".to_string() } else { s.generators.join(",") },
+        s.apps.len(),
+        st.argo_lbl_apps,
+    );
+    hint_record(&s.uid, API_ARGO, KIND_APPSET, &s.namespace, &s.name, "ApplicationSet", message, &s.hints)
+}
+
+pub fn project_record(p: &ArgoProject, st: &'static Strings) -> EventRecord {
+    let mut message = format!("{} {}", p.apps, st.argo_lbl_apps);
+    if !p.description.is_empty() {
+        message.push_str(" · ");
+        message.push_str(&p.description);
+    }
+    if !p.source_repos.is_empty() {
+        message.push_str(&format!(" · {} {}", st.argo_lbl_repos, p.source_repos.join(",")));
+    }
+    hint_record(&p.uid, API_ARGO, KIND_PROJECT, &p.namespace, &p.name, "AppProject", message, &p.hints)
+}
+
+/// An endpoint row stands in for its Secret, because that is the object the YAML view, the editor
+/// and the deletion have to open: Argo CD has no CRD for a repository.
+pub fn endpoint_record(e: &ArgoEndpoint, st: &'static Strings) -> EventRecord {
+    let message = format!(
+        "{} · {} {} · {} {}",
+        e.url, st.argo_lbl_auth, e.auth, e.used_by, st.argo_lbl_apps,
+    );
+    hint_record(&e.uid, "v1", "Secret", &e.namespace, &e.secret, e.kind.label(), message, &e.hints)
+}
+
+/// The phase of the operation an Application is running right now, read afresh. A write asked for
+/// from a page is replayed against this, not against the page's memory of it: between the two
+/// requests the operation may have finished.
+pub async fn operation_phase(client: &Client, namespace: &str, name: &str) -> Result<String, String> {
+    let api = crate::yaml::dynamic_api(client, API_ARGO, KIND_APP, namespace).await?;
+    let obj = api.get(name).await.map_err(crate::edit::api_error_text)?;
+    Ok(str_at(obj.data.get("status"), &["operationState", "phase"]))
 }
 
 // --- Writes --------------------------------------------------------------------------------------

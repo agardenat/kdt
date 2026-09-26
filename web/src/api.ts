@@ -62,6 +62,7 @@ import type {
   IssuedToken,
   ObjectYaml,
   RancherPayload,
+  ArgoPayload,
   StatusPayload,
   WorkloadRow,
   WorkloadsPayload,
@@ -467,6 +468,23 @@ export function identityWrite(
   lang: Lang,
 ): Promise<IdentityWriteResult> {
   return send<IdentityWriteResult>("/api/v1/identity/write", { ...request, lang });
+}
+
+/** Les quatre mondes de la vue Argo CD, en une lecture. */
+export function argocdInventory(lang: Lang): Promise<ArgoPayload> {
+  return get<ArgoPayload>(`/api/v1/argocd?lang=${encodeURIComponent(lang)}`);
+}
+
+/**
+ * Une écriture sur une Application : `refresh` (`hard` ou non), `sync` (`prune` ou non),
+ * `terminate`. Le serveur relit la phase avant un `terminate` : la page a pu voir une opération
+ * qui s'est terminée depuis.
+ */
+export function argocdWrite(
+  request: Record<string, unknown>,
+  lang: Lang,
+): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/argocd/write", { ...request, lang });
 }
 
 /** Les quatre mondes de la vue Rancher, en une lecture. */

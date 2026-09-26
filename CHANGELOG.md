@@ -10,6 +10,22 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 
 ## [Non publié]
 
+- **feat(web)** — la vue **Argo CD** rejoint kdt-web, avec les quatre mondes du TUI : Applications,
+  ApplicationSets, AppProjects, dépôts et clusters. Mêmes colonnes, mêmes verdicts : `sync Unknown`
+  en rouge et le health qu'il rend périmé en gris, jamais en vert ; `automated.enabled: false` lu
+  comme une politique manuelle ; un project ouvert à tout se lit `*` et `*/*`. L'installation
+  (namespace découvert, UI, période de comparaison, namespaces honorés, composants) a sa bande sous
+  la barre, et ses constats — controller à terre, Applications que rien ne pilote — leur ligne. Le
+  menu d'une Application porte refresh, hard refresh, sync, sync + prune et, pendant une opération,
+  terminate ; le serveur relit la phase avant d'arrêter quoi que ce soit.
+
+- **refactor(argocd)** — les tons, cellules dérivées et enregistrements de la vue quittent `ui.rs`
+  pour `kdt::argocd`, et `fetch_argocd` n'est plus que la couche qui dépose `argocd_inventory` :
+  le TUI et kdt-web rendent le même verdict de la même Application.
+
+- **fix(web)** — l'avertissement d'une confirmation de menu (`sync + prune`, révocation d'une session
+  Rancher) s'affichait dans le gris des autres paragraphes ; il reprend la couleur d'avertissement.
+
 - **feat(web)** — la vue **K8ssandra** rejoint kdt-web, avec les trois mondes du TUI : ring,
   sauvegardes Medusa, opérations. Mêmes colonnes (`NAMESPACE NAME KIND STATE INFO DUR AGE ALERT`),
   mêmes verdicts : un run partiel est un échec, l'âge de la dernière sauvegarde qui couvre tous les

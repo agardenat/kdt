@@ -826,6 +826,43 @@ export interface Strings {
   nsDenied: string;
   nsNoMatch: string;
   nsAdd: string;
+  argoApps: string;
+  argoSets: string;
+  argoProjects: string;
+  argoRepos: string;
+  argoDetail: string;
+  argoEmpty: string;
+  argoScopeless: string;
+  argoOutOfSync: string;
+  argoBlind: string;
+  argoUnhealthy: string;
+  argoRefresh: string;
+  argoRefreshHelp: string;
+  argoHardRefresh: string;
+  argoHardRefreshHelp: string;
+  argoSync: string;
+  argoSyncHelp: string;
+  argoSyncPrune: string;
+  argoSyncPruneHelp: string;
+  argoTerminate: string;
+  argoTerminateHelp: string;
+  argoOpRunning: string;
+  argoConfirm: string;
+  argoCancel: string;
+  argoReconciled: string;
+  argoOperation: string;
+  argoRenderedBy: string;
+  argoHistory: string;
+  argoStrategy: string;
+  argoNature: string;
+  argoUsedBy: string;
+  argoPeriod: string;
+  argoComponents: string;
+  argoVersionLabel: string;
+  argoAllExpected: string;
+  argoMore: string;
+  argoYes: string;
+  argoNo: string;
 }
 
 const FR: Strings = {
@@ -1682,6 +1719,43 @@ const FR: Strings = {
   nsDenied: "Lister les namespaces vous est refusé : tapez le nom, il sera pris tel quel.",
   nsNoMatch: "aucun namespace ne correspond",
   nsAdd: "ajouter tel quel",
+  argoApps: "Applications",
+  argoSets: "ApplicationSets",
+  argoProjects: "AppProjects",
+  argoRepos: "Repos",
+  argoDetail: "Détail",
+  argoEmpty: "Rien à afficher dans ce monde.",
+  argoScopeless: "Les Applications vivent dans le namespace du controller, pas dans celui où elles déploient : la portée de namespace ne s'y applique pas.",
+  argoOutOfSync: "Applications OutOfSync",
+  argoBlind: "sans comparaison : leur health est périmé",
+  argoUnhealthy: "en échec (Degraded/Missing)",
+  argoRefresh: "Refresh",
+  argoRefreshHelp: "Annote l'Application pour que le controller relise ses sources tout de suite.",
+  argoHardRefresh: "Hard refresh",
+  argoHardRefreshHelp: "Relit les sources après avoir jeté le cache de manifests rendus.",
+  argoSync: "Sync",
+  argoSyncHelp: "Demande une synchro vers {revision}, sans prune.",
+  argoSyncPrune: "Sync + prune",
+  argoSyncPruneHelp: "Demande une synchro avec prune : ce que git ne contient plus sera supprimé du cluster.",
+  argoTerminate: "Terminate",
+  argoTerminateHelp: "Arrête l'opération en cours ({phase}, {age}).",
+  argoOpRunning: "Opération en cours depuis {age}.",
+  argoConfirm: "Lancer",
+  argoCancel: "Annuler",
+  argoReconciled: "comparé",
+  argoOperation: "opération",
+  argoRenderedBy: "rendu par",
+  argoHistory: "historique",
+  argoStrategy: "stratégie",
+  argoNature: "nature",
+  argoUsedBy: "utilisé par",
+  argoPeriod: "période",
+  argoComponents: "composants",
+  argoVersionLabel: "label version",
+  argoAllExpected: "tout est dans l'état attendu.",
+  argoMore: "… et {n} de plus",
+  argoYes: "oui",
+  argoNo: "non",
 };
 
 const EN: Strings = {
@@ -2530,6 +2604,43 @@ const EN: Strings = {
   nsDenied: "Listing namespaces is denied to you: type the name, it will be taken as is.",
   nsNoMatch: "no namespace matches",
   nsAdd: "add as typed",
+  argoApps: "Applications",
+  argoSets: "ApplicationSets",
+  argoProjects: "AppProjects",
+  argoRepos: "Repos",
+  argoDetail: "Detail",
+  argoEmpty: "Nothing to show in this world.",
+  argoScopeless: "Applications live in the controller's namespace, not where they deploy: the namespace scope does not apply.",
+  argoOutOfSync: "Applications OutOfSync",
+  argoBlind: "not compared: their health is stale",
+  argoUnhealthy: "unhealthy (Degraded/Missing)",
+  argoRefresh: "Refresh",
+  argoRefreshHelp: "Annotates the Application so the controller re-reads its sources right away.",
+  argoHardRefresh: "Hard refresh",
+  argoHardRefreshHelp: "Re-reads the sources after throwing the rendered-manifest cache away.",
+  argoSync: "Sync",
+  argoSyncHelp: "Requests a sync to {revision}, without prune.",
+  argoSyncPrune: "Sync + prune",
+  argoSyncPruneHelp: "Requests a sync with prune: whatever git no longer holds is deleted from the cluster.",
+  argoTerminate: "Terminate",
+  argoTerminateHelp: "Stops the operation in flight ({phase}, {age}).",
+  argoOpRunning: "Operation running for {age}.",
+  argoConfirm: "Run",
+  argoCancel: "Cancel",
+  argoReconciled: "compared",
+  argoOperation: "operation",
+  argoRenderedBy: "rendered by",
+  argoHistory: "history",
+  argoStrategy: "strategy",
+  argoNature: "kind",
+  argoUsedBy: "used by",
+  argoPeriod: "period",
+  argoComponents: "components",
+  argoVersionLabel: "version label",
+  argoAllExpected: "everything is in the expected state.",
+  argoMore: "… and {n} more",
+  argoYes: "yes",
+  argoNo: "no",
 };
 
 export function strings(lang: Lang): Strings {

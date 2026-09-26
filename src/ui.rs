@@ -9586,6 +9586,7 @@ impl App {
     // panel without any code of its own.
     fn refresh_argo_snapshot(&mut self) {
         let s = self.argo_state.lock().expect("argocd poisoned").clone();
+        let st = lang::active();
         let problems_only = self.argo_filter == StoFilter::Problems;
         let worse = |hints: &[crate::storage::Hint]| {
             hints.iter().any(|h| h.level >= StoHintLevel::Warn)
@@ -9596,25 +9597,25 @@ impl App {
         match self.argo_world {
             ArgoWorld::Apps => {
                 for a in s.apps.iter().filter(|a| !problems_only || worse(&a.hints)) {
-                    recs.push(argo_app_record(a));
+                    recs.push(crate::argocd::app_record(a, st));
                     rows.push(ArgoRow::App(Box::new(a.clone())));
                 }
             }
             ArgoWorld::Sets => {
                 for x in s.sets.iter().filter(|x| !problems_only || worse(&x.hints)) {
-                    recs.push(argo_set_record(x));
+                    recs.push(crate::argocd::set_record(x, st));
                     rows.push(ArgoRow::Set(Box::new(x.clone())));
                 }
             }
             ArgoWorld::Projects => {
                 for x in s.projects.iter().filter(|x| !problems_only || worse(&x.hints)) {
-                    recs.push(argo_project_record(x));
+                    recs.push(crate::argocd::project_record(x, st));
                     rows.push(ArgoRow::Project(Box::new(x.clone())));
                 }
             }
             ArgoWorld::Repos => {
                 for x in s.endpoints.iter().filter(|x| !problems_only || worse(&x.hints)) {
-                    recs.push(argo_endpoint_record(x));
+                    recs.push(crate::argocd::endpoint_record(x, st));
                     rows.push(ArgoRow::Endpoint(Box::new(x.clone())));
                 }
             }
@@ -9707,13 +9708,7 @@ impl App {
         ];
         // What a sync would move to, named before it runs: an app whose revision is a branch and an
         // app pinned to a tag do not mean the same thing by "sync".
-        let target = app
-            .sources
-            .first()
-            .map(|s| {
-                if s.target_revision.is_empty() { "HEAD".to_string() } else { s.target_revision.clone() }
-            })
-            .unwrap_or_else(|| "HEAD".to_string());
+        let target = app.sync_target();
         items.push(ActionItem {
             label: st.k_argo_sync,
             desc: lang::fill(st.desc_argo_sync, &[("revision", &target)]),
@@ -18709,202 +18704,39 @@ fn draw_netpol_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 // account is a warning, an account with no access at all is not.
 // --- Argo CD view rendering -----------------------------------------------------------------------
 
-fn argo_severity(hints: &[crate::storage::Hint]) -> Severity {
-    match hints.iter().map(|h| h.level).max() {
-        Some(StoHintLevel::Danger) | Some(StoHintLevel::Warn) => Severity::Warning,
-        _ => Severity::Normal,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn argo_record(
-    uid: &str,
-    kind: &str,
-    namespace: &str,
-    name: &str,
-    reason: &str,
-    message: String,
-    hints: &[crate::storage::Hint],
-) -> EventRecord {
-    EventRecord {
-        uid: uid.to_string(),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: argo_severity(hints),
-        reason: reason.to_string(),
-        api_version: crate::argocd::API_ARGO.to_string(),
-        kind: kind.to_string(),
-        namespace: namespace.to_string(),
-        name: name.to_string(),
-        message,
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-// The message is what the AI panel and the search read, so it carries the two words that decide
-// everything — sync and health — plus where the app deploys and what it deploys from. `/` then finds
-// an Application from a repository url or from a destination namespace, which is how one arrives
-// here from a ticket.
-fn argo_app_record(a: &ArgoApp) -> EventRecord {
-    let st = lang::active();
-    let mut parts = vec![format!("{} / {}", a.sync, a.health)];
-    parts.push(format!("{}={}", st.argo_lbl_project, a.project));
-    parts.push(format!("{} {}/{}", st.argo_lbl_destination, a.dest_label, a.dest_namespace));
-    for s in &a.sources {
-        parts.push(s.label());
-    }
-    if !a.op_phase.is_empty() {
-        parts.push(format!("{} {}", st.argo_lbl_operation, a.op_phase));
-    }
-    argo_record(
-        &a.uid,
-        crate::argocd::KIND_APP,
-        &a.namespace,
-        &a.name,
-        if a.sync.is_empty() { "Application" } else { &a.sync },
-        parts.join(" · "),
-        &a.hints,
-    )
-}
-
-fn argo_set_record(s: &ArgoAppSet) -> EventRecord {
-    let st = lang::active();
-    let message = format!(
-        "{} {} · {} {}",
-        st.argo_lbl_generators,
-        if s.generators.is_empty() { "—".to_string() } else { s.generators.join(",") },
-        s.apps.len(),
-        st.argo_lbl_apps,
-    );
-    argo_record(
-        &s.uid,
-        crate::argocd::KIND_APPSET,
-        &s.namespace,
-        &s.name,
-        "ApplicationSet",
-        message,
-        &s.hints,
-    )
-}
-
-fn argo_project_record(p: &ArgoProject) -> EventRecord {
-    let st = lang::active();
-    let mut message = format!("{} {}", p.apps, st.argo_lbl_apps);
-    if !p.description.is_empty() {
-        message.push_str(" · ");
-        message.push_str(&p.description);
-    }
-    if !p.source_repos.is_empty() {
-        message.push_str(&format!(" · {} {}", st.argo_lbl_repos, p.source_repos.join(",")));
-    }
-    argo_record(
-        &p.uid,
-        crate::argocd::KIND_PROJECT,
-        &p.namespace,
-        &p.name,
-        "AppProject",
-        message,
-        &p.hints,
-    )
-}
-
-// An endpoint row stands in for its Secret, because that is the object `y`, `e` and `Ctrl-D` have to
-// open: Argo CD has no CRD for a repository.
-fn argo_endpoint_record(e: &ArgoEndpoint) -> EventRecord {
-    let st = lang::active();
-    let message = format!(
-        "{} · {} {} · {} {}",
-        e.url,
-        st.argo_lbl_auth,
-        e.auth,
-        e.used_by,
-        st.argo_lbl_apps,
-    );
-    argo_record(
-        &e.uid,
-        "Secret",
-        &e.namespace,
-        &e.secret,
-        e.kind.label(),
-        message,
-        &e.hints,
-    )
-    .with_api_version("v1")
-}
-
-impl EventRecord {
-    // An endpoint row is a core/v1 Secret, not an argoproj.io object: the shared YAML machinery
-    // resolves the kind through this field and would look for the wrong resource otherwise.
-    fn with_api_version(mut self, v: &str) -> Self {
-        self.api_version = v.to_string();
-        self
-    }
-}
-
-// The Argo CD install as every title names it: what it is and where, so an empty list reads as
-// "nothing is declared" rather than as "nothing was read".
 fn argo_install_label(app: &App, server: &crate::argocd::ArgoServer) -> String {
-    let st = lang::t(app.ai_language);
-    if !server.present {
-        return st.argo_absent.to_string();
-    }
-    let ns = if server.namespace.is_empty() { "?" } else { server.namespace.as_str() };
-    // A rebuilt image labels itself with its branch, and a branch shown where a version goes reads
-    // as one. The raw label stays available in the panel; only a version number reaches the title.
-    if crate::argocd::looks_like_a_version(&server.version) {
-        lang::fill(st.argo_install, &[("version", &server.version), ("ns", ns)])
-    } else {
-        lang::fill(st.argo_install_plain, &[("ns", ns)])
+    crate::argocd::install_label(server, lang::t(app.ai_language))
+}
+
+// The tones are `kdt::argocd`'s; the one local nuance is the orange of an OutOfSync app and of a
+// Missing one — a warning that is not the yellow of a manual policy or a suspended app.
+fn argo_warm(tone: LineColor, orange: bool) -> Style {
+    match tone {
+        LineColor::Warn if orange => {
+            Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)
+        }
+        other => line_color_to_style(other),
     }
 }
 
-// Green means "compared and equal", and nothing else. `Unknown` is the one that has to stand out:
-// it is the state a reader mistakes for "probably fine".
 fn argo_sync_style(sync: &str) -> Style {
-    match sync {
-        "Synced" => Style::default().fg(Color::Green),
-        "OutOfSync" => Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD),
-        "Unknown" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(DIM),
-    }
+    argo_warm(crate::argocd::sync_tone(sync), true)
 }
 
-// The health of an app whose comparison is broken is a memory, not a measurement: it is shown dim
-// whatever it says, so a stale `Healthy` never reads as a green light.
 fn argo_health_style(a: &ArgoApp) -> Style {
-    if a.comparison_broken() {
-        return Style::default().fg(DIM);
-    }
-    match a.health.as_str() {
-        "Healthy" => Style::default().fg(Color::Green),
-        "Progressing" => Style::default().fg(Color::Cyan),
-        "Degraded" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "Missing" => Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD),
-        "Suspended" => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(DIM),
-    }
+    argo_warm(a.health_tone(), a.health == "Missing")
 }
 
 fn argo_phase_style(phase: &str) -> Style {
-    match phase {
-        "Succeeded" => Style::default().fg(DIM),
-        "Running" => Style::default().fg(Color::Cyan),
-        "Terminating" => Style::default().fg(Color::Yellow),
-        "Failed" | "Error" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(DIM),
-    }
+    line_color_to_style(crate::argocd::phase_tone(phase))
 }
 
-// Auto-sync is the norm on most installs, so it reads as background; a manual policy is the
-// exception and is the one that gets a colour.
 fn argo_policy_cell(a: &ArgoApp) -> Cell<'static> {
-    let label = a.policy_label();
-    if a.auto {
-        Cell::from(label).style(Style::default().fg(DIM))
-    } else {
-        Cell::from(label).style(Style::default().fg(Color::Yellow))
-    }
+    Cell::from(a.policy_label()).style(line_color_to_style(a.policy_tone()))
+}
+
+fn argo_tone_span((text, tone): (String, LineColor)) -> Span<'static> {
+    Span::styled(text, line_color_to_style(tone))
 }
 
 // The counters the four titles are built from, read under one lock.
@@ -19052,17 +18884,8 @@ fn argo_table_parts(
                                 Style::default().fg(Color::Rgb(255, 140, 0)),
                             )
                         };
-                        let dest = elide_middle(
-                            &format!("{}/{}", a.dest_label, a.dest_namespace),
-                            dest_w,
-                        );
-                        let op = if a.op_phase.is_empty() {
-                            "—".to_string()
-                        } else if a.op_age.is_empty() {
-                            a.op_phase.clone()
-                        } else {
-                            format!("{} {}", a.op_phase, a.op_age)
-                        };
+                        let dest = elide_middle(&a.destination_label(), dest_w);
+                        let op = a.operation_label();
                         Row::new(vec![
                             Cell::from(elide_middle(&a.namespace, ns_w as usize))
                                 .style(Style::default().fg(DIM)),
@@ -19113,17 +18936,9 @@ fn argo_table_parts(
                 .iter()
                 .map(|row| match row {
                     ArgoRow::Set(x) => {
-                        let error = x
-                            .conditions
-                            .iter()
-                            .any(|c| c.kind == "ErrorOccurred" && c.status == "True");
-                        let state = if error { "ErrorOccurred" } else { "ok" };
-                        let state_style = if error {
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Green)
-                        };
-                        let policy = if x.apps_sync.is_empty() { "sync".to_string() } else { x.apps_sync.clone() };
+                        let (state, state_tone) = x.state();
+                        let state_style = line_color_to_style(state_tone);
+                        let policy = x.policy_label();
                         Row::new(vec![
                             Cell::from(elide_middle(&x.namespace, ns_w as usize))
                                 .style(Style::default().fg(DIM)),
@@ -19167,29 +18982,9 @@ fn argo_table_parts(
                 .iter()
                 .map(|row| match row {
                     ArgoRow::Project(x) => {
-                        // A `*` is not a count: a project that allows everything is shown as
-                        // allowing everything, because that is the fact one comes here to check.
-                        let repos = if x.open_sources {
-                            Span::styled("*", Style::default().fg(Color::Yellow))
-                        } else {
-                            Span::raw(x.source_repos.len().to_string())
-                        };
-                        let dests = if x.open_destinations {
-                            Span::styled("*/*", Style::default().fg(Color::Yellow))
-                        } else {
-                            Span::raw(x.destinations.len().to_string())
-                        };
-                        let writers = x.roles.iter().filter(|r| r.writes).count();
-                        let roles = if x.roles.is_empty() {
-                            Span::styled("·", Style::default().fg(DIM))
-                        } else if writers > 0 {
-                            Span::styled(
-                                format!("{} ({}w)", x.roles.len(), writers),
-                                Style::default().fg(Color::Cyan),
-                            )
-                        } else {
-                            Span::raw(x.roles.len().to_string())
-                        };
+                        let repos = argo_tone_span(x.repos_cell());
+                        let dests = argo_tone_span(x.destinations_cell());
+                        let roles = argo_tone_span(x.roles_cell());
                         Row::new(vec![
                             Cell::from(elide_middle(&x.namespace, ns_w as usize))
                                 .style(Style::default().fg(DIM)),
@@ -19248,24 +19043,15 @@ fn argo_table_parts(
                             EndpointKind::Repo => Style::default().fg(Color::Blue),
                             EndpointKind::RepoCreds => Style::default().fg(DIM),
                         };
-                        // A cluster restricted to a few namespaces behaves nothing like an
-                        // unrestricted one, and the difference is invisible in the Argo CD UI.
-                        let scope = match (e.kind, e.namespaces.is_empty()) {
-                            (EndpointKind::Cluster, false) => Span::styled(
-                                format!("{} ns", e.namespaces.len()),
-                                Style::default().fg(Color::Yellow),
-                            ),
-                            (EndpointKind::Cluster, true) => {
-                                Span::styled("all", Style::default().fg(DIM))
+                        // OCI keeps the magenta it always had: a kind of repository, not a
+                        // finding, hence not the cyan of an informational tone.
+                        let scope = match e.scope_cell() {
+                            (text, LineColor::Info) => {
+                                Span::styled(text, Style::default().fg(Color::Magenta))
                             }
-                            _ if e.oci => Span::styled("oci", Style::default().fg(Color::Magenta)),
-                            _ => Span::styled("·", Style::default().fg(DIM)),
+                            cell => argo_tone_span(cell),
                         };
-                        let auth_style = if e.auth == "none" {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(DIM)
-                        };
+                        let auth_style = line_color_to_style(e.auth_tone());
                         Row::new(vec![
                             Cell::from(e.kind.label()).style(kind_style),
                             Cell::from(elide_middle(&e.label, label_w as usize))
@@ -19463,23 +19249,12 @@ fn argo_detail_lines(
                 // Only what is not in the expected state: a list of forty Synced/Healthy rows is
                 // exactly the noise this panel exists to remove.
                 let mut shown = 0usize;
-                for r in a.resources.iter().filter(|r| {
-                    r.sync == "OutOfSync" || matches!(r.health.as_str(), "Degraded" | "Missing")
-                }) {
+                for r in a.resources_off() {
                     if shown >= 20 {
                         break;
                     }
                     shown += 1;
-                    let mut marks: Vec<String> = Vec::new();
-                    if !r.sync.is_empty() && r.sync != "Synced" {
-                        marks.push(r.sync.clone());
-                    }
-                    if !r.health.is_empty() && r.health != "Healthy" {
-                        marks.push(r.health.clone());
-                    }
-                    if r.requires_pruning {
-                        marks.push("prune".to_string());
-                    }
+                    let marks = r.marks();
                     lines.push(Line::from(vec![
                         Span::raw(format!("  {}", r.label())),
                         Span::styled(

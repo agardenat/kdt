@@ -20,6 +20,7 @@ import StorageView from "./StorageView";
 import VeleroView from "./VeleroView";
 import K8ssandraView from "./K8ssandraView";
 import RancherView from "./RancherView";
+import ArgocdView from "./ArgocdView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
 import DiagnosticView from "./DiagnosticView";
@@ -33,6 +34,7 @@ import type { Capabilities, ClusterBanner, ClusterResource, Identity } from "./t
 type ViewId =
   | "events"
   | "flux"
+  | "argocd"
   | "workloads"
   | "capacity"
   | "nodes"
@@ -68,7 +70,7 @@ const VIEWS: Array<{
   { id: "events", label: "Events", key: "e", ready: true },
   { id: "workloads", label: "Workloads", key: "w", ready: true },
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
-  { id: "argocd", label: "Argo CD", key: "a", needs: "argocd" },
+  { id: "argocd", label: "Argo CD", key: "a", ready: true, needs: "argocd" },
   { id: "velero", label: "Velero", key: "v", ready: true, needs: "velero" },
   // Les trois commandes du TUI (`:k8ssandra`, `:medusa`, `:reaper`) sont les trois mondes d'une
   // seule vue : le ring, les sauvegardes Medusa, les opérations dont Reaper.
@@ -351,6 +353,8 @@ export default function App() {
         ? st.identScopeless
         : view === "rancher"
           ? st.ranchScopeless
+          : view === "argocd"
+            ? st.argoScopeless
           : view === "kyverno"
             ? st.kyScopeless
             : view === "diagnostic"
@@ -660,6 +664,17 @@ export default function App() {
             />
           ) : view === "kyverno" ? (
             <KyvernoView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "argocd" ? (
+            <ArgocdView
               lang={lang}
               st={st}
               query={query}

@@ -2987,3 +2987,190 @@ export interface K8cRepairsPayload {
   rows: { keyspace: string; tables: string; state: string; interval: string }[];
   error: string | null;
 }
+
+// --- Vue Argo CD ---------------------------------------------------------------------------------
+
+/** Un composant de l'installation, tel que son Deployment/StatefulSet le rapporte. */
+export interface ArgoComponent {
+  name: string;
+  ready: number;
+  desired: number;
+  /** `app.kubernetes.io/version`, tel quel : sur une image reconstruite, le nom de branche. */
+  version: string;
+  tone: LineTone;
+}
+
+export interface ArgoServer {
+  present: boolean;
+  /** Le namespace d'install, **découvert** par `argocd-cm` ; vide quand il n'a pas été lu. */
+  namespace: string;
+  url: string;
+  version: string;
+  reconcile: string;
+  app_namespaces: string[];
+  components: ArgoComponent[];
+  hints: Hint[];
+  /** « Argo CD v3.0.6 · ns argocd » — la version n'y figure que si elle en a l'air. */
+  install_label: string;
+  /** Faux quand `version` n'a pas l'air d'une version : elle se montre alors à part. */
+  version_in_label: boolean;
+}
+
+export interface ArgoCondition {
+  kind: string;
+  message: string;
+  status: string;
+  reason: string;
+}
+
+export interface ArgoAppRow {
+  row: "app";
+  namespace: string;
+  name: string;
+  project: string;
+  sync: string;
+  health: string;
+  health_message: string;
+  auto: boolean;
+  auto_disabled: boolean;
+  self_heal: boolean;
+  prune: boolean;
+  sync_options: string[];
+  dest_server: string;
+  dest_namespace: string;
+  dest_label: string;
+  source_type: string;
+  revision: string;
+  revision_full: string;
+  reconciled_age: string;
+  op_phase: string;
+  op_message: string;
+  op_age: string;
+  op_by: string;
+  op_retries: number;
+  conditions: ArgoCondition[];
+  out_of_sync: number;
+  degraded: number;
+  images: string[];
+  history: { revision: string; deployed_at: string; age: string }[];
+  cascade_delete: boolean;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  /** `status.resources` reste au serveur : seul voyage ce qui n'est pas dans l'état attendu. */
+  resource_count: number;
+  resources_off_count: number;
+  resources_off: { label: string; marks: string[] }[];
+  source_labels: string[];
+  sync_tone: LineTone;
+  /** Éteint quand la comparaison a échoué : le health est alors un souvenir, pas une mesure. */
+  health_tone: LineTone;
+  comparison_broken: boolean;
+  policy_label: string;
+  policy_tone: LineTone;
+  destination_label: string;
+  operation_label: string;
+  phase_tone: LineTone;
+  operation_running: boolean;
+  /** Vers quoi un sync irait : le `targetRevision` de la première source, `HEAD` à défaut. */
+  sync_target: string;
+  record: EventRecord;
+}
+
+export interface ArgoSetRow {
+  row: "set";
+  namespace: string;
+  name: string;
+  generators: string[];
+  go_template: boolean;
+  apps_sync: string;
+  preserve_on_delete: boolean;
+  rolling: boolean;
+  apps: string[];
+  apps_out_of_sync: number;
+  apps_unhealthy: number;
+  conditions: ArgoCondition[];
+  age: string;
+  hints: Hint[];
+  uid: string;
+  state_label: string;
+  state_tone: LineTone;
+  policy_label: string;
+  record: EventRecord;
+}
+
+export interface ArgoProjectRow {
+  row: "project";
+  namespace: string;
+  name: string;
+  description: string;
+  source_repos: string[];
+  destinations: string[];
+  cluster_allow: string[];
+  cluster_deny: string[];
+  ns_allow: string[];
+  ns_deny: string[];
+  roles: { name: string; groups: string[]; policies: number; writes: boolean }[];
+  windows: string[];
+  apps: number;
+  apps_out_of_sync: number;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  repos_label: string;
+  repos_tone: LineTone;
+  destinations_label: string;
+  destinations_tone: LineTone;
+  roles_label: string;
+  roles_tone: LineTone;
+  record: EventRecord;
+}
+
+/** Un dépôt, un modèle de credentials ou un cluster : un Secret étiqueté, lu pour son adressage. */
+export interface ArgoEndpointRow {
+  row: "endpoint";
+  kind: "cluster" | "repo" | "creds";
+  kind_label: string;
+  namespace: string;
+  secret: string;
+  url: string;
+  label: string;
+  repo_type: string;
+  oci: boolean;
+  insecure: boolean;
+  project: string;
+  /** La méthode, déduite de la **présence** des clés ; aucun credential n'est lu. */
+  auth: string;
+  auth_tone: LineTone;
+  namespaces: string[];
+  cluster_resources: boolean | null;
+  used_by: number;
+  scope_label: string;
+  scope_tone: LineTone;
+  age: string;
+  hints: Hint[];
+  uid: string;
+  record: EventRecord;
+}
+
+export interface ArgoPayload {
+  server: ArgoServer;
+  error: string | null;
+  counts: {
+    apps: number;
+    out_of_sync: number;
+    blind: number;
+    unhealthy: number;
+    sets: number;
+    set_apps: number;
+    projects: number;
+    project_apps: number;
+    repos: number;
+    creds: number;
+    clusters: number;
+  };
+  apps: ArgoAppRow[];
+  sets: ArgoSetRow[];
+  projects: ArgoProjectRow[];
+  endpoints: ArgoEndpointRow[];
+}

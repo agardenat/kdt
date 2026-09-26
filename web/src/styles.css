@@ -771,6 +771,9 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
 
 .menu-confirm { padding: .2rem .45rem .3rem; }
 .menu-confirm p { margin: 0 0 .6rem; font-size: var(--fs-sm); color: var(--muted); line-height: 1.45; }
+/* Un avertissement de confirmation se lit comme tel : sans cette règle il héritait du gris des
+   autres paragraphes, et ce qu'un prune va supprimer se lisait comme une simple description. */
+.menu-confirm p.warn { color: var(--warn); }
 .menu-buttons { display: flex; gap: .4rem; justify-content: flex-end; }
 .menu-buttons button {
   padding: .3rem .7rem; border: 1px solid var(--line); border-radius: 6px;
@@ -994,6 +997,7 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
   margin: .35rem .45rem 0; font-size: var(--fs-xs); line-height: 1.4;
 }
 .menu-note.err { color: var(--err); }
+.menu-note.info { color: var(--info); }
 
 /* ---------------------------------------------------------------- gestes sur un objet
 
