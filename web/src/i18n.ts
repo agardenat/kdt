@@ -911,6 +911,25 @@ export interface Strings {
   reflAge: string;
   reflDiagnostic: string;
   reflCluster: string;
+  vulnDetail: string;
+  vulnEmpty: string;
+  vulnNoTrivy: string;
+  vulnScanned: string;
+  vulnScopeNote: string;
+  vulnFloorTitle: string;
+  vulnPatchTarget: string;
+  vulnRecentCves: string;
+  vulnNone: string;
+  vulnNoneUnavailable: string;
+  vulnReading: string;
+  nsDetail: string;
+  nsEmpty: string;
+  nsScopeless: string;
+  nsOpenEvents: string;
+  nsOpenEventsHelp: string;
+  nsPhase: string;
+  nsOrigin: string;
+  nsAge: string;
 }
 
 const FR: Strings = {
@@ -1852,6 +1871,25 @@ const FR: Strings = {
   reflAge: "âge",
   reflDiagnostic: "Diagnostic",
   reflCluster: "Cluster",
+  vulnDetail: "Détail",
+  vulnEmpty: "Aucune image scannée",
+  vulnNoTrivy: "Trivy Operator absent : pas de scan d'images, seule la version Kubernetes est évaluée.",
+  vulnScanned: "images scannées",
+  vulnScopeNote: "La ligne Kubernetes parle du cluster : la portée ne la cache pas.",
+  vulnFloorTitle: "Plancher de sévérité : n'afficher que les images dont la pire CVE l'atteint",
+  vulnPatchTarget: "cible patch",
+  vulnRecentCves: "CVEs récentes (feed officiel k8s, non filtrées par version)",
+  vulnNone: "(aucune)",
+  vulnNoneUnavailable: "(aucune / indisponible)",
+  vulnReading: "Lecture du rapport…",
+  nsDetail: "Détail",
+  nsEmpty: "Aucun namespace",
+  nsScopeless: "Un namespace est cluster-scoped : la portée ne s'applique pas à leur liste.",
+  nsOpenEvents: "voir ses évènements",
+  nsOpenEventsHelp: "Restreint la portée à ce namespace et ouvre les évènements",
+  nsPhase: "phase",
+  nsOrigin: "origine",
+  nsAge: "âge",
 };
 
 const EN: Strings = {
@@ -2785,6 +2823,25 @@ const EN: Strings = {
   reflAge: "age",
   reflDiagnostic: "Diagnosis",
   reflCluster: "Cluster",
+  vulnDetail: "Detail",
+  vulnEmpty: "No scanned image",
+  vulnNoTrivy: "No Trivy Operator: no image scan, only the Kubernetes version is assessed.",
+  vulnScanned: "scanned images",
+  vulnScopeNote: "The Kubernetes row is about the cluster itself: the scope does not hide it.",
+  vulnFloorTitle: "Severity floor: only show images whose worst CVE reaches it",
+  vulnPatchTarget: "patch target",
+  vulnRecentCves: "Recent CVEs (official k8s feed, not filtered by version)",
+  vulnNone: "(none)",
+  vulnNoneUnavailable: "(none / unavailable)",
+  vulnReading: "Reading the report…",
+  nsDetail: "Detail",
+  nsEmpty: "No namespace",
+  nsScopeless: "A namespace is cluster-scoped: the scope does not apply to their list.",
+  nsOpenEvents: "show its events",
+  nsOpenEventsHelp: "Scopes to this namespace and opens the events",
+  nsPhase: "phase",
+  nsOrigin: "origin",
+  nsAge: "age",
 };
 
 export function strings(lang: Lang): Strings {

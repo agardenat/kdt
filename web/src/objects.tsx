@@ -61,12 +61,17 @@ export function RowMenu({
   onOpen,
   onNeedsAuth,
   children,
+  generic = true,
 }: {
   record: EventRecord;
   lang: Lang;
   st: Strings;
   onOpen: (tab: ObjectTab) => void;
   onNeedsAuth: (message: string) => void;
+  /** `false` quand la ligne n'est pas un objet qu'on édite ou supprime — un résultat de scan : le
+   * menu ne garde que les items de la vue et l'analyse, comme la barre du TUI qui n'offre alors
+   * ni `y`, ni `e`, ni `h`, ni `Ctrl-D`. */
+  generic?: boolean;
   /** Les items propres à la vue (menu de kind), insérés entre `Toucher` et `Supprimer`. Une
    * fonction et non un nœud tout fait : le menu contextuel d'une vue a souvent son propre geste à
    * confirmer (`scale`, `cordon`…), et doit pouvoir refermer le hamburger une fois l'action lancée. */
@@ -111,20 +116,26 @@ export function RowMenu({
               {record.kind} {record.namespace ? `${record.namespace}/${record.name}` : record.name}
             </div>
             <div className="menu-list">
-              <button className="menu-item" onClick={() => act("yaml")}>
-                <span className="lbl">{st.actionYaml}</span>
-              </button>
-              <button className="menu-item" onClick={() => act("edit")}>
-                <span className="lbl">{st.actionEdit}</span>
-              </button>
-              <button className="menu-item" disabled={busy} onClick={() => void touch()}>
-                <span className="lbl">{st.actionTouch}</span>
-                <span className="desc">{st.objTouchHelp}</span>
-              </button>
+              {generic && (
+                <>
+                  <button className="menu-item" onClick={() => act("yaml")}>
+                    <span className="lbl">{st.actionYaml}</span>
+                  </button>
+                  <button className="menu-item" onClick={() => act("edit")}>
+                    <span className="lbl">{st.actionEdit}</span>
+                  </button>
+                  <button className="menu-item" disabled={busy} onClick={() => void touch()}>
+                    <span className="lbl">{st.actionTouch}</span>
+                    <span className="desc">{st.objTouchHelp}</span>
+                  </button>
+                </>
+              )}
               {children?.({ close })}
-              <button className="menu-item danger" onClick={() => act("delete")}>
-                <span className="lbl">{st.actionDelete}</span>
-              </button>
+              {generic && (
+                <button className="menu-item danger" onClick={() => act("delete")}>
+                  <span className="lbl">{st.actionDelete}</span>
+                </button>
+              )}
               {/* Le geste `i` de kdt. Dernier du menu et non premier : c'est celui qui fait sortir
                   de la donnée du cluster, et il se prend délibérément. */}
               <AiButton usable className="menu-item" st={st} onOpen={() => act("ai")} />

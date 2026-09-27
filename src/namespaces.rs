@@ -9,10 +9,13 @@ use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, ListParams};
 use kube::Client;
 
-use crate::events::format_age;
+use crate::events::{format_age, EventRecord, LineColor, Severity};
+use crate::lang::{fill, Strings};
 use crate::rbac::{detect_provenance, Provenance};
 
-#[derive(Debug, Clone)]
+// `Serialize` pour kdt-web, sans le manifeste : le YAML se lit par le geste générique `y`, qui le
+// relit au moment où on le demande au lieu de le faire voyager avec chaque ligne à chaque passe.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NamespaceInfo {
     pub name: String,
     // `status.phase`: "Active" or "Terminating" (empty when the API omits it).
@@ -23,7 +26,53 @@ pub struct NamespaceInfo {
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
     // Full object serialized to YAML (managedFields stripped), for "copy manifest".
+    #[serde(skip)]
     pub manifest: String,
+}
+
+impl NamespaceInfo {
+    /// `Active` est la norme, `Terminating` un namespace qui ne finit pas de partir — le plus
+    /// souvent un finalizer qu'un controller disparu ne retirera plus.
+    pub fn phase_tone(&self) -> LineColor {
+        match self.phase.as_str() {
+            "Active" => LineColor::Ok,
+            "Terminating" => LineColor::Warn,
+            _ => LineColor::Dim,
+        }
+    }
+
+    /// L'enregistrement de la ligne : c'est lui qui donne à la vue `y`, `e`, `h`, `Ctrl-D`,
+    /// l'onglet Related et l'analyse IA, sur le Namespace lui-même.
+    pub fn record(&self, st: &Strings) -> EventRecord {
+        let labels = if self.labels.is_empty() {
+            "-".to_string()
+        } else {
+            self.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
+        };
+        let message = fill(
+            st.rec_namespace,
+            &[
+                ("name", &self.name),
+                ("phase", &self.phase),
+                ("origin", &self.provenance.label()),
+                ("labels", &labels),
+            ],
+        );
+        EventRecord {
+            uid: format!("namespace|{}", self.name),
+            time: k8s_openapi::jiff::Timestamp::now(),
+            severity: if self.phase == "Terminating" { Severity::Warning } else { Severity::Normal },
+            reason: "Namespace".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+            namespace: String::new(),
+            name: self.name.clone(),
+            message,
+            component: String::new(),
+            host: String::new(),
+            count: 1,
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -46,22 +95,24 @@ pub async fn fetch_namespaces_view(client: Client, state: SharedNamespaces) {
         s.error = None;
     }
 
-    let api: Api<Namespace> = Api::all(client.clone());
-    let list = match api.list(&ListParams::default()).await {
-        Ok(l) => l,
-        Err(e) => return fail(&state, e.to_string()),
+    let items = match namespaces_inventory(&client).await {
+        Ok(items) => items,
+        Err(e) => return fail(&state, e),
     };
-
-    let mut out: Vec<NamespaceInfo> = Vec::with_capacity(list.items.len());
-    for ns in &list.items {
-        out.push(build_info(ns));
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut s = state.lock().expect("namespaces poisoned");
     s.loading = false;
     s.error = None;
-    s.items = out;
+    s.items = items;
+}
+
+/// Les namespaces du cluster, triés par nom — rendus au lieu d'être déposés, pour kdt-web.
+pub async fn namespaces_inventory(client: &Client) -> Result<Vec<NamespaceInfo>, String> {
+    let api: Api<Namespace> = Api::all(client.clone());
+    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
+    let mut out: Vec<NamespaceInfo> = list.items.iter().map(build_info).collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 fn build_info(ns: &Namespace) -> NamespaceInfo {

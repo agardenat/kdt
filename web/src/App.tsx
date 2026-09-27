@@ -22,6 +22,8 @@ import K8ssandraView from "./K8ssandraView";
 import RancherView from "./RancherView";
 import ArgocdView from "./ArgocdView";
 import ReflectorView from "./ReflectorView";
+import NamespacesView from "./NamespacesView";
+import VulnView from "./VulnView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
 import DiagnosticView from "./DiagnosticView";
@@ -44,6 +46,8 @@ type ViewId =
   | "hooks"
   | "data"
   | "reflector"
+  | "namespaces"
+  | "vuln"
   | "certs"
   | "identity"
   | "rancher"
@@ -70,6 +74,8 @@ const VIEWS: Array<{
   needs?: keyof Capabilities;
 }> = [
   { id: "events", label: "Events", key: "e", ready: true },
+  // Les namespaces comme objets : cluster-scoped et natifs, la vue répond partout.
+  { id: "namespaces", label: "Namespaces", key: "o", ready: true },
   { id: "workloads", label: "Workloads", key: "w", ready: true },
   { id: "flux", label: "Flux", key: "f", ready: true, needs: "flux" },
   { id: "argocd", label: "Argo CD", key: "a", ready: true, needs: "argocd" },
@@ -87,6 +93,9 @@ const VIEWS: Array<{
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r", ready: true },
   { id: "kyverno", label: "Kyverno", key: "k", ready: true, needs: "kyverno" },
+  // Pas de `needs`, comme le `:vuln` du TUI qui s'ouvre toujours : sans Trivy Operator il n'y a pas
+  // de scan d'images, mais la version Kubernetes a encore son risque à dire.
+  { id: "vuln", label: "Vulnerabilities", key: "l", ready: true },
   { id: "identity", label: "Identity", key: "i", ready: true, needs: "identity" },
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
@@ -344,6 +353,8 @@ export default function App() {
     view === "rbac" ||
     view === "velero" ||
     view === "k8ssandra" ||
+    // Les images d'un namespace ; la ligne Kubernetes, elle, reste quelle que soit la portée.
+    view === "vuln" ||
     // Les trois vues de constat sont dans la portée, avec une nuance qu'elles disent elles-mêmes :
     // les nodes et les StorageClass sont cluster-scoped, donc la portée ne les réduit pas — elle
     // réduit les workloads, les quotas, les claims et les policies, qui sont bien des objets d'un
@@ -362,6 +373,8 @@ export default function App() {
             ? st.argoScopeless
           : view === "reflector"
             ? st.reflScopeless
+          : view === "namespaces"
+            ? st.nsScopeless
           : view === "kyverno"
             ? st.kyScopeless
             : view === "diagnostic"
@@ -674,6 +687,33 @@ export default function App() {
               lang={lang}
               st={st}
               query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "namespaces" ? (
+            <NamespacesView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+              onOpenEvents={(namespace) => {
+                setNamespaces([namespace]);
+                setView("events");
+              }}
+            />
+          ) : view === "vuln" ? (
+            <VulnView
+              lang={lang}
+              st={st}
+              query={query}
+              namespaces={namespaces}
               panelHeight={panelHeight}
               onPanelHeight={setPanelHeight}
               panelOpen={panelOpen}

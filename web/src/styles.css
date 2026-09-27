@@ -1548,3 +1548,29 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
   font-size: var(--fs-sm); color: var(--dim); cursor: pointer; user-select: none;
 }
 .worlds .chk input { margin: 0; cursor: pointer; }
+
+/* Les CVE d'une image ou du feed Kubernetes : une grille dont chaque CVE est une ligne en
+   `display: contents`, pour que sévérité, score et identifiant s'alignent d'une CVE à l'autre. */
+.cve-list { display: grid; gap: .18rem .8rem; font-size: var(--fs-sm); align-items: baseline; }
+.cve-list.image { grid-template-columns: auto auto auto auto 1fr; }
+.cve-list.k8s { grid-template-columns: auto auto auto 1fr; }
+.cve-list .cve { display: contents; }
+.cve-list .cve > span { white-space: nowrap; }
+.cve-list .cve > .t { white-space: normal; }
+.cve-list .num { text-align: right; font-variant-numeric: tabular-nums; }
+.cve-list .pkg { color: var(--info); }
+.cve-list .ok { color: var(--ok); }
+.cve-list .dim { color: var(--dim); }
+.cve-list a { color: inherit; }
+.cve-list .sev-critical { color: var(--err); font-weight: 600; }
+.cve-list .sev-high { color: #e8590c; font-weight: 600; }
+.cve-list .sev-medium { color: var(--warn); }
+.cve-list .sev-low { color: var(--info); }
+.cve-list .sev-info { color: var(--dim); }
+
+/* Labels et annotations d'un objet : la clé est un identifiant long (`kubectl.kubernetes.io/…`) qui
+   prend la largeur qu'il lui faut jusqu'à un plafond, et une valeur-fleuve — le JSON du dernier
+   `apply` — défile dans sa case au lieu d'allonger le panneau. */
+.detail .facts.kv { grid-template-columns: minmax(10ch, max-content) 1fr; }
+.detail .facts.kv dt { font-family: var(--mono); max-width: 42ch; word-break: break-all; }
+.detail .facts.kv dd { max-height: 9rem; overflow: auto; font-size: var(--fs-sm); }

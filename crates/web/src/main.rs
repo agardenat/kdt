@@ -30,11 +30,13 @@ mod rancher;
 mod reflector;
 mod netpol;
 mod k8ssandra;
+mod namespaces;
 mod network;
 mod nodes;
 mod session;
 mod storage;
 mod velero;
+mod vuln;
 mod workloads;
 
 use std::sync::Arc;
@@ -171,6 +173,9 @@ async fn main() -> Result<()> {
         .route("/api/v1/cluster", get(cluster::banner))
         .route("/api/v1/events", get(api::events))
         .route("/api/v1/namespaces", get(api::namespaces))
+        // La vue Namespaces, distincte de la liste de noms du sélecteur de portée : phase, provenance,
+        // labels et l'enregistrement de chaque ligne.
+        .route("/api/v1/namespaces/view", get(namespaces::list))
         .route("/api/v1/logs", get(api::logs))
         .route("/api/v1/status", get(api::status))
         .route("/api/v1/related", post(api::related))
@@ -245,6 +250,10 @@ async fn main() -> Result<()> {
         // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
         // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.
         .route("/api/v1/kyverno/purge", post(kyverno::purge))
+        // Lecture seule, comme dans le TUI : un résultat de scan ne s'édite ni ne se supprime.
+        .route("/api/v1/vuln", get(vuln::list))
+        // Le détail d'une image, relu sur son seul rapport : les CVE ne voyagent pas avec la liste.
+        .route("/api/v1/vuln/report", get(vuln::report))
         // Les trois vues qui ne font que constater : elles lisent, elles diagnostiquent, et les
         // gestes génériques suffisent à agir sur l'objet d'une ligne. Aucune route d'écriture.
         .route("/api/v1/capacity", get(capacity::list))

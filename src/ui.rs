@@ -101,7 +101,8 @@ use crate::rbac::{
 };
 
 use crate::vulnerabilities::{
-    fetch_vulnerabilities, new_vuln_state, K8sVersionRisk, Sev as VulnSev, SharedVuln, VulnComponent,
+    fetch_vulnerabilities, new_vuln_state, short_image, vuln_rows, K8sVersionRisk, Sev as VulnSev,
+    SharedVuln, VulnComponent, VulnRow,
 };
 use crate::touch;
 use crate::capacity::{
@@ -339,13 +340,6 @@ impl VelRestoreView {
     }
 }
 
-// A selectable row in the vulnerability view: the k8s control-plane risk (always first when known)
-// or one scanned image.
-#[derive(Clone)]
-enum VulnRow {
-    K8s(K8sVersionRisk),
-    Image(VulnComponent),
-}
 use crate::secrets::{SecretFilter, 
     fetch_secrets, new_secrets_state, Expiry, SecretInfo, SharedSecrets,
 };
@@ -6501,38 +6495,22 @@ impl App {
         }
     }
 
-    // Selectable rows: the k8s control-plane risk first (when known, always shown), then the scanned
-    // images passing the active severity floor (already sorted highest-severity first).
+    // Selectable rows: `vulnerabilities::vuln_rows` (Kubernetes first, then the scope's images over
+    // the severity floor), narrowed by the search. The k8s row is about the cluster itself, not an
+    // image: a search still has to be able to exclude it, so it is matched on what it shows.
     fn vuln_rows(&self) -> Vec<VulnRow> {
-        let s = self.vuln_state.lock().expect("vuln poisoned");
-        let mut rows: Vec<VulnRow> = Vec::new();
-        if let Some(k8s) = &s.k8s {
-            // The k8s row is about the cluster itself, not an image: a search still has to be able
-            // to exclude it, so it is matched on what it actually shows.
-            let keep = match self.search_query.as_deref() {
-                None => true,
-                Some(q) => fields_match_search(&["kubernetes", k8s.server_version.as_str()], q),
-            };
-            if keep {
-                rows.push(VulnRow::K8s(k8s.clone()));
-            }
-        }
-        // The namespace scope hides the images of other namespaces; the Kubernetes row above is
-        // about the cluster itself and stays whatever the scope.
         let ns_filter = self.current_ns_opt();
-        rows.extend(
-            s.components
-                .iter()
-                .filter(|c| ns_filter.as_deref().is_none_or(|ns| c.namespace == ns))
-                .filter(|c| c.max_sev >= self.vuln_min_sev)
-                .filter(|c| match self.search_query.as_deref() {
-                    None => true,
-                    Some(q) => fields_match_search(&[&c.namespace, &c.workload, &c.image, &c.version], q),
-                })
-                .cloned()
-                .map(VulnRow::Image),
-        );
-        rows
+        let rows = {
+            let s = self.vuln_state.lock().expect("vuln poisoned");
+            vuln_rows(&s, ns_filter.as_deref(), self.vuln_min_sev)
+        };
+        let Some(q) = self.search_query.as_deref() else { return rows };
+        rows.into_iter()
+            .filter(|row| match row {
+                VulnRow::K8s(k) => fields_match_search(&["kubernetes", k.server_version.as_str()], q),
+                VulnRow::Image(c) => fields_match_search(&[&c.namespace, &c.workload, &c.image, &c.version], q),
+            })
+            .collect()
     }
 
     fn vuln_selected(&self) -> Option<VulnRow> {
@@ -11494,79 +11472,9 @@ impl App {
         }
     }
 
-    // Event-shaped record for the AI panel: the selected image's CVEs (or the k8s version risk), so
-    // the model can summarise impact and the upgrade path.
+    // La rédaction vit dans `vulnerabilities` : kdt-web ouvre la même analyse sur la même ligne.
     fn synthetic_vuln_record(&self) -> Option<EventRecord> {
-        match self.vuln_selected()? {
-            VulnRow::Image(c) => {
-                let cve_lines = c
-                    .cves
-                    .iter()
-                    .take(40)
-                    .map(|v| {
-                        let fix = if v.fixed.is_empty() {
-                            "pas de fix".to_string()
-                        } else {
-                            format!("{} → {}", v.installed, v.fixed)
-                        };
-                        format!("[{} {:.1}] {} {} ({})", v.severity.label(), v.score, v.id, v.package, fix)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let message = format!(
-                    "image={}:{}\nworkload={}\ncrit={} high={} med={} low={} fixables={}\nCVEs:\n{}",
-                    c.image, c.version, c.workload, c.critical, c.high, c.medium, c.low, c.fixable, cve_lines,
-                );
-                Some(EventRecord {
-                    uid: format!("vuln|{}|{}", c.namespace, c.image),
-                    time: k8s_openapi::jiff::Timestamp::now(),
-                    severity: Severity::Warning,
-                    reason: format!("VULN/{}", c.max_sev.label()),
-                    api_version: "aquasecurity.github.io/v1alpha1".to_string(),
-                    kind: "VulnerabilityReport".to_string(),
-                    namespace: c.namespace.clone(),
-                    name: c.image.clone(),
-                    message,
-                    component: String::new(),
-                    host: String::new(),
-                    count: 1,
-                })
-            }
-            VulnRow::K8s(k) => {
-                let cve_lines = k
-                    .cves
-                    .iter()
-                    .take(40)
-                    .map(|v| format!("[{} {:.1}] {} {}", v.severity.label(), v.score, v.id, v.title))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let target = k.latest_patch.clone().unwrap_or_else(|| "?".to_string());
-                let message = lang::fill(
-                    lang::t(self.ai_language).rec_k8s_cve,
-                    &[
-                        ("version", &k.server_version),
-                        ("target", &target),
-                        ("behind", &k.behind.to_string()),
-                        ("eol", &k.eol.to_string()),
-                        ("cves", &cve_lines),
-                    ],
-                );
-                Some(EventRecord {
-                    uid: format!("vuln|k8s|{}", k.server_version),
-                    time: k8s_openapi::jiff::Timestamp::now(),
-                    severity: Severity::Warning,
-                    reason: "VULN/k8s".to_string(),
-                    api_version: String::new(),
-                    kind: "KubernetesVersion".to_string(),
-                    namespace: String::new(),
-                    name: k.server_version.clone(),
-                    message,
-                    component: String::new(),
-                    host: String::new(),
-                    count: 1,
-                })
-            }
-        }
+        Some(self.vuln_selected()?.record(lang::t(self.ai_language)))
     }
 
     // Event-shaped record for the AI panel: the selected secret's type/consumers and, for a TLS
@@ -11689,35 +11597,7 @@ impl App {
     }
 
     fn synthetic_namespaces_record(&self) -> Option<EventRecord> {
-        let ns = self.namespace_selected()?;
-        let labels = if ns.labels.is_empty() {
-            "-".to_string()
-        } else {
-            ns.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
-        };
-        let msg = lang::fill(
-            lang::t(self.ai_language).rec_namespace,
-            &[
-                ("name", &ns.name),
-                ("phase", &ns.phase),
-                ("origin", &ns.provenance.label()),
-                ("labels", &labels),
-            ],
-        );
-        Some(EventRecord {
-            uid: format!("namespace|{}", ns.name),
-            time: k8s_openapi::jiff::Timestamp::now(),
-            severity: Severity::Normal,
-            reason: "Namespace".to_string(),
-            api_version: "v1".to_string(),
-            kind: "Namespace".to_string(),
-            namespace: String::new(),
-            name: ns.name.clone(),
-            message: msg,
-            component: String::new(),
-            host: String::new(),
-            count: 1,
-        })
+        Some(self.namespace_selected()?.record(lang::t(self.ai_language)))
     }
 
     // La rédaction vit dans `events` : kdt-web ouvre le même panneau sur le même Node.
@@ -23655,42 +23535,24 @@ fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let rows: Vec<Row> = rows_data.iter().map(|row| match row {
         VulnRow::K8s(k) => {
-            let crit = k.cves.iter().filter(|c| c.severity == VulnSev::Critical).count();
-            let high = k.cves.iter().filter(|c| c.severity == VulnSev::High).count();
-            let med = k.cves.iter().filter(|c| c.severity == VulnSev::Medium).count();
-            let low = k.cves.iter().filter(|c| c.severity == VulnSev::Low).count();
-            let target = match (&k.latest_patch, k.behind) {
-                (Some(v), true) => format!("→ {}", v),
-                (Some(v), false) => format!("✓ {}", v),
-                (None, _) => "?".to_string(),
-            };
-            let comp = if k.eol {
-                "kubernetes (EOL)".to_string()
-            } else {
-                "kubernetes".to_string()
-            };
-            let target_color = if k.eol || k.behind { Color::Red } else { Color::Green };
+            let (crit, high, med, low) = k.counts();
             Row::new(vec![
                 Cell::from("k8s").style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
                 Cell::from("control-plane").style(Style::default().fg(DIM)),
-                Cell::from(comp).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Cell::from(k.component_label()).style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
                 Cell::from(k.server_version.clone()),
                 count_cell(crit, Color::Red),
                 count_cell(high, Color::Rgb(255, 140, 0)),
                 count_cell(med, Color::Yellow),
                 count_cell(low, Color::Cyan),
-                Cell::from(target).style(Style::default().fg(target_color).add_modifier(Modifier::BOLD)),
+                Cell::from(k.target_label()).style(Style::default().fg(line_color(k.target_tone())).add_modifier(Modifier::BOLD)),
                 Cell::from("—").style(Style::default().fg(DIM)),
             ])
             .style(Style::default().bg(Color::Rgb(20, 20, 40)))
         }
         VulnRow::Image(c) => {
             let color = vuln_sev_color(c.max_sev);
-            let target = if c.fixable > 0 {
-                format!("{} fixables", c.fixable)
-            } else {
-                "—".to_string()
-            };
+            let target = c.target_label(st);
             Row::new(vec![
                 Cell::from(c.max_sev.label()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Cell::from(c.namespace.clone()).style(Style::default().fg(DIM)),
@@ -23721,17 +23583,6 @@ fn draw_vuln_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     render_table_keep_offset(f, table, area, cursor, &mut app.vuln_offset);
 }
 
-// Keep the trailing image path + tag-relevant part readable when the registry prefix is long.
-fn short_image(image: &str) -> String {
-    let trimmed = image
-        .strip_prefix("index.docker.io/library/")
-        .or_else(|| image.strip_prefix("index.docker.io/"))
-        .or_else(|| image.strip_prefix("docker.io/library/"))
-        .or_else(|| image.strip_prefix("docker.io/"))
-        .unwrap_or(image);
-    trimmed.to_string()
-}
-
 // Detail panel (split top / full screen): the selected component's CVEs, or the k8s version risk.
 fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(row) = app.vuln_selected() else {
@@ -23744,8 +23595,8 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let (title, mut lines) = match &row {
-        VulnRow::K8s(k) => vuln_k8s_lines(k),
-        VulnRow::Image(c) => vuln_image_lines(c),
+        VulnRow::K8s(k) => vuln_k8s_lines(k, lang::t(app.ai_language)),
+        VulnRow::Image(c) => vuln_image_lines(c, lang::t(app.ai_language)),
     };
 
     let visible = area.height.saturating_sub(2) as usize;
@@ -23760,8 +23611,7 @@ fn draw_vuln_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
-    let st = lang::active();
+fn vuln_image_lines(c: &VulnComponent, st: &'static lang::Strings) -> (Line<'static>, Vec<Line<'static>>) {
     let title = Line::from(Span::styled(
         format!(" {} : {} ", short_image(&c.image), c.version),
         Style::default().fg(Color::Black).bg(vuln_sev_color(c.max_sev)).add_modifier(Modifier::BOLD),
@@ -23788,16 +23638,15 @@ fn vuln_image_lines(c: &VulnComponent) -> (Line<'static>, Vec<Line<'static>>) {
         "CVEs", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
     )));
     if c.cves.is_empty() {
-        lines.push(Line::from(Span::styled("  (aucune)", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(format!("  {}", st.vuln_none), Style::default().fg(DIM))));
     }
     for v in &c.cves {
-        lines.push(vuln_cve_line(v, true));
+        lines.push(vuln_cve_line(v, true, st));
     }
     (title, lines)
 }
 
-fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
-    let st = lang::active();
+fn vuln_k8s_lines(k: &K8sVersionRisk, st: &'static lang::Strings) -> (Line<'static>, Vec<Line<'static>>) {
     let title = Line::from(Span::styled(
         format!(" Kubernetes {} ", k.server_version),
         Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -23810,20 +23659,14 @@ fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(label("version", k.server_version.clone()));
-    match (&k.latest_patch, k.behind) {
-        (Some(v), true) => lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", "cible patch"), Style::default().fg(DIM)),
-            Span::styled(format!("→ monter vers {}", v), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        ])),
-        (Some(v), false) => lines.push(Line::from(vec![
-            Span::styled(format!("{:<14}", "cible patch"), Style::default().fg(DIM)),
-            Span::styled(
-                    lang::fill(st.vuln_up_to_date, &[("version", v)]),
-                    Style::default().fg(Color::Green),
-                ),
-        ])),
-        (None, _) => lines.push(label("cible patch", st.vuln_target_unresolved.to_string())),
+    let mut target_style = Style::default().fg(line_color(k.target_tone()));
+    if k.behind {
+        target_style = target_style.add_modifier(Modifier::BOLD);
     }
+    lines.push(Line::from(vec![
+        Span::styled(format!("{:<14}", st.vuln_patch_target), Style::default().fg(DIM)),
+        Span::styled(k.target_text(st), target_style),
+    ]));
     if k.eol {
         lines.push(Line::from(Span::styled(
             st.vuln_eol,
@@ -23839,15 +23682,15 @@ fn vuln_k8s_lines(k: &K8sVersionRisk) -> (Line<'static>, Vec<Line<'static>>) {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
     )));
     if k.cves.is_empty() {
-        lines.push(Line::from(Span::styled("  (aucune / indisponible)", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled(format!("  {}", st.vuln_none_unavailable), Style::default().fg(DIM))));
     }
     for v in &k.cves {
-        lines.push(vuln_cve_line(v, false));
+        lines.push(vuln_cve_line(v, false, st));
     }
     (title, lines)
 }
 
-fn vuln_cve_line(v: &crate::vulnerabilities::Cve, image: bool) -> Line<'static> {
+fn vuln_cve_line(v: &crate::vulnerabilities::Cve, image: bool, st: &'static lang::Strings) -> Line<'static> {
     let color = vuln_sev_color(v.severity);
     let mut spans = vec![
         Span::styled(format!("  {:<5}", v.severity.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
@@ -23856,7 +23699,7 @@ fn vuln_cve_line(v: &crate::vulnerabilities::Cve, image: bool) -> Line<'static> 
     ];
     if image {
         let fix = if v.fixed.is_empty() {
-            Span::styled("pas de fix".to_string(), Style::default().fg(DIM))
+            Span::styled(st.vuln_no_fix.to_string(), Style::default().fg(DIM))
         } else {
             Span::styled(format!("{} → {}", v.installed, v.fixed), Style::default().fg(Color::Green))
         };
@@ -26789,10 +26632,11 @@ fn draw_namespaces_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app.namespaces_cursor = app.namespaces_cursor.min(rows_data.len() - 1);
     }
 
+    let st = lang::t(app.ai_language);
     let title = if let Some(e) = &error {
-        format!("namespaces (erreur: {})", e)
+        lang::fill(st.ui_title_error, &[("view", "namespaces"), ("e", e)])
     } else if loading && total == 0 {
-        "namespaces (chargement...)".to_string()
+        lang::fill(st.ui_title_loading, &[("view", "namespaces")])
     } else {
         format!("namespaces ({})", total)
     };
@@ -26803,11 +26647,7 @@ fn draw_namespaces_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = rows_data.iter().map(|ns| {
-        let phase_style = match ns.phase.as_str() {
-            "Active" => Style::default().fg(Color::Green),
-            "Terminating" => Style::default().fg(Color::Yellow),
-            _ => Style::default().fg(DIM),
-        };
+        let phase_style = Style::default().fg(line_color(ns.phase_tone()));
         Row::new(vec![
             Cell::from(ns.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from(ns.phase.clone()).style(phase_style),
@@ -26844,7 +26684,7 @@ fn draw_namespaces_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let (title, mut lines) = namespace_detail_lines(&ns);
+    let (title, mut lines) = namespace_detail_lines(&ns, lang::t(app.ai_language));
 
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
@@ -26858,8 +26698,7 @@ fn draw_namespaces_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn namespace_detail_lines(ns: &NamespaceInfo) -> (Line<'static>, Vec<Line<'static>>) {
-    let st = lang::active();
+fn namespace_detail_lines(ns: &NamespaceInfo, st: &'static lang::Strings) -> (Line<'static>, Vec<Line<'static>>) {
     let title = Line::from(Span::styled(
         format!(" {} ", ns.name),
         Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),

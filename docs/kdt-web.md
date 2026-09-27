@@ -248,6 +248,13 @@ qu'elle se relit toutes les dix — et la réponse dit ce qu'elle porte (`disk_i
 `reserved_included`) pour que la table garde la dernière valeur connue au lieu de la voir
 clignoter. Rien n'est mis en cache d'un compte à l'autre : un droit `nodes/proxy` ne se prête pas.
 
+Une seule lecture fait exception, et c'est parce qu'elle ne passe par aucun droit : le risque de la
+version Kubernetes de la vue Vulnérabilités (dernier patch de la mineure sur `dl.k8s.io`, feed
+officiel des CVE sur kubernetes.io). Il ne dépend que de la version servie et de sources publiques,
+donc le serveur le garde un quart d'heure par version et par langue, pour tout le monde ; une
+réponse dégradée (réseau coupé) ne se garde pas. Les rapports Trivy, eux, se relisent sous
+l'identité de chacun, et les CVE d'une image ne se lisent qu'à sa sélection, sur son seul rapport.
+
 Ses deux écrans deviennent deux mondes : **Nodes**, l'inventaire, et **Usage**, la table par
 container du node sélectionné — ce que `u` ouvre en plein écran dans le TUI. Elle n'entre pas dans
 le panneau du haut : treize colonnes n'y tiennent pas, et l'objet reste le node de toute façon,

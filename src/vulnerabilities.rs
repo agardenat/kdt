@@ -14,7 +14,8 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 use serde_json::Value;
 
-use crate::events::format_age;
+use crate::events::{format_age, EventRecord, LineColor, Severity};
+use crate::lang::{fill, Strings};
 
 const TRIVY_GROUP: &str = "aquasecurity.github.io";
 const TRIVY_VERSIONS: &[&str] = &["v1alpha1"];
@@ -28,8 +29,11 @@ const K8S_STABLE: &str = "https://dl.k8s.io/release/stable.txt";
 // Most recent feed CVEs surfaced (the feed is not filtered by version, so we cap to the newest).
 const K8S_CVE_MAX: usize = 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// `Serialize` en minuscules : kdt-web peint la colonne SEV avec la même échelle, nommée pareil.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum Sev {
+    #[default]
     Unknown,
     Low,
     Medium,
@@ -48,6 +52,16 @@ impl Sev {
         }
     }
 
+    /// Le liseré d'une ligne : seules CRITICAL et HIGH sont un écart. Une image aux seules CVE
+    /// moyennes ou basses est la norme d'un cluster, et la peindre ferait rougir toute la table.
+    pub fn tone(self) -> LineColor {
+        match self {
+            Sev::Critical => LineColor::Err,
+            Sev::High => LineColor::Warn,
+            _ => LineColor::Ok,
+        }
+    }
+
     fn parse(s: &str) -> Sev {
         match s.trim().to_ascii_uppercase().as_str() {
             "CRITICAL" => Sev::Critical,
@@ -59,7 +73,7 @@ impl Sev {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Cve {
     pub id: String,
     pub severity: Sev,
@@ -83,8 +97,12 @@ impl Cve {
 }
 
 // One scanned image (a VulnerabilityReport), aggregated to its counts and CVE list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VulnComponent {
+    // Le rapport Trivy d'où vient la ligne : kdt-web relit ce seul objet pour le détail d'une image
+    // au lieu de faire voyager toutes les CVE de toutes les images à chaque passe.
+    pub report_kind: String,
+    pub report: String,
     pub namespace: String,
     pub workload: String,
     pub image: String,
@@ -107,6 +125,15 @@ impl VulnComponent {
         self.critical + self.high + self.medium + self.low + self.unknown
     }
 
+    /// La colonne `→ TARGET` d'une image : combien de CVE une mise à jour corrige.
+    pub fn target_label(&self, st: &Strings) -> String {
+        if self.fixable > 0 {
+            fill(st.vuln_fixables_cell, &[("n", &self.fixable.to_string())])
+        } else {
+            "—".to_string()
+        }
+    }
+
     fn sort_key(&self) -> (std::cmp::Reverse<u8>, std::cmp::Reverse<i64>, String, String) {
         (
             std::cmp::Reverse(self.max_sev as u8),
@@ -118,7 +145,7 @@ impl VulnComponent {
 }
 
 // Risk on the Kubernetes control-plane version itself.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct K8sVersionRisk {
     pub server_version: String,
     // Latest patch of the running minor (the recommended upgrade target), when resolvable.
@@ -130,6 +157,59 @@ pub struct K8sVersionRisk {
     pub cves: Vec<Cve>,
     // Human note when the network part could not be fetched.
     pub note: Option<String>,
+}
+
+impl K8sVersionRisk {
+    /// `(crit, high, med, low)` parmi les CVE du feed.
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            sev_count(&self.cves, Sev::Critical),
+            sev_count(&self.cves, Sev::High),
+            sev_count(&self.cves, Sev::Medium),
+            sev_count(&self.cves, Sev::Low),
+        )
+    }
+
+    /// La colonne COMPONENT : une version hors fenêtre de support le dit dans le nom même.
+    pub fn component_label(&self) -> &'static str {
+        if self.eol { "kubernetes (EOL)" } else { "kubernetes" }
+    }
+
+    /// La colonne `→ TARGET` : `→` quand il y a un patch à monter, `✓` quand on est dessus.
+    pub fn target_label(&self) -> String {
+        match (&self.latest_patch, self.behind) {
+            (Some(v), true) => format!("→ {v}"),
+            (Some(v), false) => format!("✓ {v}"),
+            (None, _) => "?".to_string(),
+        }
+    }
+
+    /// La cible de patch rédigée, telle que le panneau de détail la dit.
+    pub fn target_text(&self, st: &Strings) -> String {
+        match (&self.latest_patch, self.behind) {
+            (Some(v), true) => fill(st.vuln_upgrade_to, &[("version", v)]),
+            (Some(v), false) => fill(st.vuln_up_to_date, &[("version", v)]),
+            (None, _) => st.vuln_target_unresolved.to_string(),
+        }
+    }
+
+    /// Rouge dès qu'il y a un retard de patch ou une version hors support ; vert sinon. Une cible
+    /// non résolue n'est pas un « à jour » : sans réseau, on ne sait pas.
+    pub fn target_tone(&self) -> LineColor {
+        if self.eol || self.behind {
+            LineColor::Err
+        } else if self.latest_patch.is_some() {
+            LineColor::Ok
+        } else {
+            LineColor::Dim
+        }
+    }
+
+    /// Le liseré de la ligne : l'écart est le retard ou la sortie de support, pas le fait d'avoir
+    /// des CVE — le feed n'est pas filtré par version, il en a toujours.
+    pub fn tone(&self) -> LineColor {
+        if self.eol || self.behind { LineColor::Err } else { LineColor::Ok }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,31 +256,175 @@ pub async fn fetch_vulnerabilities(client: Client, server_version: Option<String
         s.error = None;
     }
 
-    let trivy = fetch_trivy_reports(&client).await;
-    let k8s = match server_version {
-        Some(v) if !v.is_empty() => Some(fetch_k8s_cve(&v).await),
-        _ => None,
-    };
+    let fresh = vulnerabilities_inventory(&client, server_version, crate::lang::active()).await;
 
+    // Une lecture refusée garde la liste précédente (le TUI la laisse à l'écran avec l'erreur au
+    // titre) ; Trivy absent la vide, il n'y a plus rien à montrer.
+    let replace = fresh.error.is_none() || !fresh.available;
     let mut s = state.lock().expect("vuln poisoned");
     s.loading = false;
-    s.k8s = k8s;
-    match trivy {
+    s.k8s = fresh.k8s;
+    s.available = fresh.available;
+    s.error = fresh.error;
+    if replace {
+        s.components = fresh.components;
+    }
+}
+
+/// Les images scannées et le risque de la version Kubernetes, rendus au lieu d'être déposés.
+///
+/// Même lecture que `fetch_vulnerabilities`, qui n'est plus que la pose dans le `Mutex` : kdt-web
+/// répond à une requête et veut la valeur. La table de chaînes est un paramètre parce qu'un serveur
+/// répond à plusieurs personnes qui ne lisent pas forcément la même langue.
+pub async fn vulnerabilities_inventory(
+    client: &Client,
+    server_version: Option<String>,
+    st: &'static Strings,
+) -> VulnState {
+    let k8s = match server_version {
+        Some(v) if !v.is_empty() => Some(k8s_version_risk(&v, st).await),
+        _ => None,
+    };
+    let mut out = VulnState { k8s, ..Default::default() };
+    match fetch_trivy_reports(client).await {
         Ok(components) => {
-            s.available = true;
-            s.components = components;
-            s.error = None;
+            out.available = true;
+            out.components = components;
         }
         Err(TrivyError::NotInstalled) => {
-            s.available = false;
-            s.components.clear();
-            s.error = Some(crate::lang::active().vuln_no_trivy.into());
+            out.available = false;
+            out.error = Some(st.vuln_no_trivy.into());
         }
         Err(TrivyError::Api(e)) => {
-            s.available = true;
-            s.error = Some(e);
+            out.available = true;
+            out.error = Some(e);
         }
     }
+    out
+}
+
+/// Une ligne de la vue : le risque du control plane (toujours en tête quand il est connu) ou une
+/// image scannée.
+#[derive(Debug, Clone)]
+pub enum VulnRow {
+    K8s(K8sVersionRisk),
+    Image(VulnComponent),
+}
+
+/// Les lignes de la vue, dans l'ordre du TUI : Kubernetes d'abord, puis les images de la portée qui
+/// passent le plancher de sévérité (déjà triées de la plus grave à la moins grave).
+///
+/// La portée cache les images des autres namespaces ; la ligne Kubernetes parle du cluster lui-même
+/// et reste quelle que soit la portée. La recherche, elle, reste à l'appelant.
+pub fn vuln_rows(state: &VulnState, ns: Option<&str>, min: Sev) -> Vec<VulnRow> {
+    let mut rows: Vec<VulnRow> = Vec::new();
+    if let Some(k8s) = &state.k8s {
+        rows.push(VulnRow::K8s(k8s.clone()));
+    }
+    rows.extend(
+        state
+            .components
+            .iter()
+            .filter(|c| ns.is_none_or(|n| c.namespace == n))
+            .filter(|c| c.max_sev >= min)
+            .cloned()
+            .map(VulnRow::Image),
+    );
+    rows
+}
+
+impl VulnRow {
+    /// L'enregistrement que le panneau IA reçoit : les CVE de l'image (ou le risque de la version),
+    /// pour que le modèle en résume l'impact et le chemin de mise à jour.
+    pub fn record(&self, st: &Strings) -> EventRecord {
+        match self {
+            VulnRow::Image(c) => {
+                let cve_lines = c
+                    .cves
+                    .iter()
+                    .take(40)
+                    .map(|v| {
+                        let fix = if v.fixed.is_empty() {
+                            st.vuln_no_fix.to_string()
+                        } else {
+                            format!("{} → {}", v.installed, v.fixed)
+                        };
+                        format!("[{} {:.1}] {} {} ({})", v.severity.label(), v.score, v.id, v.package, fix)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let message = format!(
+                    "image={}:{}\nworkload={}\ncrit={} high={} med={} low={} fixables={}\nCVEs:\n{}",
+                    c.image, c.version, c.workload, c.critical, c.high, c.medium, c.low, c.fixable, cve_lines,
+                );
+                EventRecord {
+                    uid: format!("vuln|{}|{}", c.namespace, c.image),
+                    time: k8s_openapi::jiff::Timestamp::now(),
+                    severity: severity_of(c.max_sev.tone()),
+                    reason: format!("VULN/{}", c.max_sev.label()),
+                    api_version: format!("{TRIVY_GROUP}/{}", TRIVY_VERSIONS[0]),
+                    kind: TRIVY_KIND.to_string(),
+                    namespace: c.namespace.clone(),
+                    name: c.image.clone(),
+                    message,
+                    component: String::new(),
+                    host: String::new(),
+                    count: 1,
+                }
+            }
+            VulnRow::K8s(k) => {
+                let cve_lines = k
+                    .cves
+                    .iter()
+                    .take(40)
+                    .map(|v| format!("[{} {:.1}] {} {}", v.severity.label(), v.score, v.id, v.title))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let target = k.latest_patch.clone().unwrap_or_else(|| "?".to_string());
+                let message = fill(
+                    st.rec_k8s_cve,
+                    &[
+                        ("version", &k.server_version),
+                        ("target", &target),
+                        ("behind", &k.behind.to_string()),
+                        ("eol", &k.eol.to_string()),
+                        ("cves", &cve_lines),
+                    ],
+                );
+                EventRecord {
+                    uid: format!("vuln|k8s|{}", k.server_version),
+                    time: k8s_openapi::jiff::Timestamp::now(),
+                    severity: severity_of(k.tone()),
+                    reason: "VULN/k8s".to_string(),
+                    api_version: String::new(),
+                    kind: "KubernetesVersion".to_string(),
+                    namespace: String::new(),
+                    name: k.server_version.clone(),
+                    message,
+                    component: String::new(),
+                    host: String::new(),
+                    count: 1,
+                }
+            }
+        }
+    }
+}
+
+/// Un enregistrement n'est un avertissement que si la ligne est un écart : une image aux seules CVE
+/// basses est la norme, et le panneau ne doit pas la dire `WARN`.
+fn severity_of(tone: LineColor) -> Severity {
+    if tone == LineColor::Ok { Severity::Normal } else { Severity::Warning }
+}
+
+/// Garde lisible la fin du chemin d'image quand le préfixe du registre est long.
+pub fn short_image(image: &str) -> String {
+    let trimmed = image
+        .strip_prefix("index.docker.io/library/")
+        .or_else(|| image.strip_prefix("index.docker.io/"))
+        .or_else(|| image.strip_prefix("docker.io/library/"))
+        .or_else(|| image.strip_prefix("docker.io/"))
+        .unwrap_or(image);
+    trimmed.to_string()
 }
 
 enum TrivyError {
@@ -227,7 +451,7 @@ async fn fetch_trivy_reports(client: &Client) -> Result<Vec<VulnComponent>, Triv
     match api.list(&ListParams::default()).await {
         Ok(list) => {
             for obj in &list.items {
-                if let Some(c) = parse_report(obj) {
+                if let Some(c) = parse_report(obj, TRIVY_KIND) {
                     components.push(c);
                 }
             }
@@ -242,7 +466,7 @@ async fn fetch_trivy_reports(client: &Client) -> Result<Vec<VulnComponent>, Triv
             let capi: Api<DynamicObject> = Api::all_with(client.clone(), &car);
             if let Ok(list) = capi.list(&ListParams::default()).await {
                 for obj in &list.items {
-                    if let Some(c) = parse_report(obj) {
+                    if let Some(c) = parse_report(obj, TRIVY_CLUSTER_KIND) {
                         components.push(c);
                     }
                 }
@@ -255,7 +479,38 @@ async fn fetch_trivy_reports(client: &Client) -> Result<Vec<VulnComponent>, Triv
     Ok(components)
 }
 
-fn parse_report(obj: &DynamicObject) -> Option<VulnComponent> {
+/// Un seul rapport, relu par son nom : le détail d'une image, CVE comprises.
+///
+/// `kind` est celui que la ligne a porté (`VulnerabilityReport` ou `ClusterVulnerabilityReport`) ;
+/// un autre est refusé plutôt que de laisser l'appelant viser un kind arbitraire.
+pub async fn vuln_report(
+    client: &Client,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<VulnComponent, String> {
+    if kind != TRIVY_KIND && kind != TRIVY_CLUSTER_KIND {
+        return Err(format!("kind inattendu : {kind}"));
+    }
+    let mut resolved = None;
+    for v in TRIVY_VERSIONS {
+        let gvk = GroupVersionKind::gvk(TRIVY_GROUP, v, kind);
+        if let Ok((ar, _caps)) = discovery::pinned_kind(client, &gvk).await {
+            resolved = Some(ar);
+            break;
+        }
+    }
+    let ar = resolved.ok_or_else(|| format!("{kind} introuvable"))?;
+    let api: Api<DynamicObject> = if kind == TRIVY_CLUSTER_KIND || namespace.is_empty() {
+        Api::all_with(client.clone(), &ar)
+    } else {
+        Api::namespaced_with(client.clone(), namespace, &ar)
+    };
+    let obj = api.get(name).await.map_err(|e| e.to_string())?;
+    parse_report(&obj, kind).ok_or_else(|| format!("{kind} {name} : pas de rapport"))
+}
+
+fn parse_report(obj: &DynamicObject, kind: &str) -> Option<VulnComponent> {
     let labels = obj.metadata.labels.clone().unwrap_or_default();
     let report = obj.data.get("report")?;
 
@@ -307,6 +562,8 @@ fn parse_report(obj: &DynamicObject) -> Option<VulnComponent> {
     cves.sort_by_key(|a| a.sort_key());
 
     let mut comp = VulnComponent {
+        report_kind: kind.to_string(),
+        report: obj.metadata.name.clone().unwrap_or_default(),
         namespace: obj.metadata.namespace.clone().unwrap_or_default(),
         workload,
         image,
@@ -369,14 +626,18 @@ fn parse_image_cve(v: &Value) -> Cve {
 
 // --- Kubernetes version risk ------------------------------------------------------------------
 
-async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
+/// Le risque de la version Kubernetes : cible de patch, fenêtre de support, CVE du feed officiel.
+///
+/// Public parce que la réponse ne dépend que de la version et de sources publiques : kdt-web la
+/// garde en cache pour tout le monde, là où l'inventaire Trivy, lui, se relit sous chaque identité.
+pub async fn k8s_version_risk(server_version: &str, st: &'static Strings) -> K8sVersionRisk {
     let mut risk = K8sVersionRisk {
         server_version: server_version.to_string(),
         ..Default::default()
     };
 
     let Some((minor, patch)) = parse_minor_patch(server_version) else {
-        risk.note = Some(crate::lang::active().vuln_bad_server_version.into());
+        risk.note = Some(st.vuln_bad_server_version.into());
         return risk;
     };
 
@@ -389,7 +650,7 @@ async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
             }
             risk.latest_patch = Some(latest);
         }
-        None => risk.note = Some(crate::lang::active().vuln_network_down.into()),
+        None => risk.note = Some(st.vuln_network_down.into()),
     }
 
     // Support window: EOL when more than the latest 3 minors behind current stable.
@@ -402,7 +663,7 @@ async fn fetch_k8s_cve(server_version: &str) -> K8sVersionRisk {
     match http_json(K8S_CVE_FEED).await {
         Some(feed) => risk.cves = parse_k8s_feed(&feed),
         None => {
-            let n = crate::lang::active().vuln_feed_down.to_string();
+            let n = st.vuln_feed_down.to_string();
             risk.note = Some(match risk.note.take() {
                 Some(prev) => format!("{prev} · {n}"),
                 None => n,
@@ -540,5 +801,93 @@ mod tests {
     #[test]
     fn cvss_missing_is_unknown() {
         assert_eq!(parse_cvss("no rating here"), (Sev::Unknown, 0.0));
+    }
+
+    fn report(name: &str, ns: &str, vulns: serde_json::Value) -> DynamicObject {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "aquasecurity.github.io/v1alpha1",
+            "kind": "VulnerabilityReport",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "labels": {
+                    "trivy-operator.aquasecurity.github.io/resource.kind": "ReplicaSet",
+                    "trivy-operator.aquasecurity.github.io/resource.name": "api-7d9f",
+                    "trivy-operator.aquasecurity.github.io/container.name": "api",
+                },
+            },
+            "report": {
+                "artifact": { "repository": "library/nginx", "tag": "1.25.3" },
+                "registry": { "server": "index.docker.io" },
+                "vulnerabilities": vulns,
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn report_parsed_with_its_name_and_counts_derived() {
+        let obj = report(
+            "replicaset-api-7d9f-api",
+            "shop",
+            serde_json::json!([
+                { "vulnerabilityID": "CVE-2024-1", "severity": "HIGH", "score": 7.5,
+                  "resource": "openssl", "installedVersion": "3.0.1", "fixedVersion": "3.0.13" },
+                { "vulnerabilityID": "CVE-2024-2", "severity": "CRITICAL", "score": 9.8,
+                  "resource": "zlib", "installedVersion": "1.2", "fixedVersion": "" },
+                { "vulnerabilityID": "CVE-2024-3", "severity": "LOW", "resource": "bash" },
+            ]),
+        );
+        let c = parse_report(&obj, TRIVY_KIND).unwrap();
+        assert_eq!(c.report, "replicaset-api-7d9f-api");
+        assert_eq!(c.report_kind, TRIVY_KIND);
+        assert_eq!(c.workload, "ReplicaSet/api-7d9f:api");
+        assert_eq!(c.image, "index.docker.io/library/nginx");
+        assert_eq!(short_image(&c.image), "nginx");
+        assert_eq!((c.critical, c.high, c.medium, c.low), (1, 1, 0, 1));
+        assert_eq!(c.max_sev, Sev::Critical);
+        assert_eq!(c.fixable, 1);
+        // Trié du plus grave au moins grave.
+        assert_eq!(c.cves[0].id, "CVE-2024-2");
+        assert_eq!(c.max_sev.tone(), LineColor::Err);
+    }
+
+    #[test]
+    fn rows_keep_k8s_first_whatever_the_scope_and_floor() {
+        let a = parse_report(
+            &report("a", "shop", serde_json::json!([{ "vulnerabilityID": "C1", "severity": "MEDIUM" }])),
+            TRIVY_KIND,
+        )
+        .unwrap();
+        let b = parse_report(
+            &report("b", "infra", serde_json::json!([{ "vulnerabilityID": "C2", "severity": "CRITICAL" }])),
+            TRIVY_KIND,
+        )
+        .unwrap();
+        let state = VulnState {
+            components: vec![b, a],
+            k8s: Some(K8sVersionRisk { server_version: "v1.30.1".into(), ..Default::default() }),
+            available: true,
+            ..Default::default()
+        };
+        let rows = vuln_rows(&state, Some("shop"), Sev::Unknown);
+        assert!(matches!(&rows[0], VulnRow::K8s(_)));
+        assert!(matches!(&rows[1], VulnRow::Image(c) if c.namespace == "shop"));
+        assert_eq!(rows.len(), 2);
+        let rows = vuln_rows(&state, None, Sev::High);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[1], VulnRow::Image(c) if c.namespace == "infra"));
+    }
+
+    #[test]
+    fn k8s_target_says_unknown_without_network() {
+        let k = K8sVersionRisk { server_version: "v1.30.1".into(), ..Default::default() };
+        assert_eq!(k.target_label(), "?");
+        assert_eq!(k.target_tone(), LineColor::Dim);
+        assert_eq!(k.tone(), LineColor::Ok);
+        let behind = K8sVersionRisk { latest_patch: Some("v1.30.9".into()), behind: true, ..k };
+        assert_eq!(behind.target_label(), "→ v1.30.9");
+        assert_eq!(behind.tone(), LineColor::Err);
+        assert_eq!(behind.target_text(&crate::lang::EN), "→ upgrade to v1.30.9");
     }
 }

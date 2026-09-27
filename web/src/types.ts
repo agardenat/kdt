@@ -3280,3 +3280,100 @@ export interface ReflPayload {
   cluster_hints?: Hint[];
   error: string | null;
 }
+
+/** L'échelle de Trivy, nommée comme `kdt::vulnerabilities::Sev`. `unknown` sert aussi de plancher « tout ». */
+export type VulnSev = "unknown" | "low" | "medium" | "high" | "critical";
+
+export interface VulnCve {
+  id: string;
+  severity: VulnSev;
+  score: number;
+  /** Vides pour une CVE du feed Kubernetes, où `title` porte le résumé. */
+  package: string;
+  installed: string;
+  fixed: string;
+  title: string;
+  url: string;
+}
+
+/** Le risque de la version Kubernetes : toujours en tête, quelle que soit la portée. */
+export interface VulnK8sRow {
+  row: "k8s";
+  uid: string;
+  tone: LineTone;
+  component: string;
+  version: string;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  target: string;
+  target_tone: LineTone;
+  target_text: string;
+  eol: boolean;
+  eol_text: string;
+  note: string | null;
+  cves: VulnCve[];
+  record: EventRecord;
+}
+
+/** Une image scannée. Ses CVE ne voyagent pas avec la liste : le détail relit son rapport. */
+export interface VulnImageRow {
+  row: "image";
+  uid: string;
+  tone: LineTone;
+  report_kind: string;
+  report: string;
+  namespace: string;
+  workload: string;
+  component: string;
+  image: string;
+  version: string;
+  max_sev: VulnSev;
+  max_label: string;
+  max_score: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  unknown: number;
+  total: number;
+  fixable: number;
+  fixable_text: string;
+  target: string;
+  target_tone: LineTone;
+  age: string;
+  /** Sans les CVE : le détail en rend un complet, de même identité. */
+  record: EventRecord;
+}
+
+export type VulnRow = VulnK8sRow | VulnImageRow;
+
+export interface VulnPayload {
+  rows: VulnRow[];
+  /** Faux sans Trivy Operator : il ne reste que la ligne Kubernetes. */
+  available: boolean;
+  /** Lecture des rapports refusée — les lignes d'avant ne sont pas « aucune image ». */
+  error: string | null;
+  counts: { scanned: number; critical: number; high: number; medium: number; low: number };
+}
+
+export interface VulnReport {
+  cves: VulnCve[];
+  record: EventRecord;
+  no_fix: string;
+}
+
+/** Un Namespace, objet de première classe de la vue du même nom. */
+export interface NamespaceRow {
+  uid: string;
+  name: string;
+  /** `Active`, `Terminating`, ou vide quand l'API ne le dit pas. */
+  phase: string;
+  phase_tone: LineTone;
+  age: string;
+  provenance_label: string;
+  labels: Array<[string, string]>;
+  annotations: Array<[string, string]>;
+  record: EventRecord;
+}

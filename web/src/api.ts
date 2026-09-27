@@ -64,6 +64,11 @@ import type {
   RancherPayload,
   ReflPayload,
   ReflWorld,
+  NamespaceRow,
+  VulnImageRow,
+  VulnPayload,
+  VulnReport,
+  VulnSev,
   ArgoPayload,
   StatusPayload,
   WorkloadRow,
@@ -502,6 +507,29 @@ export function reflector(world: ReflWorld, problems: boolean, lang: Lang): Prom
  */
 export function reflectorForce(uid: string, lang: Lang): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/reflector/force", { uid, lang });
+}
+
+/** La ligne Kubernetes puis les images de la portée au-dessus du plancher `min`. */
+export function vuln(namespace: string, min: VulnSev, lang: Lang): Promise<VulnPayload> {
+  const params = new URLSearchParams({ min, lang });
+  if (namespace) params.set("ns", namespace);
+  return get<VulnPayload>(`/api/v1/vuln?${params.toString()}`);
+}
+
+/** Le détail d'une image : son seul rapport relu, CVE comprises. */
+export function vulnReport(row: VulnImageRow, lang: Lang): Promise<VulnReport> {
+  const params = new URLSearchParams({
+    kind: row.report_kind,
+    namespace: row.namespace,
+    name: row.report,
+    lang,
+  });
+  return get<VulnReport>(`/api/v1/vuln/report?${params.toString()}`);
+}
+
+/** Les namespaces comme objets : phase, provenance, labels. Distinct de la liste du sélecteur. */
+export function namespacesView(lang: Lang): Promise<{ namespaces: NamespaceRow[] }> {
+  return get<{ namespaces: NamespaceRow[] }>(`/api/v1/namespaces/view?lang=${encodeURIComponent(lang)}`);
 }
 
 /** Les quatre mondes de la vue Rancher, en une lecture. */

@@ -10,6 +10,29 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 
 ## [Non publié]
 
+- **feat(web)** — la vue **Namespaces** rejoint kdt-web : les colonnes de `:ns`, la phase et son
+  ton, labels et annotations dans le panneau, et « voir ses évènements » dans le menu d'une ligne,
+  qui restreint la portée et ouvre les évènements comme `Entrée`. Un refus de lister les namespaces
+  se dit au lieu de se rendre comme un cluster vide.
+
+- **feat(web)** — la vue **Vulnérabilités** rejoint kdt-web : la ligne Kubernetes en tête quelle que
+  soit la portée, les images de la portée au-dessus du plancher de sévérité, les mêmes colonnes et
+  la même cible de patch. Les CVE d'une image se relisent sur son seul rapport à la sélection, et
+  l'analyse IA reçoit cet enregistrement complet. Sans Trivy Operator, une bande le dit et la ligne
+  Kubernetes reste.
+
+- **refactor(vuln, namespaces)** — le modèle de lignes (`VulnRow`, `vuln_rows`), les
+  enregistrements, le ton d'une sévérité, la cible de patch et le ton d'une phase de namespace
+  quittent `ui.rs` pour `kdt::vulnerabilities` et `kdt::namespaces` ; `fetch_vulnerabilities` et
+  `fetch_namespaces_view` ne sont plus que la couche qui dépose `vulnerabilities_inventory` et
+  `namespaces_inventory`.
+
+- **fix(vuln, namespaces)** — le détail d'une image et du risque Kubernetes (`pas de fix`,
+  `(aucune)`, `cible patch`, `→ monter vers`), la colonne `→ TARGET` (`fixables`) et le titre de la
+  vue Namespaces (`erreur`, `chargement`) étaient en français dans les deux langues : ils passent
+  par la table de langue. Une cible de patch non résolue (réseau coupé) n'est plus peinte en vert,
+  et l'enregistrement d'une image aux seules CVE basses n'est plus un avertissement.
+
 - **feat(web)** — la vue **Reflector** rejoint kdt-web, avec les trois mondes du TUI : sources et
   leurs destinations, miroirs à plat, orphelins. Mêmes colonnes et mêmes verdicts, l'arbre replié
   par défaut, le filtre « problèmes » qui garde la source au-dessus d'une destination en échec.

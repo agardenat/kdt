@@ -720,10 +720,10 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-neuf vues
-répondent — évènements, workloads, nodes, Flux, Argo CD, Velero, K8ssandra, capacité, stockage,
-Secrets/ConfigMaps, reflector, certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks,
-diagnostic — avec
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Vingt et une
+vues répondent — évènements, namespaces, workloads, nodes, Flux, Argo CD, Velero, K8ssandra,
+capacité, stockage, Secrets/ConfigMaps, reflector, certificats, RBAC, Kyverno, vulnérabilités,
+identity, Rancher, réseau, hooks, diagnostic — avec
 les cinq gestes qui portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
 
 **La vue Argo CD** porte les quatre mondes de `:argocd` / `:appsets` / `:appprojects` /
@@ -758,6 +758,21 @@ re-réflexion », offert seulement quand elle peut bouger quelque chose ; le ser
 l'inventaire et c'est la ligne relue qui décide quel miroir vider et s'il faut horodater la source.
 La vue n'a pas de portée de namespace : une source et ses miroirs vivent dans des namespaces
 différents.
+
+**La vue Namespaces** porte les colonnes de `:ns` (`NAME STATUS ORIGIN AGE`), `Terminating` en
+jaune, et dans le panneau la phase, l'origine, les labels et les annotations. Le menu d'une ligne
+ajoute « voir ses évènements » aux gestes génériques : il restreint la portée à ce namespace et ouvre
+les évènements, comme `Entrée`. La vue n'a pas de portée de namespace.
+
+**La vue Vulnérabilités** porte les colonnes de `:vuln` (`SEV NAMESPACE COMPONENT VERSION CRIT HIGH
+MED LOW → TARGET AGE`) : la ligne Kubernetes en tête, qui reste quelle que soit la portée, puis les
+images scannées de la plus grave à la moins grave, avec le plancher de sévérité de `f` (tout,
+`HIGH+`, `CRIT`). Sans Trivy Operator, la vue ne montre que la ligne Kubernetes et le dit. Les CVE
+d'une image ne voyagent pas avec la liste : le panneau relit son seul `VulnerabilityReport` à la
+sélection. Comme dans le TUI, une ligne n'offre ni YAML, ni édition, ni touch, ni suppression —
+seulement l'analyse IA. Le risque de la version Kubernetes (dernier patch de la mineure, fenêtre de
+support, feed officiel des CVE) est gardé un quart d'heure par le serveur, pour tout le monde : il ne
+dépend que de la version et de sources publiques.
 
 **La vue Réseau** porte les trois mondes de la vue réseau du TUI : Services (et leurs endpoints),
 Ingress (et leurs IngressClass), policies. Une case range les endpoints sous leur Service ou les

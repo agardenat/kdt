@@ -118,6 +118,7 @@ export function InspectPanel({
   lang,
   st,
   detail,
+  objectTabs = true,
 }: {
   /** `null` quand rien n'est sélectionné : le panneau reste en place et le dit. */
   record: EventRecord | null;
@@ -128,6 +129,9 @@ export function InspectPanel({
   lang: Lang;
   st: Strings;
   detail?: DetailPane;
+  /** `false` quand la ligne ne désigne pas un objet Kubernetes — un résultat de scan, une version
+   * du control plane : `Logs`, `Status` et `Related` n'auraient rien à relire, seul le détail reste. */
+  objectTabs?: boolean;
 }) {
   // Un Pod rend ses propres logs, une ressource Flux ceux de son controller filtrés sur elle.
   // Ailleurs, l'onglet resterait vide : remonter d'un Deployment à ses pods demande de choisir
@@ -138,7 +142,11 @@ export function InspectPanel({
   // ligne désélectionnée ou un objet supprimé — le panneau du haut ne connaît que ses quatre
   // onglets propres.
   const shown: PanelTab =
-    isOverlayTab(tab) || (tab === "detail" && !detail) ? fallbackTab(Boolean(detail)) : tab;
+    !objectTabs && detail
+      ? "detail"
+      : isOverlayTab(tab) || (tab === "detail" && !detail)
+        ? fallbackTab(Boolean(detail))
+        : tab;
 
   return (
     <section className="panel" style={{ height }}>
@@ -149,6 +157,8 @@ export function InspectPanel({
               {detail.label}
             </button>
           )}
+          {objectTabs && (
+          <>
           <button
             role="tab"
             aria-selected={shown === "logs"}
@@ -170,6 +180,8 @@ export function InspectPanel({
           <button role="tab" aria-selected={shown === "related"} onClick={() => onTab("related")}>
             Related
           </button>
+          </>
+          )}
         </div>
 
         <div className="pid">
