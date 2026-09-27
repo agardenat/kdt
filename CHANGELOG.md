@@ -8,7 +8,7 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
-## [Non publié]
+## [2.4.0] — 2026-09-27
 
 - **feat(web)** — la vue **Namespaces** rejoint kdt-web : les colonnes de `:ns`, la phase et son
   ton, labels et annotations dans le panneau, et « voir ses évènements » dans le menu d'une ligne,
