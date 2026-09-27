@@ -181,7 +181,7 @@ pub async fn analyze(
 
     // Le canal borne ce qui peut s'accumuler si le navigateur lit moins vite que le modèle n'écrit.
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    let cluster = state.cluster_label.clone();
+    let cluster_label = state.cluster_label.clone();
     let model = config.model.clone();
 
     tokio::spawn(async move {
@@ -210,6 +210,8 @@ pub async fn analyze(
         let logs = logs_text(&client, &record, st).await;
         let status = status_text(&client, &record, st).await;
         let related = related_text(&client, &record).await;
+        stage(st.enr_cluster.to_string()).await;
+        let cluster = kdt::clusterctx::prompt_block(&client, Some(&record)).await;
 
         // Les mêmes sondes que `/related` et que le TUI, dans le même ordre : ce que l'onglet
         // Related montre est exactement ce que le modèle reçoit.
@@ -238,8 +240,9 @@ pub async fn analyze(
         stage(st.ai_building_prompt.to_string()).await;
         let prompt = kdt::ai::build_ai_prompt(
             &record,
-            &cluster,
+            &cluster_label,
             &ns_label,
+            cluster.as_deref(),
             logs.as_deref(),
             status.as_deref(),
             related.as_deref(),

@@ -2629,6 +2629,8 @@ impl App {
                 update_stage(&progress_state, &progress_key, stage);
                 update_sections_count(&progress_state, &progress_key, count);
             };
+            update_stage(&state, &key, lang::t(lang).enr_cluster);
+            let cluster = crate::clusterctx::prompt_block(&client, Some(&rec)).await;
             let mut extra = gather_extra_context_with_progress(&client, &rec, progress).await;
             if let Some(u) = usage_extra { extra.insert(0, u); }
             if let Some(d) = diagnostic_extra { extra.insert(0, d); }
@@ -2639,6 +2641,7 @@ impl App {
                 &rec,
                 &ctx_label,
                 &ns_label,
+                cluster.as_deref(),
                 logs_text.as_deref(),
                 status_text.as_deref(),
                 related_text.as_deref(),

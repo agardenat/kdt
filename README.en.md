@@ -697,7 +697,9 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## Security / privacy
 
 - **Data sent to the AI**: `i` and `X` transmit the current cluster context — event message, **pod
-  logs** (up to 200 lines), status, related resources. Logs may contain secrets: use trusted
+  logs** (up to 200 lines), status, related resources, and the cluster frame: version and
+  distribution, nodes (kubelet, runtime, OS, `providerID`), add-ons read from the served API groups,
+  IngressClasses and StorageClasses, the object's owner chain and its manager (Flux, Argo CD, Helm). Logs may contain secrets: use trusted
   endpoints only. Only bookkeeping metadata is stripped, not application data.
 - **Endpoint**: an `http://` `base_url` sends the key and the payload in the clear. Prefer `https://`
   or a local endpoint.

@@ -26,6 +26,7 @@ pub mod capacity;
 pub mod certmanager;
 pub mod cli;
 pub mod clip;
+pub mod clusterctx;
 pub mod config;
 pub mod configmaps;
 pub mod connect;

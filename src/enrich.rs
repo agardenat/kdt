@@ -650,7 +650,7 @@ fn extract_sa(msg: &str) -> Option<(String, String)> {
 
 // Fetch any object by GVK via API discovery, choosing the cluster- or namespace-scoped API
 // based on the resource's scope. Returns None on any discovery/get failure.
-async fn fetch_dynamic_obj(
+pub(crate) async fn fetch_dynamic_obj(
     client: &Client,
     api_version: &str,
     kind: &str,

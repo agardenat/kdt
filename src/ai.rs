@@ -63,8 +63,8 @@ impl AiLanguage {
     }
     fn system_prompt(self) -> &'static str {
         match self {
-            Self::Fr => "Expert Kubernetes. On te fournit un événement, le statut de l'objet, ses logs, les événements liés et des ressources contextuelles (policies, RBAC, ingress, sources flux/argo, PV/PVC…).\n\nRÈGLES :\n1. N'invente aucun problème. Ne signale que ce que le contexte montre noir sur blanc ; pas de panne supposée, pas d'erreur extrapolée. Si rien n'indique de souci, dis-le en une phrase — situation saine, rien de spécial à faire — et arrête-toi là, sans action ni commande.\n2. Sinon : cause racine la plus probable puis actions correctives, sous les titres Diagnostic, Cause probable, Actions recommandées. Concis.\n3. Chaque action porte sa commande exacte (kubectl, helm…) dans un bloc ```sh ; aucune reco sans commande. Coupe les commandes longues avec `\\` en fin de ligne, sous ~100 caractères. Pour une inspection, donne aussi la commande de vérification.\n4. Commandes courtes inline en backticks simples.\n\nRéponds en français.",
-            Self::En => "Kubernetes expert. You receive an event, the object's status, its logs, related events and contextual resources (policies, RBAC, ingress, flux/argo sources, PV/PVC…).\n\nRULES:\n1. Never invent a problem. Report only what the context shows in black and white; no assumed failure, no extrapolated error. If nothing points to an issue, say so in one sentence — healthy, nothing to do — and stop there, with no action and no command.\n2. Otherwise: most likely root cause then remediation, under the headings Diagnosis, Likely cause, Recommended actions. Concise.\n3. Every action carries its exact command (kubectl, helm…) in a ```sh block; no recommendation without a command. Split long commands with `\\` line continuations, under ~100 characters. For an inspection, also give the verification command.\n4. Short inline commands stay in single backticks.\n\nAnswer in English.",
+            Self::Fr => "Expert Kubernetes. On te fournit le cadre du cluster, un événement, le statut de l'objet, ses logs, les événements liés et des ressources contextuelles (policies, RBAC, ingress, sources flux/argo, PV/PVC…).\n\nRÈGLES :\n1. N'invente aucun problème. Ne signale que ce que le contexte montre noir sur blanc ; pas de panne supposée, pas d'erreur extrapolée. Si rien n'indique de souci, dis-le en une phrase — situation saine, rien de spécial à faire — et arrête-toi là, sans action ni commande.\n2. Sinon : cause racine la plus probable puis actions correctives, sous les titres Diagnostic, Cause probable, Actions recommandées. Concis.\n3. Le bloc Cluster décrit l'environnement réel ; tes recommandations s'y conforment. apiVersion, commandes et outils : ceux de la version et des add-ons listés, jamais un composant absent. Cluster managé (AKS, EKS, GKE…) : pas d'accès au plan de contrôle ni aux nœuds maîtres. Objet géré par Flux, Argo CD ou Helm : la correction durable va dans sa source (dépôt Git, values) — un `kubectl edit/patch` serait écrasé à la prochaine réconciliation ; dis-le, puis donne la commande de resynchronisation (`flux reconcile …`, `argocd app sync …`, `helm upgrade …`).\n4. Chaque action porte sa commande exacte (kubectl, helm…) dans un bloc ```sh ; aucune reco sans commande. Coupe les commandes longues avec `\\` en fin de ligne, sous ~100 caractères. Pour une inspection, donne aussi la commande de vérification.\n5. Commandes courtes inline en backticks simples.\n\nRéponds en français.",
+            Self::En => "Kubernetes expert. You receive the cluster frame, an event, the object's status, its logs, related events and contextual resources (policies, RBAC, ingress, flux/argo sources, PV/PVC…).\n\nRULES:\n1. Never invent a problem. Report only what the context shows in black and white; no assumed failure, no extrapolated error. If nothing points to an issue, say so in one sentence — healthy, nothing to do — and stop there, with no action and no command.\n2. Otherwise: most likely root cause then remediation, under the headings Diagnosis, Likely cause, Recommended actions. Concise.\n3. The Cluster block describes the actual environment; your recommendations fit it. apiVersions, commands and tools: those of the listed version and add-ons, never a missing component. Managed cluster (AKS, EKS, GKE…): no access to the control plane or master nodes. Object managed by Flux, Argo CD or Helm: the lasting fix goes to its source (Git repository, values) — a `kubectl edit/patch` would be overwritten at the next reconciliation; say so, then give the resync command (`flux reconcile …`, `argocd app sync …`, `helm upgrade …`).\n4. Every action carries its exact command (kubectl, helm…) in a ```sh block; no recommendation without a command. Split long commands with `\\` line continuations, under ~100 characters. For an inspection, also give the verification command.\n5. Short inline commands stay in single backticks.\n\nAnswer in English.",
         }
     }
 }
@@ -520,8 +520,8 @@ fn build_extra_block(extra: &[(String, String)], budget: Option<usize>, st: &Str
     out
 }
 
-// Assemble the full prompt sent to the model: event metadata, object status, recent logs, related
-// events, and enrichment sections. This is the complete payload transmitted to the AI endpoint.
+// Assemble the full prompt sent to the model: event metadata, cluster frame, object status,
+// recent logs, related events, and enrichment sections. This is the complete payload transmitted to the AI endpoint.
 //
 // Mirrors `build_ai_prompt_inner`'s parameters plus the budget; grouping them would only move the
 // same list into a struct used at a single call site.
@@ -530,6 +530,7 @@ pub fn build_ai_prompt(
     rec: &EventRecord,
     ctx_label: &str,
     ns_label: &str,
+    cluster: Option<&str>,
     logs: Option<&str>,
     status: Option<&str>,
     related: Option<&str>,
@@ -543,7 +544,7 @@ pub fn build_ai_prompt(
     const PLACEHOLDER: &str = "\u{0}";
     let has_extra = !extra.is_empty();
     let ph = if has_extra { Some(PLACEHOLDER) } else { None };
-    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, logs, status, related, ph);
+    let skeleton = build_ai_prompt_inner(rec, ctx_label, ns_label, cluster, logs, status, related, ph);
     if !has_extra { return skeleton; }
     let fixed_len = skeleton.len() - PLACEHOLDER.len();
     let extra_budget = char_budget.map(|b| b.saturating_sub(fixed_len));
@@ -554,10 +555,12 @@ pub fn build_ai_prompt(
 // Kept deliberately terse: every heading here is paid for on each analysis, and the model already
 // has its instructions from the system prompt — repeating them in the request only costs tokens and
 // nudges it towards finding something to say. Sections with nothing in them are not emitted at all.
+#[allow(clippy::too_many_arguments)]
 fn build_ai_prompt_inner(
     rec: &EventRecord,
     ctx_label: &str,
     ns_label: &str,
+    cluster: Option<&str>,
     logs: Option<&str>,
     status: Option<&str>,
     related: Option<&str>,
@@ -582,6 +585,7 @@ cluster {ctx} · ns {ns_label}
         msg = rec.message,
     );
     for (title, body) in [
+        ("## Cluster", cluster),
         ("## Statut", status),
         ("## Logs (200 dernières lignes)", logs),
         ("## Événements liés", related),

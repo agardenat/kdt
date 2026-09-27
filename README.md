@@ -705,7 +705,10 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## Sécurité / confidentialité
 
 - **Données envoyées à l'IA** : `i` et `X` transmettent le contexte cluster courant — message de
-  l'évènement, **logs du pod** (jusqu'à 200 lignes), status, ressources liées. Les logs peuvent
+  l'évènement, **logs du pod** (jusqu'à 200 lignes), status, ressources liées, et le cadre du
+  cluster : version et distribution, nodes (kubelet, runtime, OS, `providerID`), add-ons lus aux
+  groupes d'API servis, IngressClass et StorageClass, chaîne de propriétaires de l'objet et son
+  gestionnaire (Flux, Argo CD, Helm). Les logs peuvent
   contenir des secrets : n'utiliser que des endpoints de confiance. Seules les métadonnées de
   bookkeeping sont retirées, pas les données applicatives.
 - **Endpoint** : un `base_url` en `http://` envoie la clé et le payload en clair. Préférer `https://`

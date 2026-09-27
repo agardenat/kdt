@@ -102,7 +102,11 @@ pub async fn run_full_extract(
     if !update(&state, run_id, current, total_steps, st.progress_diag_ai) {
         return;
     }
-    let diag_prompt = build_prompt_diagnostic(&ctx_label, &ns_label, &diag_summary, lang);
+    let cluster = crate::clusterctx::prompt_block(&client, None).await;
+    let diag_prompt = with_cluster(
+        cluster.as_deref(),
+        build_prompt_diagnostic(&ctx_label, &ns_label, &diag_summary, lang),
+    );
     let (diag_ai_content, diag_ai_error) = match query_ai_direct(&config, lang, &diag_prompt).await
     {
         Ok(c) => (c, None),
@@ -134,7 +138,10 @@ pub async fn run_full_extract(
             return;
         }
         let usage_text = format_node_usage_text(&snap);
-        let prompt = build_prompt_node(&ctx_label, name, &usage_text, lang);
+        let prompt = with_cluster(
+            cluster.as_deref(),
+            build_prompt_node(&ctx_label, name, &usage_text, lang),
+        );
         let (ai_content, ai_error) = match query_ai_direct(&config, lang, &prompt).await {
             Ok(c) => (c, None),
             Err(e) => (String::new(), Some(e)),
@@ -253,6 +260,14 @@ fn line_color_to_pdf(c: crate::events::LineColor) -> &'static str {
         Err => "err",
         Info => "info",
         Dim => "dim",
+    }
+}
+
+// Le cadre du cluster en tête, sous le titre que la règle du prompt système désigne.
+fn with_cluster(cluster: Option<&str>, prompt: String) -> String {
+    match cluster {
+        Some(c) => format!("## Cluster\n{c}\n\n{prompt}"),
+        None => prompt,
     }
 }
 
