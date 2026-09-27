@@ -8,6 +8,19 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.5.0] — 2026-09-27
+
+- **feat(ai)** — le prompt de l'analyse IA (TUI `i`, kdt-web, rapport PDF `X`) s'ouvre sur un
+  bloc `## Cluster` : version Kubernetes et distribution (k3s, RKE2, k0s, EKS, GKE, AKS, OpenShift,
+  minikube, Talos, kind), nodes (kubelet, runtime, OS, architecture, `providerID`), add-ons lus aux
+  groupes d'API servis avec leur version préférée, IngressClass et StorageClass avec la classe par
+  défaut. Pour un évènement, la chaîne de propriétaires de l'objet (Pod → ReplicaSet → Deployment…)
+  et ce qui gère sa racine : Flux Kustomization ou HelmRelease, réconciliation Flux désactivée,
+  Application Argo CD, release Helm. Le prompt système en tire une règle : commandes et
+  `apiVersion` conformes au cluster, jamais un composant absent, et pour un objet géré par
+  GitOps ou Helm la correction dans la source suivie de la commande de resynchronisation plutôt
+  qu'un `kubectl patch` écrasé à la réconciliation suivante.
+
 ## [2.4.0] — 2026-09-27
 
 - **feat(web)** — la vue **Namespaces** rejoint kdt-web : les colonnes de `:ns`, la phase et son
