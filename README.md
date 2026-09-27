@@ -720,9 +720,10 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 ## L'interface web (bêta)
 
 `kdt-web` sert les mêmes vues dans un navigateur, adossé à
-[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-huit vues
+[kdt-identity](https://github.com/agardenat/kdt-identity) pour l'authentification. Dix-neuf vues
 répondent — évènements, workloads, nodes, Flux, Argo CD, Velero, K8ssandra, capacité, stockage,
-Secrets/ConfigMaps, certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks, diagnostic — avec
+Secrets/ConfigMaps, reflector, certificats, RBAC, Kyverno, identity, Rancher, réseau, hooks,
+diagnostic — avec
 les cinq gestes qui portent sur n'importe quel objet : YAML, édition, touch, suppression, analyse IA.
 
 **La vue Argo CD** porte les quatre mondes de `:argocd` / `:appsets` / `:appprojects` /
@@ -746,6 +747,17 @@ schedule, restaurer une sauvegarde complète (le nom du backup se retape, la res
 datacenter), tâches Medusa et cass-operator sur un datacenter, `nodetool` sur un node. Le serveur
 relit la ligne avant d'écrire et c'est elle qui bâtit l'objet ; la commande `nodetool` y est
 revérifiée contre la même liste de caractères que le TUI.
+
+**La vue Reflector** porte les trois mondes de `:reflector` : l'arbre des sources et de leurs
+destinations, replié par défaut, les miroirs à plat, les orphelins. Mêmes colonnes
+(`NAMESPACE NAME KIND ROLE STATE VERSION AGE ALERT`) et mêmes verdicts : `DIVERGENT` et `BLOQUÉ` en
+rouge, le filtre « problèmes » qui garde une source au-dessus d'une destination en échec. L'absence
+du contrôleur est dans la barre, et les constats qui ne tiennent à aucune source ont leur ligne sous
+elle. « voir la source » fait le saut de `s`. Le menu d'une source ou d'un miroir porte « forcer la
+re-réflexion », offert seulement quand elle peut bouger quelque chose ; le serveur relit
+l'inventaire et c'est la ligne relue qui décide quel miroir vider et s'il faut horodater la source.
+La vue n'a pas de portée de namespace : une source et ses miroirs vivent dans des namespaces
+différents.
 
 **La vue Réseau** porte les trois mondes de la vue réseau du TUI : Services (et leurs endpoints),
 Ingress (et leurs IngressClass), policies. Une case range les endpoints sous leur Service ou les

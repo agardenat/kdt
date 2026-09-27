@@ -21,6 +21,7 @@ import VeleroView from "./VeleroView";
 import K8ssandraView from "./K8ssandraView";
 import RancherView from "./RancherView";
 import ArgocdView from "./ArgocdView";
+import ReflectorView from "./ReflectorView";
 import WorkloadsView from "./WorkloadsView";
 import DataView from "./DataView";
 import DiagnosticView from "./DiagnosticView";
@@ -42,6 +43,7 @@ type ViewId =
   | "network"
   | "hooks"
   | "data"
+  | "reflector"
   | "certs"
   | "identity"
   | "rancher"
@@ -79,6 +81,9 @@ const VIEWS: Array<{
   { id: "capacity", label: "Capacity", key: "c", ready: true },
   { id: "storage", label: "Storage", key: "s", ready: true },
   { id: "data", label: "Secrets / CM", key: "b", ready: true },
+  // Reflector n'a pas de CRD : ses sources sont des Secrets et des ConfigMaps annotés, donc rien
+  // que la découverte puisse sonder. La vue répond partout, et dit elle-même si le contrôleur manque.
+  { id: "reflector", label: "Reflector", key: "x", ready: true },
   { id: "certs", label: "Certs", key: "t", ready: true, needs: "certs" },
   { id: "rbac", label: "RBAC", key: "r", ready: true },
   { id: "kyverno", label: "Kyverno", key: "k", ready: true, needs: "kyverno" },
@@ -355,6 +360,8 @@ export default function App() {
           ? st.ranchScopeless
           : view === "argocd"
             ? st.argoScopeless
+          : view === "reflector"
+            ? st.reflScopeless
           : view === "kyverno"
             ? st.kyScopeless
             : view === "diagnostic"
@@ -664,6 +671,17 @@ export default function App() {
             />
           ) : view === "kyverno" ? (
             <KyvernoView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "reflector" ? (
+            <ReflectorView
               lang={lang}
               st={st}
               query={query}

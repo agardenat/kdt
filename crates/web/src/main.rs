@@ -27,6 +27,7 @@ mod objects;
 mod portal;
 mod rbac;
 mod rancher;
+mod reflector;
 mod netpol;
 mod k8ssandra;
 mod network;
@@ -236,6 +237,10 @@ async fn main() -> Result<()> {
         // Les trois écritures du TUI sur une Application — refresh, sync, terminate —, rien sur un
         // set, un project ou un Secret de dépôt : ceux-là se changent là où ils sont déclarés.
         .route("/api/v1/argocd/write", post(argocd::write))
+        .route("/api/v1/reflector", get(reflector::list))
+        // La seule écriture de la vue : forcer une re-réflexion. Le corps ne nomme que la ligne ;
+        // le plan — quel miroir vider, faut-il horodater la source — se rebâtit sur l'inventaire relu.
+        .route("/api/v1/reflector/force", post(reflector::force))
         .route("/api/v1/kyverno", get(kyverno::list))
         // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
         // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.

@@ -863,6 +863,54 @@ export interface Strings {
   argoMore: string;
   argoYes: string;
   argoNo: string;
+  reflSources: string;
+  reflMirrors: string;
+  reflOrphans: string;
+  reflDetail: string;
+  reflEmpty: string;
+  reflScopeless: string;
+  reflCtrlAbsent: string;
+  reflCtrlAbsentHelp: string;
+  reflCtrlUnknown: string;
+  reflCtrlUnknownHelp: string;
+  reflProblems: string;
+  reflFold: string;
+  reflGotoSource: string;
+  reflSourceGone: string;
+  reflForce: string;
+  reflForceHelp: string;
+  reflForceMirrors: string;
+  reflStampsSource: string;
+  reflCancel: string;
+  reflConfirm: string;
+  reflAnnotations: string;
+  reflAllNs: string;
+  reflScopeTitle: string;
+  reflDestinations: string;
+  reflDestUnknown: string;
+  reflDestNone: string;
+  reflDestUptodate: string;
+  reflOutOfAuto: string;
+  reflState: string;
+  reflScope: string;
+  reflScopeAuto: string;
+  reflScopeManual: string;
+  reflCreatedBy: string;
+  reflYes: string;
+  reflCreatedManual: string;
+  reflExpected: string;
+  reflLastPass: string;
+  reflAgo: string;
+  reflKeys: string;
+  reflObject: string;
+  reflObjectAbsent: string;
+  reflOccupied: string;
+  reflClaimedBy: string;
+  reflConsumersUnknown: string;
+  reflProvenance: string;
+  reflAge: string;
+  reflDiagnostic: string;
+  reflCluster: string;
 }
 
 const FR: Strings = {
@@ -1756,6 +1804,54 @@ const FR: Strings = {
   argoMore: "… et {n} de plus",
   argoYes: "oui",
   argoNo: "non",
+  reflSources: "sources",
+  reflMirrors: "miroirs",
+  reflOrphans: "orphelins",
+  reflDetail: "Détail",
+  reflEmpty: "Aucun objet annoté pour reflector",
+  reflScopeless: "Une source et ses miroirs vivent dans des namespaces différents : la portée de namespace ne s'y applique pas.",
+  reflCtrlAbsent: "contrôleur absent",
+  reflCtrlAbsentHelp: "Aucun déploiement reflector dans le cluster : les annotations ne sont honorées par personne.",
+  reflCtrlUnknown: "contrôleur non vérifié",
+  reflCtrlUnknownHelp: "Les Deployments n'ont pas pu être lus : impossible de confirmer que reflector tourne.",
+  reflProblems: "à voir",
+  reflFold: "déplier / replier",
+  reflGotoSource: "voir la source",
+  reflSourceGone: "source {ns}/{name} absente du cluster",
+  reflForce: "forcer la re-réflexion",
+  reflForceHelp: "Vide l'annotation reflected-version du miroir, et — pour un miroir auto, que reflector ne repousse qu'en voyant sa source — horodate aussi la source. Seules des annotations sont écrites, jamais les données.",
+  reflForceMirrors: "miroirs concernés : {n}",
+  reflStampsSource: "la source est horodatée, puis l'horodatage est retiré",
+  reflCancel: "annuler",
+  reflConfirm: "forcer",
+  reflAnnotations: "Annotations",
+  reflAllNs: "\"\" (tous les namespaces)",
+  reflScopeTitle: "Portée résolue",
+  reflDestinations: "destinations",
+  reflDestUnknown: "indéterminée (sélecteur illisible)",
+  reflDestNone: "aucun namespace ne correspond",
+  reflDestUptodate: "{synced}/{expected} à jour",
+  reflOutOfAuto: "hors portée auto",
+  reflState: "état",
+  reflScope: "portée",
+  reflScopeAuto: "automatique",
+  reflScopeManual: "à la main",
+  reflCreatedBy: "créé par reflector",
+  reflYes: "oui",
+  reflCreatedManual: "non (déclaré à la main)",
+  reflExpected: "attendu",
+  reflLastPass: "dernier passage",
+  reflAgo: "il y a {age}",
+  reflKeys: "clés",
+  reflObject: "objet",
+  reflObjectAbsent: "absent de ce namespace",
+  reflOccupied: "occupé par",
+  reflClaimedBy: "réclamé par",
+  reflConsumersUnknown: "inconnu (pods ou ServiceAccounts illisibles)",
+  reflProvenance: "provenance",
+  reflAge: "âge",
+  reflDiagnostic: "Diagnostic",
+  reflCluster: "Cluster",
 };
 
 const EN: Strings = {
@@ -2641,6 +2737,54 @@ const EN: Strings = {
   argoMore: "… and {n} more",
   argoYes: "yes",
   argoNo: "no",
+  reflSources: "sources",
+  reflMirrors: "mirrors",
+  reflOrphans: "orphans",
+  reflDetail: "Detail",
+  reflEmpty: "No object annotated for reflector",
+  reflScopeless: "A source and its mirrors live in different namespaces: the namespace scope does not apply.",
+  reflCtrlAbsent: "controller missing",
+  reflCtrlAbsentHelp: "No reflector deployment in the cluster: nobody honours the annotations.",
+  reflCtrlUnknown: "controller not checked",
+  reflCtrlUnknownHelp: "Deployments could not be read: cannot confirm reflector is running.",
+  reflProblems: "to look at",
+  reflFold: "fold / unfold",
+  reflGotoSource: "go to source",
+  reflSourceGone: "source {ns}/{name} not in the cluster",
+  reflForce: "force re-reflection",
+  reflForceHelp: "Clears the mirror's reflected-version annotation and — for an auto mirror, which reflector only re-pushes when it sees the source — stamps the source too. Only annotations are written, never the payload.",
+  reflForceMirrors: "mirrors covered: {n}",
+  reflStampsSource: "the source is stamped, then the stamp is removed",
+  reflCancel: "cancel",
+  reflConfirm: "force",
+  reflAnnotations: "Annotations",
+  reflAllNs: "\"\" (every namespace)",
+  reflScopeTitle: "Resolved scope",
+  reflDestinations: "destinations",
+  reflDestUnknown: "undetermined (unreadable selector)",
+  reflDestNone: "no namespace matches",
+  reflDestUptodate: "{synced}/{expected} up to date",
+  reflOutOfAuto: "outside auto scope",
+  reflState: "status",
+  reflScope: "scope",
+  reflScopeAuto: "automatic",
+  reflScopeManual: "by hand",
+  reflCreatedBy: "created by reflector",
+  reflYes: "yes",
+  reflCreatedManual: "no (declared by hand)",
+  reflExpected: "expected",
+  reflLastPass: "last pass",
+  reflAgo: "{age} ago",
+  reflKeys: "keys",
+  reflObject: "object",
+  reflObjectAbsent: "absent from this namespace",
+  reflOccupied: "taken by",
+  reflClaimedBy: "claimed by",
+  reflConsumersUnknown: "unknown (pods or ServiceAccounts unreadable)",
+  reflProvenance: "provenance",
+  reflAge: "age",
+  reflDiagnostic: "Diagnosis",
+  reflCluster: "Cluster",
 };
 
 export function strings(lang: Lang): Strings {

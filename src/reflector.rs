@@ -35,7 +35,7 @@ use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::Client;
 
-use crate::events::format_age;
+use crate::events::{format_age, EventRecord, LineColor, Severity};
 use crate::rbac::{detect_provenance, Provenance};
 
 // Annotation prefix and keys, verbatim from `Mirroring/Core/Annotations.cs`.
@@ -53,14 +53,15 @@ const A_REFLECTED_AT: &str = "reflector.v1.k8s.emberstack.com/reflected-at";
 
 // --- Diagnosis ----------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HintLevel {
     Info,
     Warn,
     Danger,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hint {
     pub level: HintLevel,
     pub text: String,
@@ -237,7 +238,7 @@ fn selector_match(reqs: &[Requirement], labels: &BTreeMap<String, String>) -> bo
 // --- Parsed annotations -------------------------------------------------------------------------
 
 // The reflector annotations of one object, in the shape upstream reads them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MirroringProps {
     pub allowed: bool,
     pub allowed_ns: String,
@@ -297,7 +298,7 @@ pub fn parse_props(meta: &ObjectMeta) -> MirroringProps {
 
 // --- Rows ---------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ReflKind {
     Secret,
     ConfigMap,
@@ -332,7 +333,8 @@ pub struct ReflObject {
 }
 
 // What a target namespace looks like for one source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetStatus {
     // The mirror is there and records the source's current version.
     Synced,
@@ -374,10 +376,21 @@ impl TargetStatus {
             TargetStatus::Synced | TargetStatus::Stale | TargetStatus::Drifted | TargetStatus::Pending
         )
     }
+
+    // Coloured by what the status costs: SYNC is fine, the waiting ones are questions, the two that
+    // reflector will never resolve on its own are errors, and a manual slot is only a possibility.
+    pub fn tone(&self) -> LineColor {
+        match self {
+            TargetStatus::Synced => LineColor::Ok,
+            TargetStatus::Stale | TargetStatus::Pending | TargetStatus::Missing => LineColor::Warn,
+            TargetStatus::Blocked | TargetStatus::Drifted => LineColor::Err,
+            TargetStatus::Manual => LineColor::Dim,
+        }
+    }
 }
 
 // The mirror sitting in a target namespace, as found.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MirrorFacts {
     pub auto: bool,
     pub reflected_version: String,
@@ -391,7 +404,7 @@ pub struct MirrorFacts {
 }
 
 // One (source, namespace) pair.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReflTarget {
     pub namespace: String,
     // In the automatic scope (reflector creates and maintains the mirror by itself).
@@ -412,7 +425,7 @@ impl ReflTarget {
 }
 
 // An annotated source and everything it is meant to reach.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReflSource {
     pub kind: ReflKind,
     pub namespace: String,
@@ -452,7 +465,7 @@ impl ReflSource {
 
 // A mirror whose source cannot be resolved, or which no source claims any more. Kept apart from the
 // sources because there is no tree to hang it under.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReflOrphan {
     pub kind: ReflKind,
     pub namespace: String,
@@ -516,6 +529,243 @@ pub fn new_reflector_state() -> SharedReflector {
     Arc::new(Mutex::new(ReflectorState::default()))
 }
 
+// --- View rows ----------------------------------------------------------------------------------
+
+// The three ways to look at reflector's work. Sources is the tree everything hangs from; Mirrors
+// flattens the copies so one can scan versions side by side; Orphans isolates the copies no source
+// claims any more, which is where the surprises live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflWorld {
+    #[default]
+    Sources,
+    Mirrors,
+    Orphans,
+}
+
+// One row of the view. `Target` carries its source's index so the detail can show both sides of the
+// pair without looking anything up. Indices point into the `ReflView` that produced the row.
+#[derive(Debug, Clone)]
+pub enum ReflRow {
+    Source { idx: usize, collapsed: bool },
+    Target { src: usize, target: usize },
+    Orphan { idx: usize },
+}
+
+// What one world shows: the sources and orphans the filter kept, and the rows over them.
+#[derive(Debug, Clone, Default)]
+pub struct ReflView {
+    pub sources: Vec<ReflSource>,
+    pub orphans: Vec<ReflOrphan>,
+    pub rows: Vec<ReflRow>,
+}
+
+impl ReflView {
+    pub fn source_of(&self, row: &ReflRow) -> Option<&ReflSource> {
+        match row {
+            ReflRow::Source { idx, .. } => self.sources.get(*idx),
+            ReflRow::Target { src, .. } => self.sources.get(*src),
+            ReflRow::Orphan { .. } => None,
+        }
+    }
+
+    pub fn target_of(&self, row: &ReflRow) -> Option<&ReflTarget> {
+        match row {
+            ReflRow::Target { src, target } => self.sources.get(*src)?.targets.get(*target),
+            _ => None,
+        }
+    }
+
+    pub fn orphan_of(&self, row: &ReflRow) -> Option<&ReflOrphan> {
+        match row {
+            ReflRow::Orphan { idx } => self.orphans.get(*idx),
+            _ => None,
+        }
+    }
+}
+
+fn flagged(level: Option<HintLevel>) -> bool {
+    level.is_some_and(|l| l >= HintLevel::Warn)
+}
+
+// Fold key of a source. Also the uid suffix of its record, so a source can be found by identity.
+pub fn source_key(src: &ReflSource) -> String {
+    format!("{}/{}", src.namespace, src.name)
+}
+
+// The rows of one world. `expanded` names the unfolded sources; `None` unfolds everything, which is
+// what kdt-web asks for — it folds in the browser, from `fold_default`.
+//
+// The Problems filter never hides a source above a failing target: dropping it would strand the
+// target and lose the very context one came looking for. Under a kept source, a clean target is
+// noise.
+pub fn build_refl_view(
+    sources: &[ReflSource],
+    orphans: &[ReflOrphan],
+    world: ReflWorld,
+    problems: bool,
+    expanded: Option<&HashSet<String>>,
+) -> ReflView {
+    let mut sources = sources.to_vec();
+    let mut orphans = orphans.to_vec();
+    if problems {
+        sources.retain(|s| flagged(s.worst()));
+        orphans.retain(|o| flagged(o.worst()));
+    }
+    let mut rows: Vec<ReflRow> = Vec::new();
+    match world {
+        ReflWorld::Sources => {
+            for (i, src) in sources.iter().enumerate() {
+                let collapsed = expanded.is_some_and(|e| !e.contains(&source_key(src)));
+                rows.push(ReflRow::Source { idx: i, collapsed });
+                if collapsed {
+                    continue;
+                }
+                for (j, t) in src.targets.iter().enumerate() {
+                    if problems && !flagged(t.worst()) {
+                        continue;
+                    }
+                    rows.push(ReflRow::Target { src: i, target: j });
+                }
+            }
+        }
+        // Flat: every copy that exists, whatever source it belongs to, so versions line up.
+        ReflWorld::Mirrors => {
+            for (i, src) in sources.iter().enumerate() {
+                for (j, t) in src.targets.iter().enumerate() {
+                    if t.mirror.is_some() {
+                        rows.push(ReflRow::Target { src: i, target: j });
+                    }
+                }
+            }
+            rows.extend((0..orphans.len()).map(|idx| ReflRow::Orphan { idx }));
+        }
+        ReflWorld::Orphans => {
+            rows.extend((0..orphans.len()).map(|idx| ReflRow::Orphan { idx }));
+        }
+    }
+    ReflView { sources, orphans, rows }
+}
+
+// What the ROLE column says of a target: who made the copy, or that one is owed.
+pub fn role_label(t: &ReflTarget, st: &'static Strings) -> &'static str {
+    match &t.mirror {
+        Some(m) if m.auto => st.refl_role_auto,
+        Some(_) => st.refl_role_manual,
+        None if t.auto => st.refl_role_expected,
+        None => "—",
+    }
+}
+
+// The tone a diagnosis lends to the row that carries it: only what needs a human is coloured.
+pub fn level_tone(level: Option<HintLevel>) -> Option<LineColor> {
+    match level? {
+        HintLevel::Danger => Some(LineColor::Err),
+        HintLevel::Warn => Some(LineColor::Warn),
+        HintLevel::Info => None,
+    }
+}
+
+fn severity_of(level: Option<HintLevel>) -> Severity {
+    if flagged(level) { Severity::Warning } else { Severity::Normal }
+}
+
+// The records below are what gives the view `y`, `Ctrl-D`, the AI and the Related tab: they name a
+// real object, so the generic machinery can fetch and act on it. A target with no mirror still gets
+// a record — it names the object that *should* be there, which is what one wants to copy or create.
+pub fn source_record(src: &ReflSource, st: &'static Strings) -> EventRecord {
+    let (synced, expected) = src.tally();
+    EventRecord {
+        uid: format!("refl|src|{}", source_key(src)),
+        time: Timestamp::now(),
+        severity: severity_of(src.worst()),
+        reason: "Source".to_string(),
+        api_version: "v1".to_string(),
+        kind: src.kind.label().to_string(),
+        namespace: src.namespace.clone(),
+        name: src.name.clone(),
+        message: fill(
+            &st.plural(expected, st.refl_rec_source_one, st.refl_rec_source_many),
+            &[
+                ("synced", &synced.to_string()),
+                ("expected", &expected.to_string()),
+                ("scope", if src.scope_known { "" } else { st.refl_rec_scope_unknown }),
+            ],
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn target_record(src: &ReflSource, t: &ReflTarget, st: &'static Strings) -> EventRecord {
+    let age = match &t.mirror {
+        Some(m) if !m.reflected_age.is_empty() => {
+            fill(st.refl_rec_last_pass, &[("age", &m.reflected_age)])
+        }
+        _ => String::new(),
+    };
+    EventRecord {
+        uid: format!("refl|tgt|{}/{}|{}", src.namespace, src.name, t.namespace),
+        time: Timestamp::now(),
+        severity: severity_of(t.worst()),
+        reason: t.status.label(st).to_string(),
+        api_version: "v1".to_string(),
+        kind: src.kind.label().to_string(),
+        namespace: t.namespace.clone(),
+        name: src.name.clone(),
+        message: fill(
+            st.refl_rec_mirror,
+            &[
+                ("ns", &src.namespace),
+                ("name", &src.name),
+                ("status", t.status.label(st)),
+                ("age", &age),
+            ],
+        ),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn orphan_record(o: &ReflOrphan, st: &'static Strings) -> EventRecord {
+    let (rns, rname) = o.props.reflects.clone().unwrap_or_default();
+    EventRecord {
+        uid: format!("refl|orph|{}/{}", o.namespace, o.name),
+        time: Timestamp::now(),
+        severity: severity_of(o.worst()),
+        reason: st.rec_orphan.to_string(),
+        api_version: "v1".to_string(),
+        kind: o.kind.label().to_string(),
+        namespace: o.namespace.clone(),
+        name: o.name.clone(),
+        message: fill(st.refl_rec_orphan, &[("ns", &rns), ("name", &rname)]),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+pub fn row_record(view: &ReflView, row: &ReflRow, st: &'static Strings) -> Option<EventRecord> {
+    match row {
+        ReflRow::Source { idx, .. } => view.sources.get(*idx).map(|s| source_record(s, st)),
+        ReflRow::Target { src, target } => {
+            let s = view.sources.get(*src)?;
+            s.targets.get(*target).map(|t| target_record(s, t, st))
+        }
+        ReflRow::Orphan { idx } => view.orphans.get(*idx).map(|o| orphan_record(o, st)),
+    }
+}
+
+// The row whose record carries `uid`, looked up in the unfiltered, unfolded Sources world. That is
+// where every source and every target lives; an orphan is never a force target, and not needed.
+pub fn find_force_row<'a>(view: &'a ReflView, uid: &str, st: &'static Strings) -> Option<&'a ReflRow> {
+    view.rows
+        .iter()
+        .find(|r| row_record(view, r, st).is_some_and(|rec| rec.uid == uid))
+}
+
 // --- Fetch --------------------------------------------------------------------------------------
 
 // A namespace, reduced to what the scope arithmetic needs.
@@ -528,14 +778,36 @@ pub struct NsInfo {
 // Which workloads in a namespace reference an object by name, keyed by (namespace, kind, name).
 pub type ConsumerMap = HashMap<(String, ReflKind, String), Vec<String>>;
 
+// The TUI's side of the fetch: the inventory, laid into the shared state it redraws from.
 pub async fn fetch_reflector(client: Client, state: SharedReflector) {
-    let st = crate::lang::active();
     {
         let mut s = state.lock().expect("reflector poisoned");
         s.loading = true;
         s.error = None;
     }
+    let result = reflector_inventory(&client, crate::lang::active()).await;
+    let mut s = state.lock().expect("reflector poisoned");
+    s.loading = false;
+    match result {
+        Ok(inv) => {
+            s.error = None;
+            s.sources = inv.sources;
+            s.orphans = inv.orphans;
+            s.cluster_hints = inv.cluster_hints;
+            s.controller_present = inv.controller_present;
+            s.consumers_known = inv.consumers_known;
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
 
+// One consistent pass over everything the rules need, diagnosed. Returns a value rather than
+// filling a shared state, so kdt-web reads exactly what the TUI reads; the language is a parameter
+// because a server answers people who do not all read the same one.
+pub async fn reflector_inventory(
+    client: &Client,
+    st: &'static Strings,
+) -> Result<ReflectorState, String> {
     let lp = ListParams::default();
     let secrets: Api<Secret> = Api::all(client.clone());
     let configmaps: Api<ConfigMap> = Api::all(client.clone());
@@ -554,14 +826,8 @@ pub async fn fetch_reflector(client: Client, state: SharedReflector) {
     );
 
     // The objects are the subject of the view: without them there is nothing to say.
-    let secrets = match secrets {
-        Ok(l) => l,
-        Err(e) => return fail(&state, e.to_string()),
-    };
-    let nss = match nss {
-        Ok(l) => l,
-        Err(e) => return fail(&state, e.to_string()),
-    };
+    let secrets = secrets.map_err(|e| e.to_string())?;
+    let nss = nss.map_err(|e| e.to_string())?;
 
     let mut objects: Vec<ReflObject> = Vec::new();
     for s in &secrets.items {
@@ -616,20 +882,15 @@ pub async fn fetch_reflector(client: Client, state: SharedReflector) {
         diagnosed.cluster_hints.push(info(st.refl_controller_unknown.to_string()));
     }
 
-    let mut s = state.lock().expect("reflector poisoned");
-    s.loading = false;
-    s.error = None;
-    s.sources = diagnosed.sources;
-    s.orphans = diagnosed.orphans;
-    s.cluster_hints = diagnosed.cluster_hints;
-    s.controller_present = diagnosed.controller_present;
-    s.consumers_known = diagnosed.consumers_known;
-}
-
-fn fail(state: &SharedReflector, msg: String) {
-    let mut s = state.lock().expect("reflector poisoned");
-    s.loading = false;
-    s.error = Some(msg);
+    Ok(ReflectorState {
+        sources: diagnosed.sources,
+        orphans: diagnosed.orphans,
+        cluster_hints: diagnosed.cluster_hints,
+        controller_present: diagnosed.controller_present,
+        consumers_known: diagnosed.consumers_known,
+        error: None,
+        loading: false,
+    })
 }
 
 fn secret_object(s: &Secret) -> ReflObject {
@@ -1167,14 +1428,16 @@ fn reflected_age(raw: &str) -> String {
 
 // resourceVersions are long and only ever compared, never read: the tail is enough to tell two
 // apart on screen.
-fn short_version(v: &str) -> String {
+pub fn short_version(v: &str) -> String {
     if v.is_empty() {
         return "—".to_string();
     }
-    if v.len() <= 8 {
+    let n = v.chars().count();
+    if n <= 8 {
         return v.to_string();
     }
-    format!("…{}", &v[v.len() - 7..])
+    let tail: String = v.chars().skip(n - 7).collect();
+    format!("…{tail}")
 }
 
 fn diagnose_orphan(
@@ -1354,6 +1617,81 @@ pub fn force_plan(
         });
     }
     plan
+}
+
+// The writes a forced re-reflection performs from a row, mirrors first. Empty when a force cannot
+// move anything — the action is then not offered at all.
+//
+// On a target row: that mirror alone, and only if its status can move. On a source row: every mirror
+// it actually has, with the source stamped once for the whole batch — its auto pass covers every
+// mirror at once, so repeating the stamp per target would be noise. An orphan never gets a plan: its
+// source is gone or no longer permits it, and no amount of clearing will bring reflector back.
+pub fn force_writes(src: &ReflSource, target: Option<&ReflTarget>) -> Vec<ForceWrite> {
+    let plan_for = |t: &ReflTarget| {
+        let set = t.mirror.as_ref().is_some_and(|m| m.reflected_version_set);
+        force_plan(src.kind, &t.namespace, &src.name, set, t.auto, &src.namespace)
+    };
+    match target {
+        Some(t) if t.status.forceable() => plan_for(t),
+        Some(_) => Vec::new(),
+        None => {
+            let mut writes: Vec<ForceWrite> = Vec::new();
+            let mut touch: Option<ForceWrite> = None;
+            let mut untouch: Option<ForceWrite> = None;
+            for t in src.targets.iter().filter(|t| t.status.forceable()) {
+                for w in plan_for(t) {
+                    match w {
+                        ForceWrite::TouchSource { .. } => touch = Some(w),
+                        ForceWrite::UnstampSource { .. } => untouch = Some(w),
+                        other => writes.push(other),
+                    }
+                }
+            }
+            writes.extend(touch);
+            writes.extend(untouch);
+            writes
+        }
+    }
+}
+
+// How many mirrors a plan covers, for the confirmation line. The source stamp is not a mirror.
+pub fn mirrors_in(writes: &[ForceWrite]) -> usize {
+    writes
+        .iter()
+        .filter(|w| !matches!(w, ForceWrite::TouchSource { .. } | ForceWrite::UnstampSource { .. }))
+        .count()
+}
+
+impl ForceWrite {
+    // `namespace/name` of the object written, for the failure list.
+    pub fn target(&self) -> String {
+        match self {
+            ForceWrite::ClearMirror { namespace, name, .. }
+            | ForceWrite::EmptyMirror { namespace, name, .. }
+            | ForceWrite::TouchSource { namespace, name, .. }
+            | ForceWrite::UnstampSource { namespace, name, .. } => format!("{namespace}/{name}"),
+        }
+    }
+}
+
+// Run a plan in order and say how it went, in the words of the TUI's status line.
+pub async fn run_force(client: Client, writes: Vec<ForceWrite>, st: &'static Strings) -> Result<String, String> {
+    let n = mirrors_in(&writes);
+    let mut failed: Vec<String> = Vec::new();
+    for w in writes {
+        let label = w.target();
+        if let Err(e) = apply_force(client.clone(), w).await {
+            failed.push(format!("{label}: {e}"));
+        }
+    }
+    if failed.is_empty() {
+        Ok(st.plural(n, st.msg_refl_forced_one, st.msg_refl_forced_many))
+    } else {
+        Err(fill(
+            &st.plural(failed.len(), st.msg_refl_force_failed_one, st.msg_refl_force_failed_many),
+            &[("list", &failed.join(" ; "))],
+        ))
+    }
 }
 
 // Apply one write. Merge patches on metadata only — never on the payload.

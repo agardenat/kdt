@@ -62,6 +62,8 @@ import type {
   IssuedToken,
   ObjectYaml,
   RancherPayload,
+  ReflPayload,
+  ReflWorld,
   ArgoPayload,
   StatusPayload,
   WorkloadRow,
@@ -485,6 +487,21 @@ export function argocdWrite(
   lang: Lang,
 ): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/argocd/write", { ...request, lang });
+}
+
+/** Les lignes d'un monde de la vue reflector ; `problems` ne garde que ce qui demande un humain. */
+export function reflector(world: ReflWorld, problems: boolean, lang: Lang): Promise<ReflPayload> {
+  const params = new URLSearchParams({ world, lang });
+  if (problems) params.set("problems", "true");
+  return get<ReflPayload>(`/api/v1/reflector?${params.toString()}`);
+}
+
+/**
+ * Forcer une re-réflexion depuis une ligne. Seul l'uid part : le serveur relit l'inventaire et
+ * c'est la ligne d'aujourd'hui qui décide du plan.
+ */
+export function reflectorForce(uid: string, lang: Lang): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/reflector/force", { uid, lang });
 }
 
 /** Les quatre mondes de la vue Rancher, en une lecture. */

@@ -3174,3 +3174,109 @@ export interface ArgoPayload {
   projects: ArgoProjectRow[];
   endpoints: ArgoEndpointRow[];
 }
+
+// --- Vue reflector -------------------------------------------------------------------------------
+
+export type ReflWorld = "sources" | "mirrors" | "orphans";
+
+/** Les annotations d'un objet, telles que reflector les lit (`MirroringProps` de kdt). */
+export interface ReflProps {
+  allowed: boolean;
+  allowed_ns: string;
+  allowed_selector: string;
+  auto_enabled: boolean;
+  auto_ns: string;
+  auto_selector: string;
+  /** `[namespace, name]` de la source qu'un miroir reflète. */
+  reflects: [string, string] | null;
+  auto_reflects: boolean;
+  reflected_version: string;
+  reflected_version_set: boolean;
+  reflected_at: string;
+}
+
+export interface ReflMirror {
+  auto: boolean;
+  reflected_version: string;
+  reflected_version_set: boolean;
+  reflected_at: string;
+  reflected_age: string;
+  age: string;
+  provenance_label: string;
+  keys: string[];
+}
+
+export interface ReflRowBase {
+  uid: string;
+  depth: number;
+  /** L'uid de la source au-dessus, dans l'arbre des sources seulement. */
+  parent: string | null;
+  foldable: boolean;
+  fold_default: boolean;
+  namespace: string;
+  name: string;
+  kind: string;
+  role: string;
+  state: string;
+  state_tone: LineTone | null;
+  version: string;
+  age: string;
+  name_tone: LineTone | null;
+  hints: Hint[];
+  /** Le plan d'un forçage, calculé par kdt ; `null` quand forcer ne changerait rien. */
+  force: { mirrors: number; stamps_source: boolean } | null;
+  /** Pourquoi il n'y a rien à forcer, dans les mots du TUI. */
+  no_force: string | null;
+  record: EventRecord;
+}
+
+export interface ReflSourceRow extends ReflRowBase {
+  row: "source";
+  source: {
+    type: string;
+    resource_version: string;
+    provenance_label: string;
+    age: string;
+    props: ReflProps;
+    scope_known: boolean;
+    synced: number;
+    expected: number;
+    targets: { namespace: string; auto: boolean; status_label: string; tone: LineTone }[];
+  };
+}
+
+export interface ReflTargetRow extends ReflRowBase {
+  row: "target";
+  target: {
+    namespace: string;
+    auto: boolean;
+    status_label: string;
+    mirror: ReflMirror | null;
+    blocker: string | null;
+    consumers: string[];
+  };
+  source: { namespace: string; name: string; resource_version: string };
+}
+
+export interface ReflOrphanRow extends ReflRowBase {
+  row: "orphan";
+  orphan: {
+    props: ReflProps;
+    mirror: ReflMirror;
+    provenance_label: string;
+    consumers: string[];
+  };
+}
+
+export type ReflRow = ReflSourceRow | ReflTargetRow | ReflOrphanRow;
+
+export interface ReflPayload {
+  rows: ReflRow[];
+  counts?: { sources: number; mirrors: number; orphans: number; problems: number };
+  /** `null` quand les Deployments n'ont pas pu être lus : « non vérifié », pas « absent ». */
+  controller_present?: boolean | null;
+  /** Faux quand pods ou ServiceAccounts sont illisibles : « réclamé par » est alors inconnu. */
+  consumers_known?: boolean;
+  cluster_hints?: Hint[];
+  error: string | null;
+}

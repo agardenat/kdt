@@ -10,6 +10,21 @@ elles disent ce que chaque version a apporté, pas ce qui en avait été annonc�
 
 ## [Non publié]
 
+- **feat(web)** — la vue **Reflector** rejoint kdt-web, avec les trois mondes du TUI : sources et
+  leurs destinations, miroirs à plat, orphelins. Mêmes colonnes et mêmes verdicts, l'arbre replié
+  par défaut, le filtre « problèmes » qui garde la source au-dessus d'une destination en échec.
+  L'absence du contrôleur est dans la barre et les constats du cluster ont leur ligne. « voir la
+  source » fait le saut de `s`, et le menu d'une ligne porte « forcer la re-réflexion » quand elle
+  peut bouger quelque chose ; le serveur relit l'inventaire et rebâtit le plan depuis la ligne.
+
+- **refactor(reflector)** — le modèle de lignes (`ReflWorld`, `ReflRow`, `build_refl_view`), les
+  enregistrements synthétiques, le ton d'un statut et le plan d'un forçage quittent `ui.rs` pour
+  `kdt::reflector`, et `fetch_reflector` n'est plus que la couche qui dépose `reflector_inventory`.
+
+- **fix(reflector)** — un orphelin s'affichait `orphelin` / `ORPHAN` dans les deux langues, et son
+  enregistrement parlait français quelle que soit la langue choisie : les trois libellés passent
+  par la table de langue.
+
 - **feat(web)** — la vue **Argo CD** rejoint kdt-web, avec les quatre mondes du TUI : Applications,
   ApplicationSets, AppProjects, dépôts et clusters. Mêmes colonnes, mêmes verdicts : `sync Unknown`
   en rouge et le health qu'il rend périmé en gris, jamais en vert ; `automated.enabled: false` lu

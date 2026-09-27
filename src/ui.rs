@@ -702,9 +702,14 @@ use crate::storage::{
     fetch_storage, new_storage_state, volume_in_class, HintLevel as StoHintLevel, PvResource,
     PvcResource, ScResource, SharedStorage,
 };
+// Comme pour velero, la vue reflector n'a plus de modèle à elle : ses lignes, ses enregistrements
+// synthétiques, le ton d'un statut et le plan d'un forçage vivent dans `crate::reflector`, et
+// kdt-web parcourt exactement les mêmes.
 use crate::reflector::{
-    apply_force, fetch_reflector, force_plan, new_reflector_state, ForceWrite,
-    HintLevel as ReflHintLevel, ReflOrphan, ReflSource, ReflTarget, SharedReflector, TargetStatus,
+    build_refl_view, fetch_reflector, force_writes, new_reflector_state,
+    role_label as refl_role_label, run_force, short_version, source_key as refl_source_key,
+    ForceWrite, HintLevel as ReflHintLevel, ReflOrphan, ReflRow, ReflSource, ReflTarget, ReflWorld,
+    SharedReflector, TargetStatus,
 };
 // Comme les vues kyverno et rbac, la vue velero n'a pas de modèle à elle : ses lignes, le
 // regroupement sous les schedules, les tons de phase et les enregistrements synthétiques vivent
@@ -724,16 +729,6 @@ use crate::k8ssandra::{
     SharedK8cPanel,
 };
 
-// The three ways to look at reflector's work (`g`). Sources is the tree everything hangs from;
-// Mirrors flattens the copies so one can scan versions side by side; Orphans isolates the copies no
-// source claims any more, which is where the surprises live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReflWorld {
-    Sources,
-    Mirrors,
-    Orphans,
-}
-
 // How the reflector view is filtered (`f`): everything, or only what needs a human.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReflFilter {
@@ -748,16 +743,6 @@ impl ReflFilter {
             ReflFilter::Problems => "PROBLEMS",
         }
     }
-}
-
-// One visual row of the reflector view, index-aligned with `App::snapshot` like every other tree
-// view here. `Target` carries its source's index so the detail panel can show both sides of the
-// pair without looking anything up.
-#[derive(Debug, Clone)]
-enum ReflRow {
-    Source { idx: usize, collapsed: bool },
-    Target { src: usize, target: usize },
-    Orphan { idx: usize },
 }
 
 // The two object worlds the storage view toggles between (`g`): claims — what a workload asked for
@@ -9882,63 +9867,25 @@ impl App {
     // in both. That alignment is what gives this view `y`, `Ctrl-D`, the AI panel and the Related
     // tab without any code of its own.
     fn refresh_reflector_snapshot(&mut self) {
-        let (mut sources, mut orphans) = {
+        let view = {
             let s = self.reflector_state.lock().expect("reflector poisoned");
-            (s.sources.clone(), s.orphans.clone())
+            build_refl_view(
+                &s.sources,
+                &s.orphans,
+                self.refl_world,
+                self.refl_filter == ReflFilter::Problems,
+                Some(&self.refl_expanded),
+            )
         };
-        // The Problems filter never hides a source above a failing target: dropping it would strand
-        // the target and lose the very context one came looking for.
-        if self.refl_filter == ReflFilter::Problems {
-            sources.retain(|s| s.worst().is_some_and(|l| l >= ReflHintLevel::Warn));
-            orphans.retain(|o| o.worst().is_some_and(|l| l >= ReflHintLevel::Warn));
-        }
-
         let st = lang::t(self.ai_language);
-        let mut rows: Vec<ReflRow> = Vec::new();
-        let mut recs: Vec<EventRecord> = Vec::new();
-        match self.refl_world {
-            ReflWorld::Sources => {
-                for (i, src) in sources.iter().enumerate() {
-                    let collapsed = !self.refl_expanded.contains(&refl_source_key(src));
-                    recs.push(synthetic_refl_source_record(src, st));
-                    rows.push(ReflRow::Source { idx: i, collapsed });
-                    if collapsed { continue; }
-                    for (j, t) in src.targets.iter().enumerate() {
-                        // In the Problems filter a clean target under a flagged source is noise.
-                        if self.refl_filter == ReflFilter::Problems
-                            && t.worst().is_none_or(|l| l < ReflHintLevel::Warn)
-                        {
-                            continue;
-                        }
-                        recs.push(synthetic_refl_target_record(src, t, st));
-                        rows.push(ReflRow::Target { src: i, target: j });
-                    }
-                }
-            }
-            // Flat: every copy that exists, whatever source it belongs to, so versions line up.
-            ReflWorld::Mirrors => {
-                for (i, src) in sources.iter().enumerate() {
-                    for (j, t) in src.targets.iter().enumerate() {
-                        if t.mirror.is_none() { continue; }
-                        recs.push(synthetic_refl_target_record(src, t, st));
-                        rows.push(ReflRow::Target { src: i, target: j });
-                    }
-                }
-                for (i, o) in orphans.iter().enumerate() {
-                    recs.push(synthetic_refl_orphan_record(o));
-                    rows.push(ReflRow::Orphan { idx: i });
-                }
-            }
-            ReflWorld::Orphans => {
-                for (i, o) in orphans.iter().enumerate() {
-                    recs.push(synthetic_refl_orphan_record(o));
-                    rows.push(ReflRow::Orphan { idx: i });
-                }
-            }
-        }
-        self.refl_view_sources = sources;
-        self.refl_view_orphans = orphans;
-        self.refl_rows = rows;
+        let recs: Vec<EventRecord> = view
+            .rows
+            .iter()
+            .filter_map(|r| crate::reflector::row_record(&view, r, st))
+            .collect();
+        self.refl_view_sources = view.sources;
+        self.refl_view_orphans = view.orphans;
+        self.refl_rows = view.rows;
 
         let prev_uid = self
             .table_state
@@ -10088,54 +10035,11 @@ impl App {
         }
     }
 
-    // The writes a forced re-reflection would perform from the current row, mirrors first. Empty
-    // when there is nothing a force can move — the menu then does not offer the action at all.
-    //
-    // An orphan is deliberately excluded: its source is gone or no longer permits it, so no amount
-    // of clearing will bring reflector back to it. Saying that is more useful than a write that
-    // silently achieves nothing.
+    // The writes a forced re-reflection would perform from the current row (`force_writes` says
+    // which, and why an orphan never has any). Empty means the menu does not offer the action.
     fn refl_force_writes(&self) -> Vec<ForceWrite> {
         let Some(src) = self.refl_selected_source() else { return Vec::new() };
-        let plan_for = |t: &ReflTarget| {
-            let set = t.mirror.as_ref().is_some_and(|m| m.reflected_version_set);
-            force_plan(src.kind, &t.namespace, &src.name, set, t.auto, &src.namespace)
-        };
-        match self.refl_selected_target() {
-            // On a target row: that mirror alone, and only if a force can move it.
-            Some(t) if t.status.forceable() => plan_for(t),
-            Some(_) => Vec::new(),
-            // On a source row: every mirror it actually has. The source is stamped once, however
-            // many mirrors hang off it — its auto pass covers them all in one go.
-            None => {
-                let mut writes: Vec<ForceWrite> = Vec::new();
-                let mut touch: Option<ForceWrite> = None;
-                let mut untouch: Option<ForceWrite> = None;
-                for t in src.targets.iter().filter(|t| t.status.forceable()) {
-                    for w in plan_for(t) {
-                        match w {
-                            // The source is stamped once for the whole batch: its auto pass covers
-                            // every mirror at once, so repeating it per target would be noise.
-                            ForceWrite::TouchSource { .. } => touch = Some(w),
-                            ForceWrite::UnstampSource { .. } => untouch = Some(w),
-                            other => writes.push(other),
-                        }
-                    }
-                }
-                writes.extend(touch);
-                writes.extend(untouch);
-                writes
-            }
-        }
-    }
-
-    // How many mirrors the plan covers, for the confirmation line. The source stamp is not a mirror.
-    fn refl_force_count(&self) -> usize {
-        self.refl_force_writes()
-            .iter()
-            .filter(|w| {
-                !matches!(w, ForceWrite::TouchSource { .. } | ForceWrite::UnstampSource { .. })
-            })
-            .count()
+        force_writes(src, self.refl_selected_target())
     }
 
     fn open_reflector_action_menu(&mut self) {
@@ -10172,43 +10076,15 @@ impl App {
     fn refl_force(&mut self) {
         let writes = self.refl_force_writes();
         if writes.is_empty() { return; }
-        let n = self.refl_force_count();
         let st = lang::t(self.ai_language);
         let client = self.client.clone();
         let status = self.reconcile_status.clone();
         let state = self.reflector_state.clone();
         tokio::spawn(async move {
-            let mut failed: Vec<String> = Vec::new();
-            for w in writes {
-                let label = match &w {
-                    ForceWrite::ClearMirror { namespace, name, .. }
-                    | ForceWrite::EmptyMirror { namespace, name, .. }
-                    | ForceWrite::TouchSource { namespace, name, .. }
-                    | ForceWrite::UnstampSource { namespace, name, .. } => {
-                        format!("{namespace}/{name}")
-                    }
-                };
-                if let Err(e) = apply_force(client.clone(), w).await {
-                    failed.push(format!("{label}: {e}"));
-                }
-            }
+            let outcome = run_force(client.clone(), writes, st).await;
             {
                 let mut s = status.lock().expect("reconcile status poisoned");
-                *s = Some((
-                    std::time::Instant::now(),
-                    if failed.is_empty() {
-                        st.plural(n, st.msg_refl_forced_one, st.msg_refl_forced_many)
-                    } else {
-                        lang::fill(
-                            &st.plural(
-                                failed.len(),
-                                st.msg_refl_force_failed_one,
-                                st.msg_refl_force_failed_many,
-                            ),
-                            &[("list", &failed.join(" ; "))],
-                        )
-                    },
-                ));
+                *s = Some((std::time::Instant::now(), outcome.unwrap_or_else(|e| e)));
             }
             fetch_reflector(client, state).await;
         });
@@ -17326,102 +17202,6 @@ fn synthetic_capacity_record(row: &CapRow) -> EventRecord {
     }
 }
 
-// Fold key of a source row. Also the uid suffix, so `s` can find a source by its identity alone.
-fn refl_source_key(src: &ReflSource) -> String {
-    format!("{}/{}", src.namespace, src.name)
-}
-
-fn refl_severity(level: Option<ReflHintLevel>) -> Severity {
-    match level {
-        Some(ReflHintLevel::Danger) => Severity::Warning,
-        Some(ReflHintLevel::Warn) => Severity::Warning,
-        _ => Severity::Normal,
-    }
-}
-
-// The synthetic records below are what gives the view `y`, `Ctrl-D` and the Related tab: they name a
-// real object, so the generic machinery can fetch and act on it. A target with no mirror still gets
-// a record — it names the object that *should* be there, which is what one wants to copy or create.
-fn synthetic_refl_source_record(src: &ReflSource, st: &'static Strings) -> EventRecord {
-    let (synced, expected) = src.tally();
-    EventRecord {
-        uid: format!("refl|src|{}", refl_source_key(src)),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: refl_severity(src.worst()),
-        reason: "Source".to_string(),
-        api_version: "v1".to_string(),
-        kind: src.kind.label().to_string(),
-        namespace: src.namespace.clone(),
-        name: src.name.clone(),
-        message: lang::fill(
-            &st.plural(expected, st.refl_rec_source_one, st.refl_rec_source_many),
-            &[
-                ("synced", &synced.to_string()),
-                ("expected", &expected.to_string()),
-                ("scope", if src.scope_known { "" } else { st.refl_rec_scope_unknown }),
-            ],
-        ),
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_refl_target_record(
-    src: &ReflSource,
-    t: &ReflTarget,
-    st: &'static Strings,
-) -> EventRecord {
-    EventRecord {
-        uid: format!("refl|tgt|{}/{}|{}", src.namespace, src.name, t.namespace),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: refl_severity(t.worst()),
-        reason: t.status.label(st).to_string(),
-        api_version: "v1".to_string(),
-        kind: src.kind.label().to_string(),
-        namespace: t.namespace.clone(),
-        name: src.name.clone(),
-        message: lang::fill(
-            st.refl_rec_mirror,
-            &[
-                ("ns", &src.namespace),
-                ("name", &src.name),
-                ("status", t.status.label(st)),
-                (
-                    "age",
-                    &match &t.mirror {
-                        Some(m) if !m.reflected_age.is_empty() => {
-                            lang::fill(st.refl_rec_last_pass, &[("age", &m.reflected_age)])
-                        }
-                        _ => String::new(),
-                    },
-                ),
-            ],
-        ),
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
-fn synthetic_refl_orphan_record(o: &ReflOrphan) -> EventRecord {
-    let (rns, rname) = o.props.reflects.clone().unwrap_or_default();
-    EventRecord {
-        uid: format!("refl|orph|{}/{}", o.namespace, o.name),
-        time: k8s_openapi::jiff::Timestamp::now(),
-        severity: refl_severity(o.worst()),
-        reason: lang::active().rec_orphan.to_string(),
-        api_version: "v1".to_string(),
-        kind: o.kind.label().to_string(),
-        namespace: o.namespace.clone(),
-        name: o.name.clone(),
-        message: format!("reflects {rns}/{rname} · orphelin"),
-        component: String::new(),
-        host: String::new(),
-        count: 1,
-    }
-}
-
 fn synthetic_storage_record(row: &StoRow) -> EventRecord {
     let st = lang::active();
     match row {
@@ -21607,16 +21387,9 @@ fn refl_hint_color(level: Option<ReflHintLevel>) -> Option<Color> {
     }
 }
 
-// The status cell, coloured by what the status costs: SYNC is fine, the waiting ones are questions,
-// and the three that reflector will never resolve on its own are red.
+// The status cell, in the tone `TargetStatus::tone` gives it.
 fn refl_status_cell(status: TargetStatus, st: &'static Strings) -> Cell<'static> {
-    let color = match status {
-        TargetStatus::Synced => Color::Green,
-        TargetStatus::Stale | TargetStatus::Pending | TargetStatus::Missing => Color::Yellow,
-        TargetStatus::Blocked | TargetStatus::Drifted => Color::Red,
-        TargetStatus::Manual => DIM,
-    };
-    Cell::from(status.label(st)).style(Style::default().fg(color))
+    Cell::from(status.label(st)).style(Style::default().fg(line_color(status.tone())))
 }
 
 // One shape for all three worlds, because the columns answer the same questions whichever object
@@ -21836,7 +21609,7 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     } else {
                         "?".to_string()
                     }),
-                    Cell::from(refl_short_version(&src.resource_version)).style(Style::default().fg(DIM)),
+                    Cell::from(short_version(&src.resource_version)).style(Style::default().fg(DIM)),
                     Cell::from(src.age.clone()).style(Style::default().fg(DIM)),
                     alert(&src.hints),
                 ])
@@ -21851,19 +21624,14 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     None => Style::default(),
                 };
                 let version = match &t.mirror {
-                    Some(m) => refl_short_version(&m.reflected_version),
+                    Some(m) => short_version(&m.reflected_version),
                     None => "—".to_string(),
                 };
                 let age = match &t.mirror {
                     Some(m) => m.age.clone(),
                     None => "—".to_string(),
                 };
-                let role = match &t.mirror {
-                    Some(m) if m.auto => st.refl_role_auto,
-                    Some(_) => st.refl_role_manual,
-                    None if t.auto => st.refl_role_expected,
-                    None => "—",
-                };
+                let role = refl_role_label(t, st);
                 Row::new(vec![
                     Cell::from(t.namespace.clone()).style(Style::default().fg(DIM)),
                     Cell::from(format!("{indent}{}", s.name)).style(name_style),
@@ -21885,9 +21653,9 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Cell::from(o.namespace.clone()).style(Style::default().fg(DIM)),
                     Cell::from(o.name.clone()).style(name_style),
                     Cell::from(o.kind.label()).style(Style::default().fg(DIM)),
-                    Cell::from("orphelin").style(Style::default().fg(Color::Red)),
-                    Cell::from("ORPHAN").style(Style::default().fg(Color::Red)),
-                    Cell::from(refl_short_version(&o.mirror.reflected_version))
+                    Cell::from(st.refl_role_orphan).style(Style::default().fg(Color::Red)),
+                    Cell::from(st.refl_st_orphan).style(Style::default().fg(Color::Red)),
+                    Cell::from(short_version(&o.mirror.reflected_version))
                         .style(Style::default().fg(DIM)),
                     Cell::from(o.age.clone()).style(Style::default().fg(DIM)),
                     alert(&o.hints),
@@ -21958,18 +21726,6 @@ fn draw_reflector_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
-}
-
-// resourceVersions are only ever compared, never read: the tail is enough to tell two apart.
-fn refl_short_version(v: &str) -> String {
-    if v.is_empty() {
-        return "—".to_string();
-    }
-    if v.chars().count() <= 8 {
-        return v.to_string();
-    }
-    let tail: String = v.chars().skip(v.chars().count() - 7).collect();
-    format!("…{tail}")
 }
 
 // The facts of the selected row, then what the rules make of them — the same shape as the storage
