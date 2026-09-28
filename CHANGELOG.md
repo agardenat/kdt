@@ -8,6 +8,27 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.6.0] — 2026-09-28
+
+- **feat(k8ssandra)** — la vue suit un K8ssandra multi-cluster. Sur un data plane, qui n'a pas de
+  `K8ssandraCluster`, les `CassandraDatacenter`, leurs pods et leur ring n'avaient aucun parent et
+  n'apparaissaient pas : ils sont désormais groupés sous un en-tête « data plane ». Sur le control
+  plane, un datacenter déclaré avec un `k8sContext` s'affiche sous son `K8ssandraCluster` (`dc →`),
+  avec l'état que k8ssandra-operator recopie et les nodes que le ring local entend par gossip ; ces
+  lignes n'offrent aucune action, `y`/`e`/`Ctrl-D` n'y trouvent rien, puisque l'objet est sur
+  l'autre cluster.
+
+- **feat(k8ssandra)** — une `CassandraTask` en cours montre sa progression pod par pod : source d'un
+  rebuild (`rebuild ← dc1`), pods traités sur le total, pod en cours, pods en échec. Lue dans
+  l'annotation `control.k8ssandra.io/job-<uid>` que cass-operator pose sur les pods (vérifié sur
+  1.15) ou dans `status.podStatuses` des versions récentes. Le datacenter porte la même note, car il
+  reste `Ready` pendant tout un rebuild. Le node en cours affiche son streaming : pairs encore en
+  session et volume de ces sessions, à côté de sa charge, sans pourcentage — en 3.11 les compteurs
+  « reçus » de `netstats` ne sont pas cumulatifs et le total ne couvre que les sessions ouvertes.
+
+- **fix(k8ssandra)** — le panneau `s` d'un node lit enfin `netstats` : pair, opération et volumes à
+  recevoir et à envoyer par session, au lieu du JSON brut d'une réponse jamais observée jusque-là.
+
 ## [2.5.0] — 2026-09-27
 
 - **feat(ai)** — le prompt de l'analyse IA (TUI `i`, kdt-web, rapport PDF `X`) s'ouvre sur un
