@@ -21774,6 +21774,48 @@ fn k8ssandra_detail_lines(
             }
             format!(" {} ", d.name)
         }
+        K8cRow::RemoteDc(d) => {
+            lines.push(label("k8sContext", d.context.clone()));
+            lines.push(label("K8ssandraCluster", d.cluster.clone()));
+            lines.push(label("clusterName", dash(&d.cluster_name)));
+            if d.ring_name != d.name {
+                lines.push(label("datacenterName", d.ring_name.clone()));
+            }
+            lines.push(label("size", d.size.to_string()));
+            lines.push(label("operatorProgress", dash(&d.progress)));
+            if !d.node_statuses.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(header("nodeStatuses"));
+                for (pod, id) in &d.node_statuses {
+                    lines.push(label(pod, dash(id)));
+                }
+            }
+            if !d.conditions.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(header(st.k8c_lbl_conditions));
+                for (k, v) in &d.conditions {
+                    lines.push(label(k, v.clone()));
+                }
+            }
+            format!(" {} → {} ", d.name, d.context)
+        }
+        K8cRow::RemoteNode(n) => {
+            lines.push(label("datacenter", dash(&n.datacenter)));
+            lines.push(label("rack", dash(&n.rack)));
+            lines.push(label("hostID", dash(&n.host_id)));
+            lines.push(Line::from(""));
+            lines.push(header(st.k8c_lbl_ring));
+            lines.push(label("status", n.ring.status_code.clone()));
+            lines.push(label("state", dash(&n.ring.state)));
+            lines.push(label("address", dash(&n.ring.ip)));
+            lines.push(label(
+                "load",
+                n.ring.load_bytes.map(format_load).unwrap_or_else(|| "—".into()),
+            ));
+            lines.push(label("tokens", n.ring.tokens.to_string()));
+            lines.push(label("schema", dash(&n.ring.schema)));
+            format!(" {} ", n.name)
+        }
         K8cRow::Node(n) => {
             lines.push(label("cluster", dash(&n.cluster)));
             lines.push(label("datacenter", dash(&n.datacenter)));
@@ -21802,6 +21844,15 @@ fn k8ssandra_detail_lines(
                 // Not "down": the management API is what was not reached, and saying so is the
                 // difference between a node that is gone and a port we could not open.
                 None => lines.push(label("ring", st.k8c_ring_unread.to_string())),
+            }
+            if let Some(s) = &n.streaming {
+                lines.push(Line::from(""));
+                lines.push(header(st.k8c_lbl_streaming));
+                lines.push(label("operation", dash(&s.operation)));
+                lines.push(label("open sessions", s.expected_text()));
+                lines.push(label("files", s.files_to_receive.to_string()));
+                lines.push(label("peers", s.peers.to_string()));
+                lines.push(label("load", n.load_text()));
             }
             if !n.claims.is_empty() {
                 lines.push(Line::from(""));
@@ -21906,12 +21957,25 @@ fn k8ssandra_detail_lines(
         K8cRow::CassTask(t) => {
             lines.push(label("commands", nodes(&t.commands)));
             lines.push(label("datacenter", dash(&t.datacenter)));
+            if !t.source_dc.is_empty() {
+                lines.push(label("source_datacenter", t.source_dc.clone()));
+            }
             lines.push(label("startTime", stamp(t.start)));
             lines.push(label("completionTime", stamp(t.finish)));
             lines.push(label(st.k8c_lbl_duration, span(t.start, t.finish)));
             lines.push(label("active", t.active.to_string()));
             lines.push(label("succeeded", t.succeeded.to_string()));
             lines.push(label("failed", t.failed.to_string()));
+            if !t.pods.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(header(st.k8c_lbl_pods));
+                if let Some(progress) = t.progress_text() {
+                    lines.push(label(st.k8c_lbl_coverage, progress));
+                }
+                for (pod, phase) in &t.pods {
+                    lines.push(label(pod, phase.clone()));
+                }
+            }
             format!(" {} ", t.name)
         }
         K8cRow::Nodetool(j) => {

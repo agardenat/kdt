@@ -324,6 +324,17 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     `lastExecution`/`nextSchedule` reste propre alors que le run a échoué, CronJob de purge terminé
     en vert sans rien purger, runs réussis absents du catalogue (`MedusaTask sync` non exécutée).
     Une restauration arrête le datacenter, ce qui est annoncé avant de la lancer.
+  - Multi-cluster : sur un data plane, qui n'a pas de `K8ssandraCluster`, les datacenters locaux
+    sont groupés sous un en-tête « data plane ». Sur le control plane, un datacenter déclaré avec un
+    `k8sContext` s'affiche sous son `K8ssandraCluster` (`dc →`) : état recopié par
+    k8ssandra-operator et nodes vus par le ring local, sans aucune action — ses pods et ses tâches
+    sont sur l'autre cluster.
+  - Une `CassandraTask` en cours affiche sa progression pod par pod (`rebuild ← dc1 · 2/5`) et le
+    pod en cours, lues dans l'annotation de job que cass-operator pose sur les pods ou dans
+    `status.podStatuses` selon sa version. Le datacenter porte la même note, puisqu'il reste `Ready`
+    pendant tout un rebuild. Le node en cours affiche ce qu'il streame : pairs encore en session et
+    volume de ces sessions, face à sa charge. Aucun pourcentage : en 3.11 les compteurs « reçus » de
+    `netstats` ne sont pas cumulatifs.
   - Le ring vient de l'API de management du container `cassandra`, atteinte par le proxy de pod de
     l'apiserver (ni port-forward, ni `kubectl`, ni exec) : `nodetool status` et `describecluster` en
     données typées — état UN/DN, load, tokens, accord de schéma. La jointure pod ↔ entrée de ring se
@@ -741,6 +752,8 @@ pendant une opération ; chacune se confirme, et le serveur relit la phase avant
 **La vue K8ssandra** porte les trois mondes de `:k8ssandra` / `:medusa` / `:reaper` : le ring
 (clusters, datacenters, nodes), les sauvegardes Medusa (schedules et leurs runs, runs sans schedule,
 catalogue, restaurations), les opérations (Jobs `nodetool`, Reaper, tâches cass-operator et Medusa).
+Le groupe « data plane », les datacenters d'un autre contexte (sans case ni menu) et la progression
+des `CassandraTask` y sont les mêmes que dans le TUI.
 La barre donne l'âge de la dernière sauvegarde qui couvre tous les nodes, et les constats qui valent
 pour tout le cluster ont leur ligne sous la barre. Le panneau du haut ouvre à la demande ce que `l`,
 `m` et `S` ouvrent dans le TUI : le log du container qui explique la ligne (`cassandra` ou `medusa`),

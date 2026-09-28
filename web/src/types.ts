@@ -2803,7 +2803,20 @@ export interface K8cNodeRow extends K8cRowBase {
   /** `null` quand l'API de management n'a pas répondu : inconnu, pas down. */
   ring: K8cRingFacts | null;
   claims: [string, string][];
+  task_jobs: [string, string][];
+  /** Ce que le node reçoit pendant qu'une tâche tourne dessus ; `null` hors tâche. */
+  streaming: K8cStreamProgress | null;
+  /** Le volume à recevoir, formé par kdt. Rien de reçu : ce compteur-là n'est pas cumulatif, la
+   * charge du node en tient lieu. */
+  streaming_text: string | null;
   load_text: string;
+}
+
+export interface K8cStreamProgress {
+  operation: string;
+  peers: number;
+  bytes_to_receive: number;
+  files_to_receive: number;
 }
 
 export interface K8cScheduleRow extends K8cRowBase {
@@ -2872,8 +2885,15 @@ export interface K8cTaskRow extends K8cRowBase {
 
 export interface K8cCassTaskRow extends K8cRowBase {
   row: "ctask";
+  object_uid: string;
   datacenter: string;
   commands: string[];
+  source_dc: string;
+  /** [pod, phase] dans l'ordre où cass-operator les parcourt. */
+  pods: [string, string][];
+  total_pods: number | null;
+  /** `faits/total` tant que la tâche parcourt ses pods. */
+  progress: string | null;
   start: number | null;
   finish: number | null;
   active: number;
@@ -2910,10 +2930,37 @@ export interface K8cGroupRow extends K8cRowBase {
   count: number;
 }
 
+/** Un datacenter déclaré sur un autre cluster (`k8sContext`) : état recopié dans le
+ * K8ssandraCluster, aucune action — elles écriraient ici, à propos d'un DC qui n'y est pas. */
+export interface K8cRemoteDcRow extends K8cRowBase {
+  row: "remote_dc";
+  cluster: string;
+  ring_name: string;
+  cluster_name: string;
+  context: string;
+  size: number;
+  progress: string;
+  conditions: [string, string][];
+  node_statuses: [string, string][];
+}
+
+/** Un node de ce datacenter distant, tel que le ring local l'entend. */
+export interface K8cRemoteNodeRow extends K8cRowBase {
+  row: "remote_node";
+  cluster: string;
+  datacenter: string;
+  rack: string;
+  host_id: string;
+  ring: K8cRingFacts;
+  load_text: string;
+}
+
 export type K8cRow =
   | K8cClusterRow
   | K8cDatacenterRow
   | K8cNodeRow
+  | K8cRemoteDcRow
+  | K8cRemoteNodeRow
   | K8cScheduleRow
   | K8cJobRow
   | K8cBackupRow

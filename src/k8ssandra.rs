@@ -139,6 +139,9 @@ pub struct K8cCluster {
     pub reaper_enabled: bool,
     pub stargate_enabled: bool,
     pub datacenters: Vec<String>,
+    /// The datacenters declared with a `k8sContext`, as mirrored in `status.datacenters`. Kept only
+    /// for those with no CassandraDatacenter on this cluster, once `analyse` has the local list.
+    pub remote_dcs: Vec<K8cRemoteDc>,
     pub conditions: Vec<(String, String)>,
     // `status.error` is a free string the operator sets to the literal "None" when all is well.
     pub error: String,
@@ -178,11 +181,72 @@ impl K8cDatacenter {
     /// The operations cass-operator reports as in flight. A datacenter in one of these states is
     /// mid-change, and that is the context every other reading has to be understood in.
     pub fn in_flight(&self) -> Vec<&str> {
-        ["Updating", "RollingRestart", "ReplacingNodes", "ScalingDown", "Resuming"]
+        IN_FLIGHT
             .into_iter()
             .filter(|k| self.condition(k) == Some("True"))
             .collect()
     }
+}
+
+/// A datacenter a K8ssandraCluster of this cluster declares on another Kubernetes cluster
+/// (`spec.cassandra.datacenters[].k8sContext`). Its CassandraDatacenter, pods and tasks live over
+/// there; what is known here is the status k8ssandra-operator mirrors into the K8ssandraCluster, and
+/// what the local nodes hear of it through gossip. Nothing in this view writes to it: a write here
+/// would land on this cluster, about a datacenter it does not have.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct K8cRemoteDc {
+    pub uid: String,
+    /// The K8ssandraCluster's namespace and name, which is where the row hangs.
+    pub namespace: String,
+    pub cluster: String,
+    /// The CassandraDatacenter name, which keys the mirrored status.
+    pub name: String,
+    /// The datacenter as Cassandra names it (`datacenterName` when overridden), which is what the
+    /// ring reports.
+    pub ring_name: String,
+    /// The Cassandra cluster name, to pick this datacenter's endpoints out of a shared ring.
+    pub cluster_name: String,
+    pub context: String,
+    pub size: i64,
+    pub progress: String,
+    pub conditions: Vec<(String, String)>,
+    pub node_statuses: Vec<(String, String)>,
+    pub hints: Vec<Hint>,
+}
+
+impl K8cRemoteDc {
+    pub fn condition(&self, kind: &str) -> Option<&str> {
+        self.conditions.iter().find(|(k, _)| k == kind).map(|(_, v)| v.as_str())
+    }
+    pub fn ready(&self) -> bool {
+        self.condition("Ready") == Some("True")
+    }
+    pub fn in_flight(&self) -> Vec<&str> {
+        IN_FLIGHT
+            .into_iter()
+            .filter(|k| self.condition(k) == Some("True"))
+            .collect()
+    }
+}
+
+/// The conditions cass-operator raises while a datacenter is mid-change.
+const IN_FLIGHT: [&str; 5] = ["Updating", "RollingRestart", "ReplacingNodes", "ScalingDown", "Resuming"];
+
+/// A node of a remote datacenter, as the local ring reports it. The pod name comes from the mirrored
+/// `nodeStatuses` when its host id matches; otherwise the address is all there is.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct K8cRemoteNode {
+    pub uid: String,
+    /// The K8ssandraCluster it belongs to, as for [`K8cRemoteDc`].
+    pub namespace: String,
+    pub cluster: String,
+    /// The datacenter's ring name.
+    pub datacenter: String,
+    pub name: String,
+    pub rack: String,
+    pub host_id: String,
+    pub ring: RingFacts,
+    pub hints: Vec<Hint>,
 }
 
 /// What the ring says about a node, when the management API answered.
@@ -220,7 +284,72 @@ pub struct K8cNode {
     /// None when the management API did not answer: unknown, not down.
     pub ring: Option<RingFacts>,
     pub claims: Vec<(String, String)>,
+    /// The CassandraTask jobs cass-operator recorded on this pod, as (task object uid, phase). Up to
+    /// at least cass-operator 1.15 this bookkeeping is a pod annotation; later versions moved it to
+    /// the task's `status.podStatuses`.
+    pub task_jobs: Vec<(String, String)>,
+    /// What the node is receiving while a task runs on it, summed over its peers. Read only for a
+    /// pod a task is running on: one call per running task, never one per node.
+    pub streaming: Option<StreamProgress>,
     pub hints: Vec<Hint>,
+}
+
+/// What a node has to receive in the sessions still open, summed over their peers.
+///
+/// Only the totals: the "received" counters of `streaminfo` are not cumulative (see
+/// [`mgmtapi::StreamSession`]), so a percentage built on them goes backwards. And the totals only
+/// cover the sessions still listed: a peer that has finished drops out, so the sum shrinks as the
+/// rebuild advances (seen 270 GiB over five peers, then 209 GiB over three). What has actually arrived
+/// is the node's load in the ring; it is shown next to this figure, never divided by it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct StreamProgress {
+    pub operation: String,
+    pub peers: usize,
+    pub bytes_to_receive: f64,
+    pub files_to_receive: u64,
+}
+
+impl StreamProgress {
+    /// `None` when nothing is being received: a node that only sends is not the one being rebuilt.
+    pub fn from_sessions(sessions: &[mgmtapi::StreamSession]) -> Option<Self> {
+        let inbound: Vec<&mgmtapi::StreamSession> = sessions
+            .iter()
+            .filter(|s| s.bytes_to_receive.is_some_and(|b| b > 0.0))
+            .collect();
+        let first = inbound.first()?;
+        Some(StreamProgress {
+            operation: first.operation.clone(),
+            peers: inbound.iter().map(|s| s.peer.as_str()).collect::<HashSet<_>>().len(),
+            bytes_to_receive: inbound.iter().filter_map(|s| s.bytes_to_receive).sum(),
+            files_to_receive: inbound.iter().filter_map(|s| s.files_to_receive).sum(),
+        })
+    }
+
+    pub fn expected_text(&self) -> String {
+        format_load(self.bytes_to_receive)
+    }
+}
+
+/// The phases cass-operator writes for one pod of a task, whichever of its two bookkeepings it used.
+pub const POD_RUNNING: &str = "RUNNING";
+pub const POD_COMPLETED: &str = "COMPLETED";
+pub const POD_ERROR: &str = "ERROR";
+
+// cass-operator's per-pod job annotation, `control.k8ssandra.io/job-<task uid>`, holding
+// `{"id", "status", "handler", "retries"}`. An id with no status is the pod the task is running on:
+// the status is only written once the management API reports the job over.
+const ANN_TASK_JOB_PREFIX: &str = "control.k8ssandra.io/job-";
+
+/// The phase an annotation value stands for, `None` when it names no job at all.
+fn annotation_phase(value: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(value).ok()?;
+    let status = str_at(&v, &["status"]);
+    let id = str_at(&v, &["id"]);
+    match (status.as_str(), id.is_empty()) {
+        ("", false) => Some(POD_RUNNING.to_string()),
+        ("", true) => None,
+        (s, _) => Some(s.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -338,10 +467,18 @@ pub struct MedTask {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CassTask {
     pub uid: String,
+    /// `metadata.uid`, which is what cass-operator names its per-pod annotation after.
+    pub object_uid: String,
     pub namespace: String,
     pub name: String,
     pub datacenter: String,
     pub commands: Vec<String>,
+    /// `jobs[].args.source_datacenter`: where a `rebuild` streams from.
+    pub source_dc: String,
+    /// (pod, phase) for every pod the task has reached, in the order cass-operator walks them.
+    pub pods: Vec<(String, String)>,
+    /// Pods of the datacenter the task walks, when the pod list was read.
+    pub total_pods: Option<usize>,
     pub created: i64,
     pub start: Option<i64>,
     pub finish: Option<i64>,
@@ -375,6 +512,8 @@ pub struct K8cState {
     pub clusters: Vec<K8cCluster>,
     pub datacenters: Vec<K8cDatacenter>,
     pub nodes: Vec<K8cNode>,
+    /// Nodes of the remote datacenters, as the local ring hears them.
+    pub remote_nodes: Vec<K8cRemoteNode>,
     pub schedules: Vec<MedSchedule>,
     pub jobs: Vec<MedJob>,
     pub backups: Vec<MedBackup>,
@@ -398,8 +537,10 @@ impl K8cState {
     pub fn problems(&self) -> usize {
         let count = |hints: &[Hint]| usize::from(hints.iter().any(|h| h.level >= HintLevel::Warn));
         self.clusters.iter().map(|c| count(&c.hints)).sum::<usize>()
+            + self.clusters.iter().flat_map(|c| &c.remote_dcs).map(|d| count(&d.hints)).sum::<usize>()
             + self.datacenters.iter().map(|d| count(&d.hints)).sum::<usize>()
             + self.nodes.iter().map(|n| count(&n.hints)).sum::<usize>()
+            + self.remote_nodes.iter().map(|n| count(&n.hints)).sum::<usize>()
             + self.schedules.iter().map(|s| count(&s.hints)).sum::<usize>()
             + self.jobs.iter().map(|j| count(&j.hints)).sum::<usize>()
             + self.backups.iter().map(|b| count(&b.hints)).sum::<usize>()
@@ -508,7 +649,8 @@ pub async fn k8ssandra_inventory(client: &Client, st: &'static Strings) -> K8cSt
     // The ring is one HTTP call per datacenter, against a pod that is Ready. A datacenter with no
     // Ready pod is skipped rather than retried: there is nothing to ask.
     let pods = pods.unwrap_or_default();
-    let nodes = build_nodes(&pods, claims.as_deref().unwrap_or_default());
+    let mut nodes = build_nodes(&pods, claims.as_deref().unwrap_or_default());
+    fetch_task_streams(client, &mut nodes, &cass_tasks).await;
     // The ring is joined to the pods inside `analyse`, once the host ids have been copied out of the
     // datacenter status: nothing here knows a pod's host id yet.
     let (ring, ring_known) = fetch_rings(client, &datacenters, &nodes).await;
@@ -538,6 +680,7 @@ pub async fn k8ssandra_inventory(client: &Client, st: &'static Strings) -> K8cSt
         clusters: analysed.clusters,
         datacenters: analysed.datacenters,
         nodes: analysed.nodes,
+        remote_nodes: analysed.remote_nodes,
         schedules: analysed.schedules,
         jobs: analysed.jobs,
         backups: analysed.backups,
@@ -566,7 +709,10 @@ async fn list_kinds(client: &Client) -> Listed {
         None
     });
     let resolved: Vec<_> = join_all(probes).await.into_iter().flatten().collect();
-    let installed = resolved.iter().any(|(group, _, _)| *group == G_K8SSANDRA);
+    // A data plane may be served the CassandraDatacenter kind without the K8ssandraCluster one.
+    let installed = resolved
+        .iter()
+        .any(|(group, _, _)| *group == G_K8SSANDRA || *group == G_CASSANDRA);
 
     let lists = resolved.into_iter().map(|(_, kind, ar)| {
         let client = client.clone();
@@ -621,6 +767,37 @@ async fn fetch_rings(
     (all, known)
 }
 
+// The streaming of every pod a CassandraTask is running on, under either bookkeeping. cass-operator
+// walks a datacenter one pod at a time, so this is one call per running task and never a scan of
+// the ring; a pod whose management API does not answer simply shows no progress.
+async fn fetch_task_streams(client: &Client, nodes: &mut [K8cNode], tasks: &[CassTask]) {
+    let running: HashSet<(String, String)> = tasks
+        .iter()
+        .filter(|t| t.active > 0)
+        .flat_map(|t| {
+            t.pods
+                .iter()
+                .filter(|(_, p)| p == POD_RUNNING)
+                .map(|(pod, _)| (t.namespace.clone(), pod.clone()))
+        })
+        .chain(
+            nodes
+                .iter()
+                .filter(|n| n.task_jobs.iter().any(|(_, p)| p == POD_RUNNING))
+                .map(|n| (n.namespace.clone(), n.name.clone())),
+        )
+        .collect();
+    let calls = running.into_iter().map(|(ns, pod)| async move {
+        let sessions = mgmtapi::streams(client, &ns, &pod).await.ok()?;
+        Some(((ns, pod), StreamProgress::from_sessions(&sessions)?))
+    });
+    let found: HashMap<(String, String), StreamProgress> =
+        join_all(calls).await.into_iter().flatten().collect();
+    for n in nodes.iter_mut() {
+        n.streaming = found.get(&(n.namespace.clone(), n.name.clone())).cloned();
+    }
+}
+
 // Join the pods to their ring entries.
 //
 // The obvious key is the host id out of `status.nodeStatuses`, and it is the wrong one: that map is
@@ -647,15 +824,19 @@ fn attach_ring(nodes: &mut [K8cNode], ring: &[Endpoint]) {
         } else if n.host_id.is_empty() {
             n.host_id = e.host_id.clone();
         }
-        n.ring = Some(RingFacts {
-            state: e.state.clone(),
-            alive: e.alive,
-            status_code: e.status_code(),
-            load_bytes: e.load_bytes,
-            tokens: e.tokens,
-            schema: e.schema.clone(),
-            ip: e.ip.clone(),
-        });
+        n.ring = Some(ring_facts(e));
+    }
+}
+
+fn ring_facts(e: &Endpoint) -> RingFacts {
+    RingFacts {
+        state: e.state.clone(),
+        alive: e.alive,
+        status_code: e.status_code(),
+        load_bytes: e.load_bytes,
+        tokens: e.tokens,
+        schema: e.schema.clone(),
+        ip: e.ip.clone(),
     }
 }
 
@@ -727,6 +908,17 @@ fn build_nodes(pods: &[Pod], claims: &[PersistentVolumeClaim]) -> Vec<K8cNode> {
                 host_id_stale: false,
                 ring: None,
                 claims,
+                task_jobs: p
+                    .metadata
+                    .annotations
+                    .iter()
+                    .flatten()
+                    .filter_map(|(k, v)| {
+                        let task = k.strip_prefix(ANN_TASK_JOB_PREFIX)?;
+                        Some((task.to_string(), annotation_phase(v)?))
+                    })
+                    .collect(),
+                streaming: None,
                 hints: Vec::new(),
             }
         })
@@ -772,8 +964,59 @@ fn parse_cluster(obj: &DynamicObject) -> K8cCluster {
         }
     });
 
+    // `CassClusterName()`: the override when set, the object name otherwise. It is what the ring
+    // reports as `CLUSTER_NAME`, and a datacenter's ring name is `datacenterName` over its own name.
+    let cass_cluster = match str_at(&spec, &["cassandra", "clusterName"]) {
+        n if n.is_empty() => name.clone(),
+        n => n,
+    };
+    let remote_dcs = spec
+        .get("cassandra")
+        .and_then(|c| c.get("datacenters"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|d| {
+            let context = str_at(d, &["k8sContext"]);
+            let dc = str_at(d, &["metadata", "name"]);
+            if context.is_empty() || dc.is_empty() {
+                return None;
+            }
+            let mirrored = status
+                .get("datacenters")
+                .and_then(|m| m.get(&dc))
+                .and_then(|s| s.get("cassandra"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let node_statuses = mirrored
+                .get("nodeStatuses")
+                .and_then(Value::as_object)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), str_at(v, &["hostID"]))).collect())
+                .unwrap_or_default();
+            let ring_name = match str_at(d, &["datacenterName"]) {
+                n if n.is_empty() => dc.clone(),
+                n => n,
+            };
+            Some(K8cRemoteDc {
+                uid: format!("k8c|remote-dc|{namespace}/{name}/{dc}"),
+                namespace: namespace.clone(),
+                cluster: name.clone(),
+                name: dc,
+                ring_name,
+                cluster_name: cass_cluster.clone(),
+                context,
+                size: int_at(d, &["size"]),
+                progress: str_at(&mirrored, &["cassandraOperatorProgress"]),
+                conditions: conditions_of(&mirrored),
+                node_statuses,
+                hints: Vec::new(),
+            })
+        })
+        .collect();
+
     K8cCluster {
         uid: format!("k8c|cluster|{namespace}/{name}"),
+        remote_dcs,
         namespace,
         name,
         created: meta_ts(obj),
@@ -973,23 +1216,45 @@ fn parse_cass_task(obj: &DynamicObject) -> CassTask {
     let spec = obj.data.get("spec").cloned().unwrap_or(Value::Null);
     let status = obj.data.get("status").cloned().unwrap_or(Value::Null);
     // A K8ssandraTask wraps the same job list one level down, under `spec.template`.
-    let jobs = spec
+    let job_list: Vec<Value> = spec
         .get("jobs")
         .or_else(|| spec.get("template").and_then(|t| t.get("jobs")))
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .map(|j| str_at(j, &["command"]))
-                .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_default();
+    let jobs = job_list
+        .iter()
+        .map(|j| str_at(j, &["command"]))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let source_dc = job_list
+        .iter()
+        .map(|j| str_at(j, &["args", "source_datacenter"]))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    // The later bookkeeping: a map of pod name to `{status, jobId, …}`. Absent on older operators,
+    // where the same facts sit in pod annotations and are joined in `analyse`.
+    let mut pods: Vec<(String, String)> = status
+        .get("podStatuses")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(pod, v)| (pod.clone(), str_at(v, &["status"])))
+                .filter(|(_, phase)| !phase.is_empty())
                 .collect()
         })
         .unwrap_or_default();
+    pods.sort();
     CassTask {
         uid: format!("k8c|ctask|{namespace}/{name}"),
+        object_uid: obj.metadata.uid.clone().unwrap_or_default(),
         namespace,
         name,
         datacenter: str_at(&spec, &["datacenter", "name"]),
         commands: jobs,
+        source_dc,
+        pods,
+        total_pods: None,
         created: meta_ts(obj),
         start: real_ts(ts_at(&status, &["startTime"])),
         finish: real_ts(ts_at(&status, &["completionTime"])),
@@ -1057,6 +1322,7 @@ pub struct Analysed {
     pub clusters: Vec<K8cCluster>,
     pub datacenters: Vec<K8cDatacenter>,
     pub nodes: Vec<K8cNode>,
+    pub remote_nodes: Vec<K8cRemoteNode>,
     pub schedules: Vec<MedSchedule>,
     pub jobs: Vec<MedJob>,
     pub backups: Vec<MedBackup>,
@@ -1249,17 +1515,50 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
 
     // --- Cassandra tasks --------------------------------------------------------------------------
     for t in &mut cass_tasks {
+        // Older operators keep the per-pod bookkeeping on the pods, in the order they walk them.
+        if t.pods.is_empty() && !t.object_uid.is_empty() {
+            t.pods = nodes
+                .iter()
+                .filter(|n| n.namespace == t.namespace)
+                .flat_map(|n| {
+                    n.task_jobs
+                        .iter()
+                        .filter(|(task, _)| *task == t.object_uid)
+                        .map(|(_, phase)| (n.name.clone(), phase.clone()))
+                })
+                .collect();
+        }
+        let dc_pods = nodes
+            .iter()
+            .filter(|n| n.namespace == t.namespace && n.datacenter == t.datacenter)
+            .count();
+        t.total_pods = (pods_known && dc_pods > 0).then_some(dc_pods);
+
         if t.failed > 0 {
             t.hints.push(warn(fill(
                 st.k8c_ctask_failed,
                 &[("n", &t.failed.to_string())],
             )));
         }
-        if t.active > 0 {
-            t.hints.push(info(fill(
+        let errored: Vec<&str> = t
+            .pods
+            .iter()
+            .filter(|(_, p)| p == POD_ERROR)
+            .map(|(pod, _)| pod.as_str())
+            .collect();
+        if !errored.is_empty() && t.failed == 0 {
+            t.hints.push(warn(fill(st.k8c_ctask_pods_failed, &[("pods", &errored.join(", "))])));
+        }
+        match (t.active > 0, t.progress_text(), t.running_pod()) {
+            (true, Some(progress), Some(pod)) => t.hints.push(info(fill(
+                st.k8c_ctask_progress,
+                &[("progress", &progress), ("pod", pod)],
+            ))),
+            (true, _, _) => t.hints.push(info(fill(
                 st.k8c_ctask_running,
                 &[("n", &t.active.to_string())],
-            )));
+            ))),
+            _ => {}
         }
     }
 
@@ -1286,6 +1585,19 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
                 st.k8c_dc_progress,
                 &[("state", &d.progress)],
             )));
+        }
+        // A datacenter being rebuilt reports Ready throughout: the only place its state shows is the
+        // task walking its pods, which sits in another world of the view.
+        for t in cass_tasks
+            .iter()
+            .filter(|t| t.active > 0 && t.namespace == d.namespace && t.datacenter == d.name)
+        {
+            if let Some(progress) = t.progress_text() {
+                d.hints.push(info(fill(
+                    st.k8c_dc_task_progress,
+                    &[("cmd", &t.label()), ("progress", &progress)],
+                )));
+            }
         }
         let joined = d.node_statuses.len() as i64;
         if d.size > 0 && joined < d.size {
@@ -1350,6 +1662,19 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
         if n.host_id_stale {
             n.hints.push(info(st.k8c_node_host_id_stale.to_string()));
         }
+        if let Some(s) = &n.streaming {
+            let load = n.load_text();
+            n.hints.push(info(fill(
+                st.k8c_node_streaming,
+                &[
+                    ("op", &s.operation),
+                    ("n", &s.peers.to_string()),
+                    ("total", &s.expected_text()),
+                    ("files", &s.files_to_receive.to_string()),
+                    ("load", &load),
+                ],
+            )));
+        }
         match &n.ring {
             Some(r) if !r.alive => n.hints.push(danger(st.k8c_node_down.to_string())),
             Some(r) if r.state != "NORMAL" => n.hints.push(warn(fill(
@@ -1357,6 +1682,90 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
                 &[("state", &r.state)],
             ))),
             _ => {}
+        }
+    }
+
+    // --- Remote datacenters -----------------------------------------------------------------------
+    // A datacenter declared with a `k8sContext` and present here is simply local (a context can name
+    // the control plane itself); only the ones this cluster does not have are remote.
+    let local_ips: HashSet<&str> = nodes
+        .iter()
+        .map(|n| n.pod_ip.as_str())
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    let mut remote_nodes: Vec<K8cRemoteNode> = Vec::new();
+    for c in &mut clusters {
+        let ns = c.namespace.clone();
+        c.remote_dcs
+            .retain(|r| !datacenters.iter().any(|d| d.namespace == ns && d.name == r.name));
+        for r in &mut c.remote_dcs {
+            r.hints.push(info(fill(st.k8c_remote_dc_where, &[("ctx", &r.context)])));
+            // An empty mirror means the operator has not reported this datacenter yet: unknown,
+            // which is not the same as not ready.
+            if !r.conditions.is_empty() {
+                if r.condition("Stopped") == Some("True") {
+                    r.hints.push(danger(st.k8c_dc_stopped.to_string()));
+                } else if !r.ready() {
+                    r.hints.push(danger(st.k8c_dc_not_ready.to_string()));
+                }
+                if r.condition("Healthy") == Some("False") {
+                    r.hints.push(warn(st.k8c_dc_unhealthy.to_string()));
+                }
+                let in_flight = r.in_flight();
+                if !in_flight.is_empty() {
+                    r.hints.push(info(fill(st.k8c_dc_in_flight, &[("ops", &in_flight.join(", "))])));
+                }
+            }
+            if !r.progress.is_empty() && r.progress != "Ready" {
+                r.hints.push(info(fill(st.k8c_dc_progress, &[("state", &r.progress)])));
+            }
+            let joined = r.node_statuses.len() as i64;
+            if r.size > 0 && !r.conditions.is_empty() && joined < r.size {
+                r.hints.push(danger(fill(
+                    st.k8c_dc_missing_nodes,
+                    &[("joined", &joined.to_string()), ("size", &r.size.to_string())],
+                )));
+            }
+
+            let pod_by_host: HashMap<&str, &str> = r
+                .node_statuses
+                .iter()
+                .filter(|(_, id)| !id.is_empty())
+                .map(|(pod, id)| (id.as_str(), pod.as_str()))
+                .collect();
+            let mut members: Vec<K8cRemoteNode> = ring
+                .iter()
+                .filter(|e| {
+                    e.datacenter == r.ring_name
+                        && e.cluster_name == r.cluster_name
+                        && !local_ips.contains(e.ip.as_str())
+                })
+                .map(|e| {
+                    let name = pod_by_host
+                        .get(e.host_id.as_str())
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| e.ip.clone());
+                    let mut hints = Vec::new();
+                    if !e.alive {
+                        hints.push(danger(st.k8c_node_down.to_string()));
+                    } else if e.state != "NORMAL" {
+                        hints.push(warn(fill(st.k8c_node_state, &[("state", &e.state)])));
+                    }
+                    K8cRemoteNode {
+                        uid: format!("k8c|remote-node|{}/{}/{}/{}", r.namespace, r.cluster, r.ring_name, e.ip),
+                        namespace: r.namespace.clone(),
+                        cluster: r.cluster.clone(),
+                        datacenter: r.ring_name.clone(),
+                        name,
+                        rack: e.rack.clone(),
+                        host_id: e.host_id.clone(),
+                        ring: ring_facts(e),
+                        hints,
+                    }
+                })
+                .collect();
+            members.sort_by(|a, b| (&a.rack, &a.name).cmp(&(&b.rack, &b.name)));
+            remote_nodes.extend(members);
         }
     }
 
@@ -1437,6 +1846,7 @@ pub fn analyse(inv: Inventory, now: i64, st: &'static Strings) -> Analysed {
         clusters,
         datacenters,
         nodes,
+        remote_nodes,
         schedules,
         jobs,
         backups,
@@ -1485,6 +1895,11 @@ pub enum K8cRow {
     Cluster(Box<K8cCluster>),
     Datacenter(Box<K8cDatacenter>),
     Node(Box<K8cNode>),
+    /// A datacenter and its nodes that live on another Kubernetes cluster. Their own variants rather
+    /// than a flag on the local ones: every action, reading and shell of the view matches on
+    /// `Datacenter`/`Node`, and none of them may reach an object this cluster does not have.
+    RemoteDc(Box<K8cRemoteDc>),
+    RemoteNode(Box<K8cRemoteNode>),
     Schedule(Box<MedSchedule>),
     Job(Box<MedJob>),
     Backup(Box<MedBackup>),
@@ -1506,6 +1921,8 @@ impl K8cRow {
             K8cRow::Cluster(c) => &c.hints,
             K8cRow::Datacenter(d) => &d.hints,
             K8cRow::Node(n) => &n.hints,
+            K8cRow::RemoteDc(d) => &d.hints,
+            K8cRow::RemoteNode(n) => &n.hints,
             K8cRow::Schedule(s) => &s.hints,
             K8cRow::Job(j) => &j.hints,
             K8cRow::Backup(b) => &b.hints,
@@ -1523,6 +1940,8 @@ impl K8cRow {
             K8cRow::Cluster(c) => c.uid.clone(),
             K8cRow::Datacenter(d) => d.uid.clone(),
             K8cRow::Node(n) => n.uid.clone(),
+            K8cRow::RemoteDc(d) => d.uid.clone(),
+            K8cRow::RemoteNode(n) => n.uid.clone(),
             K8cRow::Schedule(s) => s.uid.clone(),
             K8cRow::Job(j) => j.uid.clone(),
             K8cRow::Backup(b) => b.uid.clone(),
@@ -1540,6 +1959,8 @@ impl K8cRow {
             K8cRow::Cluster(c) => &c.namespace,
             K8cRow::Datacenter(d) => &d.namespace,
             K8cRow::Node(n) => &n.namespace,
+            K8cRow::RemoteDc(d) => &d.namespace,
+            K8cRow::RemoteNode(n) => &n.namespace,
             K8cRow::Schedule(s) => &s.namespace,
             K8cRow::Job(j) => &j.namespace,
             K8cRow::Backup(b) => &b.namespace,
@@ -1557,6 +1978,8 @@ impl K8cRow {
             K8cRow::Cluster(c) => c.name.clone(),
             K8cRow::Datacenter(d) => d.name.clone(),
             K8cRow::Node(n) => n.name.clone(),
+            K8cRow::RemoteDc(d) => d.name.clone(),
+            K8cRow::RemoteNode(n) => n.name.clone(),
             K8cRow::Schedule(s) => s.name.clone(),
             K8cRow::Job(j) => j.name.clone(),
             K8cRow::Backup(b) => b.name.clone(),
@@ -1572,7 +1995,7 @@ impl K8cRow {
     /// The fold key of a row that has children, `None` for a leaf.
     pub fn fold_key(&self) -> Option<String> {
         match self {
-            K8cRow::Cluster(_) | K8cRow::Datacenter(_) | K8cRow::Schedule(_)
+            K8cRow::Cluster(_) | K8cRow::Datacenter(_) | K8cRow::RemoteDc(_) | K8cRow::Schedule(_)
             | K8cRow::Group { .. } => Some(self.uid()),
             _ => None,
         }
@@ -1590,7 +2013,8 @@ impl K8cRow {
             K8cRow::Cluster(_) | K8cRow::Schedule(_) | K8cRow::Group { .. } => 0,
             K8cRow::Reaper(_) | K8cRow::CassTask(_) | K8cRow::Task(_) | K8cRow::Nodetool(_) => 0,
             K8cRow::Datacenter(_) | K8cRow::Job(_) | K8cRow::Backup(_) | K8cRow::Restore(_) => 1,
-            K8cRow::Node(_) => 2,
+            K8cRow::RemoteDc(_) => 1,
+            K8cRow::Node(_) | K8cRow::RemoteNode(_) => 2,
         }
     }
 
@@ -1606,6 +2030,8 @@ impl K8cRow {
             K8cRow::Cluster(_) => "cluster",
             K8cRow::Datacenter(_) => "dc",
             K8cRow::Node(_) => "node",
+            K8cRow::RemoteDc(_) => "dc →",
+            K8cRow::RemoteNode(_) => "node →",
             K8cRow::Schedule(_) => "schedule",
             K8cRow::Job(_) => "run",
             K8cRow::Backup(_) => "backup",
@@ -1625,6 +2051,8 @@ impl K8cRow {
             K8cRow::Cluster(c) => c.created,
             K8cRow::Datacenter(d) => d.created,
             K8cRow::Node(n) => n.created,
+            // Neither the mirrored status nor gossip dates anything.
+            K8cRow::RemoteDc(_) | K8cRow::RemoteNode(_) => 0,
             K8cRow::Schedule(s) => s.last_execution.unwrap_or(0),
             K8cRow::Job(j) => j.created,
             K8cRow::Backup(b) => b.created,
@@ -1658,6 +2086,24 @@ impl K8cRow {
                 } else {
                     (st.k8c_state_not_ready, LineColor::Err)
                 }
+            }
+            K8cRow::RemoteDc(d) => {
+                if d.conditions.is_empty() {
+                    (st.k8c_unknown, LineColor::Dim)
+                } else if d.condition("Stopped") == Some("True") {
+                    (st.k8c_state_stopped, LineColor::Err)
+                } else if d.ready() {
+                    (st.k8c_state_ready, LineColor::Ok)
+                } else {
+                    (st.k8c_state_not_ready, LineColor::Err)
+                }
+            }
+            K8cRow::RemoteNode(n) => {
+                let ok = n.ring.alive && n.ring.state == "NORMAL";
+                return (
+                    n.ring.status_code.clone(),
+                    if ok { LineColor::Ok } else { LineColor::Err },
+                );
             }
             K8cRow::Node(n) => {
                 return match &n.ring {
@@ -1759,11 +2205,19 @@ impl K8cRow {
                 d.size,
                 if d.declared_storage.is_empty() { "—" } else { &d.declared_storage }
             ),
-            K8cRow::Node(n) => format!(
+            K8cRow::RemoteDc(d) => format!("{}/{} · → {}", d.node_statuses.len(), d.size, d.context),
+            K8cRow::RemoteNode(n) => format!(
                 "{} · {}",
                 if n.rack.is_empty() { "—" } else { &n.rack },
-                n.load_text()
+                n.ring.load_bytes.map(format_load).unwrap_or_else(|| "—".to_string())
             ),
+            K8cRow::Node(n) => {
+                let rack = if n.rack.is_empty() { "—" } else { &n.rack };
+                match &n.streaming {
+                    Some(s) => format!("{rack} · {} · {}", n.load_text(), s.operation),
+                    None => format!("{rack} · {}", n.load_text()),
+                }
+            }
             K8cRow::Schedule(s) => s.cron.clone(),
             K8cRow::Job(j) => j.coverage_text(),
             K8cRow::Backup(b) => match b.finish {
@@ -1772,7 +2226,10 @@ impl K8cRow {
             },
             K8cRow::Restore(r) => r.backup.clone(),
             K8cRow::Task(t) => t.operation.clone(),
-            K8cRow::CassTask(t) => t.commands.join(", "),
+            K8cRow::CassTask(t) => match t.progress_text() {
+                Some(progress) => format!("{} · {progress}", t.label()),
+                None => t.label(),
+            },
             K8cRow::Nodetool(j) => {
                 if j.command.is_empty() { "—".to_string() } else { j.command.clone() }
             }
@@ -2052,6 +2509,36 @@ impl K8cNode {
     }
 }
 
+impl CassTask {
+    /// The command, and for a `rebuild` the datacenter it streams from — `rebuild` alone does not say
+    /// which copy of the data a new datacenter is being filled with.
+    pub fn label(&self) -> String {
+        let commands = self.commands.join(", ");
+        if self.source_dc.is_empty() {
+            commands
+        } else {
+            format!("{commands} ← {}", self.source_dc)
+        }
+    }
+
+    pub fn done(&self) -> usize {
+        self.pods.iter().filter(|(_, p)| p == POD_COMPLETED).count()
+    }
+
+    pub fn running_pod(&self) -> Option<&str> {
+        self.pods.iter().find(|(_, p)| p == POD_RUNNING).map(|(pod, _)| pod.as_str())
+    }
+
+    /// `done/total`, only while the task is walking its pods: a finished task says it in STATE.
+    pub fn progress_text(&self) -> Option<String> {
+        if self.active == 0 || (self.pods.is_empty() && self.total_pods.is_none()) {
+            return None;
+        }
+        let total = self.total_pods.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+        Some(format!("{}/{total}", self.done()))
+    }
+}
+
 impl MedJob {
     /// `finished/expected` — `6/6` and `0/6` are the whole story, and Medusa never writes either of
     /// them anywhere. An unknown node count is a `?`, not a guess.
@@ -2097,10 +2584,23 @@ pub fn build_k8c_rows(
             for c in s.clusters.iter().filter(|c| ns_ok(&c.namespace)) {
                 let dcs: Vec<&K8cDatacenter> =
                     s.datacenters.iter().filter(|d| d.namespace == c.namespace).collect();
+                let remote_nodes = |r: &K8cRemoteDc| -> Vec<&K8cRemoteNode> {
+                    s.remote_nodes
+                        .iter()
+                        .filter(|n| {
+                            n.namespace == r.namespace
+                                && n.cluster == r.cluster
+                                && n.datacenter == r.ring_name
+                        })
+                        .collect()
+                };
                 let keep = !problems_only
                     || worse(&c.hints)
                     || dcs.iter().any(|d| worse(&d.hints))
-                    || s.nodes.iter().any(|n| n.namespace == c.namespace && worse(&n.hints));
+                    || s.nodes.iter().any(|n| n.namespace == c.namespace && worse(&n.hints))
+                    || c.remote_dcs
+                        .iter()
+                        .any(|r| worse(&r.hints) || remote_nodes(r).iter().any(|n| worse(&n.hints)));
                 if !keep {
                     continue;
                 }
@@ -2127,6 +2627,68 @@ pub fn build_k8c_rows(
                         }
                         rows.push(K8cRow::Node(Box::new(n.clone())));
                     }
+                }
+                for r in &c.remote_dcs {
+                    let members = remote_nodes(r);
+                    if problems_only && !worse(&r.hints) && !members.iter().any(|n| worse(&n.hints)) {
+                        continue;
+                    }
+                    rows.push(K8cRow::RemoteDc(Box::new(r.clone())));
+                    if collapsed.contains(&r.uid) {
+                        continue;
+                    }
+                    for n in members {
+                        if problems_only && !worse(&n.hints) {
+                            continue;
+                        }
+                        rows.push(K8cRow::RemoteNode(Box::new(n.clone())));
+                    }
+                }
+            }
+
+            // Datacenters no local K8ssandraCluster covers. On the data plane of a multi-cluster
+            // k8ssandra the K8ssandraCluster exists on the control plane only, while the
+            // CassandraDatacenter, its pods and its ring are all here: hanging them off a parent
+            // this cluster does not have would drop the whole datacenter from the view.
+            let covered: HashSet<&str> = s.clusters.iter().map(|c| c.namespace.as_str()).collect();
+            let mut loose: Vec<K8cRow> = Vec::new();
+            let mut count = 0;
+            for d in s
+                .datacenters
+                .iter()
+                .filter(|d| ns_ok(&d.namespace) && !covered.contains(d.namespace.as_str()))
+            {
+                let nodes: Vec<&K8cNode> = s
+                    .nodes
+                    .iter()
+                    .filter(|n| n.namespace == d.namespace && n.datacenter == d.name)
+                    .collect();
+                if problems_only && !worse(&d.hints) && !nodes.iter().any(|n| worse(&n.hints)) {
+                    continue;
+                }
+                count += 1;
+                loose.push(K8cRow::Datacenter(Box::new(d.clone())));
+                if collapsed.contains(&d.uid) {
+                    continue;
+                }
+                for n in nodes {
+                    if problems_only && !worse(&n.hints) {
+                        continue;
+                    }
+                    loose.push(K8cRow::Node(Box::new(n.clone())));
+                }
+            }
+            if count > 0 {
+                let row = K8cRow::Group {
+                    key: "dataplane",
+                    namespace: String::new(),
+                    label: st.k8c_grp_data_plane.to_string(),
+                    count,
+                };
+                let folded = collapsed.contains(&row.uid());
+                rows.push(row);
+                if !folded {
+                    rows.extend(loose);
                 }
             }
         }
@@ -2331,6 +2893,42 @@ pub fn k8c_row_record(row: &K8cRow, s: &K8cState, st: &'static Strings, now: i64
                 &d.hints,
             )
         }
+        // No kind on either remote row: the object is on another cluster, and `y`, `e` and `Ctrl-D`
+        // resolve what they act on here. They correctly find nothing, as on a heading.
+        K8cRow::RemoteDc(d) => record(
+            &d.uid,
+            "",
+            "",
+            &d.namespace,
+            &d.name,
+            if d.progress.is_empty() { "Datacenter" } else { &d.progress },
+            fill(
+                st.k8c_msg_remote_dc,
+                &[
+                    ("nodes", &d.node_statuses.len().to_string()),
+                    ("size", &d.size.to_string()),
+                    ("ctx", &d.context),
+                    ("cluster", &d.cluster),
+                ],
+            ),
+            &d.hints,
+        ),
+        K8cRow::RemoteNode(n) => record(
+            &n.uid,
+            "",
+            "",
+            &n.namespace,
+            &n.name,
+            &state,
+            fill(
+                st.k8c_msg_node,
+                &[
+                    ("rack", if n.rack.is_empty() { "—" } else { &n.rack }),
+                    ("load", &n.ring.load_bytes.map(format_load).unwrap_or_else(|| "—".to_string())),
+                ],
+            ),
+            &n.hints,
+        ),
         // The ring's own word for the node when it answered, "unknown" when it did not. Never a
         // fabricated "UN": an unread ring is unknown, not up.
         K8cRow::Node(n) => record(
@@ -2433,7 +3031,7 @@ pub fn k8c_row_record(row: &K8cRow, s: &K8cState, st: &'static Strings, now: i64
             fill(
                 st.k8c_msg_ctask,
                 &[
-                    ("cmd", &t.commands.join(", ")),
+                    ("cmd", &t.label()),
                     ("ok", &t.succeeded.to_string()),
                     ("ko", &t.failed.to_string()),
                     ("dur", &span(t.start, t.finish)),
@@ -2879,7 +3477,31 @@ pub async fn node_readings(
         mgmtapi::metrics(client, namespace, pod),
         mgmtapi::streams(client, namespace, pod),
     );
-    (counters, streams.unwrap_or_default())
+    (counters, streams.unwrap_or_default().iter().map(stream_pairs).collect())
+}
+
+/// One session as the panel shows it: which peer, which operation, and what each direction has to
+/// move in bytes and files. The "received"/"sent" counters are left out on purpose: they are not
+/// cumulative (see [`mgmtapi::StreamSession`]), and printed next to a total they read as progress.
+pub fn stream_pairs(s: &mgmtapi::StreamSession) -> Vec<(String, String)> {
+    let direction = |total: Option<f64>, files: Option<u64>| {
+        let total = total.filter(|t| *t > 0.0)?;
+        Some(match files {
+            Some(f) => format!("{} · {f} files", format_load(total)),
+            None => format_load(total),
+        })
+    };
+    let mut out = vec![
+        ("peer".to_string(), s.peer.clone()),
+        ("operation".to_string(), s.operation.clone()),
+    ];
+    if let Some(v) = direction(s.bytes_to_receive, s.files_to_receive) {
+        out.push(("to receive".to_string(), v));
+    }
+    if let Some(v) = direction(s.bytes_to_send, s.files_to_send) {
+        out.push(("to send".to_string(), v));
+    }
+    out
 }
 
 /// [`node_readings`], deposited in the panel the TUI redraws from.
@@ -3661,5 +4283,233 @@ mod tests {
         assert!(rows[0].fold_default());
         assert_eq!(k8c_row_record(&rows[2], &state, &FR, NOW).kind, "");
         assert!(find_k8c_row(&state, "k8c|job|ns/by-hand", &FR).is_some());
+    }
+
+    #[test]
+    fn a_job_annotation_with_an_id_and_no_status_is_the_pod_running() {
+        // Relevé sur cass-operator 1.15 pendant un rebuild.
+        assert_eq!(
+            annotation_phase(r#"{"id":"afd55769","handler":"management-api"}"#).as_deref(),
+            Some(POD_RUNNING)
+        );
+        assert_eq!(
+            annotation_phase(r#"{"id":"afd55769","status":"COMPLETED","handler":"management-api"}"#)
+                .as_deref(),
+            Some(POD_COMPLETED)
+        );
+        // Un retry en attente : l'id est effacé, le statut dit WAITING.
+        assert_eq!(annotation_phase(r#"{"status":"WAITING","retries":1}"#).as_deref(), Some("WAITING"));
+        assert_eq!(annotation_phase(r#"{}"#), None);
+    }
+
+    fn rebuild_task(pods: Vec<(String, String)>) -> CassTask {
+        CassTask {
+            uid: "k8c|ctask|ns/dc2-rebuild".to_string(),
+            object_uid: "task-uid".to_string(),
+            namespace: "ns".to_string(),
+            name: "dc2-rebuild".to_string(),
+            datacenter: "dc2".to_string(),
+            commands: vec!["rebuild".to_string()],
+            source_dc: "dc1".to_string(),
+            pods,
+            active: 1,
+            ..CassTask::default()
+        }
+    }
+
+    fn dc2_node(i: usize, job: Option<&str>) -> K8cNode {
+        K8cNode {
+            uid: format!("k8c|node|ns/dc2-sts-{i}"),
+            namespace: "ns".to_string(),
+            name: format!("dc2-sts-{i}"),
+            datacenter: "dc2".to_string(),
+            ready: true,
+            task_jobs: job.map(|p| vec![("task-uid".to_string(), p.to_string())]).unwrap_or_default(),
+            ..K8cNode::default()
+        }
+    }
+
+    // cass-operator 1.15 : le suivi est sur les pods, la tâche n'en dit rien.
+    #[test]
+    fn a_rebuild_is_followed_through_the_pod_annotations() {
+        let mut inv = inventory(vec![dc("ns", "dc2", 3, 3)], Vec::new());
+        inv.pods_known = true;
+        inv.nodes = vec![
+            dc2_node(0, Some(POD_COMPLETED)),
+            K8cNode {
+                streaming: Some(StreamProgress {
+                    operation: "Rebuild".to_string(),
+                    peers: 5,
+                    bytes_to_receive: 4.0 * 1024.0 * 1024.0 * 1024.0,
+                    files_to_receive: 100,
+                }),
+                ..dc2_node(1, Some(POD_RUNNING))
+            },
+            dc2_node(2, None),
+        ];
+        inv.cass_tasks = vec![rebuild_task(Vec::new())];
+        let out = analyse(inv, NOW, &EN);
+
+        let t = &out.cass_tasks[0];
+        assert_eq!(t.pods.len(), 2);
+        assert_eq!(t.running_pod(), Some("dc2-sts-1"));
+        assert_eq!(t.progress_text().as_deref(), Some("1/3"));
+        assert_eq!(t.label(), "rebuild ← dc1");
+        assert!(t.hints.iter().any(|h| h.text.contains("dc2-sts-1")));
+
+        // Le DC reste Ready pendant tout le rebuild : c'est la note qui dit où il en est.
+        let d = &out.datacenters[0];
+        assert!(d.hints.iter().any(|h| h.text.contains("rebuild ← dc1") && h.text.contains("1/3")));
+
+        // Le reçu de streaminfo n'est pas cumulatif : la ligne met la charge en face de l'attendu,
+        // sans pourcentage.
+        let n = &out.nodes[1];
+        assert!(n.hints.iter().any(|h| h.text.contains("4.0 GiB") && h.text.contains("100 files")));
+        let row = K8cRow::Node(Box::new(n.clone()));
+        assert!(row.info(&EN, NOW).ends_with("— · Rebuild"));
+        assert!(!row.info(&EN, NOW).contains("4.0 GiB"));
+        assert!(!row.info(&EN, NOW).contains('%'));
+    }
+
+    // Versions récentes : le même suivi dans `status.podStatuses`, les annotations absentes.
+    #[test]
+    fn a_rebuild_is_followed_through_the_task_status() {
+        let mut inv = inventory(vec![dc("ns", "dc2", 3, 3)], Vec::new());
+        inv.pods_known = true;
+        inv.nodes = vec![dc2_node(0, None), dc2_node(1, None), dc2_node(2, None)];
+        inv.cass_tasks = vec![rebuild_task(vec![
+            ("dc2-sts-0".to_string(), POD_COMPLETED.to_string()),
+            ("dc2-sts-1".to_string(), POD_COMPLETED.to_string()),
+            ("dc2-sts-2".to_string(), POD_RUNNING.to_string()),
+        ])];
+        let out = analyse(inv, NOW, &FR);
+        let t = &out.cass_tasks[0];
+        assert_eq!(t.progress_text().as_deref(), Some("2/3"));
+        assert_eq!(
+            K8cRow::CassTask(Box::new(t.clone())).info(&FR, NOW),
+            "rebuild ← dc1 · 2/3"
+        );
+    }
+
+    // Control plane : dc2 est déclaré sur un autre contexte. Il apparaît sous son K8ssandraCluster
+    // avec les nodes que le ring local entend de lui, sans aucune action ni kind — tout ce qui écrit
+    // agirait sur ce cluster-ci, qui n'a pas ce DC.
+    #[test]
+    fn a_remote_datacenter_hangs_under_its_cluster_without_actions() {
+        let remote = |name: &str| K8cRemoteDc {
+            uid: format!("k8c|remote-dc|ns/tw/{name}"),
+            namespace: "ns".to_string(),
+            cluster: "tw".to_string(),
+            name: name.to_string(),
+            ring_name: name.to_string(),
+            cluster_name: "tw".to_string(),
+            context: "other".to_string(),
+            size: 2,
+            progress: "Ready".to_string(),
+            conditions: vec![("Ready".to_string(), "True".to_string())],
+            node_statuses: vec![
+                ("tw-dc2-sts-0".to_string(), "h0".to_string()),
+                ("tw-dc2-sts-1".to_string(), "h1".to_string()),
+            ],
+            hints: Vec::new(),
+        };
+        let endpoint = |dc: &str, cluster: &str, ip: &str, host: &str, state: &str| Endpoint {
+            ip: ip.to_string(),
+            host_id: host.to_string(),
+            datacenter: dc.to_string(),
+            rack: "rack1".to_string(),
+            state: state.to_string(),
+            alive: true,
+            cluster_name: cluster.to_string(),
+            ..Endpoint::default()
+        };
+        let mut inv = inventory(vec![dc("ns", "dc1", 1, 1)], Vec::new());
+        inv.clusters = vec![K8cCluster {
+            uid: "k8c|cluster|ns/tw".to_string(),
+            namespace: "ns".to_string(),
+            name: "tw".to_string(),
+            // dc1 est déclaré distant mais existe ici : il reste local.
+            remote_dcs: vec![remote("dc1"), remote("dc2")],
+            ..K8cCluster::default()
+        }];
+        inv.nodes = vec![K8cNode {
+            uid: "k8c|node|ns/tw-dc1-sts-0".to_string(),
+            namespace: "ns".to_string(),
+            name: "tw-dc1-sts-0".to_string(),
+            datacenter: "dc1".to_string(),
+            pod_ip: "10.0.0.1".to_string(),
+            ready: true,
+            ..K8cNode::default()
+        }];
+        inv.ring = vec![
+            endpoint("dc1", "tw", "10.0.0.1", "l0", "NORMAL"),
+            endpoint("dc2", "tw", "10.1.0.1", "h0", "NORMAL"),
+            endpoint("dc2", "tw", "10.1.0.2", "unknown", "JOINING"),
+            // Un autre cluster Cassandra dont un DC s'appelle aussi dc2.
+            endpoint("dc2", "other-cluster", "10.2.0.1", "x", "NORMAL"),
+        ];
+        inv.ring_known = true;
+        let out = analyse(inv, NOW, &FR);
+        assert_eq!(out.clusters[0].remote_dcs.len(), 1);
+        assert_eq!(out.remote_nodes.len(), 2);
+
+        let state = K8cState {
+            installed: true,
+            clusters: out.clusters,
+            datacenters: out.datacenters,
+            nodes: out.nodes,
+            remote_nodes: out.remote_nodes,
+            ..K8cState::default()
+        };
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &HashSet::new(), &FR);
+        let names: Vec<String> = rows.iter().map(K8cRow::name).collect();
+        assert_eq!(names, vec!["tw", "dc1", "tw-dc1-sts-0", "dc2", "10.1.0.2", "tw-dc2-sts-0"]);
+        assert_eq!(rows.iter().map(K8cRow::depth).collect::<Vec<_>>(), vec![0, 1, 2, 1, 2, 2]);
+        assert_eq!(rows[3].info(&FR, NOW), "2/2 · → other");
+        // Le node qui rejoint encore est signalé.
+        assert!(rows[4].has_problem());
+        for r in &rows[3..] {
+            assert!(r.actions().is_empty());
+            assert!(r.log_target().is_none());
+            assert_eq!(k8c_row_record(r, &state, &FR, NOW).kind, "");
+        }
+        assert!(find_k8c_row(&state, "k8c|remote-dc|ns/tw/dc2", &FR).is_some());
+    }
+
+    // Sur un data plane, le K8ssandraCluster est sur le control plane : le datacenter local, ses
+    // pods et son ring restent visibles sous leur en-tête au lieu de disparaître faute de parent.
+    #[test]
+    fn a_data_plane_datacenter_is_shown_without_its_cluster() {
+        let node = K8cNode {
+            uid: "k8c|node|remote/dc2-sts-0".to_string(),
+            namespace: "remote".to_string(),
+            name: "dc2-sts-0".to_string(),
+            datacenter: "dc2".to_string(),
+            ..K8cNode::default()
+        };
+        let state = K8cState {
+            installed: true,
+            clusters: vec![K8cCluster {
+                uid: "k8c|cluster|ns/demo".to_string(),
+                namespace: "ns".to_string(),
+                name: "demo".to_string(),
+                ..K8cCluster::default()
+            }],
+            datacenters: vec![dc("ns", "dc1", 3, 3), dc("remote", "dc2", 1, 1)],
+            nodes: vec![node],
+            ..K8cState::default()
+        };
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &HashSet::new(), &FR);
+        let names: Vec<String> = rows.iter().map(K8cRow::name).collect();
+        assert_eq!(names, vec!["demo", "dc1", FR.k8c_grp_data_plane, "dc2", "dc2-sts-0"]);
+        assert_eq!(rows.iter().map(K8cRow::depth).collect::<Vec<_>>(), vec![0, 1, 0, 1, 2]);
+        assert!(matches!(rows[2], K8cRow::Group { count: 1, .. }));
+
+        let folded: HashSet<String> = [rows[2].uid()].into_iter().collect();
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &folded, &FR);
+        assert_eq!(rows.len(), 3);
+
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, Some("ns"), &HashSet::new(), &FR);
+        assert_eq!(rows.len(), 2);
     }
 }

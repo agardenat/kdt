@@ -120,6 +120,8 @@ fn row_json(row: &K8cRow, inventory: &K8cState, st: &'static Strings, now: i64) 
         K8cRow::Cluster(c) => ("cluster", serde_json::to_value(c)),
         K8cRow::Datacenter(d) => ("datacenter", serde_json::to_value(d)),
         K8cRow::Node(n) => ("node", serde_json::to_value(n)),
+        K8cRow::RemoteDc(d) => ("remote_dc", serde_json::to_value(d)),
+        K8cRow::RemoteNode(n) => ("remote_node", serde_json::to_value(n)),
         K8cRow::Schedule(s) => ("schedule", serde_json::to_value(s)),
         K8cRow::Job(j) => ("job", serde_json::to_value(j)),
         K8cRow::Backup(b) => ("backup", serde_json::to_value(b)),
@@ -171,6 +173,19 @@ fn row_json(row: &K8cRow, inventory: &K8cState, st: &'static Strings, now: i64) 
         );
         if let K8cRow::Node(n) = row {
             o.insert("load_text".into(), n.load_text().into());
+            o.insert(
+                "streaming_text".into(),
+                n.streaming.as_ref().map(|s| s.expected_text()).into(),
+            );
+        }
+        if let K8cRow::RemoteNode(n) = row {
+            o.insert(
+                "load_text".into(),
+                n.ring.load_bytes.map(kdt::k8ssandra::format_load).unwrap_or_else(|| "—".into()).into(),
+            );
+        }
+        if let K8cRow::CassTask(t) = row {
+            o.insert("progress".into(), t.progress_text().into());
         }
         if let K8cRow::Job(j) = row {
             o.insert("coverage".into(), j.coverage_text().into());

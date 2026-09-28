@@ -1043,6 +1043,53 @@ function RowFacts({ st, row }: { st: Strings; row: K8cRow }) {
           {conditions(row.conditions)}
         </>
       );
+    case "remote_dc":
+      return (
+        <>
+          <dl className="facts">
+            <Fact k="k8sContext">{row.context}</Fact>
+            <Fact k="K8ssandraCluster">{row.cluster}</Fact>
+            <Fact k="clusterName">{dash(row.cluster_name)}</Fact>
+            {row.ring_name !== row.name && <Fact k="datacenterName">{row.ring_name}</Fact>}
+            <Fact k="size">{row.size}</Fact>
+            <Fact k="operatorProgress">{dash(row.progress)}</Fact>
+          </dl>
+          {row.node_statuses.length > 0 && (
+            <>
+              <div className="sect">nodeStatuses</div>
+              <dl className="facts">
+                {row.node_statuses.map(([pod, id]) => (
+                  <Fact key={pod} k={pod}>
+                    {dash(id)}
+                  </Fact>
+                ))}
+              </dl>
+            </>
+          )}
+          {conditions(row.conditions)}
+        </>
+      );
+    case "remote_node":
+      return (
+        <>
+          <dl className="facts">
+            <Fact k="datacenter">{dash(row.datacenter)}</Fact>
+            <Fact k="rack">{dash(row.rack)}</Fact>
+            <Fact k="hostID">{dash(row.host_id)}</Fact>
+          </dl>
+          <div className="sect">{st.k8cLblRing}</div>
+          <dl className="facts">
+            <Fact k="status" tone={row.state_tone === "ok" ? "ok" : "err"}>
+              {row.ring.status_code}
+            </Fact>
+            <Fact k="state">{dash(row.ring.state)}</Fact>
+            <Fact k="address">{dash(row.ring.ip)}</Fact>
+            <Fact k="load">{row.load_text}</Fact>
+            <Fact k="tokens">{row.ring.tokens}</Fact>
+            <Fact k="schema">{dash(row.ring.schema)}</Fact>
+          </dl>
+        </>
+      );
     case "node":
       return (
         <>
@@ -1075,6 +1122,18 @@ function RowFacts({ st, row }: { st: Strings; row: K8cRow }) {
           ) : (
             // Pas « down » : c'est l'API de management qui n'a pas été jointe.
             <p className="dim">{st.k8cRingNotRead}</p>
+          )}
+          {row.streaming && (
+            <>
+              <div className="sect">{st.k8cStreams}</div>
+              <dl className="facts">
+                <Fact k="operation">{dash(row.streaming.operation)}</Fact>
+                <Fact k="open sessions">{row.streaming_text}</Fact>
+                <Fact k="files">{row.streaming.files_to_receive}</Fact>
+                <Fact k="peers">{row.streaming.peers}</Fact>
+                <Fact k="load">{row.load_text}</Fact>
+              </dl>
+            </>
           )}
           {row.claims.length > 0 && (
             <>
@@ -1185,18 +1244,36 @@ function RowFacts({ st, row }: { st: Strings; row: K8cRow }) {
       );
     case "ctask":
       return (
-        <dl className="facts">
-          <Fact k="commands">{nodes(row.commands)}</Fact>
-          <Fact k="datacenter">{dash(row.datacenter)}</Fact>
-          <Fact k="startTime">{stamp(row.start)}</Fact>
-          <Fact k="completionTime">{stamp(row.finish)}</Fact>
-          <Fact k={st.k8cLblDuration}>{row.span}</Fact>
-          <Fact k="active">{row.active}</Fact>
-          <Fact k="succeeded">{row.succeeded}</Fact>
-          <Fact k="failed" tone={row.failed > 0 ? "err" : undefined}>
-            {row.failed}
-          </Fact>
-        </dl>
+        <>
+          <dl className="facts">
+            <Fact k="commands">{nodes(row.commands)}</Fact>
+            <Fact k="datacenter">{dash(row.datacenter)}</Fact>
+            {row.source_dc && <Fact k="source_datacenter">{row.source_dc}</Fact>}
+            <Fact k="startTime">{stamp(row.start)}</Fact>
+            <Fact k="completionTime">{stamp(row.finish)}</Fact>
+            <Fact k={st.k8cLblDuration}>{row.span}</Fact>
+            <Fact k="active">{row.active}</Fact>
+            <Fact k="succeeded">{row.succeeded}</Fact>
+            <Fact k="failed" tone={row.failed > 0 ? "err" : undefined}>
+              {row.failed}
+            </Fact>
+          </dl>
+          {/* Le parcours pod par pod : cass-operator les traite un à un, et un DC en rebuild reste
+              Ready de bout en bout — c'est ici seulement qu'on voit où il en est. */}
+          {row.pods.length > 0 && (
+            <>
+              <div className="sect">pods</div>
+              <dl className="facts">
+                {row.progress && <Fact k={st.k8cLblCoverage}>{row.progress}</Fact>}
+                {row.pods.map(([pod, phase]) => (
+                  <Fact key={pod} k={pod} tone={phase === "ERROR" ? "err" : phase === "COMPLETED" ? "ok" : undefined}>
+                    {phase}
+                  </Fact>
+                ))}
+              </dl>
+            </>
+          )}
+        </>
       );
     case "nodetool":
       return (

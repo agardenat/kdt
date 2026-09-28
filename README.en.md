@@ -321,6 +321,17 @@ shows the query and its effect (`/coredns  (3)`).
     `lastExecution`/`nextSchedule` stays clean although the run failed, a purge CronJob completing
     green while purging nothing, successful runs missing from the catalogue (the `sync` MedusaTask
     never ran). A restore stops the datacenter, which is stated before it is started.
+  - Multi-cluster: on a data plane, which has no `K8ssandraCluster`, the local datacenters are
+    grouped under a "data plane" heading. On the control plane, a datacenter declared with a
+    `k8sContext` is shown under its `K8ssandraCluster` (`dc →`): status mirrored by
+    k8ssandra-operator and nodes as the local ring sees them, with no action at all — its pods and
+    tasks are on the other cluster.
+  - A running `CassandraTask` shows its pod-by-pod progress (`rebuild ← dc1 · 2/5`) and the pod
+    being processed, read from the job annotation cass-operator puts on the pods or from
+    `status.podStatuses` depending on its version. The datacenter carries the same note, since it
+    stays `Ready` throughout a rebuild. The node being processed shows what it streams: peers still
+    in session and the volume of those sessions, next to its load. No percentage: on 3.11 the
+    `netstats` "received" counters are not cumulative.
   - The ring comes from the `cassandra` container's management API, reached through the apiserver
     pod proxy (no port-forward, no `kubectl`, no exec): `nodetool status` and `describecluster` as
     typed data — UN/DN state, load, tokens, schema agreement. A pod is joined to its ring entry on
@@ -729,7 +740,9 @@ operation runs; each one is confirmed, and the server re-reads the phase before 
 
 **The K8ssandra view** carries the three worlds of `:k8ssandra` / `:medusa` / `:reaper`: the ring
 (clusters, datacenters, nodes), Medusa backups (schedules and their runs, runs with no schedule,
-catalogue, restores), operations (`nodetool` Jobs, Reaper, cass-operator and Medusa tasks). The bar
+catalogue, restores), operations (`nodetool` Jobs, Reaper, cass-operator and Medusa tasks). The
+"data plane" group, datacenters on another context (no checkbox, no menu) and `CassandraTask`
+progress are the same as in the TUI. The bar
 shows the age of the last backup covering every node, and cluster-wide findings get their own line
 below it. The top panel opens on demand what `l`, `m` and `S` open in the TUI: the log of the
 container that explains the row (`cassandra` or `medusa`), a node's `tpstats`/`compactionstats`/

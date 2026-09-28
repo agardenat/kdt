@@ -162,35 +162,76 @@ pub fn schema_versions_by_cluster(
 
 // --- Streams ------------------------------------------------------------------------------------
 
-/// Active streaming sessions (`nodetool netstats`). The payload's per-session shape is not modelled:
-/// on every cluster reachable here `entity` has been empty, and inventing fields for sessions that
-/// were never observed is exactly the kind of guess this codebase refuses. The entries are returned
-/// as flat key/value pairs so the detail panel can show whatever the node reports.
-pub async fn streams(
-    client: &Client,
-    namespace: &str,
-    pod: &str,
-) -> Result<Vec<Vec<(String, String)>>, String> {
-    let body = get_text(client, &pod_proxy(namespace, pod, MGMT_PORT, "/api/v0/ops/node/streaminfo")).await?;
-    parse_entity_pairs(&body)
+/// One peer of one streaming plan, as `nodetool netstats` would list it.
+///
+/// Every counter arrives as a decimal string and is read by name: a counter the node does not send
+/// stays `None` rather than reading as zero, since `0 / 0` would claim a finished transfer.
+///
+/// Only the `*_TO_RECEIVE`/`*_TO_SEND` totals are progress-worthy. The `*_RECEIVED`/`*_SENT` ones are
+/// not cumulative: `SessionInfo` keeps one progress entry per name, and on 3.11 the receiving side
+/// names it `keyspace/table` (`RangeAwareSSTableWriter.getFilename`), so each file of a table
+/// overwrites the previous one. Seen going *down* mid-rebuild while the node's load went from 26 MiB
+/// to 24 GiB (2026-09-28).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct StreamSession {
+    /// The plan id, shared by every peer of one `rebuild`, `bootstrap` or `repair`.
+    pub plan: String,
+    pub operation: String,
+    pub peer: String,
+    pub files_received: Option<u64>,
+    pub files_to_receive: Option<u64>,
+    pub bytes_received: Option<f64>,
+    pub bytes_to_receive: Option<f64>,
+    pub files_sent: Option<u64>,
+    pub files_to_send: Option<u64>,
+    pub bytes_sent: Option<f64>,
+    pub bytes_to_send: Option<f64>,
 }
 
-fn parse_entity_pairs(body: &str) -> Result<Vec<Vec<(String, String)>>, String> {
+/// Active streaming sessions (`nodetool netstats`).
+///
+/// Observed on a 3.11 node rebuilding from another datacenter (2026-09-28): `entity` is a list of
+/// objects keyed by plan id, each holding one object per peer with `PEER`, `STREAM_OPERATION` and the
+/// `TOTAL_*` counters. An idle node answers with an empty `entity`.
+pub async fn streams(client: &Client, namespace: &str, pod: &str) -> Result<Vec<StreamSession>, String> {
+    let body = get_text(client, &pod_proxy(namespace, pod, MGMT_PORT, "/api/v0/ops/node/streaminfo")).await?;
+    parse_streams(&body)
+}
+
+pub fn parse_streams(body: &str) -> Result<Vec<StreamSession>, String> {
     let root: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
     let entity = root
         .get("entity")
         .and_then(Value::as_array)
         .ok_or_else(|| "entity absent".to_string())?;
-    Ok(entity
-        .iter()
-        .map(|v| match v.as_object() {
-            Some(map) => map
-                .iter()
-                .map(|(k, val)| (k.clone(), scalar_text(val)))
-                .collect(),
-            None => vec![(String::new(), scalar_text(v))],
-        })
-        .collect())
+    let mut out = Vec::new();
+    for plans in entity.iter().filter_map(Value::as_object) {
+        for (plan, peers) in plans {
+            for peer in peers.as_array().into_iter().flatten() {
+                out.push(stream_session(plan, peer));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn stream_session(plan: &str, v: &Value) -> StreamSession {
+    let s = |k: &str| v.get(k).map(scalar_text).unwrap_or_default();
+    let n = |k: &str| s(k).trim().parse::<u64>().ok();
+    let b = |k: &str| s(k).trim().parse::<f64>().ok();
+    StreamSession {
+        plan: plan.to_string(),
+        operation: s("STREAM_OPERATION"),
+        peer: s("PEER").trim_start_matches('/').to_string(),
+        files_received: n("TOTAL_FILES_RECEIVED"),
+        files_to_receive: n("TOTAL_FILES_TO_RECEIVE"),
+        bytes_received: b("TOTAL_SIZE_RECEIVED"),
+        bytes_to_receive: b("TOTAL_SIZE_TO_RECEIVE"),
+        files_sent: n("TOTAL_FILES_SENT"),
+        files_to_send: n("TOTAL_FILES_TO_SEND"),
+        bytes_sent: b("TOTAL_SIZE_SENT"),
+        bytes_to_send: b("TOTAL_SIZE_TO_SEND"),
+    }
 }
 
 fn scalar_text(v: &Value) -> String {
@@ -733,8 +774,30 @@ mod tests {
 
     #[test]
     fn an_empty_entity_list_is_a_valid_answer() {
-        // What every cluster tried so far returns for streaminfo: no streams, not a failure.
-        let pairs = parse_entity_pairs(r#"{"entity":[],"variant":null}"#).expect("parse");
-        assert!(pairs.is_empty());
+        // What an idle node returns for streaminfo: no streams, not a failure.
+        let sessions = parse_streams(r#"{"entity":[],"variant":null}"#).expect("parse");
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_streams_one_session_per_peer_under_its_plan() {
+        // Relevé tel quel sur un node 3.11 en rebuild depuis un autre datacenter.
+        let body = r#"{"entity":[{"df6b3e70-bb3e-11f1-9e02-49fda85bdbe8":[
+            {"PEER":"/10.0.14.7","STREAM_OPERATION":"Rebuild","TOTAL_FILES_RECEIVED":"14",
+             "TOTAL_FILES_SENT":"0","TOTAL_FILES_TO_RECEIVE":"489","TOTAL_FILES_TO_SEND":"0",
+             "TOTAL_SIZE_RECEIVED":"250825681","TOTAL_SIZE_SENT":"0",
+             "TOTAL_SIZE_TO_RECEIVE":"32185770543","TOTAL_SIZE_TO_SEND":"0",
+             "USING_CONNECTION":"/10.0.14.7"},
+            {"PEER":"/10.0.14.6","STREAM_OPERATION":"Rebuild","TOTAL_FILES_RECEIVED":"8",
+             "TOTAL_FILES_TO_RECEIVE":"541","TOTAL_SIZE_RECEIVED":"226804578",
+             "TOTAL_SIZE_TO_RECEIVE":"33941577701"}]}],"variant":{}}"#;
+        let sessions = parse_streams(body).expect("parse");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].plan, "df6b3e70-bb3e-11f1-9e02-49fda85bdbe8");
+        assert_eq!(sessions[0].peer, "10.0.14.7");
+        assert_eq!(sessions[0].operation, "Rebuild");
+        assert_eq!(sessions[0].files_to_receive, Some(489));
+        assert_eq!(sessions[0].bytes_received, Some(250_825_681.0));
+        assert_eq!(sessions[1].files_sent, None);
     }
 }
