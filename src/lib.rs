@@ -53,6 +53,7 @@ pub mod pdf;
 pub mod pods;
 pub mod portfwd;
 pub mod rancher;
+pub mod rancherbackup;
 pub mod rbac;
 pub mod reflector;
 pub mod repair;

@@ -930,6 +930,49 @@ export interface Strings {
   nsPhase: string;
   nsOrigin: string;
   nsAge: string;
+  rbkBackups: string;
+  rbkRestores: string;
+  rbkResourceSets: string;
+  rbkDetail: string;
+  rbkEmpty: string;
+  rbkNotInstalled: string;
+  rbkScopeless: string;
+  rbkProblems: string;
+  rbkLast: string;
+  rbkNever: string;
+  rbkOpDown: string;
+  rbkOpAbsent: string;
+  rbkOpUnknown: string;
+  rbkBackupNow: string;
+  rbkBackupNowHelp: string;
+  rbkRestore: string;
+  rbkRestoreHelp: string;
+  rbkNoRestore: string;
+  rbkCancel: string;
+  rbkConfirm: string;
+  rbkState: string;
+  rbkRetention: string;
+  rbkRetentionDefault: string;
+  rbkRetentionN: string;
+  rbkRetentionNone: string;
+  rbkEncryption: string;
+  rbkLastSuccess: string;
+  rbkNextRun: string;
+  rbkIn: string;
+  rbkLate: string;
+  rbkArchive: string;
+  rbkStorage: string;
+  rbkStorageDefault: string;
+  rbkDone: string;
+  rbkUsedBy: string;
+  rbkOperator: string;
+  rbkDefaultStorage: string;
+  rbkDiagnostic: string;
+  rbkCluster: string;
+  rbkAge: string;
+  rbkAgo: string;
+  rbkYes: string;
+  rbkNo: string;
 }
 
 const FR: Strings = {
@@ -1890,6 +1933,49 @@ const FR: Strings = {
   nsPhase: "phase",
   nsOrigin: "origine",
   nsAge: "âge",
+  rbkBackups: "backups",
+  rbkRestores: "restores",
+  rbkResourceSets: "resourcesets",
+  rbkDetail: "Détail",
+  rbkEmpty: "Rien dans ce monde",
+  rbkNotInstalled: "rancher-backup absent : ce cluster ne sert aucune CRD resources.cattle.io/Backup.",
+  rbkScopeless: "Backup, Restore et ResourceSet sont cluster-scoped : la portée de namespace ne s'y applique pas.",
+  rbkProblems: "à voir",
+  rbkLast: "dernier backup {age}",
+  rbkNever: "jamais",
+  rbkOpDown: "opérateur à l'arrêt",
+  rbkOpAbsent: "opérateur absent",
+  rbkOpUnknown: "opérateur introuvable",
+  rbkBackupNow: "backup maintenant",
+  rbkBackupNowHelp: "Un Backup ponctuel calqué sur celui-ci : même ResourceSet, même stockage, même chiffrement, sans schedule — la rétention ne le purgera jamais.",
+  rbkRestore: "restaurer la dernière archive",
+  rbkRestoreHelp: "Une Restore de {file}, prune activé comme l'opérateur le fait par défaut : ce qui, dans le périmètre de la ResourceSet de l'archive, n'y figure pas est supprimé, et ses controllerReferences (Rancher) sont arrêtés pendant l'opération.",
+  rbkNoRestore: "Aucune archive réussie à restaurer.",
+  rbkCancel: "annuler",
+  rbkConfirm: "confirmer",
+  rbkState: "état",
+  rbkRetention: "rétention",
+  rbkRetentionDefault: "{n} archives (défaut de l'opérateur, retentionCount absent)",
+  rbkRetentionN: "{n} archives",
+  rbkRetentionNone: "aucune : un Backup ponctuel n'est jamais purgé",
+  rbkEncryption: "chiffrement",
+  rbkLastSuccess: "dernier succès",
+  rbkNextRun: "prochain run",
+  rbkIn: "dans {age}",
+  rbkLate: "en retard de {age}",
+  rbkArchive: "archive",
+  rbkStorage: "Stockage",
+  rbkStorageDefault: "défaut de l'opérateur ({loc})",
+  rbkDone: "terminée",
+  rbkUsedBy: "utilisée par",
+  rbkOperator: "Opérateur",
+  rbkDefaultStorage: "stockage par défaut",
+  rbkDiagnostic: "Diagnostic",
+  rbkCluster: "Cluster",
+  rbkAge: "âge",
+  rbkAgo: "il y a {age}",
+  rbkYes: "oui",
+  rbkNo: "non",
 };
 
 const EN: Strings = {
@@ -2842,6 +2928,49 @@ const EN: Strings = {
   nsPhase: "phase",
   nsOrigin: "origin",
   nsAge: "age",
+  rbkBackups: "backups",
+  rbkRestores: "restores",
+  rbkResourceSets: "resourcesets",
+  rbkDetail: "Detail",
+  rbkEmpty: "Nothing in this world",
+  rbkNotInstalled: "rancher-backup absent: this cluster serves no resources.cattle.io/Backup CRD.",
+  rbkScopeless: "Backup, Restore and ResourceSet are cluster-scoped: the namespace scope does not apply.",
+  rbkProblems: "to look at",
+  rbkLast: "last backup {age}",
+  rbkNever: "never",
+  rbkOpDown: "operator down",
+  rbkOpAbsent: "operator missing",
+  rbkOpUnknown: "operator unknown",
+  rbkBackupNow: "backup now",
+  rbkBackupNowHelp: "A one-time Backup modelled on this one: same ResourceSet, same storage, same encryption, no schedule — retention will never prune it.",
+  rbkRestore: "restore the last archive",
+  rbkRestoreHelp: "A Restore of {file}, with prune on as the operator defaults to: whatever is in scope of the archive's ResourceSet but not in it gets deleted, and its controllerReferences (Rancher) are scaled down while it runs.",
+  rbkNoRestore: "No successful archive to restore.",
+  rbkCancel: "cancel",
+  rbkConfirm: "confirm",
+  rbkState: "state",
+  rbkRetention: "retention",
+  rbkRetentionDefault: "{n} archives (operator default, retentionCount unset)",
+  rbkRetentionN: "{n} archives",
+  rbkRetentionNone: "none: a one-time Backup is never pruned",
+  rbkEncryption: "encryption",
+  rbkLastSuccess: "last success",
+  rbkNextRun: "next run",
+  rbkIn: "in {age}",
+  rbkLate: "{age} late",
+  rbkArchive: "archive",
+  rbkStorage: "Storage",
+  rbkStorageDefault: "operator default ({loc})",
+  rbkDone: "completed",
+  rbkUsedBy: "used by",
+  rbkOperator: "Operator",
+  rbkDefaultStorage: "default storage",
+  rbkDiagnostic: "Diagnostic",
+  rbkCluster: "Cluster",
+  rbkAge: "age",
+  rbkAgo: "{age} ago",
+  rbkYes: "yes",
+  rbkNo: "no",
 };
 
 export function strings(lang: Lang): Strings {

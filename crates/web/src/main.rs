@@ -27,6 +27,7 @@ mod objects;
 mod portal;
 mod rbac;
 mod rancher;
+mod rancherbackup;
 mod reflector;
 mod netpol;
 mod k8ssandra;
@@ -246,6 +247,10 @@ async fn main() -> Result<()> {
         // La seule écriture de la vue : forcer une re-réflexion. Le corps ne nomme que la ligne ;
         // le plan — quel miroir vider, faut-il horodater la source — se rebâtit sur l'inventaire relu.
         .route("/api/v1/reflector/force", post(reflector::force))
+        .route("/api/v1/rancher-backup", get(rancherbackup::list))
+        // Deux écritures, toutes deux depuis un Backup que le serveur relit : un run ponctuel
+        // calqué sur lui, ou la restauration de sa dernière archive réussie.
+        .route("/api/v1/rancher-backup/write", post(rancherbackup::write))
         .route("/api/v1/kyverno", get(kyverno::list))
         // La seule écriture de la vue : vider la file des UpdateRequest que le controller ne
         // draine plus. Les règles `synchronize: true` recréent ce qui est encore nécessaire.

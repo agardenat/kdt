@@ -705,6 +705,12 @@ use crate::reflector::{
     ForceWrite, HintLevel as ReflHintLevel, ReflOrphan, ReflRow, ReflSource, ReflTarget, ReflWorld,
     SharedReflector, TargetStatus,
 };
+// La vue rancher-backup suit le même partage : verdicts, lignes et écritures dans
+// `crate::rancherbackup`, que kdt-web lit tel quel.
+use crate::rancherbackup::{
+    build_rbk_view, fetch_rbk, new_rbk_state, Phase as RbkPhase, RbkBackup, RbkResourceSet,
+    RbkRestore, RbkRow, RbkView, RbkWorld, RbkWrite, SharedRbk,
+};
 // Comme les vues kyverno et rbac, la vue velero n'a pas de modèle à elle : ses lignes, le
 // regroupement sous les schedules, les tons de phase et les enregistrements synthétiques vivent
 // dans `crate::velero`, et kdt-web lit exactement les mêmes.
@@ -872,7 +878,7 @@ impl Filter {
 // Event reasons treated as "errors" by the Errors filter (crash/oom/scheduling/mount failures…).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull, Hooks, HooksFull }
+pub enum Mode { Selection, AiPanel, DetailFull, Nodes, NodesFull, NodeUsage, Diagnostic, Extract, Command, Search, Flux, FluxFull, FluxLogs, Pods, PodsFull, Rbac, RbacFull, Vuln, VulnFull, Secrets, SecretsFull, Configmaps, ConfigmapsFull, Namespaces, Services, ServicesFull, Storage, StorageFull, Capacity, CapacityFull, Certs, CertsFull, Kyverno, KyvernoFull, Reflector, ReflectorFull, Velero, VeleroFull, K8ssandra, K8ssandraFull, Rancher, RancherFull, Argo, ArgoFull, Identity, IdentityFull, Hooks, HooksFull, RBackup, RBackupFull }
 
 // One visual line in the merged workloads view: a workload (parent/group row), one of its pods
 // (child row), or — when that pod is unfolded with `x` — one of the pod's containers (grandchild).
@@ -908,6 +914,10 @@ enum MenuAction {
     // Like the drain, this one has no argument: it opens its own panel to choose before it writes.
     VelRestoreOptions,
     VelDeleteBackup,
+    // rancher-backup: a one-time run modelled on the selected Backup, or a restore of its last
+    // successful archive.
+    RbkBackupNow,
+    RbkRestore,
     // Kyverno: delete every stuck (Pending/Failed) UpdateRequest to unjam the generate queue.
     KyPurgeRequests,
     // Hooks: flip one admission webhook to the failurePolicy named here. Break glass, cluster-wide.
@@ -1053,6 +1063,7 @@ fn is_split_mode(mode: Mode) -> bool {
             | Mode::Rancher
             | Mode::Argo
             | Mode::Identity
+            | Mode::RBackup
     )
 }
 
@@ -1081,6 +1092,7 @@ fn is_text_panel_mode(mode: Mode) -> bool {
             | Mode::ServicesFull
             | Mode::StorageFull
             | Mode::CapacityFull
+            | Mode::RBackupFull
     )
 }
 
@@ -1238,6 +1250,10 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // reads, and it answers to its own name.
     ("rancher", &["ranch", "cattle"]),
     ("projects", &["project", "proj"]),
+    // rancher/backup-restore-operator. `backup` is velero's; this one answers to its chart's name,
+    // and its Restores to a command of their own so that it opens on the world it names.
+    ("rancher-backup", &["rbackup", "rancherbackup", "bro", "backup-restore", "resourceset", "resourcesets"]),
+    ("rancher-restore", &["rrestore", "rrestores", "rancher-restores"]),
     ("tokens", &["token", "apikeys", "apikey", "kubeconfigs"]),
     // Argo CD's own objects. `apps`/`app` belong here rather than to the workloads view: on a
     // cluster running Argo CD that word means an `Application`, not a Deployment. `projects` is
@@ -1749,6 +1765,14 @@ pub struct App {
     pub refl_detail_scroll: usize,
     pub refl_refresh_handle: Option<JoinHandle<()>>,
     last_refl_sel_uid: Option<String>,
+    pub rbk_state: SharedRbk,
+    rbk_world: RbkWorld,
+    rbk_filter: ReflFilter,
+    // The rows on screen and the lists they index into, snapshotted once per refresh so the draw
+    // pass never re-locks.
+    rbk_view: RbkView,
+    pub rbk_detail_scroll: usize,
+    pub rbk_refresh_handle: Option<JoinHandle<()>>,
     pub configmaps_state: SharedConfigMaps,
     pub configmaps_cursor: usize,
     pub configmaps_offset: usize,
@@ -2066,6 +2090,12 @@ impl App {
             refl_detail_scroll: 0,
             refl_refresh_handle: None,
             last_refl_sel_uid: None,
+            rbk_state: new_rbk_state(),
+            rbk_world: RbkWorld::Backups,
+            rbk_filter: ReflFilter::All,
+            rbk_view: RbkView::default(),
+            rbk_detail_scroll: 0,
+            rbk_refresh_handle: None,
             configmaps_state: new_configmaps_state(),
             configmaps_cursor: 0,
             configmaps_offset: 0,
@@ -2128,6 +2158,7 @@ impl App {
             &mut self.ranch_refresh_handle,
             &mut self.ident_refresh_handle,
             &mut self.refl_refresh_handle,
+            &mut self.rbk_refresh_handle,
             &mut self.configmaps_refresh_handle,
             &mut self.namespaces_refresh_handle,
         ];
@@ -2899,7 +2930,9 @@ impl App {
             | Mode::Argo
             | Mode::ArgoFull
             | Mode::Hooks
-            | Mode::HooksFull => {
+            | Mode::HooksFull
+            | Mode::RBackup
+            | Mode::RBackupFull => {
                 let rec = self.snapshot.get(self.table_state.selected()?)?;
                 if rec.kind.is_empty() || rec.name.is_empty() { return None; }
                 // Events carry the involved object's apiVersion, which older sources leave empty.
@@ -3837,7 +3870,7 @@ impl App {
                 | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull
                 | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull
                 | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull
-                | Mode::Hooks | Mode::HooksFull
+                | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull
         ) && !self.top_panel_collapsed()
     }
 
@@ -3872,6 +3905,7 @@ impl App {
             Mode::Kyverno | Mode::KyvernoFull => step(&mut self.ky_detail_scroll, delta),
             Mode::Hooks | Mode::HooksFull => step(&mut self.hooks_detail_scroll, delta),
             Mode::Reflector | Mode::ReflectorFull => step(&mut self.refl_detail_scroll, delta),
+            Mode::RBackup | Mode::RBackupFull => step(&mut self.rbk_detail_scroll, delta),
             Mode::Velero | Mode::VeleroFull => step(&mut self.vel_detail_scroll, delta),
             Mode::K8ssandra | Mode::K8ssandraFull => step(&mut self.k8c_detail_scroll, delta),
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_detail_scroll, delta),
@@ -3900,7 +3934,8 @@ impl App {
             Mode::Reflector | Mode::ReflectorFull | Mode::K8ssandra | Mode::K8ssandraFull
             | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull
             | Mode::Identity | Mode::IdentityFull
-            | Mode::Hooks | Mode::HooksFull => {}
+            | Mode::Hooks | Mode::HooksFull
+            | Mode::RBackup | Mode::RBackupFull => {}
             Mode::Configmaps | Mode::ConfigmapsFull => step(&mut self.configmaps_h_scroll, delta),
             Mode::Namespaces => step(&mut self.namespaces_h_scroll, delta),
             _ => step(&mut self.detail_h_scroll, delta),
@@ -3921,6 +3956,7 @@ impl App {
             Mode::Certs | Mode::CertsFull => self.refresh_certs(),
             Mode::Kyverno | Mode::KyvernoFull => self.refresh_kyverno(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector(),
+            Mode::RBackup | Mode::RBackupFull => self.refresh_rbk(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher(),
@@ -4303,6 +4339,7 @@ impl App {
             Mode::Hooks | Mode::HooksFull => self.refresh_hooks_snapshot(),
             Mode::Rbac | Mode::RbacFull => self.refresh_rbac_snapshot(),
             Mode::Reflector | Mode::ReflectorFull => self.refresh_reflector_snapshot(),
+            Mode::RBackup | Mode::RBackupFull => self.refresh_rbk_snapshot(),
             Mode::Velero | Mode::VeleroFull => self.refresh_velero_snapshot(),
             Mode::K8ssandra | Mode::K8ssandraFull => self.refresh_k8c_snapshot(),
             Mode::Rancher | Mode::RancherFull => self.refresh_rancher_snapshot(),
@@ -4441,6 +4478,16 @@ impl App {
             "velero" => {
                 self.switch_view(origin, ns_arg);
                 self.enter_velero_mode(VelWorld::Backups);
+            }
+            // Always opens: on a cluster without the operator the view says so, which answers
+            // "is Rancher backed up here" as surely as a list would.
+            "rancher-backup" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_rbk_mode(RbkWorld::Backups);
+            }
+            "rancher-restore" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_rbk_mode(RbkWorld::Restores);
             }
             "restores" => {
                 self.switch_view(origin, ns_arg);
@@ -4600,6 +4647,10 @@ impl App {
             }
             Mode::Reflector | Mode::ReflectorFull => {
                 self.stop_reflector_auto_refresh();
+                self.clear_status_state();
+            }
+            Mode::RBackup | Mode::RBackupFull => {
+                self.stop_rbk_auto_refresh();
                 self.clear_status_state();
             }
             Mode::Velero | Mode::VeleroFull => {
@@ -9765,6 +9816,225 @@ impl App {
         self.refresh_argo();
     }
 
+    // --- Rancher backup view --------------------------------------------------------------------
+
+    fn enter_rbk_mode(&mut self, world: RbkWorld) {
+        self.mode = Mode::RBackup;
+        self.rbk_world = world;
+        self.detail_tab = DetailTab::Status;
+        self.rbk_detail_scroll = 0;
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.reset_scroll();
+        self.refresh_rbk();
+        self.start_rbk_auto_refresh();
+        self.refresh_rbk_snapshot();
+    }
+
+    fn exit_rbk_mode(&mut self) {
+        self.mode = Mode::Selection;
+        self.stop_rbk_auto_refresh();
+        self.snapshot.clear();
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.last_pod_key = None;
+        self.last_status_key = None;
+        self.last_related_key = None;
+        self.clear_status_state();
+        self.reset_to_follow();
+    }
+
+    fn enter_rbk_full(&mut self) {
+        if self.snapshot.is_empty() { return; }
+        self.rbk_detail_scroll = 0;
+        self.mode = Mode::RBackupFull;
+    }
+
+    fn exit_rbk_full(&mut self) {
+        self.mode = Mode::RBackup;
+    }
+
+    fn refresh_rbk(&self) {
+        {
+            let mut s = self.rbk_state.lock().expect("rancher-backup poisoned");
+            s.loading = true;
+            s.error = None;
+        }
+        let client = self.client.clone();
+        let state = self.rbk_state.clone();
+        tokio::spawn(async move { fetch_rbk(client, state).await; });
+    }
+
+    // 30 s : un backup Rancher tourne au mieux quelques fois par jour, et la lecture ne coûte que
+    // trois listes et un Deployment. L'écriture qui demande à voir vite rafraîchit d'elle-même.
+    fn start_rbk_auto_refresh(&mut self) {
+        self.stop_rbk_auto_refresh();
+        let client = self.client.clone();
+        let state = self.rbk_state.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                fetch_rbk(client.clone(), state.clone()).await;
+            }
+        });
+        self.rbk_refresh_handle = Some(handle);
+    }
+
+    fn stop_rbk_auto_refresh(&mut self) {
+        if let Some(h) = self.rbk_refresh_handle.take() {
+            h.abort();
+        }
+    }
+
+    // Rebuilds the rows and `App::snapshot` in lockstep, so a selected index means the same row in
+    // both — which is what gives this view `y`, `Ctrl-D`, the AI panel and the Related tab.
+    fn refresh_rbk_snapshot(&mut self) {
+        let view = {
+            let s = self.rbk_state.lock().expect("rancher-backup poisoned");
+            build_rbk_view(&s, self.rbk_world, self.rbk_filter == ReflFilter::Problems)
+        };
+        let st = lang::t(self.ai_language);
+        let recs: Vec<EventRecord> = view
+            .rows
+            .iter()
+            .filter_map(|r| crate::rancherbackup::row_record(&view, r, st))
+            .collect();
+        self.rbk_view = view;
+
+        let prev_uid = self
+            .table_state
+            .selected()
+            .and_then(|i| self.snapshot.get(i))
+            .map(|r| r.uid.clone())
+            .or_else(|| self.selected_uid.clone());
+        self.snapshot = recs;
+        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            retain_aligned(&mut self.rbk_view.rows, &keep);
+            retain_aligned(&mut self.snapshot, &keep);
+        }
+        if self.snapshot.is_empty() {
+            self.table_state.select(None);
+            return;
+        }
+        let idx = prev_uid
+            .and_then(|uid| self.snapshot.iter().position(|r| r.uid == uid))
+            .unwrap_or_else(|| {
+                self.table_state.selected().unwrap_or(0).min(self.snapshot.len() - 1)
+            });
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+    }
+
+    fn move_rbk_selection(&mut self, delta: i32) {
+        if self.snapshot.is_empty() { return; }
+        let cur = self.table_state.selected().unwrap_or(0) as i32;
+        let idx = (cur + delta).clamp(0, self.snapshot.len() as i32 - 1) as usize;
+        self.table_state.select(Some(idx));
+        self.selected_uid = Some(self.snapshot[idx].uid.clone());
+        self.rbk_detail_scroll = 0;
+        self.refresh_rbk_snapshot();
+    }
+
+    fn cycle_rbk_world(&mut self) {
+        self.rbk_world = match self.rbk_world {
+            RbkWorld::Backups => RbkWorld::Restores,
+            RbkWorld::Restores => RbkWorld::ResourceSets,
+            RbkWorld::ResourceSets => RbkWorld::Backups,
+        };
+        self.rbk_detail_scroll = 0;
+        self.table_state.select(None);
+        self.selected_uid = None;
+        self.refresh_rbk_snapshot();
+    }
+
+    fn cycle_rbk_filter(&mut self) {
+        self.rbk_filter = match self.rbk_filter {
+            ReflFilter::All => ReflFilter::Problems,
+            ReflFilter::Problems => ReflFilter::All,
+        };
+        self.rbk_detail_scroll = 0;
+        self.refresh_rbk_snapshot();
+    }
+
+    fn rbk_selected_row(&self) -> Option<RbkRow> {
+        self.rbk_view.rows.get(self.table_state.selected()?).copied()
+    }
+
+    fn rbk_selected_backup(&self) -> Option<&RbkBackup> {
+        self.rbk_view.backup_of(&self.rbk_selected_row()?)
+    }
+
+    // Les deux écritures partent d'un Backup : un run ponctuel calqué sur lui, ou la restauration
+    // de sa dernière archive réussie. Une ligne qui n'en offre aucune le dit au lieu d'ouvrir un
+    // menu vide.
+    fn open_rbk_action_menu(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(b) = self.rbk_selected_backup() else {
+            self.clipboard_status = Some((std::time::Instant::now(), st.rbk_no_action.to_string()));
+            return;
+        };
+        let mut items = vec![ActionItem {
+            label: st.k_rbk_backup_now,
+            desc: st.desc_rbk_backup_now.to_string(),
+            action: MenuAction::RbkBackupNow,
+        }];
+        if !b.filename.is_empty() {
+            items.push(ActionItem {
+                label: st.k_rbk_restore,
+                desc: lang::fill(st.desc_rbk_restore, &[("file", &b.filename)]),
+                action: MenuAction::RbkRestore,
+            });
+        }
+        self.action_menu = Some(ActionMenu {
+            title: st.menu_rbk_title,
+            items,
+            cursor: 0,
+            confirm: true,
+            confirming: false,
+            input: None,
+            note: None,
+        });
+    }
+
+    fn rbk_run_write(&mut self, write: RbkWrite, ok: &'static str, failed: &'static str) {
+        let client = self.client.clone();
+        let status = self.reconcile_status.clone();
+        let state = self.rbk_state.clone();
+        let st = lang::t(self.ai_language);
+        tokio::spawn(async move {
+            let message = match crate::rancherbackup::apply_write(client.clone(), write, st).await {
+                Ok(name) => lang::fill(ok, &[("name", &name)]),
+                Err(e) => lang::fill(failed, &[("e", &e)]),
+            };
+            {
+                let mut s = status.lock().expect("reconcile status poisoned");
+                *s = Some((std::time::Instant::now(), message));
+            }
+            fetch_rbk(client, state).await;
+        });
+    }
+
+    fn rbk_backup_now(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(b) = self.rbk_selected_backup() else { return };
+        let write = RbkWrite::BackupNow { from: b.name.clone() };
+        self.rbk_run_write(write, st.msg_rbk_backup_started, st.msg_rbk_write_failed);
+    }
+
+    fn rbk_restore(&mut self) {
+        let st = lang::t(self.ai_language);
+        let Some(b) = self.rbk_selected_backup() else { return };
+        let write = RbkWrite::Restore { from: b.name.clone() };
+        self.rbk_run_write(write, st.msg_rbk_restore_started, st.msg_rbk_write_failed);
+    }
+
     // --- Reflector view -------------------------------------------------------------------------
 
     fn enter_reflector_mode(&mut self) {
@@ -11219,6 +11489,8 @@ impl App {
             Some(MenuAction::VelRestore) => self.vel_restore(),
             Some(MenuAction::VelRestoreOptions) => self.open_vel_restore_view(),
             Some(MenuAction::VelDeleteBackup) => self.vel_delete_backup(),
+            Some(MenuAction::RbkBackupNow) => self.rbk_backup_now(),
+            Some(MenuAction::RbkRestore) => self.rbk_restore(),
             Some(MenuAction::KyPurgeRequests) => self.ky_purge_requests(),
             Some(MenuAction::HookFailurePolicy(to)) => self.set_hook_failure_policy(to),
             Some(MenuAction::K8cBackupNow) => self.k8c_write(K8cAction::BackupNow),
@@ -11836,6 +12108,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
             // except the invitation, which has an overlay of its own.
             app.drain_reconcile_status();
         }
+        if matches!(app.mode, Mode::RBackup | Mode::RBackupFull) {
+            app.refresh_rbk_snapshot();
+            // The two writes report through the same channel as the Flux reconciles.
+            app.drain_reconcile_status();
+        }
         if matches!(app.mode, Mode::Reflector | Mode::ReflectorFull) {
             app.refresh_reflector_snapshot();
             // The forced re-reflection reports through the same channel as the Flux reconciles.
@@ -12276,13 +12553,13 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char(c), m, Mode::Command) if !m.contains(KeyModifiers::CONTROL) => app.command_push(c),
         (_, _, Mode::Command) => {}
 
-        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char(':'), _, Mode::Selection | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.enter_command();
         }
 
         // `/` searches: it narrows the row list in the table views, and highlights/jumps in the
         // full-screen text panels.
-        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char('/'), _, Mode::Selection | Mode::DetailFull | Mode::AiPanel | Mode::Diagnostic | Mode::FluxLogs | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.enter_search();
         }
 
@@ -12305,12 +12582,12 @@ fn handle_event(app: &mut App, ev: Event) {
         }
 
         // `y` shows the YAML of the selected object, from every view that has one.
-        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char('y'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.open_yaml_view();
         }
 
         // `e` edits the selected object in `$EDITOR`, from the same views.
-        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char('e'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.open_edit_view();
         }
 
@@ -12323,12 +12600,12 @@ fn handle_event(app: &mut App, ev: Event) {
         // `h` touches the selected object — an annotation stamp, to make admission run again. Bound
         // only in the table views, never in a scrollable overlay where `h` is a vim motion and the
         // reflex would be to move left, not to write to the cluster.
-        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char('h'), _, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.touch_selected();
         }
 
         // Ctrl-D opens the guarded delete panel on the selected object, from the same views.
-        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL, Mode::Selection | Mode::DetailFull | Mode::Nodes | Mode::NodesFull | Mode::Flux | Mode::FluxFull | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull) => {
             app.open_delete_view();
         }
 
@@ -13058,6 +13335,31 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Char('i'), _, Mode::ArgoFull) => app.enter_ai_panel(),
         (_, _, Mode::ArgoFull) => {}
 
+        (KeyCode::Up, _, Mode::RBackup) => app.move_rbk_selection(-1),
+        (KeyCode::Down, _, Mode::RBackup) => app.move_rbk_selection(1),
+        (KeyCode::PageUp, _, Mode::RBackup) => app.move_rbk_selection(-10),
+        (KeyCode::PageDown, _, Mode::RBackup) => app.move_rbk_selection(10),
+        (KeyCode::Char('g'), _, Mode::RBackup) => app.cycle_rbk_world(),
+        (KeyCode::Char('f'), _, Mode::RBackup) => app.cycle_rbk_filter(),
+        (KeyCode::Char('o'), _, Mode::RBackup) => app.open_rbk_action_menu(),
+        (KeyCode::Enter, _, Mode::RBackup) => app.enter_rbk_full(),
+        (KeyCode::F(5), _, Mode::RBackup) => app.refresh_rbk(),
+        (KeyCode::Esc, _, Mode::RBackup) => app.exit_rbk_mode(),
+        (KeyCode::Char('i'), _, Mode::RBackup) => app.enter_ai_panel(),
+        (_, _, Mode::RBackup) => {}
+
+        (KeyCode::Up, m, Mode::RBackupFull) if !m.contains(KeyModifiers::SHIFT) => app.rbk_detail_scroll = app.rbk_detail_scroll.saturating_sub(1),
+        (KeyCode::Down, m, Mode::RBackupFull) if !m.contains(KeyModifiers::SHIFT) => app.rbk_detail_scroll = app.rbk_detail_scroll.saturating_add(1),
+        (KeyCode::PageUp, _, Mode::RBackupFull) => app.rbk_detail_scroll = app.rbk_detail_scroll.saturating_sub(10),
+        (KeyCode::PageDown, _, Mode::RBackupFull) => app.rbk_detail_scroll = app.rbk_detail_scroll.saturating_add(10),
+        (KeyCode::Enter, _, Mode::RBackupFull) => app.exit_rbk_full(),
+        (KeyCode::Esc, _, Mode::RBackupFull) => app.exit_rbk_full(),
+        (KeyCode::Char('g'), _, Mode::RBackupFull) => app.rbk_detail_scroll = 0,
+        (KeyCode::Char('G'), _, Mode::RBackupFull) => app.rbk_detail_scroll = usize::MAX / 2,
+        (KeyCode::Char('o'), _, Mode::RBackupFull) => app.open_rbk_action_menu(),
+        (KeyCode::Char('i'), _, Mode::RBackupFull) => app.enter_ai_panel(),
+        (_, _, Mode::RBackupFull) => {}
+
         (KeyCode::Up, _, Mode::Reflector) => app.move_refl_selection(-1),
         (KeyCode::Down, _, Mode::Reflector) => app.move_refl_selection(1),
         (KeyCode::PageUp, _, Mode::Reflector) => app.move_refl_selection(-10),
@@ -13242,11 +13544,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Constraint::Length(3),
             ])
             .split(area),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull => Layout::default()
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull | Mode::RBackupFull => Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(3)])
             .split(area),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks => Layout::default()
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks | Mode::RBackup => Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
@@ -13264,8 +13566,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Selection => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::DetailFull => (layout[0], Some(layout[1]), None, layout[2]),
         Mode::Nodes => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
-        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull => (layout[0], Some(layout[1]), None, layout[2]),
-        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
+        Mode::NodesFull | Mode::FluxFull | Mode::PodsFull | Mode::RbacFull | Mode::VulnFull | Mode::SecretsFull | Mode::CertsFull | Mode::KyvernoFull | Mode::ReflectorFull | Mode::VeleroFull | Mode::K8ssandraFull | Mode::ConfigmapsFull | Mode::ServicesFull | Mode::StorageFull | Mode::CapacityFull | Mode::RancherFull | Mode::ArgoFull | Mode::IdentityFull | Mode::HooksFull | Mode::RBackupFull => (layout[0], Some(layout[1]), None, layout[2]),
+        Mode::Flux | Mode::Pods | Mode::Rbac | Mode::Vuln | Mode::Secrets | Mode::Certs | Mode::Kyverno | Mode::Reflector | Mode::Velero | Mode::K8ssandra | Mode::Configmaps | Mode::Namespaces | Mode::Services | Mode::Storage | Mode::Capacity | Mode::Rancher | Mode::Argo | Mode::Identity | Mode::Hooks | Mode::RBackup => (layout[0], Some(layout[1]), Some(layout[2]), layout[3]),
         Mode::AiPanel | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::FluxLogs => unreachable!(),
     } };
 
@@ -13290,6 +13592,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Certs | Mode::CertsFull => st.mode_certs,
         Mode::Kyverno | Mode::KyvernoFull => st.mode_kyverno,
         Mode::Reflector | Mode::ReflectorFull => st.mode_reflector,
+        Mode::RBackup | Mode::RBackupFull => st.mode_rbk,
         Mode::Velero | Mode::VeleroFull => st.mode_velero,
         Mode::K8ssandra | Mode::K8ssandraFull => st.mode_k8ssandra,
         Mode::Rancher | Mode::RancherFull => st.mode_rancher,
@@ -13365,6 +13668,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
             }
         } else if draw_mode == Mode::Reflector {
             draw_reflector_table(f, app, ta);
+        } else if draw_mode == Mode::RBackup {
+            draw_rbk_table(f, app, ta);
         } else if draw_mode == Mode::Velero {
             draw_velero_table(f, app, ta);
         } else if draw_mode == Mode::K8ssandra {
@@ -13390,7 +13695,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         } else {
             let rows: Vec<Row> = match draw_mode {
                 Mode::Selection => app.snapshot.iter().map(|r| row_for(r, app.h_scroll)).collect(),
-                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull => unreachable!(),
+                Mode::DetailFull | Mode::AiPanel | Mode::Nodes | Mode::NodesFull | Mode::NodeUsage | Mode::Diagnostic | Mode::Extract | Mode::Command | Mode::Search | Mode::Flux | Mode::FluxFull | Mode::FluxLogs | Mode::Pods | Mode::PodsFull | Mode::Rbac | Mode::RbacFull | Mode::Vuln | Mode::VulnFull | Mode::Secrets | Mode::SecretsFull | Mode::Certs | Mode::CertsFull | Mode::Kyverno | Mode::KyvernoFull | Mode::Reflector | Mode::ReflectorFull | Mode::Velero | Mode::VeleroFull | Mode::K8ssandra | Mode::K8ssandraFull | Mode::Configmaps | Mode::ConfigmapsFull | Mode::Namespaces | Mode::Services | Mode::ServicesFull | Mode::Storage | Mode::StorageFull | Mode::Capacity | Mode::CapacityFull | Mode::Rancher | Mode::RancherFull | Mode::Argo | Mode::ArgoFull | Mode::Identity | Mode::IdentityFull | Mode::Hooks | Mode::HooksFull | Mode::RBackup | Mode::RBackupFull => unreachable!(),
             };
 
             let header_row = Row::new(vec![
@@ -13880,6 +14185,33 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
             ]
         }
+        Mode::RBackup => {
+            // `g` names the world it switches *to*, so the bar reads as the next action.
+            let next_world = match app.rbk_world {
+                RbkWorld::Backups => st.k_rbk_restores,
+                RbkWorld::Restores => st.k_rbk_resourcesets,
+                RbkWorld::ResourceSets => st.k_rbk_backups,
+            };
+            vec![
+                Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
+                Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
+                footer_sep(),
+                Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
+                Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
+                footer_sep(),
+                Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
+                Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_refl_filter, app.rbk_filter.label())),
+                Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_rbk_ops)),
+                Span::styled(" F5 ", kbg), Span::raw(format!(" {}   ", st.k_refresh)),
+            ]
+        }
+        Mode::RBackupFull => vec![
+            Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
+            footer_sep(),
+            Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_scroll)),
+            Span::styled(" g/G ", kbg), Span::raw(format!(" {}   ", st.k_top_bot)),
+            Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_rbk_ops)),
+        ],
         Mode::ReflectorFull => vec![
             Span::styled(" Esc/Enter ", kbg), Span::raw(format!(" {}   ", st.k_split)),
             footer_sep(),
@@ -21263,6 +21595,393 @@ fn vel_volume_mode(s: &VelSchedule, st: &'static Strings) -> String {
     parts.join(" · ")
 }
 
+// --- Rancher backup view rendering ----------------------------------------------------------------
+
+fn rbk_phase_cell(phase: RbkPhase) -> Cell<'static> {
+    Cell::from(phase.label()).style(Style::default().fg(line_color(phase.tone())))
+}
+
+// The worst finding of a row — the module sorts them — when it needs a human. An `Info` is the
+// norm stated (an archive on the chart's default PV), not a departure from it: it stays in the
+// panel and the column says nothing.
+fn rbk_alert_cell(hints: &[crate::storage::Hint]) -> Cell<'static> {
+    match hints.first().filter(|h| h.level >= StoHintLevel::Warn) {
+        Some(h) => Cell::from(h.text.clone())
+            .style(Style::default().fg(sto_hint_color(std::slice::from_ref(h)).unwrap_or(DIM))),
+        None => Cell::from("—").style(Style::default().fg(DIM)),
+    }
+}
+
+fn rbk_name_style(hints: &[crate::storage::Hint]) -> Style {
+    match sto_hint_color(hints) {
+        Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+        None => Style::default(),
+    }
+}
+
+fn draw_rbk_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let (loading, error, installed, n_backups, n_restores, problems, last, op_tag) = {
+        let s = app.rbk_state.lock().expect("rancher-backup poisoned");
+        let op_tag = match (&s.operator, s.operator_known) {
+            (Some(o), _) if !o.up() => st.rbk_op_down_tag,
+            (None, true) => st.rbk_op_absent_tag,
+            _ => "",
+        };
+        (
+            s.loading,
+            s.error.clone(),
+            s.installed,
+            s.backups.len(),
+            s.restores.len(),
+            s.problems(),
+            s.last_success,
+            op_tag,
+        )
+    };
+    let now = now_secs();
+    let world = match app.rbk_world {
+        RbkWorld::Backups => st.k_rbk_backups,
+        RbkWorld::Restores => st.k_rbk_restores,
+        RbkWorld::ResourceSets => st.k_rbk_resourcesets,
+    };
+    // The age of the last successful backup goes in the title: it is the answer the view exists to
+    // give, and it has to be legible without selecting anything.
+    let last = match last {
+        Some(t) => crate::velero::age_of(t, now),
+        None => st.rbk_never.to_string(),
+    };
+    let title = if let Some(e) = &error {
+        lang::fill(st.ui_title_error, &[("view", "rancher-backup"), ("e", e)])
+    } else if loading && app.rbk_view.rows.is_empty() && !installed {
+        lang::fill(st.ui_title_loading, &[("view", "rancher-backup")])
+    } else if !installed {
+        st.rbk_not_installed.to_string()
+    } else {
+        lang::fill(
+            st.rbk_title,
+            &[
+                ("world", world),
+                ("backups", &n_backups.to_string()),
+                ("restores", &n_restores.to_string()),
+                ("problems", &problems.to_string()),
+                ("last", &last),
+                ("op", op_tag),
+                ("filter", app.rbk_filter.label()),
+            ],
+        )
+    };
+
+    let header_style =
+        Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    let yes_no = |v: bool| if v { st.lbl_yes } else { st.lbl_no };
+    let view = &app.rbk_view;
+    let (header, rows, widths): (Row, Vec<Row>, Vec<Constraint>) = match app.rbk_world {
+        RbkWorld::Backups => {
+            let backups: Vec<&RbkBackup> = view.rows.iter().filter_map(|r| view.backup_of(r)).collect();
+            let header = Row::new(vec![
+                "NAME", "TYPE", "SCHEDULE", "LAST", "NEXT", "KEEP", "STORAGE", "ENC", "STATE", "ALERT",
+            ])
+            .style(header_style);
+            let rows = backups
+                .iter()
+                .map(|b| {
+                    let late = b.late(now);
+                    Row::new(vec![
+                        Cell::from(b.name.clone()).style(rbk_name_style(&b.hints)),
+                        Cell::from(if b.recurring() { "Recurring" } else { "One-time" })
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(if b.schedule.is_empty() { "—".to_string() } else { b.schedule.clone() }),
+                        Cell::from(b.last.map(|t| crate::velero::age_of(t, now)).unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(b.next_text(now))
+                            .style(Style::default().fg(if late { Color::Red } else { DIM })),
+                        Cell::from(b.keep_text()).style(Style::default().fg(DIM)),
+                        Cell::from(b.storage_label()),
+                        Cell::from(yes_no(b.encrypted())).style(Style::default().fg(DIM)),
+                        rbk_phase_cell(b.phase),
+                        rbk_alert_cell(&b.hints),
+                    ])
+                })
+                .collect();
+            let name_w = col_width(backups.iter().map(|b| b.name.as_str()), "NAME", 14, 40);
+            let sched_w = col_width(backups.iter().map(|b| b.schedule.as_str()), "SCHEDULE", 8, 18);
+            let storages: Vec<String> = backups.iter().map(|b| b.storage_label()).collect();
+            let storage_w = col_width(storages.iter().map(|s| s.as_str()), "STORAGE", 7, 32);
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(9), Constraint::Length(sched_w),
+                Constraint::Length(5), Constraint::Length(5), Constraint::Length(4),
+                Constraint::Length(storage_w), Constraint::Length(4), Constraint::Length(9),
+                Constraint::Percentage(100),
+            ];
+            (header, rows, widths)
+        }
+        RbkWorld::Restores => {
+            let restores: Vec<&RbkRestore> = view.rows.iter().filter_map(|r| view.restore_of(r)).collect();
+            let header = Row::new(vec!["NAME", "ARCHIVE", "PRUNE", "AGE", "DONE", "STATE", "ALERT"])
+                .style(header_style);
+            let rows = restores
+                .iter()
+                .map(|r| {
+                    Row::new(vec![
+                        Cell::from(r.name.clone()).style(rbk_name_style(&r.hints)),
+                        Cell::from(r.backup_filename.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(yes_no(r.prune)),
+                        Cell::from(crate::velero::age_of(r.created, now)).style(Style::default().fg(DIM)),
+                        Cell::from(r.completed.map(|t| crate::velero::age_of(t, now)).unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        rbk_phase_cell(r.phase),
+                        rbk_alert_cell(&r.hints),
+                    ])
+                })
+                .collect();
+            let name_w = col_width(restores.iter().map(|r| r.name.as_str()), "NAME", 14, 40);
+            let file_w = col_width(restores.iter().map(|r| r.backup_filename.as_str()), "ARCHIVE", 10, 48);
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(file_w), Constraint::Length(5),
+                Constraint::Length(5), Constraint::Length(5), Constraint::Length(9),
+                Constraint::Percentage(100),
+            ];
+            (header, rows, widths)
+        }
+        RbkWorld::ResourceSets => {
+            let sets: Vec<&RbkResourceSet> =
+                view.rows.iter().filter_map(|r| view.resource_set_of(r)).collect();
+            let header = Row::new(vec!["NAME", "SELECTORS", "SECRETS", "CONTROLLERS", "USED BY", "ALERT"])
+                .style(header_style);
+            let used: Vec<String> = sets
+                .iter()
+                .map(|r| if r.used_by.is_empty() { "—".to_string() } else { r.used_by.join(",") })
+                .collect();
+            let rows = sets
+                .iter()
+                .zip(used.iter())
+                .map(|(r, used)| {
+                    Row::new(vec![
+                        Cell::from(r.name.clone()).style(rbk_name_style(&r.hints)),
+                        Cell::from(r.selectors.len().to_string()),
+                        Cell::from(yes_no(r.selects_secrets)),
+                        Cell::from(r.controller_refs.len().to_string()).style(Style::default().fg(DIM)),
+                        Cell::from(used.clone()),
+                        rbk_alert_cell(&r.hints),
+                    ])
+                })
+                .collect();
+            let name_w = col_width(sets.iter().map(|r| r.name.as_str()), "NAME", 14, 40);
+            let used_w = col_width(used.iter().map(|s| s.as_str()), "USED BY", 7, 40);
+            let widths = vec![
+                Constraint::Length(name_w), Constraint::Length(9), Constraint::Length(7),
+                Constraint::Length(11), Constraint::Length(used_w), Constraint::Percentage(100),
+            ];
+            (header, rows, widths)
+        }
+    };
+
+    // The alert column takes what is left, as a percentage rather than `Min`: a `Min` last column
+    // eats the right border as soon as the terminal is narrower than the sum of the fixed widths.
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn draw_rbk_detail(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let st = lang::t(app.ai_language);
+    let (cluster_hints, operator, installed) = {
+        let s = app.rbk_state.lock().expect("rancher-backup poisoned");
+        (s.cluster_hints.clone(), s.operator.clone(), s.installed)
+    };
+    let Some((title, mut lines)) = rbk_detail_lines(app, &cluster_hints, operator.as_ref(), st) else {
+        let text = if installed { st.rbk_empty_select } else { st.rbk_not_installed };
+        let p = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(DIM))))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" rancher-backup "));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let visible = area.height.saturating_sub(2) as usize;
+    // Wrapping instead of clipping, scroll counted in wrapped rows so the bottom stays reachable: an
+    // operator error or an S3 endpoint is longer than the panel more often than not.
+    let wrap_w = area.width.saturating_sub(2) as usize;
+    let total: usize = lines.iter().map(|l| wrapped_rows(l, wrap_w).max(1)).sum();
+    let max_scroll = total.saturating_sub(visible);
+    if app.rbk_detail_scroll > max_scroll {
+        app.rbk_detail_scroll = max_scroll;
+    }
+    app.rbk_detail_scroll = text_search_top(
+        app, Mode::RBackupFull, &mut lines, visible, app.rbk_detail_scroll, max_scroll,
+    );
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.rbk_detail_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
+}
+
+fn rbk_detail_lines(
+    app: &App,
+    cluster_hints: &[crate::storage::Hint],
+    operator: Option<&crate::rancherbackup::Operator>,
+    st: &'static Strings,
+) -> Option<(Line<'static>, Vec<Line<'static>>)> {
+    let label = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<22}", k), Style::default().fg(DIM)),
+            Span::raw(v),
+        ])
+    };
+    let dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+    let heading = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let banner = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let now = now_secs();
+    let stamp = |t: Option<i64>| match t {
+        Some(t) => lang::fill(st.refl_ago, &[("age", &crate::velero::age_of(t, now))]),
+        None => st.rbk_never.to_string(),
+    };
+    let yes_no = |v: bool| if v { st.lbl_yes } else { st.lbl_no }.to_string();
+    let s3_lines = |lines: &mut Vec<Line<'static>>, s3: &crate::rancherbackup::S3Location| {
+        lines.push(label("endpoint", dash(&s3.endpoint)));
+        lines.push(label("bucket", dash(&s3.bucket)));
+        if !s3.folder.is_empty() {
+            lines.push(label("folder", s3.folder.clone()));
+        }
+        if !s3.region.is_empty() {
+            lines.push(label("region", s3.region.clone()));
+        }
+        lines.push(label("credentialSecret", dash(&s3.credential_secret)));
+        if s3.insecure_tls {
+            lines.push(label("insecureTLSSkipVerify", "true".to_string()));
+        }
+    };
+
+    let row = app.rbk_view.rows.get(app.table_state.selected()?).copied()?;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let own_hints: Vec<crate::storage::Hint>;
+    let title = match row {
+        RbkRow::Backup(i) => {
+            let b = app.rbk_view.backups.get(i)?;
+            lines.push(label(st.lbl_state, b.phase.label().to_string()));
+            lines.push(label("type", if b.recurring() { "Recurring" } else { "One-time" }.to_string()));
+            lines.push(label("schedule", dash(&b.schedule)));
+            lines.push(label(
+                st.rbk_lbl_retention,
+                match b.retention {
+                    Some(n) if b.retention_defaulted => {
+                        lang::fill(st.rbk_retention_default, &[("n", &n.to_string())])
+                    }
+                    Some(n) => lang::fill(st.rbk_retention_n, &[("n", &n.to_string())]),
+                    None => st.rbk_retention_none.to_string(),
+                },
+            ));
+            lines.push(label("resourceSet", dash(&b.resource_set)));
+            lines.push(label(
+                st.rbk_lbl_encryption,
+                if b.encrypted() { b.encryption_secret.clone() } else { st.lbl_no.to_string() },
+            ));
+            lines.push(label(st.rbk_lbl_last, stamp(b.last)));
+            if b.recurring() {
+                lines.push(label(
+                    st.rbk_lbl_next,
+                    match b.next {
+                        Some(t) if t >= now => format_span(t - now, st),
+                        Some(t) => lang::fill(st.rbk_late, &[("age", &crate::velero::age_of(t, now))]),
+                        None => "—".to_string(),
+                    },
+                ));
+            }
+            lines.push(label(st.rbk_lbl_archive, dash(&b.filename)));
+            lines.push(Line::from(""));
+            lines.push(heading(st.rbk_lbl_storage));
+            match &b.s3 {
+                Some(s3) => s3_lines(&mut lines, s3),
+                None => lines.push(label(
+                    "storageLocation",
+                    lang::fill(st.rbk_storage_default, &[("loc", &dash(&b.storage))]),
+                )),
+            }
+            own_hints = b.hints.clone();
+            banner(format!(" Backup {} ", b.name))
+        }
+        RbkRow::Restore(i) => {
+            let r = app.rbk_view.restores.get(i)?;
+            lines.push(label(st.lbl_state, r.phase.label().to_string()));
+            lines.push(label(st.rbk_lbl_archive, dash(&r.backup_filename)));
+            lines.push(label(
+                "prune",
+                if r.prune && r.delete_timeout > 0 {
+                    format!("{} (deleteTimeoutSeconds {})", st.lbl_yes, r.delete_timeout)
+                } else {
+                    yes_no(r.prune)
+                },
+            ));
+            lines.push(label("ignoreErrors", yes_no(r.ignore_errors)));
+            lines.push(label(st.rbk_lbl_encryption, if r.encryption_secret.is_empty() { st.lbl_no.to_string() } else { r.encryption_secret.clone() }));
+            lines.push(label(st.lbl_age, crate::velero::age_of(r.created, now)));
+            lines.push(label(st.rbk_lbl_done, stamp(r.completed)));
+            if !r.backup_source.is_empty() {
+                lines.push(label("backupSource", r.backup_source.clone()));
+            }
+            if let Some(s3) = &r.s3 {
+                lines.push(Line::from(""));
+                lines.push(heading(st.rbk_lbl_storage));
+                s3_lines(&mut lines, s3);
+            }
+            own_hints = r.hints.clone();
+            banner(format!(" Restore {} ", r.name))
+        }
+        RbkRow::ResourceSet(i) => {
+            let r = app.rbk_view.resource_sets.get(i)?;
+            lines.push(label("Secrets", yes_no(r.selects_secrets)));
+            lines.push(label(
+                st.rbk_lbl_used_by,
+                if r.used_by.is_empty() { "—".to_string() } else { r.used_by.join(", ") },
+            ));
+            lines.push(Line::from(""));
+            lines.push(heading("resourceSelectors"));
+            for sel in &r.selectors {
+                lines.push(Line::from(Span::raw(format!("  {sel}"))));
+            }
+            if !r.controller_refs.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(heading("controllerReferences"));
+                for c in &r.controller_refs {
+                    lines.push(Line::from(Span::raw(format!("  {c}"))));
+                }
+            }
+            own_hints = r.hints.clone();
+            banner(format!(" ResourceSet {} ", r.name))
+        }
+    };
+
+    push_storage_hints(&mut lines, st.lbl_diagnostic, &own_hints);
+    lines.push(Line::from(""));
+    lines.push(heading(st.rbk_lbl_operator));
+    match operator {
+        Some(o) => {
+            lines.push(label("Deployment", format!("{}/{}", o.namespace, o.name)));
+            lines.push(label("ready", format!("{}/{}", o.ready, o.desired)));
+            lines.push(label("version", dash(&o.version)));
+            lines.push(label(st.rbk_lbl_default_storage, o.storage_label()));
+        }
+        None => lines.push(label("Deployment", "—".to_string())),
+    }
+    push_storage_hints(&mut lines, st.lbl_cluster, cluster_hints);
+    Some((title, lines))
+}
+
 // --- Reflector view rendering ---------------------------------------------------------------------
 
 fn refl_hint_color(level: Option<ReflHintLevel>) -> Option<Color> {
@@ -27552,6 +28271,10 @@ fn draw_detail(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rec
         draw_kyverno_detail(f, app, area);
         return;
     }
+    if matches!(view_mode(app), Mode::RBackup | Mode::RBackupFull) {
+        draw_rbk_detail(f, app, area);
+        return;
+    }
     let is_reflector_mode = matches!(view_mode(app), Mode::Reflector | Mode::ReflectorFull);
     if is_reflector_mode {
         draw_reflector_detail(f, app, area);
@@ -30399,6 +31122,7 @@ mod palette_overlay_tests {
             Mode::Certs,
             Mode::Kyverno,
             Mode::Reflector,
+            Mode::RBackup,
             Mode::Velero,
             Mode::K8ssandra,
             Mode::Configmaps,

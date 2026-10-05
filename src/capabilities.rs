@@ -49,6 +49,8 @@ pub struct Capabilities {
     pub identity: bool,
     pub k8ssandra: bool,
     pub rancher: bool,
+    /// rancher/backup-restore-operator.
+    pub rancher_backup: bool,
 }
 
 /// Le groupe d'API dont la présence suffit à conclure qu'un add-on est là.
@@ -75,6 +77,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     ("identity", &["identity.kdt.sh", "management.cattle.io"]),
     ("k8ssandra", &["k8ssandra.io"]),
     ("rancher", &["management.cattle.io"]),
+    ("rancher_backup", &["resources.cattle.io"]),
 ];
 
 /// Interroge le cluster sur les groupes d'API qu'il sert.
@@ -111,6 +114,7 @@ fn from_served(served: &HashSet<&str>) -> Capabilities {
         identity: has("identity"),
         k8ssandra: has("k8ssandra"),
         rancher: has("rancher"),
+        rancher_backup: has("rancher_backup"),
     }
 }
 

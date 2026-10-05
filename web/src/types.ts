@@ -270,6 +270,7 @@ export interface Capabilities {
   identity: boolean;
   k8ssandra: boolean;
   rancher: boolean;
+  rancher_backup: boolean;
 }
 
 /**
@@ -3425,4 +3426,115 @@ export interface NamespaceRow {
   labels: Array<[string, string]>;
   annotations: Array<[string, string]>;
   record: EventRecord;
+}
+
+// --- Vue rancher-backup ---------------------------------------------------------------------------
+
+export type RbkWorld = "backups" | "restores" | "resource_sets";
+
+/** Ce que kdt conclut d'un Backup ou d'une Restore ; `failing` se lit sur `Reconciling`, jamais sur `Ready`. */
+export type RbkPhase = "completed" | "failing" | "pending" | "overdue" | "running";
+
+export interface RbkS3 {
+  endpoint: string;
+  bucket: string;
+  folder: string;
+  region: string;
+  credential_secret: string;
+  insecure_tls: boolean;
+}
+
+export interface RbkRowBase {
+  uid: string;
+  name: string;
+  hints: Hint[];
+  name_tone: LineTone | null;
+  record: EventRecord;
+}
+
+export interface RbkBackupRow extends RbkRowBase {
+  row: "backup";
+  schedule: string;
+  /** Le nombre d'archives gardées ; `null` pour un Backup ponctuel, que la rétention ne touche pas. */
+  retention: number | null;
+  retention_defaulted: boolean;
+  resource_set: string;
+  encryption_secret: string;
+  s3: RbkS3 | null;
+  storage: string;
+  backup_type: string;
+  /** La dernière archive réussie : un échec ne touche pas ce champ. */
+  filename: string;
+  last: number | null;
+  next: number | null;
+  generation: number;
+  observed_generation: number;
+  error: string | null;
+  created: number;
+  phase: RbkPhase;
+  recurring: boolean;
+  encrypted: boolean;
+  storage_label: string;
+  next_text: string;
+  late: boolean;
+  keep_text: string;
+  last_age: string | null;
+  phase_label: string;
+  phase_tone: LineTone;
+  can_restore: boolean;
+}
+
+export interface RbkRestoreRow extends RbkRowBase {
+  row: "restore";
+  backup_filename: string;
+  s3: RbkS3 | null;
+  prune: boolean;
+  delete_timeout: number;
+  encryption_secret: string;
+  ignore_errors: boolean;
+  completed: number | null;
+  backup_source: string;
+  error: string | null;
+  created: number;
+  phase: RbkPhase;
+  age: string;
+  completed_age: string | null;
+  phase_label: string;
+  phase_tone: LineTone;
+}
+
+export interface RbkResourceSetRow extends RbkRowBase {
+  row: "resource_set";
+  selectors: string[];
+  controller_refs: string[];
+  selects_secrets: boolean;
+  bad_regex: string[];
+  used_by: string[];
+  created: number;
+}
+
+export type RbkRow = RbkBackupRow | RbkRestoreRow | RbkResourceSetRow;
+
+export interface RbkOperator {
+  namespace: string;
+  name: string;
+  ready: number;
+  desired: number;
+  version: string;
+  up: boolean;
+  default_storage: { kind: "pv"; claim: string } | { kind: "s3"; secret: string } | { kind: "none" };
+  storage_label: string;
+}
+
+export interface RbkPayload {
+  installed?: boolean;
+  rows: RbkRow[];
+  counts?: { backups: number; restores: number; resource_sets: number; problems: number };
+  last_success?: number | null;
+  last_success_age?: string | null;
+  operator?: RbkOperator | null;
+  /** `false` quand les Deployments n'ont pas pu être lus : « introuvable », pas « absent ». */
+  operator_known?: boolean;
+  cluster_hints?: Hint[];
+  error: string | null;
 }

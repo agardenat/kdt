@@ -22,6 +22,7 @@ import K8ssandraView from "./K8ssandraView";
 import RancherView from "./RancherView";
 import ArgocdView from "./ArgocdView";
 import ReflectorView from "./ReflectorView";
+import RancherBackupView from "./RancherBackupView";
 import NamespacesView from "./NamespacesView";
 import VulnView from "./VulnView";
 import WorkloadsView from "./WorkloadsView";
@@ -51,6 +52,7 @@ type ViewId =
   | "certs"
   | "identity"
   | "rancher"
+  | "rancher-backup"
   | "kyverno"
   | "rbac"
   | "velero"
@@ -100,6 +102,9 @@ const VIEWS: Array<{
   // Deux vues d'identité, nommées par leur source, comme dans kdt : `identity` liste les comptes
   // que ce cluster écrit, `rancher` l'annuaire fédéré qu'il ne fait que lire.
   { id: "rancher", label: "Rancher", key: "u", ready: true, needs: "rancher" },
+  // rancher/backup-restore-operator : ses trois CRD vivent dans `resources.cattle.io`, présent sur
+  // un cluster sans Rancher comme sur un local Rancher.
+  { id: "rancher-backup", label: "Rancher Backup", key: "g", ready: true, needs: "rancher_backup" },
   // Les trois mondes de la vue réseau de kdt : Services, Ingress, policies.
   { id: "network", label: "Network", key: "p", ready: true },
   // Les quatre kinds sont natifs de tout apiserver : pas de `needs`, la vue répond partout.
@@ -373,6 +378,8 @@ export default function App() {
             ? st.argoScopeless
           : view === "reflector"
             ? st.reflScopeless
+          : view === "rancher-backup"
+            ? st.rbkScopeless
           : view === "namespaces"
             ? st.nsScopeless
           : view === "kyverno"
@@ -722,6 +729,17 @@ export default function App() {
             />
           ) : view === "reflector" ? (
             <ReflectorView
+              lang={lang}
+              st={st}
+              query={query}
+              panelHeight={panelHeight}
+              onPanelHeight={setPanelHeight}
+              panelOpen={panelOpen}
+              onPanelOpen={setPanelOpen}
+              onNeedsAuth={onNeedsAuth}
+            />
+          ) : view === "rancher-backup" ? (
+            <RancherBackupView
               lang={lang}
               st={st}
               query={query}

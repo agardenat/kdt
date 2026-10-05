@@ -93,6 +93,8 @@ the RBAC view).
 | `certs [ns]` | `certificates`, `issuers`, `challenges`, `acme` | cert-manager |
 | `kyverno` | `ky`, `policies`, `polr`, `cpol`, `admission` | Kyverno |
 | `reflector` | `refl`, `mirror`, `miroir` | Reflector |
+| `rancher-backup` | `rbackup`, `bro`, `resourcesets` | rancher-backup, Backups side |
+| `rancher-restore` | `rrestore`, `rrestores` | rancher-backup, Restores side |
 | `velero [ns]` | `vel`, `backup`, `backups`, `schedules` | Velero, backups and schedules |
 | `restores [ns]` | `restore`, `restauration` | Velero, restores |
 | `bsl [ns]` | `backupstoragelocation`, `backuprepositories` | Velero, storage and repositories |
@@ -165,6 +167,7 @@ same), and `E` (shell) targets the context on screen.
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME · `n`/`0` namespace |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
+| rancher-backup | `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup now, restore the last archive |
 | Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
@@ -272,6 +275,19 @@ shows the query and its effect (`/coredns  (3)`).
   forces re-reflection. Detections: namespace blocked by a same-named object, mirror edited by hand
   (reflector only compares `reflected-version`, never the content), the real scope of the anchored
   regexes (an empty list means all namespaces), mirrors still waiting for the copy.
+- **rancher-backup** ([backup-restore-operator](https://github.com/rancher/backup-restore-operator))
+  — Backups, Restores and ResourceSets through `g`, `f` filters ALL / PROBLEMS, the age of the last
+  successful backup in the title. Failure is read on the `Reconciling` condition: the operator keeps
+  `Ready=True` from the last success and only rewrites its message. Detections: missed recurring
+  run (`nextSnapshotAt` passed by an hour, the operator only rewriting it on success), operator
+  missing or without a ready pod, nonexistent ResourceSet, encryption Secret missing or without an
+  `encryption-provider-config.yaml` key, unencrypted Backup whose ResourceSet selects Secrets (stored
+  in clear in the archive), neither `storageLocation` nor default storage, rejected regular
+  expression in a ResourceSet, failing Restore (retried for as long as the object exists). KEEP
+  gives the effective retention (`10*` when `retentionCount` is unset; a one-time Backup is never
+  pruned). `o` on a Backup creates a one-time Backup modelled on it, or a Restore of its last
+  successful archive (`prune: true`, the operator default). `Ctrl-D` on a Backup points out that no
+  archive is deleted.
 - **RBAC** — flat audit list by default, three tree orientations through `t` (by subject, by
   binding, by role), `f` sets the severity floor, `o` jumps to the managing Flux object. Severity is
   computed **per binding**: a Role alone is inert, and the same ClusterRole is harmless in a
@@ -724,9 +740,10 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 ## The web interface (beta)
 
 `kdt-web` serves the same views in a browser, backed by
-[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Eighteen views
-are live — events, workloads, nodes, Flux, Argo CD, Velero, K8ssandra, capacity, storage,
-Secrets/ConfigMaps, certificates, RBAC, Kyverno, identity, Rancher, network, hooks, diagnostic —
+[kdt-identity](https://github.com/agardenat/kdt-identity) for authentication. Twenty-two views
+are live — events, namespaces, workloads, nodes, Flux, Argo CD, Velero, K8ssandra, capacity,
+storage, Secrets/ConfigMaps, reflector, certificates, RBAC, Kyverno, vulnerabilities, identity,
+Rancher, rancher-backup, network, hooks, diagnostic —
 along with the five gestures that apply to any object: YAML, edit, touch, delete, AI analysis.
 
 **The Argo CD view** carries the four worlds of `:argocd` / `:appsets` / `:appprojects` /
@@ -737,6 +754,15 @@ The install — namespace discovered through `argocd-cm`, UI url, comparison per
 namespaces, components — has its own line under the bar, and so do its findings. An Application's
 menu carries the writes of `r`: refresh, hard refresh, sync, sync + prune, and terminate while an
 operation runs; each one is confirmed, and the server re-reads the phase before a terminate.
+
+**The Rancher Backup view** carries the three worlds of `:rancher-backup`: Backups, Restores,
+ResourceSets, with the TUI's columns (`NAME TYPE SCHEDULE LAST NEXT KEEP STORAGE ENC STATE ALERT`
+for Backups) and the same verdicts. The age of the last successful backup and the operator's state
+sit in the bar, installation findings on their own line under it. A Backup's menu carries "backup
+now" and "restore the last archive", each confirmed, with "cancel" focused; the server re-reads the
+Backup, and its current spec and `status.filename` build the object — never a file name received
+from the page. It only appears in the rail when the `resources.cattle.io` group is served, and has
+no namespace scope: the three kinds are cluster-scoped.
 
 **The K8ssandra view** carries the three worlds of `:k8ssandra` / `:medusa` / `:reaper`: the ring
 (clusters, datacenters, nodes), Medusa backups (schedules and their runs, runs with no schedule,
@@ -876,6 +902,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `rbac.rs` · `secrets.rs` · `certmanager.rs` | Scored RBAC, Secrets/TLS, cert-manager chain |
 | `kyverno.rs` · `reflector.rs` · `vulnerabilities.rs` | Kyverno, Reflector, CVEs |
 | `velero.rs` | Velero: backups, schedules (cron evaluated), restores, locations |
+| `rancherbackup.rs` | rancher-backup: Backups (failure read on `Reconciling`, missed runs), Restores, ResourceSets |
 | `argocd.rs` | Argo CD: Applications, ApplicationSets, AppProjects, repositories and clusters |
 | `rancher.rs` | Rancher: accounts and their real identities, bindings, projects, tokens and TTL settings |
 | `identity.rs` | kdt-identity: local accounts and groups, invitation by exec into the controller pod |

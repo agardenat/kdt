@@ -62,6 +62,8 @@ import type {
   IssuedToken,
   ObjectYaml,
   RancherPayload,
+  RbkPayload,
+  RbkWorld,
   ReflPayload,
   ReflWorld,
   NamespaceRow,
@@ -507,6 +509,21 @@ export function reflector(world: ReflWorld, problems: boolean, lang: Lang): Prom
  */
 export function reflectorForce(uid: string, lang: Lang): Promise<{ message: string }> {
   return send<{ message: string }>("/api/v1/reflector/force", { uid, lang });
+}
+
+/** Les lignes d'un monde de la vue rancher-backup ; `problems` ne garde que ce qui demande un humain. */
+export function rancherBackup(world: RbkWorld, problems: boolean, lang: Lang): Promise<RbkPayload> {
+  const params = new URLSearchParams({ world, lang });
+  if (problems) params.set("problems", "true");
+  return get<RbkPayload>(`/api/v1/rancher-backup?${params.toString()}`);
+}
+
+/**
+ * Une écriture depuis un Backup : `backup-now` ou `restore`. Seul le nom part : le serveur relit le
+ * Backup, et c'est son `status.filename` d'aujourd'hui qui désigne l'archive restaurée.
+ */
+export function rancherBackupWrite(action: "backup-now" | "restore", name: string, lang: Lang): Promise<{ message: string }> {
+  return send<{ message: string }>("/api/v1/rancher-backup/write", { action, name, lang });
 }
 
 /** La ligne Kubernetes puis les images de la portée au-dessus du plancher `min`. */

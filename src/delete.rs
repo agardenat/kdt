@@ -61,6 +61,10 @@ pub enum Reason {
     // is restarted. A `Queued`/`New` backup has not started and is the safe one to clear, so it does
     // not raise this.
     VeleroBackupRunning,
+    // A rancher-backup Backup. The operator puts no finalizer on it and ignores it once it is being
+    // deleted: the runs and the retention stop, and every archive already written stays where it
+    // is, on the PV or in the bucket, with nothing left to prune it.
+    RancherBackup,
     // A CassandraDatacenter or K8ssandraCluster: deleting it takes the StatefulSet and, with it, the
     // PersistentVolumeClaims holding the database. There is no undo short of a Medusa restore, and
     // the whole point of the `:k8ssandra` view is that the restore may not exist.
@@ -93,6 +97,7 @@ impl Reason {
             | Reason::NodeDrain
             | Reason::PersistentData
             | Reason::VeleroBackup
+            | Reason::RancherBackup
             | Reason::MedusaBackup
             | Reason::MedusaRunning => Level::Warn,
             Reason::KdtUserMembership | Reason::Finalizers => Level::Info,
@@ -127,6 +132,7 @@ pub fn reason_text(st: &Strings, reason: &Reason) -> String {
         Reason::PersistentData => st.del_persistent.to_string(),
         Reason::VeleroBackup => st.del_velero_backup.to_string(),
         Reason::VeleroBackupRunning => st.del_velero_backup_running.to_string(),
+        Reason::RancherBackup => st.del_rancher_backup.to_string(),
         Reason::CassandraData => st.del_cassandra_data.to_string(),
         Reason::MedusaBackup => st.del_medusa_backup.to_string(),
         Reason::MedusaRunning => st.del_medusa_running.to_string(),
@@ -336,6 +342,9 @@ pub fn assess(obj: &Value) -> Vec<Reason> {
             if velero_backup_running(obj) {
                 out.push(Reason::VeleroBackupRunning);
             }
+        }
+        "Backup" if api_version.starts_with("resources.cattle.io/") => {
+            out.push(Reason::RancherBackup);
         }
         "KdtUser" if api_version.starts_with("identity.kdt.sh/") => {
             out.push(Reason::KdtUserMembership);
