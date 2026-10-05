@@ -8,6 +8,22 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.7.0] — 2026-10-05
+
+- **feat(rancher-backup)** — vue `:rancher-backup` (alias `:rbackup`, `:bro`, `:resourcesets` ;
+  `:rancher-restore` ouvre sur les Restores) pour rancher/backup-restore-operator, dans le TUI et
+  dans kdt-web. Trois mondes par `g` : Backups (type, schedule, dernier succès, prochain run,
+  rétention effective, stockage, chiffrement), Restores, ResourceSets ; l'âge du dernier backup
+  réussi est dans le titre. L'échec se lit sur `Reconciling`, l'opérateur laissant `Ready=True` hérité
+  du dernier succès. Constats : run récurrent manqué, opérateur absent ou sans pod prêt, ResourceSet
+  inexistante, Secret de chiffrement absent ou sans clé `encryption-provider-config.yaml`, Backup non
+  chiffré dont la ResourceSet retient des Secrets, aucun stockage, expression régulière refusée,
+  Restore en échec. `o` sur un Backup : backup ponctuel calqué sur lui, ou restauration de sa
+  dernière archive réussie (`prune: true`). `Ctrl-D` sur un Backup rappelle qu'aucune archive n'est
+  supprimée. Dans kdt-web, la vue n'apparaît au rail que si `resources.cattle.io` est servi.
+
+- **feat(nodes)** — colonne `INTERNAL-IP` dans la liste des nœuds, TUI et kdt-web, et `/` y cherche.
+
 ## [2.6.0] — 2026-09-28
 
 - **feat(k8ssandra)** — la vue suit un K8ssandra multi-cluster. Sur un data plane, qui n'a pas de
