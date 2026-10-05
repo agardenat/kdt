@@ -206,7 +206,7 @@ shows the query and its effect (`/coredns  (3)`).
 - **Nodes** — list, detail, CPU/memory/disk usage (`u`), sort (`s`), PDF export (`p`/`P`). The list
   answers, for every node, the three questions one asks of it — what is **reserved**, what is
   **allowed**, what is **used** — in seven columns: `CPU req/lim/use`, `MEM req/lim/use` and
-  `DISK`, all against the node's own allocatable. The `req`/`lim` sums are those of the pods it
+  `DISK`, all against the node's own allocatable, next to its `INTERNAL-IP`. The `req`/`lim` sums are those of the pods it
   carries (Kubernetes publishes them nowhere), and a `lim` above 100% simply says the node is
   over-committed. A dash marks what was not measured rather than a zero. The detail panel gives conditions, capacity/allocatable, disk, system info, addresses,
   reservations and recent OOM kills, then annotations, labels and taints at its end — what is on
@@ -759,7 +759,7 @@ EndpointSlices cannot be read, and `—` for an `ExternalName` Service. The `TLS
 Ingress detail carry the state of each TLS Secret, and "show Secret" opens the Secrets view on it,
 like `s`. Port-forwarding (`f`/`F`) stays TUI-only.
 
-**The Nodes view** carries both screens of `:nodes`: the inventory — `READY`, roles, version, age,
+**The Nodes view** carries both screens of `:nodes`: the inventory — `INTERNAL-IP`, `READY`, roles, version, age,
 the seven `CPU req/lim/use`, `MEM req/lim/use` and `DISK` rates and the alerts, `Cordoned` first — and the per-container usage of the selected node, with its six
 quantities, its sizing findings (`noMemLim`, `cpuOver!!`, `OOMrisk`…), the user / system / total
 tally and the node's disk as its kubelet reports it (`nodefs`, `imagefs`, inodes, and the pods

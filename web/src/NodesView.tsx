@@ -37,10 +37,10 @@ import type {
 } from "./types";
 import { cols } from "./table";
 
-/** `NAME READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
+/** `NAME INTERNAL-IP READY ROLES VERSION AGE ALERTS`, dans l'ordre du TUI. La première piste (`34px`) porte la
  * case de sélection multiple, la dernière le hamburger de la ligne. */
 const NODE_COLUMNS =
-  "34px fit-content(30ch) 64px fit-content(18ch) fit-content(13ch) 56px 62px 62px 62px 62px 62px 62px 56px minmax(18ch,1fr) 34px";
+  "34px fit-content(30ch) fit-content(39ch) 64px fit-content(18ch) fit-content(13ch) 56px 62px 62px 62px 62px 62px 62px 56px minmax(18ch,1fr) 34px";
 
 /**
  * Les treize colonnes de la table d'usage, dans l'ordre du TUI.
@@ -221,7 +221,7 @@ export default function NodesView({
       nodes.filter(
         (n) =>
           !needle ||
-          [n.name, n.roles, n.version, n.ready, ...n.alerts]
+          [n.name, n.internal_ip, n.roles, n.version, n.ready, ...n.alerts]
             .join(" ")
             .toLowerCase()
             .includes(needle),
@@ -517,6 +517,7 @@ function NodeTable({
         <div className="tr">
           <SelectionHead />
           <div className="cell">NAME</div>
+          <div className="cell">INTERNAL-IP</div>
           <div className="cell">READY</div>
           <div className="cell">ROLES</div>
           <div className="cell">VERSION</div>
@@ -552,6 +553,7 @@ function NodeTable({
               label={st.selectRow}
             />
             <div className="cell id">{n.name}</div>
+            <div className="cell mono dim">{n.internal_ip || "—"}</div>
             <div className={`cell mono tone-${n.ready_tone}`}>{n.ready}</div>
             <div className="cell mono">{n.roles}</div>
             <div className="cell mono dim">{n.version}</div>

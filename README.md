@@ -208,7 +208,7 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
 - **Nodes** — liste, détail, usage CPU/mémoire/disque (`u`), tri (`s`), export PDF (`p`/`P`). La
   liste répond pour chaque nœud aux trois questions qu'on lui pose — ce qui est **réservé**, ce qui
   est **permis**, ce qui est **consommé** — en sept colonnes : `CPU req/lim/use`, `MEM req/lim/use`
-  et `DISK`, toutes rapportées à l'allocatable du nœud. Les sommes `req`/`lim` sont celles des pods
+  et `DISK`, toutes rapportées à l'allocatable du nœud, à côté de son `INTERNAL-IP`. Les sommes `req`/`lim` sont celles des pods
   qu'il porte (Kubernetes ne les publie nulle part), un `lim` au-delà de 100 % disant simplement
   que le nœud est sur-engagé. Un tiret marque ce qui n'a pas été mesuré plutôt qu'un zéro. Le détail donne conditions, capacity/allocatable, disque, system info,
   adresses, réservations et OOM récents, puis annotations, labels et taints en fin de panneau — la
@@ -797,7 +797,7 @@ sont pas lisibles, et `—` pour un Service `ExternalName`. La colonne `TLS` et 
 reprennent l'état de chaque Secret TLS, et « voir le Secret » ouvre la vue Secrets dessus, comme
 `s`. Le port-forward (`f`/`F`) reste propre au TUI.
 
-**La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `READY`, rôles, version, âge,
+**La vue Nodes** porte les deux écrans de `:nodes` : l'inventaire — `INTERNAL-IP`, `READY`, rôles, version, âge,
 les sept taux `CPU req/lim/use`, `MEM req/lim/use`, `DISK` et les alertes, `Cordoned` en tête — et l'usage par container du node sélectionné, avec ses six
 quantités, ses constats de dimensionnement (`noMemLim`, `cpuOver!!`, `OOMrisk`…), le cumul
 user / système / total et le disque du node lu chez son kubelet (`nodefs`, `imagefs`, inodes, et les

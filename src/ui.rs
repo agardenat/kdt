@@ -1121,7 +1121,7 @@ fn fields_match_search<S: AsRef<str>>(fields: &[S], q: &str) -> bool {
 // A node row against the query, matched on what the table actually shows — including the alerts
 // column, so `/cordoned` and `/diskpressure` pick out exactly the nodes one goes looking for.
 fn node_matches_search(n: &NodeSummary, q: &str) -> bool {
-    fields_match_search(&[&n.name, &n.roles, &n.version, &n.ready], q)
+    fields_match_search(&[&n.name, &n.internal_ip, &n.roles, &n.version, &n.ready], q)
         || fields_match_search(&n.abnormal, q)
         || (!n.schedulable && "cordoned".contains(q))
 }
@@ -16911,7 +16911,7 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // « CPU req ». La ressource se dit une fois, au-dessus de ses trois aspects, et la ligne du
     // dessous nomme ce qu'on lit — réservé, permis, consommé.
     let header_row = Row::new(vec![
-        Cell::from("\nNAME"), Cell::from("\nREADY"), Cell::from("\nROLES"),
+        Cell::from("\nNAME"), Cell::from("\nINTERNAL-IP"), Cell::from("\nREADY"), Cell::from("\nROLES"),
         Cell::from("\nVERSION"), Cell::from("\nAGE"),
         Cell::from("CPU\nreq"), Cell::from("\nlim"), Cell::from("\nuse"),
         Cell::from("MEM\nreq"), Cell::from("\nlim"), Cell::from("\nuse"),
@@ -16943,6 +16943,8 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         };
         Row::new(vec![
             Cell::from(n.name.clone()),
+            Cell::from(if n.internal_ip.is_empty() { "—".to_string() } else { n.internal_ip.clone() })
+                .style(Style::default().fg(DIM)),
             Cell::from(n.ready.clone()).style(Style::default().fg(ready_color).add_modifier(Modifier::BOLD)),
             Cell::from(n.roles.clone()).style(Style::default().fg(Color::Cyan)),
             Cell::from(n.version.clone()).style(Style::default().fg(DIM)),
@@ -16966,8 +16968,9 @@ fn draw_nodes_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // mange la bordure droite dès que le terminal est plus étroit que la somme des largeurs fixes.
     let name_w = col_width(nodes.iter().map(|n| n.name.as_str()), "NAME", 18, 44);
     let roles_w = col_width(nodes.iter().map(|n| n.roles.as_str()), "ROLES", 8, 20);
+    let ip_w = col_width(nodes.iter().map(|n| n.internal_ip.as_str()), "INTERNAL-IP", 11, 39);
     let widths = [
-        Constraint::Length(name_w), Constraint::Length(6), Constraint::Length(roles_w),
+        Constraint::Length(name_w), Constraint::Length(ip_w), Constraint::Length(6), Constraint::Length(roles_w),
         Constraint::Length(14), Constraint::Length(5),
         Constraint::Length(5), Constraint::Length(5), Constraint::Length(5),
         Constraint::Length(5), Constraint::Length(5), Constraint::Length(5),

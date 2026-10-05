@@ -1249,6 +1249,9 @@ pub fn format_age(t: &Timestamp) -> String {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeSummary {
     pub name: String,
+    /// La première adresse `InternalIP` du node, celle de `kubectl get nodes -o wide`. Vide quand
+    /// le node n'en publie pas.
+    pub internal_ip: String,
     pub ready: String,
     pub roles: String,
     pub age: String,
@@ -1672,6 +1675,11 @@ fn node_summary(n: &Node) -> NodeSummary {
     let age = n.metadata.creation_timestamp.as_ref()
         .map(|t| format_age(&t.0))
         .unwrap_or_default();
+    let internal_ip = n.status.as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
+        .map(|a| a.address.clone())
+        .unwrap_or_default();
     let version = n.status.as_ref()
         .and_then(|s| s.node_info.as_ref())
         .map(|i| i.kubelet_version.clone())
@@ -1702,6 +1710,7 @@ fn node_summary(n: &Node) -> NodeSummary {
         .unwrap_or((0, 0));
     NodeSummary {
         name,
+        internal_ip,
         ready,
         roles,
         age,
@@ -2589,6 +2598,7 @@ mod node_row_tests {
     fn node(cpu_use: Option<i64>, mem_use: Option<i64>) -> NodeSummary {
         NodeSummary {
             name: "n1".to_string(),
+            internal_ip: "10.0.0.1".to_string(),
             ready: "True".to_string(),
             roles: "worker".to_string(),
             age: "12d".to_string(),

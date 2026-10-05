@@ -652,6 +652,7 @@ mod tests {
     fn node(ready: &str, schedulable: bool, abnormal: &[&str]) -> NodeSummary {
         NodeSummary {
             name: "aks-pool-000003".into(),
+            internal_ip: "10.224.0.4".into(),
             ready: ready.into(),
             roles: "agent".into(),
             age: "42d".into(),

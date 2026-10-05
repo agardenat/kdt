@@ -2406,6 +2406,8 @@ export type AiProviderChoice =
 export interface NodeRow {
   uid: string;
   name: string;
+  /** La première adresse `InternalIP` du node, vide quand il n'en publie pas. */
+  internal_ip: string;
   /** La condition `Ready` telle quelle : `True`, `False` ou `Unknown`. */
   ready: string;
   roles: string;
