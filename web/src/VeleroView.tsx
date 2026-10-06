@@ -504,11 +504,6 @@ export default function VeleroView({
                     contentsOpen={
                       entry.row.row === "backup" ? Boolean(contents[entry.row.uid]) : false
                     }
-                    contentsCount={
-                      entry.row.row === "backup" && typeof contents[entry.row.uid] === "object"
-                        ? (contents[entry.row.uid] as VelContentsPayload).total
-                        : null
-                    }
                     selected={selected === entry.row.uid}
                     onSelect={() => setSelected(entry.row.uid)}
                     onOpenTab={(t) => {
@@ -602,7 +597,6 @@ function Line({
   grouped,
   collapsed,
   contentsOpen,
-  contentsCount,
   selected,
   onSelect,
   onOpenTab,
@@ -620,7 +614,6 @@ function Line({
   grouped: boolean;
   collapsed: boolean;
   contentsOpen: boolean;
-  contentsCount: number | null;
   selected: boolean;
   onSelect: () => void;
   onOpenTab: (tab: ObjectTab) => void;
@@ -664,6 +657,9 @@ function Line({
         else if (e.key === " " && foldable) {
           e.preventDefault();
           onFold();
+        } else if (e.key === " " && row.row === "backup") {
+          e.preventDefault();
+          onContents();
         }
       }}
     >
@@ -681,6 +677,21 @@ function Line({
           >
             {collapsed ? "▸" : "▾"}
           </button>
+        ) : row.row === "backup" ? (
+          // L'équivalent des touches `+`/`-` du TUI, à la place du pli : après le nom, un nom de
+          // backup horodaté poussait la commande hors de la cellule. Le contenu se télécharge
+          // depuis le stockage objet, il n'est jamais dans la liste.
+          <button
+            className="fold"
+            title={st.velContentsHelp}
+            aria-expanded={contentsOpen}
+            onClick={(e) => {
+              e.stopPropagation();
+              onContents();
+            }}
+          >
+            {contentsOpen ? "▾" : "▸"}
+          </button>
         ) : (
           <span className="fold-gap" />
         )}
@@ -691,21 +702,6 @@ function Line({
           st={st}
         />
         {row.name}
-        {/* L'équivalent des touches `+`/`-` du TUI. Le contenu se télécharge depuis le stockage
-            objet : il n'est jamais dans la liste. */}
-        {row.row === "backup" && (
-          <button
-            className="inv-pill"
-            aria-expanded={contentsOpen}
-            title={st.velContentsHelp}
-            onClick={(e) => {
-              e.stopPropagation();
-              onContents();
-            }}
-          >
-            {contentsOpen ? "⊟" : "⊞"} {contentsCount ?? st.velContents}
-          </button>
-        )}
         {row.row === "schedule" && row.gitops && (
           <span className="badge info" title={st.velGitops.replace("{engine}", row.gitops)}>
             {row.gitops}
