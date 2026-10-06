@@ -8,6 +8,16 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.8.1] — 2026-10-06
+
+- **fix(velero)** — le contenu d'un backup (`+`, ou le pli dans kdt-web) et le log du run (`l`) se
+  lisent quand la BackupStorageLocation pointe un stockage interne au cluster
+  (`s3Url: http://minio.velero.svc.cluster.local:9000`). L'URL signée par velero n'étant pas
+  joignable depuis le poste, kdt la relit par un port-forward vers un pod prêt du Service désigné,
+  en gardant l'en-tête `Host` couvert par la signature. Demande `pods/portforward` dans le
+  namespace du Service ; si ce repli échoue aussi, le message `publicUrl` d'avant s'affiche, avec
+  les deux erreurs.
+
 ## [2.8.0] — 2026-10-06
 
 - **feat(rancher-backup)** — un Backup récurrent se déplie sur ses archives : `Espace` dans le TUI,
