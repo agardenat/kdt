@@ -334,6 +334,10 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
     (options)* s'en sert pour préremplir un `Restore` restreint : namespaces à cocher, remapping
     vers un autre namespace, filtre par type et par labels, choix entre ignorer et écraser
     l'existant. Velero ne cible pas un objet par son nom : la sélection s'arrête au type.
+  - Le contenu et le log du run sont lus par l'URL que velero signe sur `spec.config.s3Url`. Quand
+    elle désigne un Service du cluster (`<svc>.<ns>.svc…`, cas de MinIO installé dans le cluster)
+    et que le poste ne la joint pas, kdt la lit par un port-forward vers un pod de ce Service, ce
+    qui demande `pods/portforward` dans son namespace.
 - **K8ssandra / Cassandra** (`:k8ssandra`, `:medusa`, `:reaper`) — trois mondes par `g` : ring du
   cluster, sauvegardes Medusa, opérations et Reaper. `f` filtre ALL / PROBLEMS, `Space` plie/déplie,
   `l` ouvre les logs du container fautif. La colonne `DUR` donne la durée de tout ce qui commence et

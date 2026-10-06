@@ -2392,6 +2392,8 @@ dependencies = [
  "flate2",
  "futures",
  "http",
+ "http-body-util",
+ "hyper",
  "hyper-timeout",
  "hyper-util",
  "json-patch",

@@ -64,6 +64,10 @@ x509-parser = "0.16"
 # Everything velero serves through a DownloadRequest (backup logs, restore logs, results) is
 # gzipped, with no option to ask for plain text: reading a run log means un-gzipping it.
 flate2 = "1"
+# A signed URL on an in-cluster endpoint is read over a port-forward stream, which reqwest cannot
+# drive: the HTTP/1 client is spoken directly on it. Both already in the tree through kube.
+hyper = { version = "1", features = ["client", "http1"] }
+http-body-util = "0.1"
 typst = "0.14"
 typst-pdf = "0.14"
 typst-as-lib = { version = "0.15", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }

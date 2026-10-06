@@ -2050,13 +2050,112 @@ async fn download_target(
         .read_timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| Other(e.to_string()))?;
-    let resp =
-        http.get(&url).send().await.map_err(|e| Unreachable(without_query(&e.to_string())))?;
+    let resp = match http.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let direct = without_query(&e.to_string());
+            return match through_service(client, &url, st).await {
+                None => Err(Unreachable(direct)),
+                Some(Ok(bytes)) => Ok(bytes),
+                Some(Err(Other(e))) => Err(Other(e)),
+                Some(Err(Unreachable(e))) => Err(Unreachable(format!("{} · {}", direct, e))),
+            };
+        }
+    };
     if !resp.status().is_success() {
         return Err(Other(fill(st.vel_log_http, &[("code", resp.status().as_str())])));
     }
     let bytes = resp.bytes().await.map_err(|e| Other(without_query(&e.to_string())))?;
     Ok(bytes.to_vec())
+}
+
+// How long the port-forward read may take, resolution and transfer included.
+const FORWARD_TIMEOUT_SECS: u64 = 30;
+
+// Second try for a signed URL this machine could not reach, when it names a Service of the cluster
+// (`http://minio.velero.svc.cluster.local:9000/...`, the endpoint of every in-cluster MinIO): the
+// same request, sent down a port-forward to one of its pods. The Host header stays the one in the
+// URL — SigV4 signs it, and the store would refuse any other with `SignatureDoesNotMatch`, which is
+// also why the API server's service proxy, which rewrites it, cannot serve here.
+//
+// `None` when the URL is not an in-cluster Service: there is nothing more to try, and the first
+// failure is the whole story.
+async fn through_service(
+    client: &Client,
+    url: &str,
+    st: &'static Strings,
+) -> Option<Result<Vec<u8>, DownloadFailure>> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_string();
+    let (service, namespace) = cluster_service(&host)?;
+    let port = parsed.port_or_known_default()?;
+    let authority = match parsed.port() {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.clone(),
+    };
+    let path = match parsed.query() {
+        Some(q) => format!("{}?{}", parsed.path(), q),
+        None => parsed.path().to_string(),
+    };
+    let read = forward_get(client, namespace, service, i32::from(port), &authority, &path, st);
+    Some(
+        match tokio::time::timeout(std::time::Duration::from_secs(FORWARD_TIMEOUT_SECS), read).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(DownloadFailure::Unreachable(format!(
+                "port-forward {}/{}:{}: timeout",
+                namespace, service, port
+            ))),
+        },
+    )
+}
+
+async fn forward_get(
+    client: &Client,
+    namespace: &str,
+    service: &str,
+    port: i32,
+    authority: &str,
+    path: &str,
+    st: &'static Strings,
+) -> Result<Vec<u8>, DownloadFailure> {
+    use http_body_util::BodyExt;
+    use DownloadFailure::{Other, Unreachable};
+    let label = |e: String| Unreachable(format!("port-forward {}/{}:{}: {}", namespace, service, port, e));
+
+    let (pf, stream) = crate::portfwd::open_stream(client, namespace, service, port).await.map_err(label)?;
+    let outcome = async {
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .map_err(|e| label(e.to_string()))?;
+        tokio::spawn(conn);
+        let req = http::Request::get(path)
+            .header(http::header::HOST, authority)
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .map_err(|e| Other(e.to_string()))?;
+        let resp = sender.send_request(req).await.map_err(|e| label(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(Other(fill(st.vel_log_http, &[("code", resp.status().as_str())])));
+        }
+        let body = resp.into_body().collect().await.map_err(|e| label(e.to_string()))?;
+        Ok(body.to_bytes().to_vec())
+    }
+    .await;
+    pf.abort();
+    outcome
+}
+
+// (service, namespace) of an in-cluster Service host: `<svc>.<ns>.svc`, followed or not by the
+// cluster domain — which is `cluster.local` only by default, so the third label decides, not the
+// suffix.
+fn cluster_service(host: &str) -> Option<(&str, &str)> {
+    let mut labels = host.split('.');
+    let service = labels.next().filter(|l| !l.is_empty())?;
+    let namespace = labels.next().filter(|l| !l.is_empty())?;
+    (labels.next()? == "svc").then_some((service, namespace))
 }
 
 // Everything velero serves this way is gzipped — but a proxy or a future target that is not would
@@ -3244,6 +3343,16 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
     use crate::lang::{reads_as, FR};
+
+    #[test]
+    fn cluster_service_reads_the_service_and_namespace_off_the_host() {
+        assert_eq!(cluster_service("minio.velero.svc.cluster.local"), Some(("minio", "velero")));
+        assert_eq!(cluster_service("minio.velero.svc"), Some(("minio", "velero")));
+        assert_eq!(cluster_service("minio.velero.svc.corp.example"), Some(("minio", "velero")));
+        assert_eq!(cluster_service("minio.velero"), None);
+        assert_eq!(cluster_service("s3.eu-west-1.amazonaws.com"), None);
+        assert_eq!(cluster_service("10.43.0.12"), None);
+    }
 
     // 2026-07-30 12:00:00 UTC, so the cron assertions read as wall-clock times.
     const NOW: i64 = 1_785_412_800;

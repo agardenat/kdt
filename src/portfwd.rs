@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, ListParams};
+use kube::api::{Api, ListParams, Portforwarder};
 use kube::Client;
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -248,6 +248,34 @@ async fn run(client: Client, req: PfRequest, id: u64, shared: SharedForwards) {
     );
 
     serve(client, target, listener, id, shared).await;
+}
+
+/// One stream to a Service port, for a caller that speaks the protocol itself rather than exposing
+/// a local socket. Same resolution as a forward — a ready endpoint, never the ClusterIP — and the
+/// forwarder comes back with the stream: dropping it would not close the websocket, `abort` does.
+pub async fn open_stream(
+    client: &Client,
+    namespace: &str,
+    service: &str,
+    service_port: i32,
+) -> Result<(Portforwarder, impl AsyncRead + AsyncWrite + Unpin), String> {
+    let req = PfRequest {
+        namespace: namespace.to_string(),
+        service: service.to_string(),
+        service_port,
+        port_name: None,
+        local_port: 0,
+    };
+    let target = resolve(client, &req).await?;
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), &target.namespace);
+    let mut pf = pods
+        .portforward(&target.pod, &[target.port])
+        .await
+        .map_err(|e| e.to_string())?;
+    let stream = pf
+        .take_stream(target.port)
+        .ok_or_else(|| lang::active().pf_no_stream.to_string())?;
+    Ok((pf, stream))
 }
 
 // Which pod, and which port on it.
