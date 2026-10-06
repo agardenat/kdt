@@ -2,8 +2,8 @@ apiVersion: v2
 name: kdt-web
 description: Interface web de kdt, adossée à kdt-identity
 type: application
-version: 2.7.0
-appVersion: "2.7.0"
+version: 2.8.0
+appVersion: "2.8.0"
 home: https://github.com/agardenat/kdt
 sources:
   - https://github.com/agardenat/kdt

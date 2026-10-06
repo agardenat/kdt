@@ -8,6 +8,16 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.8.0] — 2026-10-06
+
+- **feat(rancher-backup)** — un Backup récurrent se déplie sur ses archives : `Espace` dans le TUI,
+  le pli de la ligne dans kdt-web. L'opérateur ne crée aucun objet par run, chaque run est un
+  fichier : kdt le lit par un `ls` exécuté dans le pod de l'opérateur (`pods/exec` dans son
+  namespace) sur le montage du volume `pv-storage`, et seulement tant qu'un Backup est déplié. Une
+  archive est rattachée par son nom `<backup>-<uid>-<horodatage>.tar.gz[.enc]`, la plus récente
+  d'abord, avec son âge, sa taille, son chiffrement, et `Latest` sur `status.filename`, la cible de
+  la restauration. Les archives sur S3 ne sont pas listées : une note le dit sous le Backup.
+
 ## [2.7.0] — 2026-10-05
 
 - **feat(rancher-backup)** — vue `:rancher-backup` (alias `:rbackup`, `:bro`, `:resourcesets` ;
