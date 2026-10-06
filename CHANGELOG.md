@@ -8,6 +8,13 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.8.2] — 2026-10-06
+
+- **fix(web)** — vue Velero : le contenu d'un backup se déplie par le `▸` placé devant son nom,
+  comme le pli d'un Schedule, ou par `Espace` sur la ligne. La pastille « ⊞ contenu » qui le
+  faisait jusqu'ici suivait le nom, et un nom de backup horodaté la poussait hors de la colonne
+  NAME, où elle n'était ni visible ni cliquable.
+
 ## [2.8.1] — 2026-10-06
 
 - **fix(velero)** — le contenu d'un backup (`+`, ou le pli dans kdt-web) et le log du run (`l`) se

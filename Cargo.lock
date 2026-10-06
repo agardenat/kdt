@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "kdt"
-version = "2.8.1"
+version = "2.8.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2436,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "kdt-web"
-version = "2.8.1"
+version = "2.8.2"
 dependencies = [
  "anyhow",
  "axum",
