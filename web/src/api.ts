@@ -512,9 +512,16 @@ export function reflectorForce(uid: string, lang: Lang): Promise<{ message: stri
 }
 
 /** Les lignes d'un monde de la vue rancher-backup ; `problems` ne garde que ce qui demande un humain. */
-export function rancherBackup(world: RbkWorld, problems: boolean, lang: Lang): Promise<RbkPayload> {
+export function rancherBackup(
+  world: RbkWorld,
+  problems: boolean,
+  expanded: string[],
+  lang: Lang,
+): Promise<RbkPayload> {
   const params = new URLSearchParams({ world, lang });
   if (problems) params.set("problems", "true");
+  // Un Backup déplié fait aussi lire ses archives sur le PV de l'opérateur, par un exec.
+  if (expanded.length) params.set("expanded", expanded.join(","));
   return get<RbkPayload>(`/api/v1/rancher-backup?${params.toString()}`);
 }
 

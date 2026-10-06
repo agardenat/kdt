@@ -167,7 +167,7 @@ same), and `E` (shell) targets the context on screen.
 | cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME · `n`/`0` namespace |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
-| rancher-backup | `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup now, restore the last archive |
+| rancher-backup | `Space` fold/unfold a recurring Backup's archives · `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup now, restore the last archive |
 | Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
@@ -287,7 +287,12 @@ shows the query and its effect (`/coredns  (3)`).
   gives the effective retention (`10*` when `retentionCount` is unset; a one-time Backup is never
   pruned). `o` on a Backup creates a one-time Backup modelled on it, or a Restore of its last
   successful archive (`prune: true`, the operator default). `Ctrl-D` on a Backup points out that no
-  archive is deleted.
+  archive is deleted. A recurring Backup creates no object per run: `Space` unfolds it onto its
+  archives, read by an `ls` run in the operator pod (`pods/exec` in its namespace) on the mount of
+  the `pv-storage` volume. An archive belongs to the Backup when its name is
+  `<backup>-<uid>-<timestamp>.tar.gz[.enc]`; newest first, with its age, its size, and `Latest` on
+  `status.filename`, the restore target. Archives on S3 are not listed. The read only happens while
+  a Backup is unfolded.
 - **RBAC** — flat audit list by default, three tree orientations through `t` (by subject, by
   binding, by role), `f` sets the severity floor, `o` jumps to the managing Flux object. Severity is
   computed **per binding**: a Role alone is inert, and the same ClusterRole is harmless in a
@@ -761,7 +766,8 @@ for Backups) and the same verdicts. The age of the last successful backup and th
 sit in the bar, installation findings on their own line under it. A Backup's menu carries "backup
 now" and "restore the last archive", each confirmed, with "cancel" focused; the server re-reads the
 Backup, and its current spec and `status.filename` build the object — never a file name received
-from the page. It only appears in the rail when the `resources.cattle.io` group is served, and has
+from the page. A recurring Backup's fold unfolds its archives on the PV, like `Space` in the TUI. It
+only appears in the rail when the `resources.cattle.io` group is served, and has
 no namespace scope: the three kinds are cluster-scoped.
 
 **The K8ssandra view** carries the three worlds of `:k8ssandra` / `:medusa` / `:reaper`: the ring

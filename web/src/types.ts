@@ -3482,6 +3482,29 @@ export interface RbkBackupRow extends RbkRowBase {
   phase_label: string;
   phase_tone: LineTone;
   can_restore: boolean;
+  /** Pourquoi les archives manquent sous ce Backup déplié ; `null` tant qu'elles n'ont pas été lues. */
+  archives_note: string | null;
+}
+
+/** Une archive d'un Backup récurrent déplié, lue sur le PV de l'opérateur : pas un objet Kubernetes. */
+export interface RbkArchiveRow extends RbkRowBase {
+  row: "archive";
+  backup: string;
+  file: string;
+  size: number;
+  size_text: string;
+  taken: number;
+  taken_age: string;
+  encrypted: boolean;
+  /** C'est `status.filename` : la cible de la restauration. */
+  latest: boolean;
+}
+
+/** Ce qui tient lieu d'archives sous un Backup déplié : lecture en cours, S3, refus, aucune. */
+export interface RbkArchiveNoteRow extends RbkRowBase {
+  row: "archive_note";
+  backup: string;
+  note: string;
 }
 
 export interface RbkRestoreRow extends RbkRowBase {
@@ -3513,7 +3536,7 @@ export interface RbkResourceSetRow extends RbkRowBase {
   created: number;
 }
 
-export type RbkRow = RbkBackupRow | RbkRestoreRow | RbkResourceSetRow;
+export type RbkRow = RbkBackupRow | RbkArchiveRow | RbkArchiveNoteRow | RbkRestoreRow | RbkResourceSetRow;
 
 export interface RbkOperator {
   namespace: string;
@@ -3524,6 +3547,8 @@ export interface RbkOperator {
   up: boolean;
   default_storage: { kind: "pv"; claim: string } | { kind: "s3"; secret: string } | { kind: "none" };
   storage_label: string;
+  /** Le montage du PV dans le pod de l'opérateur ; vide hors stockage PV. */
+  pv_path: string;
 }
 
 export interface RbkPayload {

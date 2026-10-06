@@ -25,6 +25,7 @@ use kdt::rancherbackup::{
     build_rbk_view, hint_tone, row_record, RbkRow, RbkView, RbkWorld, RbkWrite,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 use tracing::{info, warn};
 
 use crate::api::session_client;
@@ -38,6 +39,10 @@ pub struct RbkQuery {
     /// Ne garder que ce qui porte un constat `Warn` ou pire.
     #[serde(default)]
     problems: bool,
+    /// Les Backups récurrents dépliés sur leurs archives, séparés par des virgules — un nom d'objet
+    /// n'en contient jamais. Non vide, la lecture passe aussi par le PV de l'opérateur.
+    #[serde(default)]
+    expanded: String,
     #[serde(default)]
     lang: String,
 }
@@ -55,15 +60,21 @@ pub async fn list(
         Err(response) => return response,
     };
     let st = lang_of(&query.lang);
+    let expanded: HashSet<String> = query
+        .expanded
+        .split(',')
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+        .collect();
 
-    let inv = match kdt::rancherbackup::rbk_inventory(&client, st).await {
+    let inv = match kdt::rancherbackup::rbk_inventory(&client, st, !expanded.is_empty()).await {
         Ok(inv) => inv,
         Err(e) => {
             return axum::Json(serde_json::json!({ "rows": [], "error": e })).into_response();
         }
     };
     let now = k8s_openapi::jiff::Timestamp::now().as_second();
-    axum::Json(payload(&inv, query.world, query.problems, now, st)).into_response()
+    axum::Json(payload(&inv, query.world, query.problems, &expanded, now, st)).into_response()
 }
 
 /// La réponse de `list`, sur un inventaire déjà lu.
@@ -71,10 +82,11 @@ fn payload(
     inv: &kdt::rancherbackup::RbkState,
     world: RbkWorld,
     problems: bool,
+    expanded: &HashSet<String>,
     now: i64,
     st: &'static Strings,
 ) -> serde_json::Value {
-    let view = build_rbk_view(inv, world, problems);
+    let view = build_rbk_view(inv, world, problems, expanded);
     let rows: Vec<serde_json::Value> =
         view.rows.iter().filter_map(|row| row_json(&view, row, now, st)).collect();
 
@@ -98,6 +110,7 @@ fn payload(
             "up": o.up(),
             "default_storage": o.default_storage,
             "storage_label": o.storage_label(),
+            "pv_path": o.pv_path,
         })),
         // `false` quand les Deployments n'ont pas pu être lus : « introuvable », pas « absent ».
         "operator_known": inv.operator_known,
@@ -118,6 +131,8 @@ fn row_json(view: &RbkView, row: &RbkRow, now: i64, st: &'static Strings) -> Opt
             if let Some(o) = v.as_object_mut() {
                 o.insert("row".into(), "backup".into());
                 o.insert("recurring".into(), b.recurring().into());
+                // Les archives voyagent dans leurs propres lignes : pas deux fois dans la réponse.
+                o.remove("archives");
                 o.insert("encrypted".into(), b.encrypted().into());
                 o.insert("storage_label".into(), b.storage_label().into());
                 o.insert("next_text".into(), b.next_text(now).into());
@@ -131,6 +146,31 @@ fn row_json(view: &RbkView, row: &RbkRow, now: i64, st: &'static Strings) -> Opt
                 o.insert("can_restore".into(), (!b.filename.is_empty()).into());
             }
             v
+        }
+        RbkRow::Archive(..) => {
+            let (b, a) = view.archive_of(row)?;
+            let mut v = serde_json::to_value(a).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("row".into(), "archive".into());
+                o.insert("backup".into(), b.name.clone().into());
+                o.insert("name".into(), kdt::rancherbackup::archive_label(a).into());
+                o.insert("size_text".into(), kdt::configmaps::human_size(a.size as usize).into());
+                o.insert("taken_age".into(), kdt::velero::age_of(a.taken, now).into());
+                o.insert("hints".into(), serde_json::json!([]));
+                o.insert("name_tone".into(), serde_json::Value::Null);
+            }
+            v
+        }
+        RbkRow::ArchiveNote(_) => {
+            let b = view.backup_of(&RbkRow::Backup(row.backup_index()?))?;
+            serde_json::json!({
+                "row": "archive_note",
+                "backup": b.name,
+                "name": "",
+                "note": kdt::rancherbackup::archive_note(b, st),
+                "hints": [],
+                "name_tone": null,
+            })
         }
         RbkRow::Restore(_) => {
             let r = view.restore_of(row)?;

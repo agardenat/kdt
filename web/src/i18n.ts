@@ -973,6 +973,12 @@ export interface Strings {
   rbkAgo: string;
   rbkYes: string;
   rbkNo: string;
+  rbkArchFile: string;
+  rbkArchSize: string;
+  rbkArchTaken: string;
+  rbkArchPath: string;
+  rbkArchLatest: string;
+  rbkArchCount: string;
 }
 
 const FR: Strings = {
@@ -1976,6 +1982,12 @@ const FR: Strings = {
   rbkAgo: "il y a {age}",
   rbkYes: "oui",
   rbkNo: "non",
+  rbkArchFile: "fichier",
+  rbkArchSize: "taille",
+  rbkArchTaken: "prise",
+  rbkArchPath: "chemin",
+  rbkArchLatest: "dernière réussie — cible de la restauration",
+  rbkArchCount: "archives sur le PV",
 };
 
 const EN: Strings = {
@@ -2971,6 +2983,12 @@ const EN: Strings = {
   rbkAgo: "{age} ago",
   rbkYes: "yes",
   rbkNo: "no",
+  rbkArchFile: "file",
+  rbkArchSize: "size",
+  rbkArchTaken: "taken",
+  rbkArchPath: "path",
+  rbkArchLatest: "latest success — the restore target",
+  rbkArchCount: "archives on the PV",
 };
 
 export function strings(lang: Lang): Strings {

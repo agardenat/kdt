@@ -168,7 +168,7 @@ courant de kubectl reste le même), et `E` (shell) vise le contexte affiché.
 | cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME · `n`/`0` namespace |
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge des `UpdateRequest` bloqués) |
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
-| rancher-backup | `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup maintenant, restaurer la dernière archive |
+| rancher-backup | `Espace` plier/déplier les archives d'un Backup récurrent · `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup maintenant, restaurer la dernière archive |
 | Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`0` namespace |
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `x` commande nodetool en Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
@@ -289,7 +289,12 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   rétention effective (`10*` quand `retentionCount` est absent ; un Backup ponctuel n'est jamais
   purgé). `o` sur un Backup crée un Backup ponctuel calqué sur lui, ou une Restore de sa dernière
   archive réussie (`prune: true`, le défaut de l'opérateur). `Ctrl-D` sur un Backup rappelle
-  qu'aucune archive n'est supprimée.
+  qu'aucune archive n'est supprimée. Un Backup récurrent ne crée aucun objet par run : `Espace` le
+  déplie sur ses archives, lues par un `ls` exécuté dans le pod de l'opérateur (`pods/exec` dans son
+  namespace) sur le montage du volume `pv-storage`. Une archive appartient au Backup quand son nom
+  est `<backup>-<uid>-<horodatage>.tar.gz[.enc]` ; la plus récente d'abord, avec son âge, sa taille,
+  et `Latest` sur `status.filename`, la cible de la restauration. Les archives sur S3 ne sont pas
+  listées. La lecture n'a lieu que tant qu'un Backup est déplié.
 - **RBAC** — liste plate d'audit par défaut, trois orientations d'arbre par `t` (par sujet, par
   binding, par rôle), `f` règle le plancher de sévérité, `o` saute à l'objet Flux gérant. La
   sévérité est calculée **par binding** : un Role seul est inerte, et le même ClusterRole est anodin
@@ -797,7 +802,8 @@ pour les Backups) et les mêmes verdicts. L'âge du dernier backup réussi et l'
 dans la barre, les constats d'installation sur leur ligne sous elle. Le menu d'un Backup porte
 « backup maintenant » et « restaurer la dernière archive », chacun confirmé, « annuler » focalisé ;
 le serveur relit le Backup et c'est son spec et son `status.filename` du moment qui bâtissent
-l'objet, jamais un nom de fichier reçu de la page. Elle n'apparaît au rail que si le groupe
+l'objet, jamais un nom de fichier reçu de la page. Le pli d'un Backup récurrent déplie ses archives
+sur le PV, comme `Espace` dans le TUI. Elle n'apparaît au rail que si le groupe
 `resources.cattle.io` est servi, et n'a pas de portée de namespace : les trois kinds sont
 cluster-scoped.
 

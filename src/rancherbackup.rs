@@ -26,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{Api, DynamicObject, ListParams, PostParams};
+use kube::api::{Api, AttachParams, DynamicObject, ListParams, PostParams};
 use kube::core::GroupVersionKind;
 use kube::discovery;
 use kube::Client;
@@ -98,6 +98,17 @@ pub struct Operator {
     pub desired: i32,
     pub version: String,
     pub default_storage: DefaultStorage,
+    /// Où vit le Deployment, qui peut différer de `CHART_NAMESPACE` : c'est là qu'on cherche le pod.
+    #[serde(skip)]
+    pub deploy_namespace: String,
+    /// Le `matchLabels` du Deployment, en sélecteur de labels.
+    #[serde(skip)]
+    pub pod_selector: String,
+    #[serde(skip)]
+    pub container: String,
+    /// Le point de montage du volume `pv-storage` dans le conteneur : là où sont les archives.
+    #[serde(skip)]
+    pub pv_path: String,
 }
 
 impl Operator {
@@ -180,6 +191,31 @@ pub struct RbkBackup {
     pub created: i64,
     pub phase: Phase,
     pub hints: Vec<Hint>,
+    /// Les archives de ce Backup sur le PV de l'opérateur, la plus récente d'abord. Lues seulement
+    /// quand un Backup est déplié : la lecture est un `exec` dans le pod de l'opérateur.
+    pub archives: Vec<RbkArchive>,
+    /// Pourquoi la liste manque ou est vide, une fois demandée.
+    pub archives_note: Option<String>,
+}
+
+/// Une archive d'un Backup, telle que `ls` la montre sur le PV de l'opérateur.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RbkArchive {
+    pub file: String,
+    pub size: u64,
+    /// L'heure du run, lue dans le nom ; à défaut l'heure de modification du fichier.
+    pub taken: i64,
+    pub encrypted: bool,
+    /// C'est `status.filename` : la dernière archive réussie, celle que la restauration vise.
+    pub latest: bool,
+}
+
+/// Une ligne de `ls -l` sur le PV, avant d'être rattachée à un Backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PvFile {
+    pub name: String,
+    pub size: u64,
+    pub modified: i64,
 }
 
 impl RbkBackup {
@@ -300,6 +336,8 @@ pub struct RbkState {
     pub last_success: Option<i64>,
     pub error: Option<String>,
     pub loading: bool,
+    /// Un Backup est déplié : la prochaine passe lit aussi les archives du PV.
+    pub want_archives: bool,
 }
 
 impl RbkState {
@@ -332,8 +370,23 @@ pub enum RbkWorld {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RbkRow {
     Backup(usize),
+    /// La `j`-ième archive du `i`-ième Backup.
+    Archive(usize, usize),
+    /// Ce qui tient lieu d'archives sous un Backup déplié qui n'en montre aucune : lecture en
+    /// cours, stockage S3, refus d'exec, aucune archive.
+    ArchiveNote(usize),
     Restore(usize),
     ResourceSet(usize),
+}
+
+impl RbkRow {
+    /// Le Backup dont la ligne dépend, elle ou son parent.
+    pub fn backup_index(&self) -> Option<usize> {
+        match self {
+            RbkRow::Backup(i) | RbkRow::Archive(i, _) | RbkRow::ArchiveNote(i) => Some(*i),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -365,6 +418,16 @@ impl RbkView {
             _ => None,
         }
     }
+
+    pub fn archive_of(&self, row: &RbkRow) -> Option<(&RbkBackup, &RbkArchive)> {
+        match row {
+            RbkRow::Archive(i, j) => {
+                let b = self.backups.get(*i)?;
+                Some((b, b.archives.get(*j)?))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn flagged(level: Option<HintLevel>) -> bool {
@@ -372,7 +435,9 @@ fn flagged(level: Option<HintLevel>) -> bool {
 }
 
 /// Les lignes d'un monde. `problems` ne garde que ce qui porte un constat `Warn` ou pire.
-pub fn build_rbk_view(state: &RbkState, world: RbkWorld, problems: bool) -> RbkView {
+/// `expanded` nomme les Backups récurrents dépliés sur leurs archives ; un Backup ponctuel n'en a
+/// qu'une, déjà dans son panneau, et ne se déplie pas.
+pub fn build_rbk_view(state: &RbkState, world: RbkWorld, problems: bool, expanded: &HashSet<String>) -> RbkView {
     let mut view = RbkView {
         backups: state.backups.clone(),
         restores: state.restores.clone(),
@@ -385,7 +450,21 @@ pub fn build_rbk_view(state: &RbkState, world: RbkWorld, problems: bool) -> RbkV
         view.resource_sets.retain(|r| flagged(r.worst()));
     }
     view.rows = match world {
-        RbkWorld::Backups => (0..view.backups.len()).map(RbkRow::Backup).collect(),
+        RbkWorld::Backups => {
+            let mut rows = Vec::new();
+            for (i, b) in view.backups.iter().enumerate() {
+                rows.push(RbkRow::Backup(i));
+                if !b.recurring() || !expanded.contains(&b.name) {
+                    continue;
+                }
+                if b.archives.is_empty() {
+                    rows.push(RbkRow::ArchiveNote(i));
+                } else {
+                    rows.extend((0..b.archives.len()).map(|j| RbkRow::Archive(i, j)));
+                }
+            }
+            rows
+        }
         RbkWorld::Restores => (0..view.restores.len()).map(RbkRow::Restore).collect(),
         RbkWorld::ResourceSets => (0..view.resource_sets.len()).map(RbkRow::ResourceSet).collect(),
     };
@@ -463,9 +542,52 @@ pub fn resource_set_record(r: &RbkResourceSet, st: &'static Strings) -> EventRec
     )
 }
 
+/// Une archive n'est pas un objet Kubernetes : ni kind ni nom d'objet, pour que `y`, `Ctrl-D` et
+/// les gestes qui visent le cluster n'aient rien à viser — et surtout pas le Backup parent.
+fn archive_record(b: &RbkBackup, a: &RbkArchive) -> EventRecord {
+    EventRecord {
+        uid: format!("rbk|archive|{}|{}", b.name, a.file),
+        time: Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: "Archive".to_string(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: a.file.clone(),
+        message: a.file.clone(),
+        component: "rancher-backup".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
+/// Le texte qui tient lieu d'archives : la raison posée par la lecture, sinon « lecture en cours ».
+pub fn archive_note(b: &RbkBackup, st: &'static Strings) -> String {
+    b.archives_note.clone().unwrap_or_else(|| st.rbk_arch_loading.to_string())
+}
+
+fn archive_note_record(b: &RbkBackup, st: &'static Strings) -> EventRecord {
+    EventRecord {
+        uid: format!("rbk|archives|{}", b.name),
+        time: Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: "Archive".to_string(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: String::new(),
+        message: archive_note(b, st),
+        component: "rancher-backup".to_string(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 pub fn row_record(view: &RbkView, row: &RbkRow, st: &'static Strings) -> Option<EventRecord> {
     match row {
         RbkRow::Backup(i) => view.backups.get(*i).map(|b| backup_record(b, st)),
+        RbkRow::Archive(..) => view.archive_of(row).map(|(b, a)| archive_record(b, a)),
+        RbkRow::ArchiveNote(i) => view.backups.get(*i).map(|b| archive_note_record(b, st)),
         RbkRow::Restore(i) => view.restores.get(*i).map(|r| restore_record(r, st)),
         RbkRow::ResourceSet(i) => view.resource_sets.get(*i).map(|r| resource_set_record(r, st)),
     }
@@ -596,6 +718,8 @@ pub fn parse_backup(obj: &DynamicObject) -> RbkBackup {
         created: meta_ts(obj),
         phase: Phase::Pending,
         hints: Vec::new(),
+        archives: Vec::new(),
+        archives_note: None,
     }
 }
 
@@ -757,10 +881,22 @@ fn parse_operator(d: &Deployment) -> Operator {
     } else {
         DefaultStorage::None
     };
+    let deploy_namespace = d.metadata.namespace.clone().unwrap_or_default();
     let namespace = {
         let chart_ns = env("CHART_NAMESPACE");
-        if chart_ns.is_empty() { d.metadata.namespace.clone().unwrap_or_default() } else { chart_ns }
+        if chart_ns.is_empty() { deploy_namespace.clone() } else { chart_ns }
     };
+    let pod_selector = d
+        .spec
+        .as_ref()
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let pv_path = container
+        .and_then(|c| c.volume_mounts.as_ref())
+        .and_then(|ms| ms.iter().find(|m| m.name == "pv-storage"))
+        .map(|m| m.mount_path.clone())
+        .unwrap_or_default();
     let status = d.status.as_ref();
     Operator {
         namespace,
@@ -772,6 +908,10 @@ fn parse_operator(d: &Deployment) -> Operator {
             .and_then(|i| i.rsplit_once(':').map(|(_, tag)| tag.to_string()))
             .unwrap_or_default(),
         default_storage,
+        deploy_namespace,
+        pod_selector,
+        container: container.map(|c| c.name.clone()).unwrap_or_default(),
+        pv_path,
     }
 }
 
@@ -984,22 +1124,180 @@ pub fn diagnose(mut obs: Observed, now: i64, st: &'static Strings) -> RbkState {
         last_success,
         error: None,
         loading: false,
+        want_archives: false,
     }
+}
+
+// --- Archives -----------------------------------------------------------------------------------
+
+/// Les fichiers ordinaires d'un `ls -l --time-style=+%s` : mode, liens, propriétaire, groupe,
+/// taille, epoch, nom. Les noms d'archive n'ont pas d'espace (nom d'objet, uid, horodatage).
+pub fn parse_ls(out: &str) -> Vec<PvFile> {
+    out.lines()
+        .filter(|l| l.starts_with('-'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 7 {
+                return None;
+            }
+            Some(PvFile {
+                name: f[6..].join(" "),
+                size: f[4].parse().ok()?,
+                modified: f[5].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn is_uid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// L'heure d'une archive de `backup`, ou `None` si le fichier n'en est pas une. Le nom que pose
+/// l'opérateur est `<backup>-<uid kube-system>-<AAAA-MM-JJTHH-MM-SSZ>.tar.gz`, `.enc` en plus quand
+/// il chiffre. Exiger l'uid derrière le nom écarte les archives d'un Backup dont le nom prolonge
+/// celui-ci (`daily-now-…` sous `daily`).
+pub fn archive_time(backup: &str, file: &str) -> Option<Option<i64>> {
+    let rest = file.strip_prefix(backup)?.strip_prefix('-')?;
+    let (uid, rest) = (rest.get(..36)?, rest.get(36..)?);
+    if !is_uid(uid) {
+        return None;
+    }
+    let rest = rest.strip_prefix('-')?;
+    let stamp = rest
+        .strip_suffix(".tar.gz.enc")
+        .or_else(|| rest.strip_suffix(".tar.gz"))?;
+    Some(
+        chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%SZ")
+            .ok()
+            .map(|t| t.and_utc().timestamp()),
+    )
+}
+
+/// Le nom court d'une archive dans la liste : l'heure de son run, en UTC comme dans le fichier.
+pub fn archive_label(a: &RbkArchive) -> String {
+    chrono::DateTime::from_timestamp(a.taken, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%SZ").to_string())
+        .unwrap_or_else(|| a.file.clone())
+}
+
+/// Le PV de l'opérateur est-il là où ce Backup range ses archives ?
+fn on_operator_pv(b: &RbkBackup, default: Option<&DefaultStorage>) -> bool {
+    b.s3.is_none() && (b.storage == "PV" || matches!(default, Some(DefaultStorage::Pv { .. })))
+}
+
+/// Range les fichiers du PV sous leurs Backups. `files` est `Err` quand la lecture a échoué : la
+/// raison devient la note de chaque Backup qui range sur le PV.
+pub fn attach_archives(state: &mut RbkState, files: Result<Vec<PvFile>, String>, st: &'static Strings) {
+    let default = state.operator.as_ref().map(|o| o.default_storage.clone());
+    for b in &mut state.backups {
+        b.archives.clear();
+        b.archives_note = None;
+        if !on_operator_pv(b, default.as_ref()) {
+            b.archives_note = Some(st.rbk_arch_off_pv.to_string());
+            continue;
+        }
+        let files = match &files {
+            Ok(files) => files,
+            Err(e) => {
+                b.archives_note = Some(e.clone());
+                continue;
+            }
+        };
+        b.archives = files
+            .iter()
+            .filter_map(|f| {
+                let taken = archive_time(&b.name, &f.name)?;
+                Some(RbkArchive {
+                    file: f.name.clone(),
+                    size: f.size,
+                    taken: taken.unwrap_or(f.modified),
+                    encrypted: f.name.ends_with(".enc"),
+                    latest: f.name == b.filename,
+                })
+            })
+            .collect();
+        b.archives.sort_by(|x, y| y.taken.cmp(&x.taken).then_with(|| y.file.cmp(&x.file)));
+        if b.archives.is_empty() {
+            b.archives_note = Some(st.rbk_arch_none.to_string());
+        }
+    }
+}
+
+/// `ls` du PV dans le pod de l'opérateur, en argv : aucun shell n'est requis.
+async fn list_pv_files(client: &Client, op: &Operator, st: &'static Strings) -> Result<Vec<PvFile>, String> {
+    use tokio::io::AsyncReadExt;
+
+    if !op.up() {
+        return Err(st.rbk_arch_op_down.to_string());
+    }
+    if op.pv_path.is_empty() || op.pod_selector.is_empty() {
+        return Err(st.rbk_arch_no_mount.to_string());
+    }
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &op.deploy_namespace);
+    let list = pods
+        .list(&ListParams::default().labels(&op.pod_selector))
+        .await
+        .map_err(crate::edit::api_error_text)?;
+    let pod = list
+        .items
+        .iter()
+        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+        .and_then(|p| p.metadata.name.clone())
+        .ok_or_else(|| st.rbk_arch_op_down.to_string())?;
+
+    let mut params = AttachParams::default().stdin(false).stdout(true).stderr(true).tty(false);
+    if !op.container.is_empty() {
+        params = params.container(&op.container);
+    }
+    let command = vec!["ls", "-l", "--time-style=+%s", "--", op.pv_path.as_str()];
+    let mut process = pods
+        .exec(&pod, command, &params)
+        .await
+        .map_err(|e| fill(st.rbk_arch_exec_failed, &[("e", &crate::edit::api_error_text(e))]))?;
+    let status = process.take_status();
+    let mut out = process.stdout().ok_or_else(|| st.rbk_arch_no_output.to_string())?;
+    let mut err = process.stderr().ok_or_else(|| st.rbk_arch_no_output.to_string())?;
+    let (mut so, mut se) = (Vec::new(), Vec::new());
+    // Les deux tubes se vident ensemble : lire l'un jusqu'au bout avant l'autre bloque un processus
+    // qui écrit dans les deux.
+    let (ro, re) = tokio::join!(out.read_to_end(&mut so), err.read_to_end(&mut se));
+    ro.map_err(|e| e.to_string())?;
+    re.map_err(|e| e.to_string())?;
+    let code = match status {
+        Some(f) => f.await,
+        None => None,
+    };
+    let _ = process.join().await;
+    if code.is_some_and(|s| s.status.as_deref() != Some("Success")) {
+        let reason = String::from_utf8_lossy(&se).trim().to_string();
+        return Err(fill(st.rbk_arch_exec_failed, &[("e", &reason)]));
+    }
+    Ok(parse_ls(&String::from_utf8_lossy(&so)))
 }
 
 // --- Sondes -------------------------------------------------------------------------------------
 
 /// Le côté TUI : l'inventaire, posé dans l'état partagé qu'il redessine.
 pub async fn fetch_rbk(client: Client, state: SharedRbk) {
-    {
+    let archives = {
         let mut s = state.lock().expect("rancher-backup poisoned");
         s.loading = true;
         s.error = None;
-    }
-    let result = rbk_inventory(&client, crate::lang::active()).await;
+        s.want_archives
+    };
+    let result = rbk_inventory(&client, crate::lang::active(), archives).await;
     let mut s = state.lock().expect("rancher-backup poisoned");
     match result {
-        Ok(inv) => *s = inv,
+        Ok(mut inv) => {
+            // Le dépliage a pu changer pendant la lecture : c'est le vœu d'aujourd'hui qui reste.
+            inv.want_archives = s.want_archives;
+            *s = inv;
+        }
         Err(e) => {
             s.loading = false;
             s.error = Some(e);
@@ -1009,7 +1307,8 @@ pub async fn fetch_rbk(client: Client, state: SharedRbk) {
 
 /// Une passe complète, diagnostiquée. Rend une valeur plutôt que de remplir un état, pour que
 /// kdt-web lise exactement ce que lit le TUI ; la langue est un paramètre pour la même raison.
-pub async fn rbk_inventory(client: &Client, st: &'static Strings) -> Result<RbkState, String> {
+/// `archives` ajoute la lecture du PV de l'opérateur, qui n'a lieu que si un Backup y range.
+pub async fn rbk_inventory(client: &Client, st: &'static Strings, archives: bool) -> Result<RbkState, String> {
     let gvk = |kind: &str| GroupVersionKind::gvk(GROUP, "v1", kind);
     let Ok((backup_ar, _)) = discovery::pinned_kind(client, &gvk("Backup")).await else {
         return Ok(RbkState::default());
@@ -1084,7 +1383,20 @@ pub async fn rbk_inventory(client: &Client, st: &'static Strings) -> Result<RbkS
         }
     }
 
-    Ok(diagnose(obs, Timestamp::now().as_second(), st))
+    let mut state = diagnose(obs, Timestamp::now().as_second(), st);
+    if archives {
+        let default = state.operator.as_ref().map(|o| o.default_storage.clone());
+        let files = if !state.backups.iter().any(|b| on_operator_pv(b, default.as_ref())) {
+            Ok(Vec::new())
+        } else {
+            match &state.operator {
+                Some(op) => list_pv_files(client, op, st).await,
+                None => Err(st.rbk_arch_op_down.to_string()),
+            }
+        };
+        attach_archives(&mut state, files, st);
+    }
+    Ok(state)
 }
 
 // --- Écritures ----------------------------------------------------------------------------------
@@ -1209,6 +1521,10 @@ mod tests {
             desired: 1,
             version: "v5.0.4".into(),
             default_storage: storage,
+            deploy_namespace: "cattle-resources-system".into(),
+            pod_selector: "app.kubernetes.io/name=rancher-backup".into(),
+            container: "rancher-backup".into(),
+            pv_path: "/var/lib/backups".into(),
         }
     }
 
@@ -1404,5 +1720,101 @@ mod tests {
             "resourceSelectors": [{ "apiVersion": "v1", "kindsRegexp": "(" }],
         })));
         assert_eq!(r.bad_regex, vec!["(".to_string()]);
+    }
+
+    const UID: &str = "df567de2-3f9b-4039-9170-f483aaa0d3a9";
+
+    // Sortie relevée sur un opérateur v6.0.3 : `ls -l --time-style=+%s /var/lib/backups`.
+    fn ls_output() -> String {
+        format!(
+            "total 12904\n\
+             drwx------ 2 root root   16384 1791204897 lost+found\n\
+             -rw-r--r-- 1 root root 3180304 1791204950 daily-{UID}-2026-10-05T12-55-27Z.tar.gz.enc\n\
+             -rw-r--r-- 1 root root 3170853 1791252022 daily-{UID}-2026-10-06T02-00-00Z.tar.gz.enc\n\
+             -rw-r--r-- 1 root root 3171160 1791260871 daily-now-20261006042715-{UID}-2026-10-06T04-27-31Z.tar.gz.enc\n"
+        )
+    }
+
+    #[test]
+    fn ls_ne_garde_que_les_fichiers() {
+        let files = parse_ls(&ls_output());
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].size, 3180304);
+        assert_eq!(files[0].modified, 1791204950);
+        assert!(files.iter().all(|f| f.name != "lost+found"));
+    }
+
+    #[test]
+    fn une_archive_se_reconnait_a_l_uid_derriere_le_nom() {
+        let f = format!("daily-{UID}-2026-10-06T02-00-00Z.tar.gz.enc");
+        assert_eq!(archive_time("daily", &f), Some(Some(1791252000)));
+        assert_eq!(archive_time("daily", &format!("daily-{UID}-2026-10-06T02-00-00Z.tar.gz")), Some(Some(1791252000)));
+        // Le Backup ponctuel `daily-now-…` n'est pas une archive de `daily`.
+        let now = format!("daily-now-20261006042715-{UID}-2026-10-06T04-27-31Z.tar.gz.enc");
+        assert_eq!(archive_time("daily", &now), None);
+        assert!(archive_time("daily-now-20261006042715", &now).is_some());
+        assert_eq!(archive_time("daily", "daily-backup.tar.gz"), None);
+    }
+
+    fn pv_state(filename: &str) -> RbkState {
+        let mut b = backup(json!({
+            "apiVersion": API_V1, "kind": "Backup",
+            "metadata": { "name": "daily" },
+            "spec": { "schedule": "0 2 * * *", "resourceSetName": "rs" },
+            "status": { "storageLocation": "PV", "filename": filename },
+        }));
+        b.phase = Phase::Completed;
+        RbkState {
+            installed: true,
+            backups: vec![b],
+            operator: Some(operator(1, DefaultStorage::Pv { claim: "rancher-backup-data".into() })),
+            operator_known: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn les_archives_se_rangent_sous_leur_backup_la_plus_recente_d_abord() {
+        let latest = format!("daily-{UID}-2026-10-06T02-00-00Z.tar.gz.enc");
+        let mut state = pv_state(&latest);
+        attach_archives(&mut state, Ok(parse_ls(&ls_output())), st());
+        let b = &state.backups[0];
+        assert_eq!(b.archives.len(), 2);
+        assert_eq!(b.archives[0].file, latest);
+        assert!(b.archives[0].latest && !b.archives[1].latest);
+        assert!(b.archives.iter().all(|a| a.encrypted));
+        assert_eq!(b.archives_note, None);
+    }
+
+    #[test]
+    fn le_depliage_insere_les_archives_sous_le_backup() {
+        let mut state = pv_state("");
+        attach_archives(&mut state, Ok(parse_ls(&ls_output())), st());
+        let folded = build_rbk_view(&state, RbkWorld::Backups, false, &HashSet::new());
+        assert_eq!(folded.rows, vec![RbkRow::Backup(0)]);
+        let open: HashSet<String> = ["daily".to_string()].into();
+        let view = build_rbk_view(&state, RbkWorld::Backups, false, &open);
+        assert_eq!(view.rows, vec![RbkRow::Backup(0), RbkRow::Archive(0, 0), RbkRow::Archive(0, 1)]);
+        let rec = row_record(&view, &view.rows[1], st()).unwrap();
+        assert!(rec.kind.is_empty(), "une archive n'est pas un objet à viser");
+    }
+
+    #[test]
+    fn un_echec_de_lecture_tient_lieu_d_archives() {
+        let mut state = pv_state("");
+        attach_archives(&mut state, Err("refus".into()), st());
+        let open: HashSet<String> = ["daily".to_string()].into();
+        let view = build_rbk_view(&state, RbkWorld::Backups, false, &open);
+        assert_eq!(view.rows, vec![RbkRow::Backup(0), RbkRow::ArchiveNote(0)]);
+        assert_eq!(archive_note(&view.backups[0], st()), "refus");
+    }
+
+    #[test]
+    fn un_backup_s3_n_est_pas_lu_sur_le_pv() {
+        let mut state = pv_state("");
+        state.backups[0].s3 = Some(S3Location::default());
+        attach_archives(&mut state, Ok(parse_ls(&ls_output())), st());
+        assert!(state.backups[0].archives.is_empty());
+        assert_eq!(state.backups[0].archives_note.as_deref(), Some(st().rbk_arch_off_pv));
     }
 }

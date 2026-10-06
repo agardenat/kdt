@@ -4,7 +4,10 @@
 //
 // Rien n'est jugé ici. La phase d'une ligne et son ton, les constats, les colonnes NEXT et KEEP
 // arrivent tout faits de `kdt::rancherbackup`. Ce qui reste au navigateur : la sélection, la
-// recherche, et la confirmation d'une écriture.
+// recherche, les Backups dépliés et la confirmation d'une écriture.
+//
+// Un Backup récurrent ne crée aucun objet par run : chaque run est une archive sur le stockage.
+// Le déplier fait lire ces archives par le serveur, sur le PV de l'opérateur.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
@@ -17,6 +20,7 @@ import { RowCheckbox, SelectionBar, SelectionHead, useMultiSelect } from "./sele
 import type {
   EventRecord,
   Hint,
+  RbkArchiveRow,
   RbkBackupRow,
   RbkOperator,
   RbkPayload,
@@ -43,13 +47,22 @@ function matches(row: RbkRow, needle: string): boolean {
   const extra =
     row.row === "backup"
       ? [row.schedule, row.storage_label, row.filename, row.resource_set, row.phase_label]
-      : row.row === "restore"
-        ? [row.backup_filename, row.phase_label]
-        : [...row.selectors, ...row.used_by];
+      : row.row === "archive"
+        ? [row.file, row.backup]
+        : row.row === "archive_note"
+          ? [row.note, row.backup]
+          : row.row === "restore"
+            ? [row.backup_filename, row.phase_label]
+            : [...row.selectors, ...row.used_by];
   return [row.name, row.record.message, ...extra, ...row.hints.map((h) => h.text)]
     .join(" ")
     .toLowerCase()
     .includes(needle);
+}
+
+/** Une archive n'est pas un objet Kubernetes : ni case, ni menu, rien que le cluster puisse viser. */
+function isObject(row: RbkRow): boolean {
+  return row.row !== "archive" && row.row !== "archive_note";
 }
 
 function hintTone(h: Hint | undefined): string {
@@ -86,10 +99,11 @@ export default function RancherBackupView({
   const [busy, setBusy] = useState(false);
   const { checked, toggle, clear, setAll } = useMultiSelect();
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     try {
-      const data = await api.rancherBackup(world, problems, lang);
+      const data = await api.rancherBackup(world, problems, [...expanded].sort(), lang);
       setPayload(data);
       setError(null);
     } catch (e) {
@@ -99,7 +113,7 @@ export default function RancherBackupView({
     } finally {
       setLoaded(true);
     }
-  }, [world, problems, lang, onNeedsAuth]);
+  }, [world, problems, expanded, lang, onNeedsAuth]);
 
   useEffect(() => {
     void load();
@@ -119,7 +133,15 @@ export default function RancherBackupView({
   );
   const selectedRow = useMemo(() => rows.find((r) => r.uid === selected) ?? null, [rows, selected]);
   const selectedRecord: EventRecord | null = selectedRow?.record ?? null;
-  const selectableKeys = useMemo(() => display.map((r) => r.uid), [display]);
+  const selectableKeys = useMemo(() => display.filter(isObject).map((r) => r.uid), [display]);
+
+  const fold = (name: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(name)) next.add(name);
+      return next;
+    });
+  };
 
   const switchWorld = (w: RbkWorld) => {
     setWorld(w);
@@ -166,6 +188,10 @@ export default function RancherBackupView({
                 <Detail
                   row={selectedRow}
                   operator={operator}
+                  archives={rows.filter(
+                    (r): r is RbkArchiveRow =>
+                      r.row === "archive" && selectedRow.row === "backup" && r.backup === selectedRow.name,
+                  ).length}
                   clusterHints={payload?.cluster_hints ?? []}
                   st={st}
                 />
@@ -351,6 +377,14 @@ export default function RancherBackupView({
                   }}
                   onNeedsAuth={onNeedsAuth}
                   onWrite={(action) => void write(action, row.name)}
+                  expanded={row.row === "backup" && expanded.has(row.name)}
+                  onFold={() => {
+                    if (row.row === "backup") fold(row.name);
+                    else if (row.row === "archive" || row.row === "archive_note") {
+                      fold(row.backup);
+                      setSelected(`rbk|backup|${row.backup}`);
+                    }
+                  }}
                   checked={checked.has(row.uid)}
                   onToggleCheck={() => toggle(row.uid)}
                 />
@@ -380,6 +414,8 @@ function Line({
   onOpenTab,
   onNeedsAuth,
   onWrite,
+  expanded,
+  onFold,
   checked,
   onToggleCheck,
 }: {
@@ -391,12 +427,17 @@ function Line({
   onOpenTab: (tab: ObjectTab) => void;
   onNeedsAuth: (message: string) => void;
   onWrite: (action: "backup-now" | "restore") => void;
+  expanded: boolean;
+  onFold: () => void;
   checked: boolean;
   onToggleCheck: () => void;
 }) {
   // Le pire constat, s'il demande un humain : un `info` dit la norme, il reste dans le panneau.
   const alert = row.hints.find((h) => h.level !== "info");
   const yesNo = (v: boolean) => (v ? st.rbkYes : st.rbkNo);
+  // Un Backup ponctuel n'a qu'une archive, déjà nommée dans son panneau : il ne se déplie pas.
+  const foldable = row.row === "backup" && row.recurring;
+  const child = !isObject(row);
   return (
     <div
       className={`tr sev-${row.record.tone}`}
@@ -405,11 +446,56 @@ function Line({
       onClick={onSelect}
       onKeyDown={(e) => {
         if (e.key === "Enter") onSelect();
+        else if (e.key === " " && (foldable || child)) {
+          e.preventDefault();
+          onFold();
+        }
       }}
     >
-      <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} st={st} />
-      <div className={`cell id ${row.name_tone ?? ""}`}>{row.name}</div>
-      {row.row === "backup" ? (
+      {child ? (
+        <div className="cell sel" />
+      ) : (
+        <RowCheckbox checked={checked} onToggle={onToggleCheck} label={st.selectRow} st={st} />
+      )}
+      <div
+        className={`cell id ${row.name_tone ?? ""} ${row.row === "archive_note" ? "dim" : ""}`}
+        style={child ? { paddingLeft: "1.15rem" } : undefined}
+      >
+        {foldable ? (
+          <button
+            className="fold"
+            title={st.velFold}
+            aria-expanded={expanded}
+            onClick={(e) => {
+              e.stopPropagation();
+              onFold();
+            }}
+          >
+            {expanded ? "▾" : "▸"}
+          </button>
+        ) : (
+          <span className="fold-gap" />
+        )}
+        {row.row === "archive_note" ? "—" : row.name}
+      </div>
+      {row.row === "archive" ? (
+        <>
+          <div className="cell dim">Archive</div>
+          <div className="cell" />
+          <div className="cell num dim">{row.taken_age}</div>
+          <div className="cell" />
+          <div className="cell" />
+          <div className="cell mono dim">{row.size_text}</div>
+          <div className="cell dim">{yesNo(row.encrypted)}</div>
+          <div className={`cell ${row.latest ? "ok" : ""}`}>{row.latest ? "Latest" : ""}</div>
+        </>
+      ) : row.row === "archive_note" ? (
+        <>
+          {Array.from({ length: 8 }, (_, i) => (
+            <div key={i} className="cell" />
+          ))}
+        </>
+      ) : row.row === "backup" ? (
         <>
           <div className="cell dim">{row.recurring ? "Recurring" : "One-time"}</div>
           <div className="cell mono">{row.schedule || "—"}</div>
@@ -436,25 +522,35 @@ function Line({
           <div className="cell">{row.used_by.length ? row.used_by.join(", ") : "—"}</div>
         </>
       )}
-      <div className={`cell wrap ${hintTone(alert)}`} title={row.hints.map((h) => h.text).join(" · ")}>
-        {alert?.text ?? "—"}
-      </div>
-      <div className="cell act">
-        <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
-          {row.row === "backup"
-            ? ({ close }) => (
-                <WriteMenu
-                  row={row}
-                  st={st}
-                  onWrite={(action) => {
-                    close();
-                    onWrite(action);
-                  }}
-                />
-              )
-            : undefined}
-        </RowMenu>
-      </div>
+      {row.row === "archive_note" ? (
+        <div className="cell wrap dim">{row.note}</div>
+      ) : child ? (
+        <div className="cell" />
+      ) : (
+        <div className={`cell wrap ${hintTone(alert)}`} title={row.hints.map((h) => h.text).join(" · ")}>
+          {alert?.text ?? "—"}
+        </div>
+      )}
+      {child ? (
+        <div className="cell act" />
+      ) : (
+        <div className="cell act">
+          <RowMenu record={row.record} lang={lang} st={st} onOpen={onOpenTab} onNeedsAuth={onNeedsAuth}>
+            {row.row === "backup"
+              ? ({ close }) => (
+                  <WriteMenu
+                    row={row}
+                    st={st}
+                    onWrite={(action) => {
+                      close();
+                      onWrite(action);
+                    }}
+                  />
+                )
+              : undefined}
+          </RowMenu>
+        </div>
+      )}
     </div>
   );
 }
@@ -519,18 +615,33 @@ function WriteMenu({
 function Detail({
   row,
   operator,
+  archives,
   clusterHints,
   st,
 }: {
   row: RbkRow;
   operator: RbkOperator | null;
+  /** Les archives listées sous le Backup sélectionné, quand il est déplié. */
+  archives: number;
   clusterHints: Hint[];
   st: Strings;
 }) {
+  if (row.row === "archive" || row.row === "archive_note") {
+    return (
+      <div className="detail">
+        {row.row === "archive" ? (
+          <ArchiveDetail row={row} pvPath={operator?.pv_path ?? ""} st={st} />
+        ) : (
+          <p className="dim">{row.note}</p>
+        )}
+        <Field label="Backup" value={row.backup} mono />
+      </div>
+    );
+  }
   return (
     <div className="detail">
       {row.row === "backup" ? (
-        <BackupDetail row={row} st={st} />
+        <BackupDetail row={row} archives={archives} st={st} />
       ) : row.row === "restore" ? (
         <RestoreDetail row={row} st={st} />
       ) : (
@@ -557,7 +668,21 @@ function Detail({
   );
 }
 
-function BackupDetail({ row, st }: { row: RbkBackupRow; st: Strings }) {
+function ArchiveDetail({ row, pvPath, st }: { row: RbkArchiveRow; pvPath: string; st: Strings }) {
+  const dir = pvPath.replace(/\/+$/, "");
+  return (
+    <>
+      <Field label={st.rbkArchFile} value={row.file} mono />
+      <Field label={st.rbkArchTaken} value={`${row.name} (${st.rbkAgo.replace("{age}", row.taken_age)})`} />
+      <Field label={st.rbkArchSize} value={row.size_text} />
+      <Field label={st.rbkEncryption} value={row.encrypted ? st.rbkYes : st.rbkNo} />
+      {dir && <Field label={st.rbkArchPath} value={`${dir}/${row.file}`} mono />}
+      {row.latest && <Field label="status.filename" value={st.rbkArchLatest} tone="ok" />}
+    </>
+  );
+}
+
+function BackupDetail({ row, archives, st }: { row: RbkBackupRow; archives: number; st: Strings }) {
   const retention =
     row.retention === null
       ? st.rbkRetentionNone
@@ -586,6 +711,7 @@ function BackupDetail({ row, st }: { row: RbkBackupRow; st: Strings }) {
       />
       {next !== null && <Field label={st.rbkNextRun} value={next} tone={row.late ? "err" : undefined} />}
       <Field label={st.rbkArchive} value={row.filename || "—"} mono />
+      {archives > 0 && <Field label={st.rbkArchCount} value={String(archives)} />}
       <div className="sect">{st.rbkStorage}</div>
       {row.s3 ? (
         <S3Fields s3={row.s3} />

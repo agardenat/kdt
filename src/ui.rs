@@ -1771,6 +1771,8 @@ pub struct App {
     // The rows on screen and the lists they index into, snapshotted once per refresh so the draw
     // pass never re-locks.
     rbk_view: RbkView,
+    // The recurring Backups unfolded onto their archives, by name.
+    rbk_expanded: std::collections::HashSet<String>,
     pub rbk_detail_scroll: usize,
     pub rbk_refresh_handle: Option<JoinHandle<()>>,
     pub configmaps_state: SharedConfigMaps,
@@ -2094,6 +2096,7 @@ impl App {
             rbk_world: RbkWorld::Backups,
             rbk_filter: ReflFilter::All,
             rbk_view: RbkView::default(),
+            rbk_expanded: std::collections::HashSet::new(),
             rbk_detail_scroll: 0,
             rbk_refresh_handle: None,
             configmaps_state: new_configmaps_state(),
@@ -9898,7 +9901,7 @@ impl App {
     fn refresh_rbk_snapshot(&mut self) {
         let view = {
             let s = self.rbk_state.lock().expect("rancher-backup poisoned");
-            build_rbk_view(&s, self.rbk_world, self.rbk_filter == ReflFilter::Problems)
+            build_rbk_view(&s, self.rbk_world, self.rbk_filter == ReflFilter::Problems, &self.rbk_expanded)
         };
         let st = lang::t(self.ai_language);
         let recs: Vec<EventRecord> = view
@@ -9940,6 +9943,37 @@ impl App {
         self.selected_uid = Some(self.snapshot[idx].uid.clone());
         self.rbk_detail_scroll = 0;
         self.refresh_rbk_snapshot();
+    }
+
+    // Space: unfold a recurring Backup onto its archives, or fold it back — from the Backup or from
+    // any of its archive rows. Its archives live on the operator's PV, read by an exec in the
+    // operator pod: that read only happens while something is unfolded, and the first unfold
+    // triggers it right away rather than waiting for the next tick.
+    fn toggle_rbk_node(&mut self) {
+        let Some(row) = self.rbk_selected_row() else { return };
+        let Some(b) = row.backup_index().and_then(|i| self.rbk_view.backups.get(i)) else { return };
+        if !b.recurring() {
+            return;
+        }
+        let name = b.name.clone();
+        let opening = !self.rbk_expanded.remove(&name);
+        if opening {
+            self.rbk_expanded.insert(name.clone());
+        }
+        let fetch = {
+            let mut s = self.rbk_state.lock().expect("rancher-backup poisoned");
+            let was = s.want_archives;
+            s.want_archives = !self.rbk_expanded.is_empty();
+            s.want_archives && !was
+        };
+        if !opening {
+            self.selected_uid = Some(format!("rbk|backup|{name}"));
+            self.table_state.select(None);
+        }
+        self.refresh_rbk_snapshot();
+        if fetch {
+            self.refresh_rbk();
+        }
     }
 
     fn cycle_rbk_world(&mut self) {
@@ -13339,6 +13373,7 @@ fn handle_event(app: &mut App, ev: Event) {
         (KeyCode::Down, _, Mode::RBackup) => app.move_rbk_selection(1),
         (KeyCode::PageUp, _, Mode::RBackup) => app.move_rbk_selection(-10),
         (KeyCode::PageDown, _, Mode::RBackup) => app.move_rbk_selection(10),
+        (KeyCode::Char(' '), _, Mode::RBackup) => app.toggle_rbk_node(),
         (KeyCode::Char('g'), _, Mode::RBackup) => app.cycle_rbk_world(),
         (KeyCode::Char('f'), _, Mode::RBackup) => app.cycle_rbk_filter(),
         (KeyCode::Char('o'), _, Mode::RBackup) => app.open_rbk_action_menu(),
@@ -14199,6 +14234,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
                 Span::styled(" ↑↓ ", kbg), Span::raw(format!(" {}   ", st.k_nav)),
                 Span::styled(" Enter ", kbg), Span::raw(format!(" {}   ", st.k_zoom)),
                 footer_sep(),
+                Span::styled(" Space ", kbg), Span::raw(format!(" {}   ", st.k_fold)),
                 Span::styled(" g ", kbg), Span::raw(format!(" {}   ", next_world)),
                 Span::styled(" f ", kbg), Span::raw(format!(" {} ({})   ", st.k_refl_filter, app.rbk_filter.label())),
                 Span::styled(" o ", kbg), Span::raw(format!(" {}   ", st.k_rbk_ops)),
@@ -21683,12 +21719,64 @@ fn draw_rbk_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 "NAME", "TYPE", "SCHEDULE", "LAST", "NEXT", "KEEP", "STORAGE", "ENC", "STATE", "ALERT",
             ])
             .style(header_style);
-            let rows = backups
+            // A recurring Backup wears its fold marker; a one-time one, which has a single archive
+            // already named in its panel, is padded to the same column so the names line up.
+            let names: Vec<String> = view
+                .rows
                 .iter()
-                .map(|b| {
+                .map(|r| match r {
+                    RbkRow::Backup(i) => {
+                        let b = &view.backups[*i];
+                        let marker = match (b.recurring(), app.rbk_expanded.contains(&b.name)) {
+                            (true, true) => "▾ ",
+                            (true, false) => "▸ ",
+                            (false, _) => "  ",
+                        };
+                        format!("{marker}{}", b.name)
+                    }
+                    RbkRow::Archive(..) => view
+                        .archive_of(r)
+                        .map(|(_, a)| format!("    {}", crate::rancherbackup::archive_label(a)))
+                        .unwrap_or_default(),
+                    RbkRow::ArchiveNote(_) => "    —".to_string(),
+                    _ => String::new(),
+                })
+                .collect();
+            let rows = view
+                .rows
+                .iter()
+                .zip(names.iter())
+                .filter_map(|(r, name)| {
+                    if let Some((_, a)) = view.archive_of(r) {
+                        let dim = Style::default().fg(DIM);
+                        return Some(Row::new(vec![
+                            Cell::from(name.clone()),
+                            Cell::from("Archive").style(dim),
+                            Cell::from(""),
+                            Cell::from(crate::velero::age_of(a.taken, now)).style(dim),
+                            Cell::from(""),
+                            Cell::from(""),
+                            Cell::from(crate::configmaps::human_size(a.size as usize)).style(dim),
+                            Cell::from(yes_no(a.encrypted)).style(dim),
+                            if a.latest {
+                                Cell::from("Latest").style(Style::default().fg(Color::Green))
+                            } else {
+                                Cell::from("")
+                            },
+                            Cell::from(""),
+                        ]));
+                    }
+                    if let RbkRow::ArchiveNote(i) = r {
+                        let note = crate::rancherbackup::archive_note(&view.backups[*i], st);
+                        let mut cells = vec![Cell::from(name.clone()).style(Style::default().fg(DIM))];
+                        cells.extend((0..8).map(|_| Cell::from("")));
+                        cells.push(Cell::from(note).style(Style::default().fg(DIM)));
+                        return Some(Row::new(cells));
+                    }
+                    let b = view.backup_of(r)?;
                     let late = b.late(now);
-                    Row::new(vec![
-                        Cell::from(b.name.clone()).style(rbk_name_style(&b.hints)),
+                    Some(Row::new(vec![
+                        Cell::from(name.clone()).style(rbk_name_style(&b.hints)),
                         Cell::from(if b.recurring() { "Recurring" } else { "One-time" })
                             .style(Style::default().fg(DIM)),
                         Cell::from(if b.schedule.is_empty() { "—".to_string() } else { b.schedule.clone() }),
@@ -21701,10 +21789,10 @@ fn draw_rbk_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(yes_no(b.encrypted())).style(Style::default().fg(DIM)),
                         rbk_phase_cell(b.phase),
                         rbk_alert_cell(&b.hints),
-                    ])
+                    ]))
                 })
                 .collect();
-            let name_w = col_width(backups.iter().map(|b| b.name.as_str()), "NAME", 14, 40);
+            let name_w = col_width(names.iter().map(|n| n.as_str()), "NAME", 14, 42);
             let sched_w = col_width(backups.iter().map(|b| b.schedule.as_str()), "SCHEDULE", 8, 18);
             let storages: Vec<String> = backups.iter().map(|b| b.storage_label()).collect();
             let storage_w = col_width(storages.iter().map(|s| s.as_str()), "STORAGE", 7, 32);
@@ -21903,6 +21991,9 @@ fn rbk_detail_lines(
                 ));
             }
             lines.push(label(st.rbk_lbl_archive, dash(&b.filename)));
+            if !b.archives.is_empty() {
+                lines.push(label(st.rbk_arch_count, b.archives.len().to_string()));
+            }
             lines.push(Line::from(""));
             lines.push(heading(st.rbk_lbl_storage));
             match &b.s3 {
@@ -21913,6 +22004,35 @@ fn rbk_detail_lines(
                 )),
             }
             own_hints = b.hints.clone();
+            banner(format!(" Backup {} ", b.name))
+        }
+        RbkRow::Archive(..) => {
+            let (b, a) = app.rbk_view.archive_of(&row)?;
+            lines.push(label(st.rbk_arch_file, a.file.clone()));
+            lines.push(label(
+                st.rbk_arch_taken,
+                format!("{} ({})", crate::rancherbackup::archive_label(a), stamp(Some(a.taken))),
+            ));
+            lines.push(label(st.rbk_arch_size, crate::configmaps::human_size(a.size as usize)));
+            lines.push(label(st.rbk_lbl_encryption, yes_no(a.encrypted)));
+            if let Some(path) = operator.map(|o| o.pv_path.trim_end_matches('/')).filter(|p| !p.is_empty()) {
+                lines.push(label(st.rbk_arch_path, format!("{path}/{}", a.file)));
+            }
+            if a.latest {
+                lines.push(label("status.filename", st.rbk_arch_latest.to_string()));
+            }
+            lines.push(label("Backup", b.name.clone()));
+            own_hints = Vec::new();
+            banner(format!(" Archive {} ", crate::rancherbackup::archive_label(a)))
+        }
+        RbkRow::ArchiveNote(i) => {
+            let b = app.rbk_view.backups.get(i)?;
+            lines.push(Line::from(Span::styled(
+                format!("  {}", crate::rancherbackup::archive_note(b, st)),
+                Style::default().fg(DIM),
+            )));
+            lines.push(label("Backup", b.name.clone()));
+            own_hints = Vec::new();
             banner(format!(" Backup {} ", b.name))
         }
         RbkRow::Restore(i) => {
