@@ -8,6 +8,31 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.9.0] — 2026-10-12
+
+- **feat(storage)** — la vue stockage gagne deux mondes, dans le TUI (`g` fait le tour claims →
+  volumes → snapshots → attachments, `:snapshots`/`:vs`, `:attachments`/`:va`) comme dans kdt-web :
+  - **snapshots** : VolumeSnapshotClass → VolumeSnapshot → VolumeSnapshotContent, avec les
+    snapshots dont la classe est absente et les contenus qu'aucun snapshot ne désigne sous leur
+    propre en-tête. Constats : erreur du snapshot, pas prêt au-delà de 10 min, contenu lié absent
+    (plus restaurable), classe introuvable, claim source supprimée, contenu orphelin (`Retain` :
+    toujours chez le fournisseur), suppression retenue par un finalizer, deux classes par défaut
+    pour un pilote, pilote absent des CSIDriver. Sans les CRD `snapshot.storage.k8s.io`, le monde
+    le dit au lieu de s'afficher vide ;
+  - **attachments** : nœud → VolumeAttachment, l'en-tête du nœud comptant ses emplacements par
+    pilote contre `CSINode.allocatable` (plein ou à 80 % signalé). Un VolumeAttachment en
+    suppression dont le PV a disparu est un **fantôme** : son finalizer attend un détachement qui ne
+    peut plus se faire, et le constat dit si `attached=true` impose de vérifier le disque chez le
+    fournisseur avant de retirer le finalizer. Aussi : échec d'attachement ou de détachement, pas
+    attaché au-delà de 5 min, nœud ou PV absent.
+
+  Fantômes et contenus orphelins en `Retain` remontent dans les constats du cluster, visibles
+  depuis tous les mondes. Le filtre `f` et la recherche `/` gardent l'en-tête de chaque ligne
+  retenue.
+- **fix(storage)** — TUI, monde volumes : les PV sans `storageClassName` (ou nommant une classe
+  absente) ont leur en-tête « (classe absente) », comme dans kdt-web. Ils s'ajoutaient jusqu'ici
+  à la suite des volumes de la dernière classe, au même retrait, et s'y lisaient comme rattachés.
+
 ## [2.8.2] — 2026-10-06
 
 - **fix(web)** — vue Velero : le contenu d'un backup se déplie par le `▸` placé devant son nom,
