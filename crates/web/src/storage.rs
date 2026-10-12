@@ -1,4 +1,5 @@
-//! La vue stockage : PVC, PV et StorageClass — et surtout ce qui ne va pas avec eux.
+//! La vue stockage : PVC, PV et StorageClass, snapshots et attachements CSI — et surtout ce qui
+//! ne va pas avec eux.
 //!
 //! L'intérêt de cette vue n'est pas de lister des volumes, `kubectl get pvc` le fait déjà, mais de
 //! dire ce qui coûte une après-midi : une claim qui ne se liera jamais et pourquoi, un PV qui tient
@@ -27,6 +28,11 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use kdt::events::format_memory_bytes;
+use kdt::csi::{
+    attach_record, content_record, csi_phase_tone, node_attach_record, snap_class_record,
+    snapshot_record, AttachResource, NodeAttachResource, SnapClassResource, SnapContentResource,
+    SnapshotResource,
+};
 use kdt::storage::{
     phase_tone, pv_record, pvc_record, sc_record, PvResource, PvcResource, ScResource,
 };
@@ -78,10 +84,21 @@ pub async fn list(
     };
 
     let d = inventory.diagnosed;
+    let csi = inventory.csi;
     axum::Json(serde_json::json!({
         "pvcs": d.pvcs.iter().map(|c| pvc_json(c, st)).collect::<Vec<_>>(),
         "pvs": d.pvs.iter().map(pv_json).collect::<Vec<_>>(),
         "classes": d.classes.iter().map(sc_json).collect::<Vec<_>>(),
+        // Le côté CSI : snapshots rangés sous leur classe, attachements sous leur nœud. Comme pour
+        // les volumes, le rattachement est un champ, et le navigateur range sans rien déduire.
+        "snap_classes": csi.snap_classes.iter().map(vsclass_json).collect::<Vec<_>>(),
+        "snapshots": csi.snapshots.iter().map(vs_json).collect::<Vec<_>>(),
+        "contents": csi.contents.iter().map(vsc_json).collect::<Vec<_>>(),
+        "attachments": csi.attachments.iter().map(va_json).collect::<Vec<_>>(),
+        "attach_nodes": csi.nodes.iter().map(vanode_json).collect::<Vec<_>>(),
+        // Faux quand les CRD de snapshot ne sont pas installées : un monde vide dirait sinon
+        // « aucun snapshot pris » là où la vérité est « pas de snapshot CSI ici ».
+        "snapshots_installed": csi.snapshots_installed,
         // Les constats qui n'appartiennent à aucune ligne : pas de classe par défaut, deux
         // classes par défaut, du `Released` qui s'accumule.
         "cluster_hints": d.cluster_hints,
@@ -152,6 +169,51 @@ fn sc_json(c: &ScResource) -> serde_json::Value {
     if let Some(object) = value.as_object_mut() {
         object.insert("row".to_string(), "sc".into());
         object.insert("record".to_string(), record_json(sc_record(c)));
+    }
+    value
+}
+
+/// Une ligne CSI : l'objet tel que kdt l'a lu, son étiquette de forme, le ton de sa phase et
+/// l'enregistrement qui donne les gestes génériques.
+fn csi_json<T: serde::Serialize>(
+    v: &T,
+    row: &str,
+    phase: Option<&str>,
+    record: kdt::events::EventRecord,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(v).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("row".to_string(), row.into());
+        if let Some(phase) = phase {
+            object.insert("phase_tone".to_string(), tone_json(csi_phase_tone(phase)));
+        }
+        object.insert("record".to_string(), record_json(record));
+    }
+    value
+}
+
+fn vsclass_json(c: &SnapClassResource) -> serde_json::Value {
+    csi_json(c, "vsclass", None, snap_class_record(c))
+}
+
+fn vs_json(s: &SnapshotResource) -> serde_json::Value {
+    csi_json(s, "vs", Some(&s.phase), snapshot_record(s))
+}
+
+fn vsc_json(c: &SnapContentResource) -> serde_json::Value {
+    csi_json(c, "vsc", Some(&c.phase), content_record(c))
+}
+
+fn va_json(a: &AttachResource) -> serde_json::Value {
+    csi_json(a, "va", Some(&a.phase), attach_record(a))
+}
+
+/// L'en-tête d'un nœud : ses emplacements d'attachement, comptés par pilote contre la limite que
+/// publie son CSINode.
+fn vanode_json(n: &NodeAttachResource) -> serde_json::Value {
+    let mut value = csi_json(n, "vanode", None, node_attach_record(n));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("slots_label".to_string(), n.slots_label().into());
     }
     value
 }

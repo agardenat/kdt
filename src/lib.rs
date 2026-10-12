@@ -28,6 +28,7 @@ pub mod cli;
 pub mod clip;
 pub mod clusterctx;
 pub mod config;
+pub mod csi;
 pub mod configmaps;
 pub mod connect;
 pub mod delete;

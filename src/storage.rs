@@ -143,6 +143,7 @@ pub struct StorageState {
     // False when listing pods failed: the "nothing mounts this claim" rule then stays silent rather
     // than reporting an absence it cannot actually observe.
     pub mounts_known: bool,
+    pub csi: crate::csi::CsiDiagnosed,
     pub error: Option<String>,
     pub loading: bool,
 }
@@ -167,6 +168,9 @@ pub fn volume_in_class(pv: &PvResource, sc: &ScResource) -> bool {
 #[derive(Debug, Clone)]
 pub struct StorageInventory {
     pub diagnosed: Diagnosed,
+    /// Snapshots et attachements CSI, diagnostiqués sur la même passe. Leurs constats de niveau
+    /// cluster sont déjà repris dans `diagnosed.cluster_hints`.
+    pub csi: crate::csi::CsiDiagnosed,
     /// Faux quand la liste des pods a été refusée : la règle « rien ne monte cette claim » se tait
     /// alors, au lieu de rapporter une absence qu'elle n'a pas pu constater.
     pub mounts_known: bool,
@@ -185,10 +189,25 @@ pub async fn storage_inventory(
     st: &'static Strings,
 ) -> Result<StorageInventory, String> {
     let classes_raw = list_classes(client).await.unwrap_or_default();
-    let pvs_raw = list_volumes(client).await.unwrap_or_default();
+    let pvs_read = list_volumes(client).await.ok();
     let pvcs_raw = list_claims(client, &namespace).await?;
 
-    let mounts = list_mounts(client, &namespace).await;
+    let (mounts, csi_raw) =
+        futures::join!(list_mounts(client, &namespace), crate::csi::fetch_csi(client, &namespace));
+    let pv_names: Option<HashSet<String>> =
+        pvs_read.as_ref().map(|pvs| pvs.iter().map(|p| p.name.clone()).collect());
+    let claim_keys: HashSet<String> =
+        pvcs_raw.iter().map(|c| format!("{}/{}", c.namespace, c.name)).collect();
+    let csi = crate::csi::diagnose_csi(
+        csi_raw,
+        &crate::csi::CsiContext {
+            namespace: &namespace,
+            pvs: pv_names.as_ref(),
+            pvcs: &claim_keys,
+        },
+        st,
+    );
+    let pvs_raw = pvs_read.unwrap_or_default();
     let mounts_known = mounts.is_some();
     let mounts = mounts.unwrap_or_default();
 
@@ -201,10 +220,10 @@ pub async fn storage_inventory(
         HashMap::new()
     };
 
-    Ok(StorageInventory {
-        diagnosed: diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events, st),
-        mounts_known,
-    })
+    let mut diagnosed = diagnose(pvcs_raw, pvs_raw, classes_raw, &mounts, mounts_known, &events, st);
+    diagnosed.cluster_hints.extend(csi.cluster_hints.iter().cloned());
+    diagnosed.cluster_hints.sort_by_key(|h| std::cmp::Reverse(h.level));
+    Ok(StorageInventory { diagnosed, csi, mounts_known })
 }
 
 pub async fn fetch_storage(client: Client, namespace: Option<String>, state: SharedStorage) {
@@ -234,6 +253,7 @@ pub async fn fetch_storage(client: Client, namespace: Option<String>, state: Sha
     s.cluster_hints = inventory.diagnosed.cluster_hints;
     s.released_bytes = inventory.diagnosed.released_bytes;
     s.mounts_known = inventory.mounts_known;
+    s.csi = inventory.csi;
 }
 
 async fn list_classes(client: &Client) -> Result<Vec<ScResource>, String> {

@@ -121,6 +121,8 @@ portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
 | `apiservice` | `apisvc`, `aggregated`, `agg` | APIService agrégées |
 | `storage [ns]` | `stockage`, `pvc`, `claims` | Stockage, côté demandes (PVC → PV) |
 | `pv` | `sc`, `storageclass`, `persistentvolume` | Stockage, côté volumes (SC → PV) |
+| `snapshots [ns]` | `vs`, `volumesnapshots`, `vsc`, `vsclass` | Stockage, snapshots CSI (VolumeSnapshotClass → VolumeSnapshot → contenu) |
+| `attachments` | `va`, `volumeattachments`, `csinodes` | Stockage, attachements CSI (nœud → VolumeAttachment) |
 | `capacity` | `cap`, `marge`, `headroom` | Capacité, côté nœuds |
 | `quota [ns]` | `quotas`, `rq`, `resourcequota` | Capacité, côté quotas |
 | `ctx [contexte]` | `context`, `cluster`, `kubectx` | Changer de contexte kubeconfig (voir ci-dessous) |
@@ -177,7 +179,7 @@ courant de kubectl reste le même), et `E` (shell) vise le contexte affiché.
 | RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
 | Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `s` Secret TLS de l'Ingress · `n`/`0` namespace |
 | Hooks | `g` admission → conversion → apiservices · `t` webhooks sous leur configuration (admission) · `←`/`→` lire le verdict qui déborde · `P` basculer `failurePolicy` |
-| Stockage | `g` claims ↔ volumes · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
+| Stockage | `g` claims → volumes → snapshots → attachments · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
 | YAML | `t` neat ↔ brut · `c` copier · `r` recharger |
 
@@ -579,12 +581,26 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   donne le pod atteint, l'état, le nombre de connexions ouvertes et servies, et `d` arrête. Les
   tunnels vivent dans le processus kdt : ils suivent les changements de vue et de namespace, et
   disparaissent avec lui.
-- **Stockage** (`:storage`, `:pv`) — deux mondes par `g` (PVC → PV, SC → PV), `t` imbrique
-  parent/enfant, `f` ne garde que les problèmes, `n`/`0` changent de namespace. Détections :
-  StorageClass introuvable, aucune classe par défaut (ou deux), `WaitForFirstConsumer` en attente
-  d'un pod, classe sans provisioner, `ProvisioningFailed` laissé par le provisioner (son message
-  prime), PV `Released`, `reclaimPolicy: Delete` rappelé sur le PVC, PVC `RWO` monté par plusieurs
-  pods.
+- **Stockage** (`:storage`, `:pv`, `:snapshots`, `:attachments`) — quatre mondes par `g` (PVC → PV,
+  SC → PV, VolumeSnapshotClass → VolumeSnapshot → VolumeSnapshotContent, nœud → VolumeAttachment),
+  `t` imbrique parent/enfant, `f` ne garde que les problèmes (en gardant l'en-tête de chaque ligne
+  retenue), `n`/`0` changent de namespace. Les objets sans parent ont leur propre en-tête : PV et
+  snapshots dont la classe est absente, contenus de snapshot qu'aucun VolumeSnapshot ne désigne.
+  Détections :
+  - claims et volumes : StorageClass introuvable, aucune classe par défaut (ou deux),
+    `WaitForFirstConsumer` en attente d'un pod, classe sans provisioner, `ProvisioningFailed`
+    laissé par le provisioner (son message prime), PV `Released`, `reclaimPolicy: Delete` rappelé
+    sur le PVC, PVC `RWO` monté par plusieurs pods ;
+  - snapshots (CRD `snapshot.storage.k8s.io/v1`, absence signalée et non traitée en erreur) :
+    erreur du snapshot, pas prêt au-delà de 10 min, contenu lié absent (plus restaurable), classe
+    introuvable, claim source supprimée, contenu orphelin (`Retain` : toujours chez le
+    fournisseur), suppression retenue par un finalizer, plusieurs classes par défaut pour un même
+    pilote, pilote absent des CSIDriver, classe étiquetée pour velero ;
+  - attachements : VolumeAttachment fantôme (suppression demandée, PV disparu, finalizer qui
+    attend un détachement impossible — avec `attached=true`, vérifier le disque chez le
+    fournisseur avant de retirer le finalizer), échec d'attachement ou de détachement, pas attaché
+    au-delà de 5 min, nœud ou PV absent, emplacements d'attachement d'un nœud pleins ou à 80 %
+    (comptés contre `CSINode.allocatable`).
 - **Secrets / ConfigMaps** — inventaires, avec l'expiration des certificats TLS et leurs
   consommateurs. Les deux vues suivent la portée namespace de la session (`:cm <ns>`, `n`/`0`) et
   ne listent alors que ce namespace.
@@ -957,6 +973,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `identity.rs` | kdt-identity : comptes et groups locaux, invitation par exec dans le pod contrôleur |
 | `k8ssandra.rs` · `mgmtapi.rs` · `nodetool.rs` | K8ssandra/Medusa/Reaper, l'API de management Cassandra via le proxy apiserver, et `nodetool` lancé en Job |
 | `storage.rs` | PVC / PV / StorageClass et règles de diagnostic |
+| `csi.rs` | Snapshots CSI et VolumeAttachments, emplacements d'attachement par nœud |
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
 | `diagnostic.rs` · `spread.rs` · `extract.rs` · `pdf.rs` | Diagnostic, répartition des replicas, extraction, rendu Typst |
 | `enrich.rs` · `ai.rs` | Contexte lié à un évènement, client OpenAI |

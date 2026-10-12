@@ -745,12 +745,35 @@ impl ReflFilter {
     }
 }
 
-// The two object worlds the storage view toggles between (`g`): claims — what a workload asked for
-// and whether it got it — and volumes, grouped under the class that provisions them.
+// The object worlds the storage view cycles through (`g`): claims — what a workload asked for and
+// whether it got it —, volumes grouped under the class that provisions them, CSI snapshots grouped
+// under their class, and volume attachments grouped under the node they plug into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoWorld {
     Claims,
     Volumes,
+    Snapshots,
+    Attachments,
+}
+
+impl StoWorld {
+    fn next(self) -> Self {
+        match self {
+            StoWorld::Claims => StoWorld::Volumes,
+            StoWorld::Volumes => StoWorld::Snapshots,
+            StoWorld::Snapshots => StoWorld::Attachments,
+            StoWorld::Attachments => StoWorld::Claims,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            StoWorld::Claims => "claims",
+            StoWorld::Volumes => "volumes",
+            StoWorld::Snapshots => "snapshots",
+            StoWorld::Attachments => "attachments",
+        }
+    }
 }
 
 // One visual row of the storage view. Kept index-aligned with the snapshot so the detail panel and
@@ -763,6 +786,15 @@ enum StoRow {
     // Header of the volumes whose class is empty or unknown, with their count. Without it they trail
     // the last class's volumes at the same indent and read as belonging to it.
     NoClass(usize),
+    SnapClass(crate::csi::SnapClassResource),
+    Snapshot(crate::csi::SnapshotResource),
+    // The depth is carried: a content nests under its snapshot (2), or under the header of the
+    // contents no snapshot references (1), or nowhere when flat (0).
+    SnapContent(crate::csi::SnapContentResource, usize),
+    // A header that stands for no object: snapshots without a known class, unreferenced contents.
+    Group { uid: &'static str, label: &'static str, n: usize },
+    AttachNode(crate::csi::NodeAttachResource),
+    Attachment(crate::csi::AttachResource),
 }
 
 impl StoRow {
@@ -772,14 +804,21 @@ impl StoRow {
             StoRow::Claim(c) => &c.hints,
             StoRow::Volume(v) => &v.hints,
             StoRow::Class(c) => &c.hints,
-            StoRow::NoClass(_) => &[],
+            StoRow::NoClass(_) | StoRow::Group { .. } => &[],
+            StoRow::SnapClass(c) => &c.hints,
+            StoRow::Snapshot(v) => &v.hints,
+            StoRow::SnapContent(c, _) => &c.hints,
+            StoRow::AttachNode(n) => &n.hints,
+            StoRow::Attachment(a) => &a.hints,
         }
     }
 
-    // A volume nests under the row above it only when the grouping is on.
+    // How deep the row nests. Children nest only when the grouping is on.
     fn depth(&self, grouped: bool) -> usize {
+        if !grouped { return 0; }
         match self {
-            StoRow::Volume(_) if grouped => 1,
+            StoRow::Volume(_) | StoRow::Snapshot(_) | StoRow::Attachment(_) => 1,
+            StoRow::SnapContent(_, d) => *d,
             _ => 0,
         }
     }
@@ -1207,17 +1246,22 @@ fn k8c_keep_ancestors(rows: &[K8cRow], keep: &mut [bool]) {
     }
 }
 
-// The same rule for the storage view, one level deep: a kept volume keeps the class (or claim) it is
-// drawn under, or it slides under whichever header the filter happened to leave above it.
+// The same rule for the storage view: a kept volume keeps the class (or claim) it is drawn under, a
+// kept snapshot content its snapshot and class, or it slides under whichever header the filter
+// happened to leave above it.
 fn sto_keep_ancestors(rows: &[StoRow], keep: &mut [bool], grouped: bool) {
-    let mut parent: Option<usize> = None;
+    const DEPTHS: usize = 3;
+    let mut last_at: [Option<usize>; DEPTHS] = [None; DEPTHS];
     for (i, row) in rows.iter().enumerate() {
-        if row.depth(grouped) == 0 {
-            parent = Some(i);
-        } else if keep.get(i).copied().unwrap_or(false) {
-            if let Some(p) = parent {
-                keep[p] = true;
+        let d = row.depth(grouped).min(DEPTHS - 1);
+        if keep.get(i).copied().unwrap_or(false) {
+            for ancestor in last_at.iter().take(d).flatten() {
+                keep[*ancestor] = true;
             }
+        }
+        last_at[d] = Some(i);
+        for slot in last_at.iter_mut().skip(d + 1) {
+            *slot = None;
         }
     }
 }
@@ -1316,6 +1360,8 @@ const COMMANDS: &[(&str, &[&str])] = &[
     // `:pvc` land on the side of the view the user was already thinking in.
     ("storage", &["stockage", "pvc", "claims", "volumes"]),
     ("pv", &["persistentvolume", "persistentvolumes", "sc", "storageclass", "storageclasses"]),
+    ("snapshots", &["vs", "volumesnapshot", "volumesnapshots", "vsc", "volumesnapshotcontents", "vsclass"]),
+    ("attachments", &["va", "volumeattachment", "volumeattachments", "csinode", "csinodes"]),
     // Headroom: `:capacity` opens on the nodes, `:quota` straight on the quotas — the two ways one
     // arrives at this view. The workloads world is one `g` away.
     ("capacity", &["cap", "capacite", "marge", "headroom"]),
@@ -1395,6 +1441,7 @@ fn command_takes_ns(cmd: &str) -> bool {
             | "ingress"
             | "netpol"
             | "storage"
+            | "snapshots"
             | "quota"
             | "velero"
             | "restores"
@@ -4625,6 +4672,14 @@ impl App {
                 self.switch_view(origin, ns_arg);
                 self.enter_storage_mode(StoWorld::Volumes);
             }
+            "snapshots" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_storage_mode(StoWorld::Snapshots);
+            }
+            "attachments" => {
+                self.switch_view(origin, ns_arg);
+                self.enter_storage_mode(StoWorld::Attachments);
+            }
             _ => self.exit_command(),
         }
     }
@@ -5868,12 +5923,9 @@ impl App {
         self.refresh_storage_snapshot();
     }
 
-    // `g`: switch between the Claims and Volumes worlds (same inventory, no reload).
+    // `g`: cycle claims → volumes → snapshots → attachments (same inventory, no reload).
     fn cycle_storage_world(&mut self) {
-        self.sto_world = match self.sto_world {
-            StoWorld::Claims => StoWorld::Volumes,
-            StoWorld::Volumes => StoWorld::Claims,
-        };
+        self.sto_world = self.sto_world.next();
         self.last_sto_sel_uid = None;
         self.last_status_key = None;
         self.last_related_key = None;
@@ -5975,6 +6027,8 @@ impl App {
                     rows
                 }
                 (StoWorld::Volumes, false) => s.pvs.iter().cloned().map(StoRow::Volume).collect(),
+                (StoWorld::Snapshots, grouped) => sto_snapshot_rows(&s.csi, grouped),
+                (StoWorld::Attachments, grouped) => sto_attachment_rows(&s.csi, grouped),
             }
         };
         // The `f` filter drops rows before the search does, and both must cut `sto_rows` and the
@@ -14185,7 +14239,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) -> usize {
         Mode::Storage => {
             // `t` and `g` name what they switch *to*, so the bar reads as the next action.
             let toggle_label = if app.sto_group { st.k_sto_flat } else { st.k_sto_grouped };
-            let world_label = if app.sto_world == StoWorld::Claims { st.k_sto_volumes } else { st.k_sto_claims };
+            let world_label = match app.sto_world.next() {
+                StoWorld::Claims => st.k_sto_claims,
+                StoWorld::Volumes => st.k_sto_volumes,
+                StoWorld::Snapshots => st.k_sto_snapshots,
+                StoWorld::Attachments => st.k_sto_attachments,
+            };
             vec![
                 Span::styled(" : ", kbg), Span::raw(format!(" {}   ", st.k_command)),
                 Span::styled(" Esc ", kbg), Span::raw(format!(" {}   ", st.k_back)),
@@ -17500,7 +17559,77 @@ fn synthetic_storage_record(row: &StoRow) -> EventRecord {
         StoRow::Volume(v) => crate::storage::pv_record(v),
         StoRow::Class(c) => crate::storage::sc_record(c),
         StoRow::NoClass(n) => crate::storage::no_class_record(*n, st),
+        StoRow::SnapClass(c) => crate::csi::snap_class_record(c),
+        StoRow::Snapshot(v) => crate::csi::snapshot_record(v),
+        StoRow::SnapContent(c, _) => crate::csi::content_record(c),
+        StoRow::Group { uid, label, n } => crate::csi::header_record(uid, label, *n),
+        StoRow::AttachNode(n) => crate::csi::node_attach_record(n),
+        StoRow::Attachment(a) => crate::csi::attach_record(a),
     }
+}
+
+// The Snapshots world. Grouped: each class, its snapshots, each snapshot's bound content beneath
+// it; then the snapshots whose class is absent or unknown under their own header, and last the
+// contents no listed snapshot references — the ones still billed for nothing. Flat: classes,
+// snapshots, contents, each list on its own.
+fn sto_snapshot_rows(d: &crate::csi::CsiDiagnosed, grouped: bool) -> Vec<StoRow> {
+    let st = lang::active();
+    if !grouped {
+        let mut rows: Vec<StoRow> = d.snap_classes.iter().cloned().map(StoRow::SnapClass).collect();
+        rows.extend(d.snapshots.iter().cloned().map(StoRow::Snapshot));
+        rows.extend(d.contents.iter().cloned().map(|c| StoRow::SnapContent(c, 0)));
+        return rows;
+    }
+    let content_of = |s: &crate::csi::SnapshotResource| {
+        s.content.as_ref().and_then(|n| d.contents.iter().find(|c| &c.name == n)).cloned()
+    };
+    let mut rows = Vec::new();
+    let push_snapshot = |rows: &mut Vec<StoRow>, s: &crate::csi::SnapshotResource| {
+        rows.push(StoRow::Snapshot(s.clone()));
+        if let Some(c) = content_of(s) {
+            rows.push(StoRow::SnapContent(c, 2));
+        }
+    };
+    for c in &d.snap_classes {
+        rows.push(StoRow::SnapClass(c.clone()));
+        for s in d.snapshots.iter().filter(|s| s.class.as_deref() == Some(c.name.as_str())) {
+            push_snapshot(&mut rows, s);
+        }
+    }
+    let known: std::collections::HashSet<&str> =
+        d.snap_classes.iter().map(|c| c.name.as_str()).collect();
+    let unclassed: Vec<&crate::csi::SnapshotResource> = d
+        .snapshots
+        .iter()
+        .filter(|s| s.class.as_deref().is_none_or(|c| !known.contains(c)))
+        .collect();
+    if !unclassed.is_empty() {
+        rows.push(StoRow::Group { uid: "vs-no-class", label: st.sto_no_class_group, n: unclassed.len() });
+        for s in unclassed {
+            push_snapshot(&mut rows, s);
+        }
+    }
+    let loose = crate::csi::unreferenced_contents(d);
+    if !loose.is_empty() {
+        rows.push(StoRow::Group { uid: "vsc-loose", label: st.csi_orphan_contents_group, n: loose.len() });
+        rows.extend(loose.into_iter().cloned().map(|c| StoRow::SnapContent(c, 1)));
+    }
+    rows
+}
+
+// The Attachments world: each node with its attach slots, the attachments plugged into it beneath.
+fn sto_attachment_rows(d: &crate::csi::CsiDiagnosed, grouped: bool) -> Vec<StoRow> {
+    if !grouped {
+        return d.attachments.iter().cloned().map(StoRow::Attachment).collect();
+    }
+    let mut rows = Vec::new();
+    for n in &d.nodes {
+        rows.push(StoRow::AttachNode(n.clone()));
+        for a in d.attachments.iter().filter(|a| a.node == n.node) {
+            rows.push(StoRow::Attachment(a.clone()));
+        }
+    }
+    rows
 }
 
 // A usage value (CPU millicores / memory bytes) formatted, or a dim "—" when metrics are unavailable.
@@ -23417,6 +23546,30 @@ fn sto_phase_cell(phase: &str) -> Cell<'static> {
     Cell::from(phase.to_string()).style(Style::default().fg(color))
 }
 
+// The NAME cell of the CSI rows, marker and indent included, so the column width is measured on what
+// is drawn.
+fn sto_name(row: &StoRow, grouped: bool) -> String {
+    let pad = "    ".repeat(row.depth(grouped));
+    match row {
+        StoRow::SnapClass(c) => format!("▾ {}{}", c.name, if c.is_default { " (default)" } else { "" }),
+        StoRow::Group { label, .. } => format!("▾ {}", label),
+        StoRow::AttachNode(n) if n.exists => format!("▾ {}", n.node),
+        StoRow::AttachNode(n) => format!("▾ {} {}", n.node, lang::active().csi_node_gone_label),
+        StoRow::Snapshot(v) => format!("{}{}", pad, v.name),
+        StoRow::SnapContent(c, _) => format!("{}{}", pad, c.name),
+        StoRow::Attachment(a) => format!("{}{}", pad, a.name),
+        StoRow::Claim(c) => c.name.clone(),
+        StoRow::Volume(v) => format!("{}{}", pad, v.name),
+        StoRow::Class(c) => c.name.clone(),
+        StoRow::NoClass(_) => lang::active().sto_no_class_group.to_string(),
+    }
+}
+
+fn csi_phase_cell(phase: &str) -> Cell<'static> {
+    Cell::from(phase.to_string())
+        .style(Style::default().fg(line_color(crate::csi::csi_phase_tone(phase))))
+}
+
 // The grouping marker a claim gets: `▾` only when a volume is actually nested under it, so a Pending
 // claim does not advertise a child it does not have. The blank keeps the names column-aligned.
 fn sto_claim_prefix(grouped: bool, c: &PvcResource) -> &'static str {
@@ -23434,9 +23587,31 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let s = app.storage_state.lock().expect("storage poisoned");
         (s.loading, s.error.clone(), s.pvcs.len(), s.pvs.len(), s.classes.len(), s.released_bytes)
     };
+    let (n_vs, n_vsc, n_vsclass, n_va, n_nodes, snapshots_installed) = {
+        let s = app.storage_state.lock().expect("storage poisoned");
+        (
+            s.csi.snapshots.len(),
+            s.csi.contents.len(),
+            s.csi.snap_classes.len(),
+            s.csi.attachments.len(),
+            s.csi.nodes.len(),
+            s.csi.snapshots_installed,
+        )
+    };
     let src = &app.sto_rows;
 
-    let world = if app.sto_world == StoWorld::Claims { "claims" } else { "volumes" };
+    let world = app.sto_world.name();
+    let counts = match app.sto_world {
+        StoWorld::Claims | StoWorld::Volumes => format!("{} pvc · {} pv · {} class", n_pvc, n_pv, n_sc),
+        StoWorld::Snapshots => format!("{} vs · {} vsc · {} vsclass", n_vs, n_vsc, n_vsclass),
+        StoWorld::Attachments => format!("{} va · {} nodes", n_va, n_nodes),
+    };
+    // An empty Snapshots world on a cluster without the CRDs is not "no snapshot taken yet".
+    let absent = if app.sto_world == StoWorld::Snapshots && !snapshots_installed && !loading {
+        format!(" · {}", lang::active().csi_no_snapshot_crd)
+    } else {
+        String::new()
+    };
     // Released bytes go in the title rather than in a row: it is the one number that belongs to the
     // cluster and not to any single volume, and it is the reason to open this view at all.
     let waste = if released > 0 {
@@ -23450,28 +23625,36 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         "stockage (chargement...)".to_string()
     } else {
         format!(
-            "stockage/{} ({} pvc · {} pv · {} class){} · ns={} · [g] {} · [f] {}",
+            "stockage/{} ({}){}{} · ns={} · [g] {} · [f] {}",
             world,
-            n_pvc,
-            n_pv,
-            n_sc,
+            counts,
             waste,
+            absent,
             app.namespace_label,
-            if app.sto_world == StoWorld::Claims { "volumes" } else { "claims" },
+            app.sto_world.next().name(),
             app.sto_filter.label(),
         )
     };
 
-    let header_row = Row::new(vec![
-        Cell::from("NAMESPACE"), Cell::from("NAME"), Cell::from("KIND"), Cell::from("PHASE"),
-        Cell::from("SIZE"), Cell::from("ACCESS"), Cell::from("CLASS"), Cell::from("RECLAIM"),
-        Cell::from("USED BY"), Cell::from("AGE"),
-    ])
-    .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    // One column grid for every world; the headers say what each column holds in this one.
+    let headers: [&str; 10] = match app.sto_world {
+        StoWorld::Claims | StoWorld::Volumes => [
+            "NAMESPACE", "NAME", "KIND", "PHASE", "SIZE", "ACCESS", "CLASS", "RECLAIM", "USED BY", "AGE",
+        ],
+        StoWorld::Snapshots => [
+            "NAMESPACE", "NAME", "KIND", "READY", "SIZE", "", "CLASS", "POLICY", "SOURCE / DRIVER", "AGE",
+        ],
+        StoWorld::Attachments => [
+            "", "NAME", "KIND", "PHASE", "", "", "ATTACHED", "", "PV / SLOTS", "AGE",
+        ],
+    };
+    let header_row = Row::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
+        .style(Style::default().fg(Color::Black).bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     // Children are indented only when the grouping actually nests them: a volume is a child in both
     // worlds, a claim never is.
     let indent = if app.sto_group { "    " } else { "" };
+    let grouped = app.sto_group;
     let blank = || Cell::from("");
     let rows: Vec<Row> = src
         .iter()
@@ -23566,6 +23749,119 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     blank(),
                     blank(),
                 ]),
+                StoRow::Group { label, .. } => Row::new(vec![
+                    blank(),
+                    Cell::from(format!("▾ {}", label))
+                        .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
+                StoRow::SnapClass(c) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    };
+                    let driver = if c.velero { format!("{} · velero", c.driver) } else { c.driver.clone() };
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(sto_name(row, grouped)).style(name_style),
+                        Cell::from("VSClass").style(Style::default().fg(DIM)),
+                        blank(),
+                        blank(),
+                        blank(),
+                        blank(),
+                        Cell::from(c.deletion_policy.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(driver).style(Style::default().fg(DIM)),
+                        Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                StoRow::Snapshot(v) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color),
+                        None => Style::default(),
+                    };
+                    let source = match (&v.source_pvc, &v.content) {
+                        (Some(pvc), _) => format!("pvc:{}", pvc),
+                        (None, Some(content)) => format!("vsc:{}", content),
+                        _ => "—".to_string(),
+                    };
+                    Row::new(vec![
+                        Cell::from(v.namespace.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(sto_name(row, grouped)).style(name_style),
+                        Cell::from("VS").style(Style::default().fg(DIM)),
+                        csi_phase_cell(&v.phase),
+                        Cell::from(v.restore_size.clone()),
+                        blank(),
+                        Cell::from(v.class.clone().unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        blank(),
+                        Cell::from(source).style(Style::default().fg(DIM)),
+                        Cell::from(v.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                StoRow::SnapContent(c, _) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color),
+                        None => Style::default().fg(DIM),
+                    };
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(sto_name(row, grouped)).style(name_style),
+                        Cell::from("VSC").style(Style::default().fg(DIM)),
+                        csi_phase_cell(&c.phase),
+                        Cell::from(c.restore_size.clone()),
+                        blank(),
+                        Cell::from(c.class.clone().unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(c.deletion_policy.clone()).style(Style::default().fg(DIM)),
+                        Cell::from(c.snapshot.clone().unwrap_or_else(|| "—".to_string()))
+                            .style(Style::default().fg(DIM)),
+                        Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
+                StoRow::AttachNode(n) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    };
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(sto_name(row, grouped)).style(name_style),
+                        Cell::from("Node").style(Style::default().fg(DIM)),
+                        blank(),
+                        blank(),
+                        blank(),
+                        blank(),
+                        blank(),
+                        Cell::from(n.slots_label()).style(Style::default().fg(DIM)),
+                        blank(),
+                    ])
+                }
+                StoRow::Attachment(a) => {
+                    let name_style = match flag {
+                        Some(color) => Style::default().fg(color),
+                        None => Style::default(),
+                    };
+                    let target = if grouped { a.pv.clone() } else { format!("{} @ {}", a.pv, a.node) };
+                    Row::new(vec![
+                        blank(),
+                        Cell::from(sto_name(row, grouped)).style(name_style),
+                        Cell::from("VA").style(Style::default().fg(DIM)),
+                        csi_phase_cell(&a.phase),
+                        blank(),
+                        blank(),
+                        Cell::from(a.attached.to_string()).style(Style::default().fg(DIM)),
+                        blank(),
+                        Cell::from(target).style(Style::default().fg(DIM)),
+                        Cell::from(a.age.clone()).style(Style::default().fg(DIM)),
+                    ])
+                }
             }
         })
         .collect();
@@ -23583,12 +23879,15 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             StoRow::Volume(v) => format!("{}{}", indent, v.name),
             StoRow::Class(c) => format!("▾ {}{}", c.name, if c.is_default { " (default)" } else { "" }),
             StoRow::NoClass(_) => format!("▾ {}", lang::active().sto_no_class_group),
+            other => sto_name(other, grouped),
         })
         .collect();
     let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
     let name_w = col_width(names.iter().map(|s| s.as_str()), "NAME", 14, 40);
+    // `VSClass` is the one kind wider than the four columns `PVC`/`Node` need.
+    let kind_w = if app.sto_world == StoWorld::Snapshots { 7 } else { 4 };
     let widths = [
-        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(4),
+        Constraint::Length(ns_w), Constraint::Length(name_w), Constraint::Length(kind_w),
         Constraint::Length(10), Constraint::Length(8), Constraint::Length(8),
         Constraint::Length(16), Constraint::Length(8), Constraint::Min(16),
         Constraint::Length(5),
@@ -25875,6 +26174,106 @@ fn storage_detail_lines(
             )));
             Line::from(Span::styled(
                 format!(" {} ", st.sto_no_class_group),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::Group { label, n, .. } => {
+            lines.push(Line::from(format!(
+                "  {}",
+                lang::fill(st.csi_header_detail, &[("n", &n.to_string())])
+            )));
+            Line::from(Span::styled(
+                format!(" {} ", label),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::SnapClass(c) => {
+            lines.push(label("driver", dash(&c.driver)));
+            lines.push(label("deletionPolicy", dash(&c.deletion_policy)));
+            lines.push(label(
+                st.sto_lbl_default,
+                if c.is_default { st.lbl_yes } else { st.lbl_no }.to_string(),
+            ));
+            lines.push(label("velero", if c.velero { st.lbl_yes } else { st.lbl_no }.to_string()));
+            lines.push(label(st.lbl_age, c.age.clone()));
+            Line::from(Span::styled(
+                format!(" VolumeSnapshotClass {} ", c.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::Snapshot(v) => {
+            lines.push(label("phase", v.phase.clone()));
+            lines.push(label("restoreSize", dash(&v.restore_size)));
+            lines.push(label("snapshotClass", dash(v.class.as_deref().unwrap_or(""))));
+            lines.push(label("source", dash(v.source_pvc.as_deref().unwrap_or(""))));
+            lines.push(label("content", dash(v.content.as_deref().unwrap_or(""))));
+            if let Some(e) = &v.error {
+                lines.push(label("error", e.clone()));
+            }
+            if let Some(since) = &v.deleting_since {
+                lines.push(label("deletion", since.clone()));
+                lines.push(label("finalizers", v.finalizers.join(", ")));
+            }
+            lines.push(label(st.lbl_age, v.age.clone()));
+            Line::from(Span::styled(
+                format!(" VolumeSnapshot {}/{} ", v.namespace, v.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::SnapContent(c, _) => {
+            lines.push(label("phase", c.phase.clone()));
+            lines.push(label("restoreSize", dash(&c.restore_size)));
+            lines.push(label("driver", dash(&c.driver)));
+            lines.push(label("deletionPolicy", dash(&c.deletion_policy)));
+            lines.push(label("snapshotClass", dash(c.class.as_deref().unwrap_or(""))));
+            lines.push(label("volumeSnapshotRef", dash(c.snapshot.as_deref().unwrap_or(""))));
+            lines.push(label("snapshotHandle", dash(&c.handle)));
+            if let Some(e) = &c.error {
+                lines.push(label("error", e.clone()));
+            }
+            if let Some(since) = &c.deleting_since {
+                lines.push(label("deletion", since.clone()));
+                lines.push(label("finalizers", c.finalizers.join(", ")));
+            }
+            lines.push(label(st.lbl_age, c.age.clone()));
+            Line::from(Span::styled(
+                format!(" VolumeSnapshotContent {} ", c.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::AttachNode(n) => {
+            for slot in &n.slots {
+                let limit = slot.limit.map(|l| l.to_string()).unwrap_or_else(|| "—".to_string());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", slot.driver), Style::default().fg(DIM)),
+                    Span::raw(format!("{} / {}", slot.used, limit)),
+                ]));
+            }
+            Line::from(Span::styled(
+                format!(" Node {} ", n.node),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::Attachment(a) => {
+            lines.push(label("phase", a.phase.clone()));
+            lines.push(label("attacher", dash(&a.attacher)));
+            lines.push(label("node", dash(&a.node)));
+            lines.push(label("persistentVolume", dash(&a.pv)));
+            lines.push(label("attached", a.attached.to_string()));
+            lines.push(label("metadata", dash(&a.metadata)));
+            if let Some(e) = &a.attach_error {
+                lines.push(label("attachError", e.clone()));
+            }
+            if let Some(e) = &a.detach_error {
+                lines.push(label("detachError", e.clone()));
+            }
+            if let Some(since) = &a.deleting_since {
+                lines.push(label("deletion", since.clone()));
+                lines.push(label("finalizers", a.finalizers.join(", ")));
+            }
+            lines.push(label(st.lbl_age, a.age.clone()));
+            Line::from(Span::styled(
+                format!(" VolumeAttachment {} ", a.name),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))
         }
@@ -29689,6 +30088,10 @@ mod palette_tests {
         assert_eq!(sto, vec!["pv"]);
         assert_eq!(resolve_command("volumes"), Some("storage"));
         assert_eq!(resolve_command("persistentvolume"), Some("pv"));
+        assert_eq!(resolve_command("volumesnapshots"), Some("snapshots"));
+        assert_eq!(resolve_command("vs"), Some("snapshots"));
+        assert_eq!(resolve_command("va"), Some("attachments"));
+        assert_eq!(resolve_command("volumeattachments"), Some("attachments"));
     }
 
     // The three velero entries share a prefix on purpose — `backup` opens the view, and every
@@ -29713,7 +30116,7 @@ mod palette_tests {
         for word in [
             "configmap", "cm", "secret", "certificates", "svc", "ingress", "netpol", "pvc",
             "resourcequota", "vulnerabilities", "backups", "restore", "medusabackup", "pods",
-            "deployments", "rbac", "roles", "bindings",
+            "deployments", "rbac", "roles", "bindings", "vs", "volumesnapshots",
         ] {
             let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
             assert!(command_takes_ns(cmd), "{word} -> {cmd} refuses a namespace");
@@ -29726,7 +30129,7 @@ mod palette_tests {
     fn the_cluster_scoped_views_refuse_one() {
         for word in [
             "nodes", "capacity", "pv", "rancher", "argocd", "flux", "reflector", "kyverno",
-            "hooks", "webhooks", "conversion", "apiservice",
+            "hooks", "webhooks", "conversion", "apiservice", "va", "volumeattachments",
         ] {
             let cmd = resolve_command(word).unwrap_or_else(|| panic!("{word} resolves to nothing"));
             assert!(!command_takes_ns(cmd), "{word} -> {cmd} accepts a namespace it cannot apply");

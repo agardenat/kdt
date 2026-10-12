@@ -1997,7 +1997,110 @@ export interface ScRow {
   record: EventRecord;
 }
 
-export type StorageRow = PvcRow | PvRow | ScRow;
+/** Une classe de snapshot : quel pilote prend les snapshots, et ce qu'il advient du snapshot chez
+ * le fournisseur quand le VolumeSnapshot part. */
+export interface VsClassRow {
+  row: "vsclass";
+  uid: string;
+  name: string;
+  driver: string;
+  deletion_policy: string;
+  is_default: boolean;
+  /** Étiquetée pour le plugin CSI de velero : la classe que velero prend pour ce pilote. */
+  velero: boolean;
+  age: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Un VolumeSnapshot : `Ready`, `NotReady`, `Error` ou `Deleting`. */
+export interface VsRow {
+  row: "vs";
+  uid: string;
+  namespace: string;
+  name: string;
+  phase: string;
+  phase_tone: LineTone;
+  class: string | null;
+  /** La claim d'origine ; `null` pour un snapshot pré-provisionné. */
+  source_pvc: string | null;
+  /** Le VolumeSnapshotContent lié. */
+  content: string | null;
+  restore_size: string;
+  error: string | null;
+  age: string;
+  deleting_since: string | null;
+  finalizers: string[];
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Un VolumeSnapshotContent : le snapshot tel que le fournisseur le tient. */
+export interface VscRow {
+  row: "vsc";
+  uid: string;
+  name: string;
+  phase: string;
+  phase_tone: LineTone;
+  /** `spec.volumeSnapshotRef` en `namespace/name`. */
+  snapshot: string | null;
+  driver: string;
+  deletion_policy: string;
+  class: string | null;
+  /** Le handle chez le fournisseur : ce qui reste facturé quand plus rien ne le désigne. */
+  handle: string;
+  restore_size: string;
+  error: string | null;
+  age: string;
+  deleting_since: string | null;
+  finalizers: string[];
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Un VolumeAttachment : `Attached`, `Detached`, `Error` ou `Deleting`. */
+export interface VaRow {
+  row: "va";
+  uid: string;
+  name: string;
+  phase: string;
+  phase_tone: LineTone;
+  attacher: string;
+  node: string;
+  pv: string;
+  /** `status.attached` tel que l'attacher l'a écrit en dernier — figé sur un fantôme. */
+  attached: boolean;
+  attach_error: string | null;
+  detach_error: string | null;
+  metadata: string;
+  age: string;
+  deleting_since: string | null;
+  finalizers: string[];
+  hints: Hint[];
+  record: EventRecord;
+}
+
+/** Les emplacements d'un pilote sur un nœud : volumes attachés contre la limite du CSINode. */
+export interface NodeSlots {
+  driver: string;
+  used: number;
+  limit: number | null;
+}
+
+/** L'en-tête d'un nœud dans le monde des attachements. */
+export interface VaNodeRow {
+  row: "vanode";
+  uid: string;
+  node: string;
+  /** Faux quand l'objet Node a disparu : les attachements dessous sont des restes. */
+  exists: boolean;
+  slots: NodeSlots[];
+  slots_label: string;
+  hints: Hint[];
+  record: EventRecord;
+}
+
+export type StorageRow = PvcRow | PvRow | ScRow | VsClassRow | VsRow | VscRow | VaRow | VaNodeRow;
 
 export interface StoragePayload {
   pvcs: PvcRow[];
@@ -2009,6 +2112,13 @@ export interface StoragePayload {
   released_text: string;
   /** Faux quand les pods ont été refusés : « rien ne monte cette claim » n'est alors pas affirmé. */
   mounts_known: boolean;
+  snap_classes: VsClassRow[];
+  snapshots: VsRow[];
+  contents: VscRow[];
+  attachments: VaRow[];
+  attach_nodes: VaNodeRow[];
+  /** Faux quand les CRD `snapshot.storage.k8s.io` ne sont pas installées. */
+  snapshots_installed: boolean;
 }
 
 // --- Vue réseau : Services et Ingress ------------------------------------------------------------

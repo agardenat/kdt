@@ -1332,6 +1332,8 @@ body:has(.splitter.dragging) { cursor: row-resize; user-select: none; }
    filiation, et la classe garde la graisse d'une racine. */
 .tbody .tr.sto-class .cell.id { font-weight: 600; }
 .tbody .tr.sto-volume .cell.id.nested { padding-left: 1.15rem; color: var(--fg); }
+/* Le contenu d'un snapshot, un étage sous le snapshot lui-même. */
+.tbody .tr.sto-volume .cell.id.nested.deep { padding-left: 2.3rem; }
 .badge-default {
   font-size: var(--fs-micro); padding: 0 .3rem; border-radius: 3px; margin-left: .4rem;
   background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);

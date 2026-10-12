@@ -673,6 +673,9 @@ export interface Strings {
   stoDeletes: string;
   stoDefault: string;
   stoNoClass: string;
+  stoLooseContents: string;
+  stoNodeGone: string;
+  stoNoSnapshotCrd: string;
   stoMountedBy: string;
   stoBackend: string;
 
@@ -1686,6 +1689,9 @@ const FR: Strings = {
   stoDeletes: "reclaimPolicy Delete : supprimer la claim supprime la donnée.",
   stoDefault: "défaut",
   stoNoClass: "(classe absente)",
+  stoLooseContents: "(contenus sans snapshot)",
+  stoNodeGone: "nœud absent",
+  stoNoSnapshotCrd: "CRD snapshot.storage.k8s.io absentes : pas de snapshot CSI sur ce cluster.",
   stoMountedBy: "monté par",
   stoBackend: "backend",
 
@@ -2689,6 +2695,9 @@ const EN: Strings = {
   stoDeletes: "reclaimPolicy Delete: deleting the claim deletes the data.",
   stoDefault: "default",
   stoNoClass: "(class missing)",
+  stoLooseContents: "(contents without snapshot)",
+  stoNodeGone: "node missing",
+  stoNoSnapshotCrd: "snapshot.storage.k8s.io CRDs not installed: no CSI snapshots on this cluster.",
   stoMountedBy: "mounted by",
   stoBackend: "backend",
 
