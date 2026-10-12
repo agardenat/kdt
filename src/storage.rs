@@ -915,6 +915,25 @@ pub fn sc_record(c: &ScResource) -> crate::events::EventRecord {
     }
 }
 
+// The header of the volumes no class answers for. It stands for no object, so it carries no kind
+// and the generic gestures find nothing to act on — like velero's "no schedule" header.
+pub fn no_class_record(n: usize, st: &'static Strings) -> crate::events::EventRecord {
+    crate::events::EventRecord {
+        uid: "sto|no-class".to_string(),
+        time: k8s_openapi::jiff::Timestamp::now(),
+        severity: crate::events::Severity::Normal,
+        reason: String::new(),
+        api_version: String::new(),
+        kind: String::new(),
+        namespace: String::new(),
+        name: st.sto_no_class_group.to_string(),
+        message: n.to_string(),
+        component: String::new(),
+        host: String::new(),
+        count: 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

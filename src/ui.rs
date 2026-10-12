@@ -760,6 +760,9 @@ enum StoRow {
     Claim(PvcResource),
     Volume(PvResource),
     Class(ScResource),
+    // Header of the volumes whose class is empty or unknown, with their count. Without it they trail
+    // the last class's volumes at the same indent and read as belonging to it.
+    NoClass(usize),
 }
 
 impl StoRow {
@@ -769,6 +772,15 @@ impl StoRow {
             StoRow::Claim(c) => &c.hints,
             StoRow::Volume(v) => &v.hints,
             StoRow::Class(c) => &c.hints,
+            StoRow::NoClass(_) => &[],
+        }
+    }
+
+    // A volume nests under the row above it only when the grouping is on.
+    fn depth(&self, grouped: bool) -> usize {
+        match self {
+            StoRow::Volume(_) if grouped => 1,
+            _ => 0,
         }
     }
 
@@ -1191,6 +1203,21 @@ fn k8c_keep_ancestors(rows: &[K8cRow], keep: &mut [bool]) {
         last_at[d] = Some(i);
         for slot in last_at.iter_mut().skip(d + 1) {
             *slot = None;
+        }
+    }
+}
+
+// The same rule for the storage view, one level deep: a kept volume keeps the class (or claim) it is
+// drawn under, or it slides under whichever header the filter happened to leave above it.
+fn sto_keep_ancestors(rows: &[StoRow], keep: &mut [bool], grouped: bool) {
+    let mut parent: Option<usize> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if row.depth(grouped) == 0 {
+            parent = Some(i);
+        } else if keep.get(i).copied().unwrap_or(false) {
+            if let Some(p) = parent {
+                keep[p] = true;
+            }
         }
     }
 }
@@ -5936,9 +5963,15 @@ impl App {
                         }
                     }
                     let known: Vec<&str> = s.classes.iter().map(|c| c.name.as_str()).collect();
-                    for pv in s.pvs.iter().filter(|p| !known.contains(&p.storage_class.as_str())) {
-                        rows.push(StoRow::Volume(pv.clone()));
+                    let unclassed: Vec<&PvResource> = s
+                        .pvs
+                        .iter()
+                        .filter(|p| !known.contains(&p.storage_class.as_str()))
+                        .collect();
+                    if !unclassed.is_empty() {
+                        rows.push(StoRow::NoClass(unclassed.len()));
                     }
+                    rows.extend(unclassed.into_iter().cloned().map(StoRow::Volume));
                     rows
                 }
                 (StoWorld::Volumes, false) => s.pvs.iter().cloned().map(StoRow::Volume).collect(),
@@ -5946,10 +5979,13 @@ impl App {
         };
         // The `f` filter drops rows before the search does, and both must cut `sto_rows` and the
         // snapshot with the same keep-set or the selection stops matching what is drawn.
-        let rows: Vec<StoRow> = match self.sto_filter {
-            StoFilter::All => rows,
-            StoFilter::Problems => rows.into_iter().filter(StoRow::has_problem).collect(),
-        };
+        let grouped = self.sto_group;
+        let mut rows: Vec<StoRow> = rows;
+        if self.sto_filter == StoFilter::Problems {
+            let mut keep: Vec<bool> = rows.iter().map(StoRow::has_problem).collect();
+            sto_keep_ancestors(&rows, &mut keep, grouped);
+            retain_aligned(&mut rows, &keep);
+        }
         let recs: Vec<EventRecord> = rows.iter().map(synthetic_storage_record).collect();
         self.sto_rows = rows;
         let prev_uid = self
@@ -5959,7 +5995,8 @@ impl App {
             .map(|r| r.uid.clone())
             .or_else(|| self.selected_uid.clone());
         self.snapshot = recs;
-        if let Some(keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+        if let Some(mut keep) = search_keep(self.search_query.as_deref(), &self.snapshot) {
+            sto_keep_ancestors(&self.sto_rows, &mut keep, grouped);
             retain_aligned(&mut self.sto_rows, &keep);
             retain_aligned(&mut self.snapshot, &keep);
         }
@@ -17462,6 +17499,7 @@ fn synthetic_storage_record(row: &StoRow) -> EventRecord {
         StoRow::Claim(c) => crate::storage::pvc_record(c, st),
         StoRow::Volume(v) => crate::storage::pv_record(v),
         StoRow::Class(c) => crate::storage::sc_record(c),
+        StoRow::NoClass(n) => crate::storage::no_class_record(*n, st),
     }
 }
 
@@ -23515,6 +23553,19 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Cell::from(c.age.clone()).style(Style::default().fg(DIM)),
                     ])
                 }
+                StoRow::NoClass(_) => Row::new(vec![
+                    blank(),
+                    Cell::from(format!("▾ {}", lang::active().sto_no_class_group))
+                        .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                    blank(),
+                ]),
             }
         })
         .collect();
@@ -23531,6 +23582,7 @@ fn draw_storage_table(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             StoRow::Claim(c) => format!("{}{}", sto_claim_prefix(app.sto_group, c), c.name),
             StoRow::Volume(v) => format!("{}{}", indent, v.name),
             StoRow::Class(c) => format!("▾ {}{}", c.name, if c.is_default { " (default)" } else { "" }),
+            StoRow::NoClass(_) => format!("▾ {}", lang::active().sto_no_class_group),
         })
         .collect();
     let ns_w = col_width(ns_values, "NAMESPACE", 9, 24);
@@ -25813,6 +25865,16 @@ fn storage_detail_lines(
             lines.push(label(st.lbl_age, c.age.clone()));
             Line::from(Span::styled(
                 format!(" StorageClass {} ", c.name),
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        }
+        StoRow::NoClass(n) => {
+            lines.push(Line::from(format!(
+                "  {}",
+                lang::fill(st.sto_no_class_detail, &[("n", &n.to_string())])
+            )));
+            Line::from(Span::styled(
+                format!(" {} ", st.sto_no_class_group),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))
         }
@@ -32082,5 +32144,65 @@ mod ingress_widths {
         assert_eq!(ingress_elastic_widths(160, 37, 29), (19, 29, 20));
         assert_eq!(ingress_elastic_widths(240, 37, 29), (37, 29, 20));
         assert_eq!(ingress_elastic_widths(200, 10, 3), (10, 3, 20));
+    }
+}
+
+#[cfg(test)]
+mod storage_tree {
+    use super::*;
+
+    fn pv(name: &str, class: &str) -> PvResource {
+        PvResource {
+            name: name.into(),
+            capacity: "10Gi".into(),
+            access_modes: "RWX".into(),
+            reclaim_policy: "Retain".into(),
+            phase: "Bound".into(),
+            claim: None,
+            storage_class: class.into(),
+            source: String::new(),
+            node_affinity: String::new(),
+            age: String::new(),
+            uid: format!("pv|{name}"),
+            hints: Vec::new(),
+        }
+    }
+
+    fn sc(name: &str) -> ScResource {
+        ScResource {
+            name: name.into(),
+            provisioner: "csi".into(),
+            reclaim_policy: "Retain".into(),
+            binding_mode: "Immediate".into(),
+            allow_expansion: true,
+            is_default: false,
+            age: String::new(),
+            uid: format!("sc|{name}"),
+            hints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_kept_volume_keeps_its_own_header_not_the_previous_one() {
+        let rows = vec![
+            StoRow::Class(sc("sfs-standard-retain")),
+            StoRow::Volume(pv("pvc-1", "sfs-standard-retain")),
+            StoRow::NoClass(1),
+            StoRow::Volume(pv("nfs-shared", "")),
+        ];
+        let mut keep = vec![false, false, false, true];
+        sto_keep_ancestors(&rows, &mut keep, true);
+        assert_eq!(keep, vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn ungrouped_volumes_have_no_header_to_keep() {
+        let rows = vec![
+            StoRow::Class(sc("sbs-default")),
+            StoRow::Volume(pv("nfs-shared", "")),
+        ];
+        let mut keep = vec![false, true];
+        sto_keep_ancestors(&rows, &mut keep, false);
+        assert_eq!(keep, vec![false, true]);
     }
 }
