@@ -685,24 +685,26 @@ key that opened the pane moves towards the write. A ⛔ finding (`e`, `Ctrl-D`, 
 
 ## Configuration
 
-Optional JSON file, looked up in order: `$KDT_CONFIG` (or `$KEV_CONFIG`),
-`$XDG_CONFIG_HOME/kdt/config.json`, `~/.config/kdt/config.json`.
+Optional YAML file, looked up in order: `$KDT_CONFIG` (or `$KEV_CONFIG`),
+`$XDG_CONFIG_HOME/kdt/config.yaml`, `~/.config/kdt/config.yaml`.
 
-```json
-{
-  "language": "en",
-  "active_provider": "openai",
-  "providers": [
-    {
-      "name": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "api_key": "sk-...",
-      "model": "gpt-4o",
-      "context_window": 128000
-    },
-    { "name": "local", "base_url": "http://localhost:11434/v1", "api_key": "ollama", "model": "qwen2.5-coder" }
-  ]
-}
+The file was JSON up to 2.9: a `config.json` found where `config.yaml` is expected is converted at
+the first launch (same keys, same permissions) and set aside as `config.json.bak`. A `$KDT_CONFIG`
+ending in `.json` is still read as JSON.
+
+```yaml
+language: en
+active_provider: openai
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key: sk-...
+    model: gpt-4o
+    context_window: 128000
+  - name: local
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    model: qwen2.5-coder
 ```
 
 `m` cycles through providers at runtime; the active one shows in the AI status bar (`[EN · openai]`).
@@ -717,6 +719,68 @@ sent to the API. Behind a multi-model proxy, declare the window of the **smalles
 The `hide_top_panel` key remembers the last fold of the top pane (`²`): it is rewritten on its own
 at every keypress, like `language`, and brings the interface back in the same state next session.
 
+### Jump hosts
+
+A cluster that only a jump host can see keeps its kubeconfig entry: the `jumps` key says how to get
+there. The first hop is a local command that opens a shell on the jump host (a bastion CLI, an
+`ssh`…); the next ones are lines typed at each shell prompt. At the end of the chain kdt switches
+the terminal to raw mode and runs `nc` to the API server there: the kube client goes through that
+stream via a local SOCKS5 proxy, and the certificate is checked against the kubeconfig's name.
+
+```yaml
+jumps:
+  - name: dc2
+    contexts: [prod-dc2]
+    command: [bastion-cli, connect, jump-01]
+    then:
+      - exec ssh -t -e none -l %u admin-02.dc2.example
+```
+
+| Key | Role | Default |
+|---|---|---|
+| `name` | Name of the jump, used in messages | — |
+| `contexts` | Kubeconfig contexts reached through this jump (exact name) | `[]` |
+| `command` | First hop: program and arguments, run in a pseudo-terminal | — |
+| `then` | Next hops: one line typed at each prompt, in order, `%u` = account | `[]` |
+| `user` | Account that `%u` stands for in `then`; when absent it is asked once on the terminal | — |
+| `encode` | Escape the upstream and decode it with `python3` on the last hop, instead of `connect` | `false` |
+| `connect` | What opens the stream on the last hop; `%h`, `%p` = API server host and port | `nc %h %p` |
+| `ready` | Regular expression of the shell prompt, matched on the last line | `[$#] ?$` |
+| `prompt` | Regular expression of a question to ask (password, code) | password, passphrase, code |
+| `escape` | Escape character of the first hop's `ssh`, `none` if it has none | `~` |
+| `open_timeout` | Time allowed to open a session, in seconds, typing excluded | `120` |
+| `spare` | Sessions opened ahead of time, up to the final prompt | `2` |
+| `max_sessions` | Sessions open at the same time | `12` |
+
+- **One session per connection**: a terminal carries a single stream, so each TCP connection of the
+  client uses one. Spare sessions make a new connection immediate; they are reopened in the
+  background as they get used.
+- **Account**: a `%u` in a `then` line is replaced by `user`, or failing that by an account asked
+  once, in clear, in the opening window, before the first session. It only goes through if it has
+  the shape of an account name (letters, digits, `. _ @ -`), and stays in memory like the answers.
+- **Questions**: a question matched by `prompt` (and the `%u` account) is asked in a kdt window,
+  input hidden for a secret, when kdt starts or when the context is opened with `:ctx`; the window
+  shows the hop being reached, never what the sessions print. The answer stays in memory for as long
+  as kdt runs and answers the same questions of later sessions; a new question in the background
+  fails the session, and the error carries the end of its output. `Esc` abandons, `r` retries after
+  a failure.
+- **Shell prompt**: `ready` recognises a prompt ending in `$` or `#`. For a decorated prompt over two
+  lines, kdt types a probe (`printf` of a marker) as soon as the terminal goes quiet without asking
+  anything: the marker coming back says the shell is listening.
+- **ssh escape**: the first hop's `ssh` normally has a terminal, hence an active `~` escape; kdt
+  doubles every `~` at the start of a line, the sequence ssh forwards as a single `~`. The hops in
+  `then` must turn theirs off (`ssh -e none`): only one level is compensated.
+- **`encode`**: a bastion CLI that drives its `ssh` through pexpect (to type the password) relays the
+  terminal with `interact()`, which stops at the first `0x1d` byte it receives — a TLS stream sends
+  one during its handshake, and the connection ends in `tls handshake eof`. With `encode: true`, kdt
+  escapes the control bytes, `~` and `!` of the upstream, and a `python3` relay typed on the last
+  hop decodes them before the API server; the downstream stays raw. `python3` is needed on the last
+  hop, and its absence is named.
+- **`connect`**: its first word is looked up with `command -v` on the last hop, and its absence is
+  named. Without `nc`, `ncat %h %p` or `socat - TCP:%h:%p` will do.
+- **`E`** (`kubectl exec`) goes through the same proxy, via `HTTPS_PROXY`; a `proxy-url` in the
+  kubeconfig would take precedence for `kubectl`, and kdt ignores it for a jump context.
+
 ### Language
 
 The whole UI is bilingual (panes, diagnostics, PDF reports, prompts). Selection order: the
@@ -724,7 +788,7 @@ The whole UI is bilingual (panes, diagnostics, PDF reports, prompts). Selection 
 gives French, anything else English), else French.
 
 `L` switches at runtime, even inside a view, and rewrites **only the `language` key** of the config
-file (everything else, permissions included, is left alone). Kubernetes jargon stays in English on
+file (everything else, comments and permissions included, is left alone). Kubernetes jargon stays in English on
 both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
 
 ### Environment variables
@@ -750,10 +814,14 @@ both sides (`pod`, `node`, `taint`, `requests`…), as do column headers.
   endpoints only. Only bookkeeping metadata is stripped, not application data.
 - **Endpoint**: an `http://` `base_url` sends the key and the payload in the clear. Prefer `https://`
   or a local endpoint.
-- **API key**: stored in clear text in `config.json` — `chmod 600`. It is never logged.
+- **API key**: stored in clear text in the config file — `chmod 600`. It is never logged.
 - **Cluster access**: read-only apart from the writes listed above, all of which the API refuses if
   the kubeconfig isn't allowed. Two shell-outs, both on demand: `$EDITOR` (`e`) and
   `kubectl exec -it` (`E`).
+- **Jump hosts**: the `command` and the `then` lines are run as written. The local SOCKS5 proxy
+  listens on `127.0.0.1` and requires a token drawn at startup, or any local process could use the
+  jump; answers to questions only live in memory. The API server host is only typed into the
+  remote shell if it has the shape of a host name or an address.
 - **PDF rendering**: AI content is escaped before being evaluated as Typst markup, and code blocks
   go through `raw()` — no injection possible.
 
@@ -933,6 +1001,7 @@ Application logs: `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kdt
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, edit, delete, touch |
 | `diagnostic.rs` · `spread.rs` · `extract.rs` · `pdf.rs` | Diagnostic, replica placement, extraction, Typst rendering |
 | `enrich.rs` · `ai.rs` | Context related to an event, OpenAI client |
+| `jump.rs` | Jump hosts: pseudo-terminal sessions, token-protected local SOCKS5 proxy |
 | `lang.rs` · `clip.rs` | FR/EN string table, OSC 52 clipboard |
 
 Stack: Rust 2021 · `kube` 3.1 (rustls, socks5) · `k8s-openapi` 0.27 · `ratatui` 0.30 · `tokio` ·

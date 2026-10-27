@@ -47,9 +47,11 @@ unicode-width = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # The client stack of `connect.rs`, rebuilt to slot in a DNS resolver that sorts IPv4 first.
 # All three are already transitive dependencies of kube: naming them costs no extra compilation.
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "tokio"] }
 hyper-timeout = "0.5"
 tower = { version = "0.5", features = ["util"] }
+# Le pseudo-terminal des rebonds (`jump.rs`) : openpty, setsid, termios. Déjà dans l'arbre.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

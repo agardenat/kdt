@@ -79,8 +79,15 @@ fn shell_command() -> String {
 // exit code is the only trace left of them.
 pub async fn run(target: &Target, context: Option<&str>) -> Result<(), String> {
     let (program, args) = command_line(target, context);
-    let status = tokio::process::Command::new(&program)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args);
+    // A cluster behind a jump host is only reachable through kdt's own proxy: kubectl is pointed at
+    // it the standard way, which it honours as long as the kubeconfig gives no `proxy-url`.
+    let ctx = context.map(String::from).or_else(crate::current_context);
+    if let Some(url) = ctx.as_deref().and_then(crate::jump::proxy_url_for) {
+        cmd.env("HTTPS_PROXY", &url).env("https_proxy", &url).env_remove("NO_PROXY").env_remove("no_proxy");
+    }
+    let status = cmd
         .status()
         .await
         .map_err(|e| format!("{program} : {e}"))?;

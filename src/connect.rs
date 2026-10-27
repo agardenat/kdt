@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use anyhow::Result;
 use hyper_timeout::TimeoutConnector;
 use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
+use hyper_util::client::legacy::connect::proxy::SocksV5;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use kube::client::{Body, ConfigExt};
@@ -47,7 +48,37 @@ pub fn build(config: Config) -> Result<Client> {
     connector.set_connect_timeout(config.connect_timeout);
     connector.set_read_timeout(config.read_timeout);
     connector.set_write_timeout(config.write_timeout);
+    assemble(config, connector)
+}
 
+/// Build the client for a context reached through a jump host: the same stack, over the jump's
+/// local SOCKS5 listener.
+///
+/// kube's own socks5 support cannot carry the listener's token, so the connector is built here.
+/// The host name goes to the proxy unresolved — only the last hop can resolve it — and a
+/// `proxy-url` in the kubeconfig is set aside: the jump is the way to this cluster. No connect
+/// timeout: opening a session through the hops has its own (`open_timeout`), and may wait on a
+/// slot.
+pub fn build_via(config: Config, proxy: &crate::jump::Proxy) -> Result<Client> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let socks = SocksV5::new(proxy.uri().parse()?, http).with_auth(crate::jump::USER.to_string(), proxy.token.clone());
+    let https = config.rustls_https_connector_with_connector(socks)?;
+
+    let mut connector = TimeoutConnector::new(https);
+    connector.set_read_timeout(config.read_timeout);
+    connector.set_write_timeout(config.write_timeout);
+    assemble(config, connector)
+}
+
+fn assemble<C>(config: Config, connector: TimeoutConnector<C>) -> Result<Client>
+where
+    TimeoutConnector<C>: Service<http::Uri> + Clone + Send + Sync + 'static,
+    <TimeoutConnector<C> as Service<http::Uri>>::Response:
+        hyper_util::client::legacy::connect::Connection + hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
+    <TimeoutConnector<C> as Service<http::Uri>>::Future: Send + Unpin + 'static,
+    <TimeoutConnector<C> as Service<http::Uri>>::Error: Into<tower::BoxError>,
+{
     let hyper = hyper_util::client::legacy::Builder::new(TokioExecutor::new()).build::<_, Body>(connector);
 
     let default_ns = config.default_namespace.clone();

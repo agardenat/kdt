@@ -41,6 +41,7 @@ pub mod extract;
 pub mod flux;
 pub mod hooks;
 pub mod identity;
+pub mod jump;
 pub mod k8ssandra;
 pub mod kyverno;
 pub mod lang;
@@ -97,7 +98,19 @@ pub async fn build_client(context: Option<&str>) -> Result<(Client, String)> {
         None => Config::infer().await?,
     };
     let url = config.cluster_url.to_string();
+    // A context behind a jump host keeps its kubeconfig entry: only the way there changes.
+    let jumps = config::load().jumps;
+    let name = context.map(String::from).or_else(current_context);
+    if let Some(jump) = name.as_deref().and_then(|c| jump::for_context(&jumps, c)) {
+        let proxy = jump::proxy(jump).await?;
+        return Ok((connect::build_via(config, &proxy)?, url));
+    }
     Ok((connect::build(config)?, url))
+}
+
+/// Le contexte courant du kubeconfig, celui qu'on utilise sans `--context`.
+pub fn current_context() -> Option<String> {
+    kube::config::Kubeconfig::read().ok()?.current_context
 }
 
 /// Les libellés (contexte, cluster) affichés dans le bandeau, lus dans le kubeconfig.

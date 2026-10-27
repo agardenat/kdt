@@ -18,6 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::DefaultTerminal;
 
+use crate::jump::{JumpConfig, JumpEvent};
 use crate::lang;
 
 // Long enough for a VPN handshake or a cold API server, short enough that a black hole is called
@@ -217,6 +218,185 @@ fn draw(f: &mut ratatui::Frame, state: &Probe, target: &Target<'_>) {
                     Probe::Failed(_) => Color::Red,
                 })),
         );
+    f.render_widget(p, popup);
+}
+
+enum Opening {
+    Running(Instant),
+    Failed(String),
+}
+
+struct Question {
+    prompt: String,
+    hidden: bool,
+    input: String,
+    reply: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
+/// The window that opens a jump host before the cluster is probed: the hop being reached, and the
+/// questions of the hops (account, password) asked in place. What the sessions print stays behind
+/// it — a bastion's banners are not the user's business unless a hop fails, and then the error
+/// carries the end of it.
+pub async fn jump(terminal: &mut DefaultTerminal, cfg: &JumpConfig, context: &str, stay: Option<&str>) -> Result<Outcome> {
+    let mut events = EventStream::new();
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // Polled in place rather than spawned: dropping it on `Esc` is what closes the sessions.
+    let mut task = Box::pin(crate::jump::prepare(cfg, tx.clone()));
+    let mut state = Opening::Running(Instant::now());
+    let mut hop: Option<(usize, usize, String)> = None;
+    let mut question: Option<Question> = None;
+
+    loop {
+        terminal.draw(|f| draw_jump(f, cfg, context, stay, &state, hop.as_ref(), question.as_ref()))?;
+
+        tokio::select! {
+            res = &mut task, if matches!(state, Opening::Running(_)) => match res {
+                Ok(()) => return Ok(Outcome::Ready),
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    tracing::warn!(jump = %cfg.name, error = %err, "jump not opened");
+                    state = Opening::Failed(err);
+                    question = None;
+                }
+            },
+            Some(ev) = rx.recv() => match ev {
+                JumpEvent::Hop { n, total, what } => hop = Some((n, total, what)),
+                JumpEvent::Ask { prompt, hidden, reply } => {
+                    question = Some(Question { prompt, hidden, input: String::new(), reply });
+                }
+            },
+            _ = ticker.tick() => {}
+            Some(Ok(ev)) = events.next() => {
+                let Event::Key(k) = ev else { continue };
+                if k.kind != KeyEventKind::Press { continue }
+                if k.code == KeyCode::Esc || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)) {
+                    return Ok(Outcome::Aborted);
+                }
+                // While a question is up, every printable key belongs to the answer, `q` included.
+                if question.is_some() {
+                    match k.code {
+                        KeyCode::Enter => {
+                            if let Some(q) = question.take() {
+                                let _ = q.reply.send(Some(q.input));
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(q) = question.as_mut() {
+                                q.input.pop();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(q) = question.as_mut() {
+                                q.input.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Char('q') => return Ok(Outcome::Aborted),
+                    KeyCode::Char('r') if matches!(state, Opening::Failed(_)) => {
+                        task = Box::pin(crate::jump::prepare(cfg, tx.clone()));
+                        state = Opening::Running(Instant::now());
+                        hop = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn draw_jump(
+    f: &mut ratatui::Frame,
+    cfg: &JumpConfig,
+    context: &str,
+    stay: Option<&str>,
+    state: &Opening,
+    hop: Option<&(usize, usize, String)>,
+    question: Option<&Question>,
+) {
+    let st = lang::active();
+    let area = f.area();
+    let width = 76.min(area.width.saturating_sub(4)).max(24);
+    let text_width = width.saturating_sub(4) as usize;
+    let indented = |text: &str, style: Style| -> Vec<Line<'static>> {
+        wrap(text, text_width)
+            .into_iter()
+            .map(|l| Line::from(vec![Span::raw("  "), Span::styled(l, style)]))
+            .collect()
+    };
+
+    let title = lang::fill(st.jump_opening_title, &[("name", &cfg.name)]);
+    let (headline, color) = match state {
+        // Nothing is being waited for while the question is up: no spinner, no clock.
+        Opening::Running(_) if question.is_some() => (format!("▸  {}", title), Color::Yellow),
+        Opening::Running(since) => {
+            let spinner = SPINNER[(since.elapsed().as_millis() / 100) as usize % SPINNER.len()];
+            (format!("{}  {}  {}s", spinner, title, since.elapsed().as_secs()), Color::Yellow)
+        }
+        Opening::Failed(_) => (format!("✗  {}", title), Color::Red),
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(headline, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        field("context", context),
+    ];
+    if let Some((n, total, what)) = hop {
+        let label = lang::fill(st.jump_hop, &[("n", &n.to_string()), ("total", &total.to_string())]);
+        lines.push(field("jump", &label));
+        lines.extend(indented(what, Style::default().fg(Color::DarkGray)));
+    }
+
+    if let Some(q) = question {
+        lines.push(Line::from(""));
+        lines.extend(indented(&q.prompt, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let shown = if q.hidden { "•".repeat(q.input.chars().count()) } else { q.input.clone() };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+            Span::styled(shown, Style::default().fg(Color::White)),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+    if let Opening::Failed(err) = state {
+        lines.push(Line::from(""));
+        lines.extend(indented(err, Style::default().fg(Color::Red)));
+    }
+
+    let leave = match stay {
+        Some(ctx) => lang::fill(st.splash_stay, &[("ctx", ctx)]),
+        None => match state {
+            Opening::Running(_) => st.splash_abort.to_string(),
+            Opening::Failed(_) => st.k_quit.to_string(),
+        },
+    };
+    let keys = match (state, question) {
+        (Opening::Running(_), Some(_)) => format!("Enter  {}    Esc  {}", st.jump_validate, leave),
+        (Opening::Running(_), None) => format!("Esc  {}", leave),
+        (Opening::Failed(_), _) => format!("r  {}    q  {}", st.splash_retry, leave),
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::raw("  "), Span::styled(keys, Style::default().fg(Color::DarkGray))]));
+
+    let height = (lines.len() as u16 + 3).min(area.height);
+    let popup = centered(width, height, area);
+    f.render_widget(Clear, popup);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" kdt v{} ", env!("CARGO_PKG_VERSION")))
+            .border_style(Style::default().fg(match state {
+                Opening::Running(_) => Color::Cyan,
+                Opening::Failed(_) => Color::Red,
+            })),
+    );
     f.render_widget(p, popup);
 }
 

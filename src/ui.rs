@@ -12113,7 +12113,16 @@ pub async fn run(mut app: App, rebuild: impl Fn(Switch) -> App) -> Result<()> {
         server: &app.api_url,
         stay: None,
     };
-    let outcome = crate::splash::run(&mut terminal, app.client.clone(), target).await;
+    // A jump host opens first, in its own window: the probe would only time out without it.
+    let jumps = config::load().jumps;
+    let outcome = match crate::jump::for_context(&jumps, &app.context_label) {
+        Some(j) => crate::splash::jump(&mut terminal, j, &app.context_label, None).await,
+        None => Ok(crate::splash::Outcome::Ready),
+    };
+    let outcome = match outcome {
+        Ok(crate::splash::Outcome::Ready) => crate::splash::run(&mut terminal, app.client.clone(), target).await,
+        other => other,
+    };
     match outcome {
         Ok(crate::splash::Outcome::Ready) => {}
         Ok(crate::splash::Outcome::Aborted) => {
@@ -12284,6 +12293,21 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
         // user chose to enter anyway) replaces it.
         if let Some(ctx) = app.pending_context.take() {
             let st = lang::t(app.ai_language);
+            // A jump host with no session waiting opens in its own window first, where its
+            // questions are asked; `Esc` there stays on this session.
+            let jumps = crate::config::load().jumps;
+            if let Some(j) = crate::jump::for_context(&jumps, &ctx).filter(|j| !crate::jump::is_warm(j)) {
+                drop(events);
+                let outcome = crate::splash::jump(terminal, j, &ctx, Some(&app.context_label)).await?;
+                events = EventStream::new();
+                if matches!(outcome, crate::splash::Outcome::Aborted) {
+                    app.clipboard_status = Some((
+                        std::time::Instant::now(),
+                        lang::fill(st.msg_ctx_stayed, &[("ctx", &app.context_label)]),
+                    ));
+                    continue;
+                }
+            }
             match crate::build_client(Some(&ctx)).await {
                 Err(e) => {
                     let err = e.to_string();

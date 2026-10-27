@@ -697,24 +697,26 @@ annulent, seule la touche qui a ouvert le panneau avance vers l'écriture. Un co
 
 ## Configuration
 
-Fichier JSON optionnel, cherché dans l'ordre : `$KDT_CONFIG` (ou `$KEV_CONFIG`),
-`$XDG_CONFIG_HOME/kdt/config.json`, `~/.config/kdt/config.json`.
+Fichier YAML optionnel, cherché dans l'ordre : `$KDT_CONFIG` (ou `$KEV_CONFIG`),
+`$XDG_CONFIG_HOME/kdt/config.yaml`, `~/.config/kdt/config.yaml`.
 
-```json
-{
-  "language": "fr",
-  "active_provider": "openai",
-  "providers": [
-    {
-      "name": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "api_key": "sk-...",
-      "model": "gpt-4o",
-      "context_window": 128000
-    },
-    { "name": "local", "base_url": "http://localhost:11434/v1", "api_key": "ollama", "model": "qwen2.5-coder" }
-  ]
-}
+Le fichier était en JSON jusqu'à la 2.9 : un `config.json` trouvé à la place du `config.yaml`
+attendu est converti au premier lancement (mêmes clés, mêmes permissions) et mis de côté en
+`config.json.bak`. Un `$KDT_CONFIG` qui finit en `.json` reste lu en JSON.
+
+```yaml
+language: fr
+active_provider: openai
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key: sk-...
+    model: gpt-4o
+    context_window: 128000
+  - name: local
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    model: qwen2.5-coder
 ```
 
 `m` fait défiler les fournisseurs à chaud ; l'actif est affiché dans le bandeau IA (`[FR · openai]`).
@@ -730,6 +732,70 @@ déclarer la fenêtre du **plus petit** modèle atteignable.
 La clé `hide_top_panel` retient le dernier pli du panneau du haut (`²`) : elle est réécrite seule à
 chaque appui, comme `language`, et relit l'interface dans le même état à la session suivante.
 
+### Rebonds
+
+Un cluster que seul un hôte de rebond voit garde son entrée dans le kubeconfig : la clé `jumps`
+dit par où passer pour l'atteindre. Le premier saut est une commande locale qui ouvre un shell sur
+l'hôte de rebond (une CLI de bastion, un `ssh`…) ; les suivants sont des lignes tapées à l'invite de
+chaque shell. Au bout de la chaîne, kdt passe le terminal en mode brut et y lance `nc` vers
+l'apiserver : le client kube emprunte ce flux par un proxy SOCKS5 local, et le certificat est
+vérifié contre le nom du kubeconfig.
+
+```yaml
+jumps:
+  - name: dc2
+    contexts: [prod-dc2]
+    command: [bastion-cli, connect, jump-01]
+    then:
+      - exec ssh -t -e none -l %u admin-02.dc2.example
+```
+
+| Clé | Rôle | Défaut |
+|---|---|---|
+| `name` | Nom du rebond, repris dans les messages | — |
+| `contexts` | Contextes du kubeconfig joints par ce rebond (nom exact) | `[]` |
+| `command` | Premier saut : programme et arguments, lancé dans un pseudo-terminal | — |
+| `then` | Sauts suivants : une ligne tapée à chaque invite, dans l'ordre, `%u` = compte | `[]` |
+| `user` | Compte que `%u` remplace dans `then` ; absent, il est demandé une fois sur le terminal | — |
+| `encode` | Échappe le flux montant et le décode par `python3` sur le dernier saut, à la place de `connect` | `false` |
+| `connect` | Ce qui ouvre le flux sur le dernier saut ; `%h`, `%p` = hôte et port de l'apiserver | `nc %h %p` |
+| `ready` | Expression régulière de l'invite du shell, lue sur la dernière ligne | `[$#] ?$` |
+| `prompt` | Expression régulière d'une question à poser (mot de passe, code) | mot de passe, phrase de passe, code |
+| `escape` | Caractère d'échappement du `ssh` du premier saut, `none` s'il n'en a pas | `~` |
+| `open_timeout` | Délai d'ouverture d'une session, en secondes, hors saisie | `120` |
+| `spare` | Sessions ouvertes d'avance jusqu'à l'invite finale | `2` |
+| `max_sessions` | Sessions ouvertes en même temps | `12` |
+
+- **Une session par connexion** : un terminal ne porte qu'un flux, chaque connexion TCP du client en
+  consomme une. Les sessions de réserve rendent une nouvelle connexion immédiate ; elles sont
+  réouvertes en tâche de fond à mesure qu'elles servent.
+- **Compte** : un `%u` dans une ligne de `then` est remplacé par `user`, ou à défaut par un compte
+  demandé une fois, en clair, dans la fenêtre d'ouverture, avant la première session. Il ne passe
+  que s'il a la forme d'un nom de compte (lettres, chiffres, `. _ @ -`), et reste en mémoire comme
+  les réponses.
+- **Questions** : une question reconnue par `prompt` (et le compte de `%u`) est posée dans une
+  fenêtre de kdt, saisie masquée pour un secret, au lancement ou à l'ouverture du contexte par
+  `:ctx` ; la fenêtre montre le saut en cours, jamais ce que les sessions affichent. La réponse
+  reste en mémoire pour la durée de kdt et répond aux mêmes questions des sessions suivantes ; une
+  question nouvelle en tâche de fond fait échouer la session, et l'erreur reprend la fin de sa
+  sortie. `Échap` abandonne, `r` réessaie après un échec.
+- **Invite du shell** : `ready` reconnaît une invite qui finit par `$` ou `#`. Pour une invite
+  décorée, sur deux lignes, kdt tape une sonde (`printf` d'un marqueur) dès que le terminal se tait
+  sans poser de question : le marqueur revenu dit que le shell écoute.
+- **Échappement ssh** : le `ssh` du premier saut a normalement un terminal, donc l'échappement `~`
+  actif ; kdt double chaque `~` en début de ligne, la séquence que ssh transmet comme un `~` seul.
+  Les sauts de `then` doivent couper le leur (`ssh -e none`), un seul niveau se compense.
+- **`encode`** : une CLI de bastion qui pilote son `ssh` par pexpect (saisie du mot de passe) relaie
+  le terminal par `interact()`, qui s'arrête au premier octet `0x1d` reçu — un flux TLS en envoie
+  dès sa poignée de main, et la connexion finit en `tls handshake eof`. Avec `encode: true`, kdt
+  échappe les octets de contrôle, `~` et `!` du flux montant, et un relais `python3` tapé sur le
+  dernier saut les décode avant l'apiserver ; le flux descendant reste brut. Il faut `python3` sur
+  le dernier saut, son absence est nommée.
+- **`connect`** : son premier mot est cherché par `command -v` sur le dernier saut, son absence est
+  nommée. Sans `nc`, `ncat %h %p` ou `socat - TCP:%h:%p` conviennent.
+- **`E`** (`kubectl exec`) passe par le même proxy, via `HTTPS_PROXY` ; un `proxy-url` dans le
+  kubeconfig prendrait le pas chez `kubectl`, et kdt l'ignore pour un contexte à rebond.
+
 ### Langue
 
 Toute l'interface est bilingue (panneaux, diagnostics, rapports PDF, prompts). L'ordre de choix :
@@ -737,7 +803,7 @@ clé `language` du fichier de config, puis la locale système (`LC_ALL`, `LC_MES
 `LANGUAGE` — `fr*` donne le français, le reste l'anglais), sinon le français.
 
 `L` bascule à chaud, y compris à l'intérieur d'une vue, et réécrit **la seule clé `language`** du
-fichier de config (le reste et les permissions sont laissés tels quels). Le jargon Kubernetes reste
+fichier de config (le reste, commentaires et permissions compris, est laissé tel quel). Le jargon Kubernetes reste
 en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les en-têtes de colonnes.
 
 ### Variables d'environnement
@@ -765,10 +831,15 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
   bookkeeping sont retirées, pas les données applicatives.
 - **Endpoint** : un `base_url` en `http://` envoie la clé et le payload en clair. Préférer `https://`
   ou un endpoint local.
-- **Clé API** : en clair dans `config.json` — `chmod 600`. Elle n'est jamais journalisée.
+- **Clé API** : en clair dans le fichier de config — `chmod 600`. Elle n'est jamais journalisée.
 - **Accès cluster** : lecture seule sauf les écritures listées plus haut, toutes refusées par l'API
   si le kubeconfig n'en a pas le droit. Deux shell-out, à la demande : `$EDITOR` (`e`) et
   `kubectl exec -it` (`E`).
+- **Rebonds** : la commande de `command` et les lignes de `then` sont lancées telles qu'écrites.
+  Le proxy SOCKS5 local écoute sur `127.0.0.1` et exige un jeton tiré au lancement, sans quoi
+  n'importe quel processus local emprunterait le rebond ; les réponses aux questions ne vivent
+  qu'en mémoire. L'hôte de l'apiserver n'est tapé dans le shell distant que s'il a la forme d'un
+  nom d'hôte ou d'une adresse.
 - **Rendu PDF** : le contenu IA est échappé avant évaluation comme markup Typst, les blocs de code
   passent par `raw()` — pas d'injection possible.
 
@@ -977,6 +1048,7 @@ Logs applicatifs : `$KDT_LOG`, `$XDG_STATE_HOME/kdt/kdt.log`, `~/.local/state/kd
 | `yaml.rs` · `edit.rs` · `delete.rs` · `touch.rs` | YAML, édition, suppression, touch |
 | `diagnostic.rs` · `spread.rs` · `extract.rs` · `pdf.rs` | Diagnostic, répartition des replicas, extraction, rendu Typst |
 | `enrich.rs` · `ai.rs` | Contexte lié à un évènement, client OpenAI |
+| `jump.rs` | Rebonds : sessions en pseudo-terminal, proxy SOCKS5 local à jeton |
 | `lang.rs` · `clip.rs` | Table de chaînes FR/EN, presse-papier OSC 52 |
 
 Stack : Rust 2021 · `kube` 3.1 (rustls, socks5) · `k8s-openapi` 0.27 · `ratatui` 0.30 · `tokio` ·
