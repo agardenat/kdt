@@ -8,6 +8,31 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.10.0] — 2026-10-27
+
+- **feat(jump)** — rebonds : un cluster que seul un hôte de rebond voit garde son entrée dans le
+  kubeconfig, et la clé `jumps` du fichier de config dit par où passer. Le premier saut est une
+  commande locale qui ouvre un shell (une CLI de bastion, un `ssh`…), les suivants des lignes tapées
+  à chaque invite (`then`, `%u` pour le compte) ; au bout, kdt passe le terminal en mode brut et y
+  ouvre le flux vers l'apiserver. Le client kube l'emprunte par un proxy SOCKS5 local protégé par
+  un jeton, `E` (`kubectl exec`) aussi via `HTTPS_PROXY`, et le certificat reste vérifié contre le
+  nom du kubeconfig :
+  - compte et mots de passe des sauts demandés une fois, dans une fenêtre de kdt au lancement ou au
+    `:ctx`, gardés en mémoire pour les sessions suivantes ; le déroulé des sessions n'est jamais
+    montré, la fin de leur sortie seulement quand un saut échoue ;
+  - une session par connexion, des sessions de réserve ouvertes d'avance (`spare`), et les premières
+    connexions qui attendent la fenêtre au lieu d'ouvrir les leurs ;
+  - invite du shell reconnue par `ready`, ou par une sonde tapée quand le terminal se tait — une
+    invite décorée sur deux lignes ne bloque plus un saut ;
+  - échappement `~` du `ssh` du premier saut compensé ; `encode: true` échappe le flux montant et le
+    décode par `python3` sur le dernier saut, pour une CLI qui relaie le terminal par pexpect
+    (`interact()` s'arrête au premier octet `0x1d`, et la connexion finissait en
+    `tls handshake eof`).
+- **feat(config)** — le fichier de config passe en YAML (`~/.config/kdt/config.yaml`) : un
+  `config.json` trouvé à sa place est converti au premier lancement, mêmes clés et mêmes
+  permissions, et gardé en `config.json.bak`. `L` et `²` ne réécrivent que la ligne de leur clé, les
+  commentaires restent.
+
 ## [2.9.0] — 2026-10-12
 
 - **feat(storage)** — la vue stockage gagne deux mondes, dans le TUI (`g` fait le tour claims →
