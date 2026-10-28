@@ -750,41 +750,44 @@ fn encode_into(data: &[u8], out: &mut Vec<u8>) {
 }
 
 // The last hop's end of `encode`: connects to the apiserver, decodes what comes from the terminal,
-// copies the answer back untouched. Shipped in base64 so that it is typed as one line with no quote
-// of its own.
-const RELAY: &str = "import os,socket,select,sys
-s=socket.create_connection((sys.argv[1],int(sys.argv[2])))
-i=sys.stdin.fileno()
-o=sys.stdout.fileno()
-p=False
+// copies the answer back untouched. Typed in clear between single quotes, so that the shell history
+// and the session audit of the last hop show what runs; it holds no quote of its own.
+const RELAY: &str = "# kdt jump relay: TCP to the apiserver, upstream unescaped (byte 33 announces byte+64)
+import os, select, socket, sys
+sock = socket.create_connection((sys.argv[1], int(sys.argv[2])))
+inp = sys.stdin.fileno()
+out = sys.stdout.fileno()
+pending = False
 while True:
-    r=select.select([i,s],[],[])[0]
-    if s in r:
-        d=s.recv(65536)
-        if not d:
+    ready = select.select([inp, sock], [], [])[0]
+    if sock in ready:
+        data = sock.recv(65536)
+        if not data:
             break
-        while d:
-            d=d[os.write(o,d):]
-    if i in r:
-        d=os.read(i,65536)
-        if not d:
+        while data:
+            data = data[os.write(out, data):]
+    if inp in ready:
+        data = os.read(inp, 65536)
+        if not data:
             break
-        b=bytearray()
-        for c in d:
-            if p:
-                b.append((c-64)&255)
-                p=False
-            elif c==33:
-                p=True
+        plain = bytearray()
+        for c in data:
+            if pending:
+                plain.append((c - 64) & 255)
+                pending = False
+            elif c == 33:
+                pending = True
             else:
-                b.append(c)
-        s.sendall(b)
+                plain.append(c)
+        sock.sendall(plain)
 ";
 
 fn relay_command(host: &str, port: u16) -> String {
-    use base64::Engine;
-    let code = base64::engine::general_purpose::STANDARD.encode(RELAY);
-    format!("python3 -c \"import base64;exec(base64.b64decode('{code}'))\" {host} {port}")
+    format!("python3 -c {} {host} {port}", shell_quote(RELAY))
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 // What ssh's escape handling turns back into `data`: an escape character at the start of a line is
@@ -1039,7 +1042,17 @@ mod tests {
             }
         }
         assert_eq!(back, all);
-        assert_eq!(ESC, 33, "RELAY tests c==33");
+        assert_eq!(ESC, 33, "RELAY tests c == 33");
+    }
+
+    #[test]
+    fn the_relay_is_typed_in_clear() {
+        assert!(!RELAY.contains(['\'', '!', '~', '\t', '\\']), "{RELAY}");
+        let cmd = relay_command("api.example", 6443);
+        assert!(cmd.starts_with("python3 -c '# kdt jump relay"), "{cmd}");
+        assert!(cmd.ends_with("\n' api.example 6443"), "{cmd}");
+        assert!(!cmd.contains("base64") && !cmd.contains("exec("), "{cmd}");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

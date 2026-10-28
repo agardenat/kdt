@@ -789,8 +789,9 @@ jumps:
   le terminal par `interact()`, qui s'arrête au premier octet `0x1d` reçu — un flux TLS en envoie
   dès sa poignée de main, et la connexion finit en `tls handshake eof`. Avec `encode: true`, kdt
   échappe les octets de contrôle, `~` et `!` du flux montant, et un relais `python3` tapé sur le
-  dernier saut les décode avant l'apiserver ; le flux descendant reste brut. Il faut `python3` sur
-  le dernier saut, son absence est nommée.
+  dernier saut les décode avant l'apiserver ; le flux descendant reste brut. Le script du relais est
+  tapé en clair entre apostrophes (`python3 -c '…'`), lisible tel quel dans l'historique et l'audit de
+  session du dernier saut. Il faut `python3` sur le dernier saut, son absence est nommée.
 - **`connect`** : son premier mot est cherché par `command -v` sur le dernier saut, son absence est
   nommée. Sans `nc`, `ncat %h %p` ou `socat - TCP:%h:%p` conviennent.
 - **`E`** (`kubectl exec`) passe par le même proxy, via `HTTPS_PROXY` ; un `proxy-url` dans le

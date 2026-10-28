@@ -774,8 +774,9 @@ jumps:
   terminal with `interact()`, which stops at the first `0x1d` byte it receives — a TLS stream sends
   one during its handshake, and the connection ends in `tls handshake eof`. With `encode: true`, kdt
   escapes the control bytes, `~` and `!` of the upstream, and a `python3` relay typed on the last
-  hop decodes them before the API server; the downstream stays raw. `python3` is needed on the last
-  hop, and its absence is named.
+  hop decodes them before the API server; the downstream stays raw. The relay script is typed in clear
+  between single quotes (`python3 -c '…'`), readable as is in the shell history and session audit of
+  the last hop. `python3` is needed on the last hop, and its absence is named.
 - **`connect`**: its first word is looked up with `command -v` on the last hop, and its absence is
   named. Without `nc`, `ncat %h %p` or `socat - TCP:%h:%p` will do.
 - **`E`** (`kubectl exec`) goes through the same proxy, via `HTTPS_PROXY`; a `proxy-url` in the
