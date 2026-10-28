@@ -8,6 +8,13 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.10.1] — 2026-10-28
+
+- **fix(jump)** — avec `encode: true`, le relais `python3` du dernier saut est tapé en clair
+  (`python3 -c '…'`) et non plus en base64 décodé par `exec` : l'historique du shell et l'audit de
+  session du saut montrent le script tel qu'il s'exécute, un motif qu'un EDR ne prend plus pour une
+  charge masquée.
+
 ## [2.10.0] — 2026-10-27
 
 - **feat(jump)** — rebonds : un cluster que seul un hôte de rebond voit garde son entrée dans le
