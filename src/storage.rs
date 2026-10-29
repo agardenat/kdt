@@ -25,6 +25,7 @@ use kube::api::{Api, ListParams};
 use kube::Client;
 
 use crate::events::format_age;
+use crate::nsscope::{self, NsScope};
 
 // Annotation marking the cluster's default StorageClass. The `beta` spelling is still what several
 // distributions (and anything provisioned a few years ago) write, so both are accepted.
@@ -185,15 +186,15 @@ pub struct StorageInventory {
 // requête, et c'est la seule différence entre les deux appels.
 pub async fn storage_inventory(
     client: &Client,
-    namespace: Option<String>,
+    scope: &NsScope,
     st: &'static Strings,
 ) -> Result<StorageInventory, String> {
     let classes_raw = list_classes(client).await.unwrap_or_default();
     let pvs_read = list_volumes(client).await.ok();
-    let pvcs_raw = list_claims(client, &namespace).await?;
+    let pvcs_raw = list_claims(client, scope).await?;
 
     let (mounts, csi_raw) =
-        futures::join!(list_mounts(client, &namespace), crate::csi::fetch_csi(client, &namespace));
+        futures::join!(list_mounts(client, scope), crate::csi::fetch_csi(client, scope));
     let pv_names: Option<HashSet<String>> =
         pvs_read.as_ref().map(|pvs| pvs.iter().map(|p| p.name.clone()).collect());
     let claim_keys: HashSet<String> =
@@ -201,7 +202,7 @@ pub async fn storage_inventory(
     let csi = crate::csi::diagnose_csi(
         csi_raw,
         &crate::csi::CsiContext {
-            namespace: &namespace,
+            scope,
             pvs: pv_names.as_ref(),
             pvcs: &claim_keys,
         },
@@ -215,7 +216,7 @@ pub async fn storage_inventory(
     // cluster this is the common case and the request is skipped entirely.
     let has_pending = pvcs_raw.iter().any(|c| c.phase == "Pending");
     let events = if has_pending {
-        claim_events(client, &namespace).await
+        claim_events(client, scope).await
     } else {
         HashMap::new()
     };
@@ -226,7 +227,7 @@ pub async fn storage_inventory(
     Ok(StorageInventory { diagnosed, csi, mounts_known })
 }
 
-pub async fn fetch_storage(client: Client, namespace: Option<String>, state: SharedStorage) {
+pub async fn fetch_storage(client: Client, scope: NsScope, state: SharedStorage) {
     let st = crate::lang::active();
     {
         let mut s = state.lock().expect("storage poisoned");
@@ -234,7 +235,7 @@ pub async fn fetch_storage(client: Client, namespace: Option<String>, state: Sha
         s.error = None;
     }
 
-    let inventory = match storage_inventory(&client, namespace, st).await {
+    let inventory = match storage_inventory(&client, &scope, st).await {
         Ok(inv) => inv,
         Err(e) => {
             let mut s = state.lock().expect("storage poisoned");
@@ -274,14 +275,11 @@ async fn list_volumes(client: &Client) -> Result<Vec<PvResource>, String> {
 
 async fn list_claims(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> Result<Vec<PvcResource>, String> {
-    let api: Api<PersistentVolumeClaim> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
-    let mut out: Vec<PvcResource> = list.items.iter().map(claim_resource).collect();
+    let items: Vec<PersistentVolumeClaim> =
+        nsscope::list(client, scope, &ListParams::default()).await.map_err(|e| e.to_string())?;
+    let mut out: Vec<PvcResource> = items.iter().map(claim_resource).collect();
     out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Ok(out)
 }
@@ -290,15 +288,11 @@ async fn list_claims(
 // which is not the same answer as "no pod mounts anything".
 async fn list_mounts(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> Option<HashMap<(String, String), Vec<String>>> {
-    let api: Api<Pod> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api.list(&ListParams::default()).await.ok()?;
+    let items: Vec<Pod> = nsscope::list(client, scope, &ListParams::default()).await.ok()?;
     let mut out: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for pod in &list.items {
+    for pod in &items {
         let ns = pod.metadata.namespace.clone().unwrap_or_default();
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
         let Some(volumes) = pod.spec.as_ref().map(|s| &s.volumes) else { continue };
@@ -325,17 +319,13 @@ async fn list_mounts(
 // selector keeps this to claim events instead of pulling the whole cluster's event stream.
 async fn claim_events(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> HashMap<(String, String), String> {
-    let api: Api<K8sEvent> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
     let lp = ListParams::default().fields("involvedObject.kind=PersistentVolumeClaim");
-    let Ok(list) = api.list(&lp).await else { return HashMap::new() };
+    let Ok(items) = nsscope::list::<K8sEvent>(client, scope, &lp).await else { return HashMap::new() };
 
     let mut out: HashMap<(String, String), (i64, String)> = HashMap::new();
-    for ev in &list.items {
+    for ev in &items {
         let reason = ev.reason.clone().unwrap_or_default();
         if !matches!(
             reason.as_str(),

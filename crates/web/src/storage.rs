@@ -69,7 +69,7 @@ pub async fn list(
     let st = lang_of(&query.lang);
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
-    let inventory = match kdt::storage::storage_inventory(&client, namespace, st).await {
+    let inventory = match kdt::storage::storage_inventory(&client, &namespace.into(), st).await {
         Ok(inv) => inv,
         // Les claims sont la seule dépendance dure : sans elles la vue n'a rien à dire, donc c'est
         // bien une erreur et non une liste vide qui ferait croire à un cluster sans stockage.

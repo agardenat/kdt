@@ -3,6 +3,7 @@
 //! shared, mutex-guarded state struct that the UI polls.
 
 use crate::lang::fill;
+use crate::nsscope::NsScope;
 use kube::api::DynamicObject;
 use kube::core::GroupVersionKind;
 use kube::discovery::{self, Scope};
@@ -194,49 +195,57 @@ pub fn new_buffer() -> SharedBuffer {
 // Spawn a background task that watches Events and maintains a bounded ring buffer (`capacity`).
 // On reconnect the watcher re-emits objects, so an existing record with the same uid is replaced
 // in place to keep counts/messages fresh. The outer loop restarts the stream after any error.
+// A scope of several namespaces runs one watch per namespace inside the same task, so aborting the
+// handle stops them all.
 pub fn spawn_watcher(
     client: Client,
-    namespace: Option<String>,
+    scope: NsScope,
     buffer: SharedBuffer,
     capacity: usize,
 ) -> JoinHandle<()> {
+    let apis = crate::nsscope::apis(&scope, |ns| match ns {
+        Some(ns) => Api::<K8sEvent>::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    });
     tokio::spawn(async move {
-        let api: Api<K8sEvent> = match namespace {
-            Some(ns) => Api::namespaced(client, &ns),
-            None => Api::all(client),
-        };
+        futures::future::join_all(
+            apis.into_iter().map(|api| watch_into(api, buffer.clone(), capacity)),
+        )
+        .await;
+    })
+}
+
+async fn watch_into(api: Api<K8sEvent>, buffer: SharedBuffer, capacity: usize) {
+    loop {
+        let stream = watcher(api.clone(), watcher::Config::default())
+            .default_backoff()
+            .applied_objects();
+        tokio::pin!(stream);
 
         loop {
-            let stream = watcher(api.clone(), watcher::Config::default())
-                .default_backoff()
-                .applied_objects();
-            tokio::pin!(stream);
-
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(ev)) => {
-                        let rec = EventRecord::from_k8s(ev);
-                        let mut buf = buffer.lock().expect("buffer poisoned");
-                        if !rec.uid.is_empty() {
-                            if let Some(pos) = buf.iter().rposition(|r| r.uid == rec.uid) {
-                                buf.remove(pos);
-                            }
+            match stream.try_next().await {
+                Ok(Some(ev)) => {
+                    let rec = EventRecord::from_k8s(ev);
+                    let mut buf = buffer.lock().expect("buffer poisoned");
+                    if !rec.uid.is_empty() {
+                        if let Some(pos) = buf.iter().rposition(|r| r.uid == rec.uid) {
+                            buf.remove(pos);
                         }
-                        if buf.len() >= capacity {
-                            buf.pop_front();
-                        }
-                        buf.push_back(rec);
-                    }                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "watcher stream error, backing off");
-                        break;
                     }
+                    if buf.len() >= capacity {
+                        buf.pop_front();
+                    }
+                    buf.push_back(rec);
+                }                    Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "watcher stream error, backing off");
+                    break;
                 }
             }
-
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-    })
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 #[derive(Default, Debug, Clone)]

@@ -93,7 +93,7 @@ pub async fn list(
     // pas une absence : les faits restent inconnus, et les règles s'abstiennent.
     let (secrets, secrets_error) = match kdt::secrets::secrets(
         client.clone(),
-        Some(scope.clone()).filter(|s| !s.is_empty()),
+        &Some(scope.clone()).filter(|s| !s.is_empty()).into(),
     )
     .await
     {

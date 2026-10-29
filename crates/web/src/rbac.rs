@@ -83,7 +83,7 @@ pub async fn list(
     // Déplié : le pliage est un état de la personne qui regarde. Chaque ligne porte en revanche le
     // pli que kdt poserait, pour que le navigateur n'ait pas à redire quelle branche mérite d'être
     // ouverte — sur un vrai cluster l'arbre des sujets fait des milliers de lignes.
-    let nodes = build_rbac_rows(&graph, query.orient, query.min_sev, ns, &HashSet::new());
+    let nodes = build_rbac_rows(&graph, query.orient, query.min_sev, &ns.into(), &HashSet::new());
     let rows: Vec<serde_json::Value> = nodes.iter().map(|node| row_json(&graph, node)).collect();
 
     axum::Json(serde_json::json!({
@@ -433,7 +433,7 @@ mod tests {
         let bindings = vec![binding()];
         let (roles, sas, subjects, order) = (vec![], vec![], vec![], vec![]);
         let g = graph(&bindings, &roles, &sas, &subjects, &order);
-        let nodes = build_rbac_rows(&g, RbacOrient::Flat, Severity::Info, None, &HashSet::new());
+        let nodes = build_rbac_rows(&g, RbacOrient::Flat, Severity::Info, &kdt::nsscope::NsScope::All, &HashSet::new());
         let v = row_json(&g, &nodes[0]);
 
         assert_eq!(v["row"], "binding");
@@ -461,7 +461,7 @@ mod tests {
         let bindings = vec![binding(), low];
         let (roles, sas, subjects, order) = (vec![], vec![], vec![], vec![]);
         let g = graph(&bindings, &roles, &sas, &subjects, &order);
-        let nodes = build_rbac_rows(&g, RbacOrient::Flat, Severity::High, None, &HashSet::new());
+        let nodes = build_rbac_rows(&g, RbacOrient::Flat, Severity::High, &kdt::nsscope::NsScope::All, &HashSet::new());
         assert_eq!(nodes.len(), 1);
         assert_eq!(row_json(&g, &nodes[0])["binding_name"], "ci-admin");
     }
@@ -492,7 +492,7 @@ mod tests {
         let (bindings, sas, subjects) = (vec![], vec![], vec![]);
         let order = vec![0usize];
         let g = graph(&bindings, &roles, &sas, &subjects, &order);
-        let nodes = build_rbac_rows(&g, RbacOrient::Role, Severity::Info, None, &HashSet::new());
+        let nodes = build_rbac_rows(&g, RbacOrient::Role, Severity::Info, &kdt::nsscope::NsScope::All, &HashSet::new());
         let v = row_json(&g, &nodes[0]);
         assert_eq!(v["row"], "role");
         assert_eq!(v["is_template"], true);

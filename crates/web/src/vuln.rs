@@ -112,10 +112,11 @@ fn payload(
     min: Sev,
     st: &'static Strings,
 ) -> serde_json::Value {
-    let (crit, high, med, low) = inv.counts(ns);
-    let scanned = inv.scanned(ns);
+    let scope: kdt::nsscope::NsScope = ns.into();
+    let (crit, high, med, low) = inv.counts(&scope);
+    let scanned = inv.scanned(&scope);
     let rows: Vec<serde_json::Value> =
-        vuln_rows(&inv, ns, min).iter().map(|row| row_json(row, st)).collect();
+        vuln_rows(&inv, &scope, min).iter().map(|row| row_json(row, st)).collect();
     let error = if inv.available { inv.error } else { None };
 
     serde_json::json!({

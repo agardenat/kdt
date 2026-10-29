@@ -60,7 +60,7 @@ kdt [OPTIONS]
 
 | Option | Description | Default |
 |---|---|---|
-| `-n, --namespace <NS>` | Namespace to watch | all |
+| `-n, --namespace <NS>` | Namespace(s) to watch, comma-separated | all |
 | `-A, --all-namespaces` | All namespaces | — |
 | `--context <CTX>` | kubeconfig context | current context |
 | `--buffer-size <N>` | Event buffer size | `5000` |
@@ -72,8 +72,14 @@ IPv6 for the API server, IPv4 is tried first. The app starts on the events view.
 
 `:` opens a k9s-style prompt: `Tab` completes, `Enter` runs, `Esc` cancels. Every view whose rows are
 namespaced objects takes a namespace argument (`:cm kube-system`, `:pods istio-system`, `:certs
-prod`) — marked `[ns]` below; `all` (or `*`/`0`) targets every namespace. The namespace picked this
-way becomes the session scope, shown in the `ns=` banner. The cluster-scoped views (`nodes`,
+prod`) — marked `[ns]` below; `all` (or `*`/`0`) targets every namespace. Several namespaces are
+typed one after the other, separated by spaces or commas (`:wl app app-db monitoring`): completion
+only works on the last word and does not offer one already typed again, and a name the cluster does
+not have is reported. Each namespace is read by its own list, never by a cluster-wide list filtered
+afterwards, which works with rights limited to those namespaces. The scope picked this way becomes
+the session scope, shown in the `ns=` banner. On a row, `n` replaces the scope with the row's
+namespace, `N` adds it to the scope or takes it out (except in the events view, where `N` stays the
+pod's nodes), `0` goes back to the whole cluster. The cluster-scoped views (`nodes`,
 `capacity`, `pv`, `rancher`, `identity`) and those built as a graph across namespaces (`flux`,
 `reflector`, `argocd`, `kyverno`) take no argument, and say so if given one. `rbac` takes a namespace
 while still reading the whole cluster: the scope picks the rows that are drawn, not what is read (see
@@ -161,24 +167,24 @@ same), and `E` (shell) targets the context on screen.
 | View | Keys |
 |---|---|
 | Events | `s` freeze scrolling · `Tab` Logs/Status/Related tab · `a`/`w`/`x` All/Warnings/Errors filter · `p`/`C`/`f` logs previous run/container/follow · `n`/`0` namespace filter · `N` nodes of the pod · `E` shell · `D` diagnostic · `X` PDF export |
-| Workloads | `t` list ↔ tree · `Space` (or `→`/`←`) unfold the pod into its containers · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
+| Workloads | `t` list ↔ tree · `Space` (or `→`/`←`) unfold the pod into its containers · `s` scale · `r` rescale/recycle/restart · `E` shell · `p`/`C`/`f` logs · `n`/`N`/`0` namespace |
 | Nodes | `u` usage view · `s` sort · `o` cordon/uncordon/drain · `p`/`P` PDF export |
-| Capacity | `g` world (nodes → workloads → quotas) · `f` problems only · `n`/`0` namespace (workloads and quotas worlds) |
+| Capacity | `g` world (nodes → workloads → quotas) · `f` problems only · `n`/`N`/`0` namespace (workloads and quotas worlds) |
 | FluxCD | `r` reconcile menu · `Ctrl-R` unblock · `z` suspend/resume · `t` table ↔ tree · `Space` fold/unfold · `a` auto-reveal of the branches reconciling or failing · `←`/`→` pan the message of the selected row (`Home` resets it) · `l` logs of every controller · `Tab` Logs/Status/Related/Inventory tab |
-| Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) · `n`/`0` namespace |
-| cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME · `n`/`0` namespace |
+| Vulnerabilities | `f` severity floor (all → HIGH+ → CRIT) · `n`/`N`/`0` namespace |
+| cert-manager | `Space` fold/unfold · `t` tree ↔ list · `←`/`→` pan the message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` jump to the Secret · `r` renew, restart ACME · `n`/`N`/`0` namespace |
 | Kyverno | `Space` fold/unfold · `t` by policy ↔ by resource · `←`/`→` pan the message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge stuck `UpdateRequest`s) |
 | Reflector | `Space` fold/unfold · `g` sources → mirrors → orphans · `f` ALL/PROBLEMS · `s` jump to the source · `r` force re-reflection |
 | rancher-backup | `Space` fold/unfold a recurring Backup's archives · `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup now, restore the last archive |
-| Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`0` namespace |
+| Velero | `g` backups → restores → storage · `t` grouping · `f` filter · `+`/`-` backup contents · `o` actions · `l` run log · `n`/`N`/`0` namespace |
 | K8ssandra | `Space` fold/unfold · `g` cluster → backups → operations · `f` ALL/PROBLEMS · `l` log of the container at fault · `s` node stats (tpstats, compactionstats, netstats) or Reaper repairs · `S` node snapshots (listsnapshots) · `x` nodetool command as a Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (issue a token, change a TTL, revoke, set a setting) · `h` touch a Project · `e` and `Ctrl-D` deliberately absent |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (invite, close the sessions, disable/enable, membership, create, copy the subject) · in the invitation overlay: `l` copies the link, `c` copies the code |
-| RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`0` namespace |
-| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `s` the Ingress TLS Secret · `n`/`0` namespace |
+| RBAC | `Space` fold/unfold · `t` flat → by subject → by binding → by role · `f` severity floor · `o` jump to the managing Flux object · `n`/`N`/`0` namespace |
+| Network | `g` services → ingress → netpol · `t` grouping (services/ingress) · `f` port-forward the Service · `F` running port-forwards · `s` the Ingress TLS Secret · `n`/`N`/`0` namespace |
 | Hooks | `g` admission → conversion → apiservices · `t` webhooks under their configuration (admission) · `←`/`→` read the verdict past the edge · `P` flip `failurePolicy` |
-| Storage | `g` claims → volumes → snapshots → attachments · `t` parent/child nesting · `f` problems only · `n`/`0` namespace |
+| Storage | `g` claims → volumes → snapshots → attachments · `t` parent/child nesting · `f` problems only · `n`/`N`/`0` namespace |
 | Diagnostic | `r` re-run · `p`/`P` PDF export |
 | YAML | `t` neat ↔ raw · `c` copy · `r` reload |
 
@@ -310,7 +316,8 @@ shows the query and its effect (`/coredns  (3)`).
   and a bare ownerRef carry the "outside GitOps" finding. `RISK` shows the worst finding and how
   many others there are (`impersonate +8`); the full list is in the top panel.
 
-  `:rbac <ns>` (or `n` on a row, `0` to go back to the cluster) narrows the view to one namespace.
+  `:rbac <ns>` (or `n` on a row, `0` to go back to the cluster) narrows the view to one namespace;
+  several namespaces (`:rbac a b`, `N`) give their union.
   The whole cluster is still read — otherwise an aggregation edge, a template count or a "nobody
   binds this role" claim would be wrong — and the scope only decides which rows are drawn: the
   RoleBindings of that namespace, and the cluster bindings (ClusterRoleBinding included) granted to a

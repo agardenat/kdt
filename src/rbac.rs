@@ -23,6 +23,7 @@ use k8s_openapi::api::rbac::v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule as K8sPolicyRule, Role, RoleBinding,
 };
 use crate::lang::{Strings, fill};
+use crate::nsscope::NsScope;
 use kube::api::{Api, DynamicObject, ListParams};
 use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
@@ -1693,28 +1694,29 @@ pub fn build_rbac_rows(
     g: &RbacGraph,
     orient: RbacOrient,
     min_sev: Severity,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
 ) -> Vec<RbacNode> {
     let mut out = Vec::new();
     match orient {
-        RbacOrient::Flat => flat_rows(g, min_sev, ns, &mut out),
-        RbacOrient::Subject => subject_rows(g, min_sev, ns, collapsed, &mut out),
-        RbacOrient::Binding => binding_rows(g, min_sev, ns, collapsed, &mut out),
-        RbacOrient::Role => role_rows(g, min_sev, ns, collapsed, &mut out),
+        RbacOrient::Flat => flat_rows(g, min_sev, scope, &mut out),
+        RbacOrient::Subject => subject_rows(g, min_sev, scope, collapsed, &mut out),
+        RbacOrient::Binding => binding_rows(g, min_sev, scope, collapsed, &mut out),
+        RbacOrient::Role => role_rows(g, min_sev, scope, collapsed, &mut out),
     }
     out
 }
 
-fn shown(b: &RbacBinding, ns: Option<&str>) -> bool {
-    ns.is_none_or(|ns| binding_in_ns(b, ns))
+/// [`binding_in_ns`] over a scope: a binding belongs to it when it belongs to any of its namespaces.
+pub fn binding_in_scope(b: &RbacBinding, scope: &NsScope) -> bool {
+    scope.is_all() || scope.names().iter().any(|ns| binding_in_ns(b, ns))
 }
 
 // The flat audit list: one row per binding, worst first. No nesting, no folding — the reading
 // `:rbac` exists for, kept as an orientation rather than replaced by the tree.
-fn flat_rows(g: &RbacGraph, min_sev: Severity, ns: Option<&str>, out: &mut Vec<RbacNode>) {
+fn flat_rows(g: &RbacGraph, min_sev: Severity, scope: &NsScope, out: &mut Vec<RbacNode>) {
     for (i, b) in g.bindings.iter().enumerate() {
-        if b.severity < min_sev || !shown(b, ns) {
+        if b.severity < min_sev || !binding_in_scope(b, scope) {
             continue;
         }
         let uid = binding_uid(b);
@@ -1731,7 +1733,7 @@ fn flat_rows(g: &RbacGraph, min_sev: Severity, ns: Option<&str>, out: &mut Vec<R
 fn subject_rows(
     g: &RbacGraph,
     min_sev: Severity,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
     out: &mut Vec<RbacNode>,
 ) {
@@ -1742,11 +1744,11 @@ fn subject_rows(
         // A ServiceAccount of the namespace is in scope even when nobody binds it — an unused
         // account with a mounted token is part of what the namespace exposes. A User or a Group has
         // no namespace of its own: it is in scope through its bindings.
-        if let Some(ns) = ns {
-            let mine = n.namespace == ns
+        if !scope.is_all() {
+            let mine = scope.contains(&n.namespace)
                 || n.bindings
                     .iter()
-                    .any(|&bi| g.bindings.get(bi).is_some_and(|b| binding_in_ns(b, ns)));
+                    .any(|&bi| g.bindings.get(bi).is_some_and(|b| binding_in_scope(b, scope)));
             if !mine {
                 continue;
             }
@@ -1763,7 +1765,7 @@ fn subject_rows(
         }
         for &bi in &n.bindings {
             let b = &g.bindings[bi];
-            if b.severity < min_sev || !shown(b, ns) {
+            if b.severity < min_sev || !binding_in_scope(b, scope) {
                 continue;
             }
             let key = binding_uid(b);
@@ -1793,12 +1795,12 @@ fn subject_rows(
 fn binding_rows(
     g: &RbacGraph,
     min_sev: Severity,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
     out: &mut Vec<RbacNode>,
 ) {
     for (i, b) in g.bindings.iter().enumerate() {
-        if b.severity < min_sev || !shown(b, ns) {
+        if b.severity < min_sev || !binding_in_scope(b, scope) {
             continue;
         }
         let uid = binding_uid(b);
@@ -1835,29 +1837,31 @@ fn binding_rows(
 fn role_rows(
     g: &RbacGraph,
     min_sev: Severity,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
     out: &mut Vec<RbacNode>,
 ) {
     // Which bindings reach each role.
     let mut by_role: HashMap<usize, Vec<usize>> = HashMap::new();
     for (bi, b) in g.bindings.iter().enumerate() {
-        if !shown(b, ns) {
+        if !binding_in_scope(b, scope) {
             continue;
         }
         if let Some(ri) = b.role_idx {
             by_role.entry(ri).or_default().push(bi);
         }
     }
-    let reached = ns.map(|ns| roles_reached_in_ns(g.bindings, ns));
+    let reached: Option<HashSet<usize>> = (!scope.is_all()).then(|| {
+        scope.names().iter().flat_map(|ns| roles_reached_in_ns(g.bindings, ns)).collect()
+    });
 
     for &ri in g.role_order {
         let Some(r) = g.roles.get(ri) else { continue };
         if r.severity < min_sev {
             continue;
         }
-        if let (Some(ns), Some(reached)) = (ns, reached.as_ref()) {
-            if !role_in_ns(r, ri, reached, ns) {
+        if let Some(reached) = reached.as_ref() {
+            if !scope.names().iter().any(|ns| role_in_ns(r, ri, reached, ns)) {
                 continue;
             }
         }
@@ -1883,7 +1887,7 @@ fn role_rows(
                 // Under a scope the group only exists if a binding still shown grants the role
                 // there: an empty "re-granted in namespace X" node would claim a level the rows
                 // below it no longer fill.
-                if ns.is_some()
+                if !scope.is_all()
                     && !bindings.iter().any(|&bi| {
                         matches!(&g.bindings[bi].scope, Scope::Namespace(n) if n == bound)
                     })

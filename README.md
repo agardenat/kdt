@@ -60,7 +60,7 @@ kdt [OPTIONS]
 
 | Option | Description | Défaut |
 |---|---|---|
-| `-n, --namespace <NS>` | Namespace à surveiller | tous |
+| `-n, --namespace <NS>` | Namespace(s) à surveiller, séparés par des virgules | tous |
 | `-A, --all-namespaces` | Tous les namespaces | — |
 | `--context <CTX>` | Contexte kubeconfig | contexte courant |
 | `--buffer-size <N>` | Taille du buffer d'évènements | `5000` |
@@ -74,8 +74,13 @@ vue évènements.
 `:` ouvre une invite façon k9s : `Tab` complète, `Entrée` valide, `Esc` annule. Toute vue dont les
 lignes sont des objets namespacés accepte un namespace en argument (`:cm kube-system`, `:pods
 istio-system`, `:certs prod`) — marquées `[ns]` ci-dessous ; `all` (ou `*`/`0`) cible tous les
-namespaces. Le namespace ainsi choisi devient la portée de la session, affichée dans le bandeau
-`ns=`. Les vues cluster (`nodes`, `capacity`, `pv`, `rancher`, `identity`) et celles construites en graphe entre
+namespaces. Plusieurs namespaces se tapent à la suite, séparés par des espaces ou des virgules
+(`:wl app app-db monitoring`) : la complétion ne porte que sur le dernier mot et n'en repropose pas
+un déjà tapé, et un nom absent du cluster est signalé. Chaque namespace est lu par sa propre liste,
+jamais par une liste cluster-wide filtrée, ce qui marche avec des droits limités à ces namespaces.
+La portée ainsi choisie devient celle de la session, affichée dans le bandeau `ns=`. Sur une
+ligne, `n` remplace la portée par le namespace de la ligne, `N` l'y ajoute ou l'en retire (sauf
+dans la vue évènements, où `N` reste les nodes du pod), `0` revient à tout le cluster. Les vues cluster (`nodes`, `capacity`, `pv`, `rancher`, `identity`) et celles construites en graphe entre
 namespaces (`flux`, `reflector`, `argocd`, `kyverno`) n'acceptent pas d'argument et le disent
 si on leur en donne un. `rbac` prend un namespace tout en continuant de lire tout le cluster : la
 portée choisit les lignes affichées, pas ce qui est lu (voir la vue RBAC).
@@ -162,24 +167,24 @@ courant de kubectl reste le même), et `E` (shell) vise le contexte affiché.
 | Vue | Touches |
 |---|---|
 | Évènements | `s` geler le défilement · `Tab` onglet Logs/Status/Related · `a`/`w`/`x` filtre All/Warnings/Errors · `p`/`C`/`f` logs run précédent/container/suivi · `n`/`0` filtre namespace · `N` nodes du pod · `E` shell · `D` diagnostic · `X` export PDF |
-| Workloads | `t` liste ↔ arbre · `Space` (ou `→`/`←`) déplier le pod en containers · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`0` namespace |
+| Workloads | `t` liste ↔ arbre · `Space` (ou `→`/`←`) déplier le pod en containers · `s` scale · `r` rescale/recyclage/restart · `E` shell · `p`/`C`/`f` logs · `n`/`N`/`0` namespace |
 | Nodes | `u` vue usage · `s` tri · `o` cordon/uncordon/drain · `p`/`P` export PDF |
-| Capacité | `g` monde (nœuds → workloads → quotas) · `f` problèmes seulement · `n`/`0` namespace (mondes workloads et quotas) |
+| Capacité | `g` monde (nœuds → workloads → quotas) · `f` problèmes seulement · `n`/`N`/`0` namespace (mondes workloads et quotas) |
 | FluxCD | `r` menu réconciliation · `Ctrl-R` déblocage · `z` suspend/reprise · `t` table ↔ arbre · `Space` plier/déplier · `a` suivi auto des branches en cours ou en échec · `←`/`→` faire défiler le message de la ligne sélectionnée (`Home` remet à zéro) · `l` logs de tous les controllers · `Tab` onglet Logs/Status/Related/Inventory |
-| Vulnérabilités | `f` seuil de sévérité (tous → HIGH+ → CRIT) · `n`/`0` namespace |
-| cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME · `n`/`0` namespace |
+| Vulnérabilités | `f` seuil de sévérité (tous → HIGH+ → CRIT) · `n`/`N`/`0` namespace |
+| cert-manager | `Space` plier/déplier · `t` arbre ↔ liste · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/IN-FLIGHT · `s` aller au Secret · `r` renouveler, relancer ACME · `n`/`N`/`0` namespace |
 | Kyverno | `Space` plier/déplier · `t` par policy ↔ par ressource · `←`/`→` faire défiler le message · `f` ALL/PROBLEMS/ENFORCE · `P` actions (purge des `UpdateRequest` bloqués) |
 | Reflector | `Space` plier/déplier · `g` sources → miroirs → orphelins · `f` ALL/PROBLEMS · `s` aller à la source · `r` forcer la re-réflexion |
 | rancher-backup | `Espace` plier/déplier les archives d'un Backup récurrent · `g` backups → restores → resourcesets · `f` ALL/PROBLEMS · `o` backup maintenant, restaurer la dernière archive |
-| Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`0` namespace |
+| Velero | `g` backups → restaurations → stockage · `t` regroupement · `f` filtre · `+`/`-` contenu du backup · `o` actions · `l` log du run · `n`/`N`/`0` namespace |
 | K8ssandra | `Space` plier/déplier · `g` cluster → sauvegardes → opérations · `f` ALL/PROBLEMS · `l` logs du container fautif · `s` stats du node (tpstats, compactionstats, netstats) ou repairs Reaper · `S` snapshots du node (listsnapshots) · `x` commande nodetool en Job · `o` actions |
 | Rancher | `g` users → access → projects → tokens · `f` ALL/PROBLEMS · `o` actions (émettre un token, changer un TTL, révoquer, régler un setting) · `h` touch sur un Project · `e` et `Ctrl-D` volontairement absents |
 | Argo CD | `g` apps → sets → projects → repos · `f` ALL/PROBLEMS · `r` actions (refresh, hard refresh, sync, sync + prune, terminate) |
 | kdt-identity | `g` users ↔ groups · `f` ALL/PROBLEMS · `o` actions (inviter, fermer les sessions, désactiver/réactiver, appartenance, créer, copier le subject) · dans l'overlay d'invitation : `l` copier le lien, `c` copier le code |
-| RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`0` namespace |
-| Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `s` Secret TLS de l'Ingress · `n`/`0` namespace |
+| RBAC | `Space` plier/déplier · `t` plat → par sujet → par binding → par rôle · `f` plancher de sévérité · `o` saut vers l'objet Flux gérant · `n`/`N`/`0` namespace |
+| Réseau | `g` services → ingress → netpol · `t` regroupement (services/ingress) · `f` port-forward du Service · `F` port-forwards en cours · `s` Secret TLS de l'Ingress · `n`/`N`/`0` namespace |
 | Hooks | `g` admission → conversion → apiservices · `t` webhooks sous leur configuration (admission) · `←`/`→` lire le verdict qui déborde · `P` basculer `failurePolicy` |
-| Stockage | `g` claims → volumes → snapshots → attachments · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`0` namespace |
+| Stockage | `g` claims → volumes → snapshots → attachments · `t` imbrication parent/enfant · `f` problèmes seulement · `n`/`N`/`0` namespace |
 | Diagnostic | `r` relancer · `p`/`P` export PDF |
 | YAML | `t` neat ↔ brut · `c` copier · `r` recharger |
 
@@ -313,7 +318,8 @@ affiche toujours la requête et son effet (`/coredns  (3)`).
   plus grave et le nombre des autres (`impersonate +8`) ; la liste complète est dans le panneau du
   haut.
 
-  `:rbac <ns>` (ou `n` sur une ligne, `0` pour revenir au cluster) restreint la vue à un namespace.
+  `:rbac <ns>` (ou `n` sur une ligne, `0` pour revenir au cluster) restreint la vue à un namespace ;
+  plusieurs namespaces (`:rbac a b`, `N`) en font l'union.
   Tout le cluster reste lu — sinon une arête d'agrégation, un compte de template ou un « rôle que
   personne ne lie » serait faux — et la portée ne décide que des lignes affichées : les RoleBindings
   du namespace, et les bindings cluster (ClusterRoleBinding compris) accordés à un ServiceAccount de

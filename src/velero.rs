@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 
 use crate::events::{EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
+use crate::nsscope::NsScope;
 pub use crate::storage::{Hint, HintLevel};
 
 fn info(text: String) -> Hint {
@@ -2816,10 +2817,10 @@ pub fn build_vel_rows(
     world: VelWorld,
     grouped: bool,
     problems_only: bool,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
 ) -> Vec<VelRow> {
-    let ns_ok = |x: &str| ns.is_none_or(|f| f == x);
+    let ns_ok = |x: &str| scope.contains(x);
     let worse = |hints: &[Hint]| hints.iter().any(|h| h.level >= HintLevel::Warn);
     let mut rows: Vec<VelRow> = Vec::new();
 

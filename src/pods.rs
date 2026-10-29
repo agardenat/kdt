@@ -19,6 +19,7 @@ use crate::events::{
     ContainerUsageMap, EventRecord, LineColor, Severity,
 };
 use crate::flux::SharedReconcile;
+use crate::nsscope::{self, NsScope};
 
 // Live usage per pod, keyed by (namespace, name): CPU millicores and memory bytes.
 type UsageMap = HashMap<(String, String), (i64, i64)>;
@@ -359,17 +360,17 @@ const WORKLOAD_KINDS: &[(&str, &str, &str)] = &[
     ("batch", "v1", "Job"),
 ];
 
-// List every pod plus every top-level workload in `namespace` (None = all namespaces). Pods carry
+// List every pod plus every top-level workload in `scope`. Pods carry
 // their resolved owner so the UI can group each pod under its workload row. Workloads are listed
 // directly (not derived from pods) so a scaled-to-zero Deployment still shows up for scale/restart.
-pub async fn fetch_workloads(client: Client, namespace: Option<String>, state: SharedPods) {
+pub async fn fetch_workloads(client: Client, scope: NsScope, state: SharedPods) {
     {
         let mut s = state.lock().expect("pods poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    let result = workloads(client, namespace).await;
+    let result = workloads(client, &scope).await;
 
     let mut s = state.lock().expect("pods poisoned");
     s.loading = false;
@@ -398,13 +399,10 @@ pub struct WorkloadInventory {
 
 pub async fn workloads(
     client: Client,
-    namespace: Option<String>,
+    scope: &NsScope,
 ) -> Result<WorkloadInventory, String> {
-    let api: Api<Pod> = match &namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api.list(&ListParams::default()).await.map_err(|e| e.to_string())?;
+    let items: Vec<Pod> =
+        nsscope::list(&client, scope, &ListParams::default()).await.map_err(|e| e.to_string())?;
 
     // One metrics read serves both levels: the container rows use it as it comes, the pod rows use
     // the sum of it, so expanding a pod costs no extra API call.
@@ -416,14 +414,14 @@ pub async fn workloads(
         e.1 += mem;
     }
     let mut rs_cache: HashMap<String, Option<OwnerRef>> = HashMap::new();
-    let mut pods: Vec<PodResource> = Vec::with_capacity(list.items.len());
-    for p in &list.items {
+    let mut pods: Vec<PodResource> = Vec::with_capacity(items.len());
+    for p in &items {
         let owner = resolve_owner(&client, p, &mut rs_cache).await;
         pods.push(pod_resource(p, owner, &usage, &cusage));
     }
     pods.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
-    let (mut workloads, missing_kinds) = list_workloads(&client, &namespace).await;
+    let (mut workloads, missing_kinds) = list_workloads(&client, scope).await;
     workloads.sort_by(|a, b| {
         (a.namespace.as_str(), a.kind.as_str(), a.name.as_str())
             .cmp(&(b.namespace.as_str(), b.kind.as_str(), b.name.as_str()))
@@ -437,7 +435,7 @@ pub async fn workloads(
 // without Jobs.
 async fn list_workloads(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> (Vec<WorkloadResource>, Vec<String>) {
     let mut out = Vec::new();
     let mut missing = Vec::new();
@@ -450,11 +448,7 @@ async fn list_workloads(
                 continue;
             }
         };
-        let api: Api<DynamicObject> = match namespace {
-            Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-            None => Api::all_with(client.clone(), &ar),
-        };
-        let list = match api.list(&ListParams::default()).await {
+        let items = match nsscope::list_dyn(client, scope, &ar, &ListParams::default()).await {
             Ok(l) => l,
             Err(e) => {
                 missing.push(format!("{}: {}", kind, short_reason(&e.to_string())));
@@ -462,7 +456,7 @@ async fn list_workloads(
             }
         };
         let api_version = format!("{}/{}", group, version);
-        for obj in &list.items {
+        for obj in &items {
             out.push(workload_from_obj(obj, kind, &api_version));
         }
     }

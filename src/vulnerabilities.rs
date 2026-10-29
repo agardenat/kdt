@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::events::{format_age, EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
+use crate::nsscope::NsScope;
 
 const TRIVY_GROUP: &str = "aquasecurity.github.io";
 const TRIVY_VERSIONS: &[&str] = &["v1alpha1"];
@@ -224,11 +225,11 @@ pub struct VulnState {
 
 impl VulnState {
     // (critical, high, medium, low) summed across all components.
-    // Totals for the title. `ns` restricts them to one namespace, so the header cannot claim the
-    // cluster's CVE count over a list scoped to a single namespace.
-    pub fn counts(&self, ns: Option<&str>) -> (usize, usize, usize, usize) {
+    // Totals for the title. `scope` restricts them to its namespaces, so the header cannot claim the
+    // cluster's CVE count over a list scoped to a few namespaces.
+    pub fn counts(&self, scope: &NsScope) -> (usize, usize, usize, usize) {
         let mut c = (0, 0, 0, 0);
-        for comp in self.components.iter().filter(|x| ns.is_none_or(|n| x.namespace == n)) {
+        for comp in self.components.iter().filter(|x| scope.contains(&x.namespace)) {
             c.0 += comp.critical;
             c.1 += comp.high;
             c.2 += comp.medium;
@@ -238,8 +239,8 @@ impl VulnState {
     }
 
     // How many scanned images the scope holds — the `total` the title shows.
-    pub fn scanned(&self, ns: Option<&str>) -> usize {
-        self.components.iter().filter(|x| ns.is_none_or(|n| x.namespace == n)).count()
+    pub fn scanned(&self, scope: &NsScope) -> usize {
+        self.components.iter().filter(|x| scope.contains(&x.namespace)).count()
     }
 }
 
@@ -316,7 +317,7 @@ pub enum VulnRow {
 ///
 /// La portée cache les images des autres namespaces ; la ligne Kubernetes parle du cluster lui-même
 /// et reste quelle que soit la portée. La recherche, elle, reste à l'appelant.
-pub fn vuln_rows(state: &VulnState, ns: Option<&str>, min: Sev) -> Vec<VulnRow> {
+pub fn vuln_rows(state: &VulnState, scope: &NsScope, min: Sev) -> Vec<VulnRow> {
     let mut rows: Vec<VulnRow> = Vec::new();
     if let Some(k8s) = &state.k8s {
         rows.push(VulnRow::K8s(k8s.clone()));
@@ -325,7 +326,7 @@ pub fn vuln_rows(state: &VulnState, ns: Option<&str>, min: Sev) -> Vec<VulnRow> 
         state
             .components
             .iter()
-            .filter(|c| ns.is_none_or(|n| c.namespace == n))
+            .filter(|c| scope.contains(&c.namespace))
             .filter(|c| c.max_sev >= min)
             .cloned()
             .map(VulnRow::Image),
@@ -870,11 +871,11 @@ mod tests {
             available: true,
             ..Default::default()
         };
-        let rows = vuln_rows(&state, Some("shop"), Sev::Unknown);
+        let rows = vuln_rows(&state, &NsScope::one("shop"), Sev::Unknown);
         assert!(matches!(&rows[0], VulnRow::K8s(_)));
         assert!(matches!(&rows[1], VulnRow::Image(c) if c.namespace == "shop"));
         assert_eq!(rows.len(), 2);
-        let rows = vuln_rows(&state, None, Sev::High);
+        let rows = vuln_rows(&state, &NsScope::All, Sev::High);
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[1], VulnRow::Image(c) if c.namespace == "infra"));
     }

@@ -49,7 +49,7 @@ pub async fn list(
     };
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
-    let (policies, native_error) = kdt::netpol::list_netpols(&client, &namespace).await;
+    let (policies, native_error) = kdt::netpol::list_netpols(&client, &namespace.into()).await;
 
     let count = |engine: NetPolEngine| policies.iter().filter(|p| p.engine == engine).count();
     axum::Json(serde_json::json!({

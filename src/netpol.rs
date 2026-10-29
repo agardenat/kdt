@@ -16,6 +16,7 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 
 use crate::events::format_age;
+use crate::nsscope::{self, NsScope};
 
 // Which controller owns a policy row. Drives the KIND badge and whether a posture verdict is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -99,12 +100,12 @@ const CRD_CANDIDATES: &[(&str, &[&str], &str, bool)] = &[
 // CRD errors are not (their absence is normal).
 pub async fn list_netpols(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> (Vec<NetPolResource>, Option<String>) {
     let mut out: Vec<NetPolResource> = Vec::new();
     let mut native_err = None;
 
-    match list_native(client, namespace).await {
+    match list_native(client, scope).await {
         Ok(mut v) => out.append(&mut v),
         Err(e) => native_err = Some(e),
     }
@@ -120,13 +121,11 @@ pub async fn list_netpols(
         }
         let Some((ar, version)) = resolved else { continue };
         // Clusterwide CRDs are cluster-scoped; namespaced CRDs honor the current scope.
-        let api: Api<DynamicObject> = if *cluster_scoped {
-            Api::all_with(client.clone(), &ar)
+        let lp = ListParams::default();
+        let items = if *cluster_scoped {
+            Api::<DynamicObject>::all_with(client.clone(), &ar).list(&lp).await.map(|l| l.items)
         } else {
-            match namespace {
-                Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
-                None => Api::all_with(client.clone(), &ar),
-            }
+            nsscope::list_dyn(client, scope, &ar, &lp).await
         };
         let engine = if group.starts_with("cilium") {
             NetPolEngine::Cilium
@@ -134,8 +133,8 @@ pub async fn list_netpols(
             NetPolEngine::Calico
         };
         let api_version = format!("{}/{}", group, version);
-        if let Ok(list) = api.list(&ListParams::default()).await {
-            for obj in &list.items {
+        if let Ok(items) = items {
+            for obj in &items {
                 out.push(parse_crd(obj, engine, kind, &api_version));
             }
         }
@@ -147,17 +146,12 @@ pub async fn list_netpols(
 
 async fn list_native(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> Result<Vec<NetPolResource>, String> {
-    let api: Api<NetworkPolicy> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api
-        .list(&ListParams::default())
+    let items: Vec<NetworkPolicy> = nsscope::list(client, scope, &ListParams::default())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(list.items.iter().map(native_resource).collect())
+    Ok(items.iter().map(native_resource).collect())
 }
 
 fn native_resource(p: &NetworkPolicy) -> NetPolResource {

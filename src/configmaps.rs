@@ -8,10 +8,11 @@
 use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{Api, ListParams};
+use kube::api::ListParams;
 use kube::Client;
 
 use crate::events::format_age;
+use crate::nsscope::{self, NsScope};
 use crate::rbac::{detect_provenance, Provenance};
 
 // `Serialize` : une ConfigMap est du texte en clair, et c'est ce qui la distingue d'un Secret —
@@ -62,17 +63,16 @@ pub fn new_configmaps_state() -> SharedConfigMaps {
     Arc::new(Mutex::new(ConfigMapsState::default()))
 }
 
-// `namespace` is the active scope: None lists the whole cluster, Some(ns) only that namespace —
-// the list is fetched already scoped rather than filtered afterwards, so a `:cm <ns>` on a big
-// cluster reads one namespace instead of every ConfigMap in it.
-pub async fn fetch_configmaps(client: Client, namespace: Option<String>, state: SharedConfigMaps) {
+// `scope` is the active namespace scope — the list is fetched already scoped rather than filtered
+// afterwards, so a `:cm <ns>` on a big cluster reads one namespace instead of every ConfigMap in it.
+pub async fn fetch_configmaps(client: Client, scope: NsScope, state: SharedConfigMaps) {
     {
         let mut s = state.lock().expect("configmaps poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    match configmaps(client, namespace).await {
+    match configmaps(client, &scope).await {
         Ok(items) => {
             let mut s = state.lock().expect("configmaps poisoned");
             s.loading = false;
@@ -86,19 +86,14 @@ pub async fn fetch_configmaps(client: Client, namespace: Option<String>, state: 
 /// Le même inventaire, rendu plutôt que déposé dans un état partagé.
 pub async fn configmaps(
     client: Client,
-    namespace: Option<String>,
+    scope: &NsScope,
 ) -> Result<Vec<ConfigMapInfo>, String> {
-    let api: Api<ConfigMap> = match &namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api
-        .list(&ListParams::default())
+    let items: Vec<ConfigMap> = nsscope::list(&client, scope, &ListParams::default())
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut out: Vec<ConfigMapInfo> = Vec::with_capacity(list.items.len());
-    for cm in &list.items {
+    let mut out: Vec<ConfigMapInfo> = Vec::with_capacity(items.len());
+    for cm in &items {
         out.push(build_info(cm));
     }
     out.sort_by_key(|a| a.sort_key());

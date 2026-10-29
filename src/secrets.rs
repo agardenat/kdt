@@ -22,6 +22,7 @@ use kube::core::GroupVersionKind;
 use kube::{discovery, Client};
 
 use crate::events::format_age;
+use crate::nsscope::{self, NsScope};
 use crate::rbac::{detect_provenance, Provenance};
 
 const TLS_TYPE: &str = "kubernetes.io/tls";
@@ -156,10 +157,10 @@ pub struct SecretsState {
     pub loading: bool,
     // Whether the cert-manager CRD was present on the last fetch (drives the issuer column hint).
     pub cert_manager_present: bool,
-    // The namespace scope the list was fetched under (None = whole cluster). The certs view joins
-    // its Secret leaves from here, and a list fetched for one namespace says nothing about another:
-    // without this it would read a Secret it never listed as missing.
-    pub scope: Option<String>,
+    // The namespace scope the list was fetched under. The certs view joins its Secret leaves from
+    // here, and a list fetched for one namespace says nothing about another: without this it would
+    // read a Secret it never listed as missing.
+    pub scope: NsScope,
 }
 
 impl SecretsState {
@@ -220,23 +221,22 @@ pub fn new_secrets_state() -> SharedSecrets {
     Arc::new(Mutex::new(SecretsState::default()))
 }
 
-// `namespace` is the active scope: None lists the whole cluster, Some(ns) only that namespace. The
-// Ingress list is scoped the same way — a TLS reference is namespace-local, so an Ingress from
-// another namespace could never name a Secret of this one.
-pub async fn fetch_secrets(client: Client, namespace: Option<String>, state: SharedSecrets) {
+// `scope` is the active namespace scope. The Ingress list is scoped the same way — a TLS reference
+// is namespace-local, so an Ingress from another namespace could never name a Secret of this one.
+pub async fn fetch_secrets(client: Client, scope: NsScope, state: SharedSecrets) {
     {
         let mut s = state.lock().expect("secrets poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    match secrets(client, namespace.clone()).await {
+    match secrets(client, &scope).await {
         Ok(inv) => {
             let mut s = state.lock().expect("secrets poisoned");
             s.loading = false;
             s.error = None;
             s.cert_manager_present = inv.cert_manager_present;
-            s.scope = namespace;
+            s.scope = scope;
             s.secrets = inv.secrets;
         }
         Err(e) => fail(&state, e),
@@ -255,22 +255,21 @@ pub struct SecretsInventory {
 /// la réponse.
 pub async fn secrets(
     client: Client,
-    namespace: Option<String>,
+    scope: &NsScope,
 ) -> Result<SecretsInventory, String> {
-    let (secret_api, ingress_api): (Api<Secret>, Api<Ingress>) = match &namespace {
-        Some(ns) => (Api::namespaced(client.clone(), ns), Api::namespaced(client.clone(), ns)),
-        None => (Api::all(client.clone()), Api::all(client.clone())),
-    };
     let lp = ListParams::default();
 
-    let (secrets, ingresses) = tokio::join!(secret_api.list(&lp), ingress_api.list(&lp));
+    let (secrets, ingresses) = tokio::join!(
+        nsscope::list::<Secret>(&client, scope, &lp),
+        nsscope::list::<Ingress>(&client, scope, &lp)
+    );
 
     let secrets = secrets.map_err(|e| e.to_string())?;
 
     // (namespace, secretName) → Ingresses consuming it. Ingress TLS references are namespace-local.
     let mut ingress_map: HashMap<(String, String), Vec<String>> = HashMap::new();
     if let Ok(list) = ingresses {
-        for ing in &list.items {
+        for ing in &list {
             let ns = ing.metadata.namespace.clone().unwrap_or_default();
             let name = ing.metadata.name.clone().unwrap_or_default();
             let tls = ing.spec.as_ref().and_then(|s| s.tls.as_ref());
@@ -288,8 +287,8 @@ pub async fn secrets(
     // (namespace, secretName) → cert-manager Certificate name. Optional: absent CRD just skips it.
     let (cm_map, cm_present) = fetch_cert_manager_map(&client).await;
 
-    let mut out: Vec<SecretInfo> = Vec::with_capacity(secrets.items.len());
-    for sec in &secrets.items {
+    let mut out: Vec<SecretInfo> = Vec::with_capacity(secrets.len());
+    for sec in &secrets {
         out.push(build_secret_info(sec, &ingress_map, &cm_map));
     }
     out.sort_by_key(|a| a.sort_key());

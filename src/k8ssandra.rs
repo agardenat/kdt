@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 
 use crate::events::{EventRecord, LineColor};
 use crate::lang::{fill, Strings};
+use crate::nsscope::NsScope;
 use crate::mgmtapi::{self, Endpoint};
 
 // The severity vocabulary is the cluster-wide one, deliberately not a local copy: reflector defined
@@ -2572,11 +2573,11 @@ pub fn build_k8c_rows(
     s: &K8cState,
     world: K8cWorld,
     problems_only: bool,
-    ns: Option<&str>,
+    scope: &NsScope,
     collapsed: &HashSet<String>,
     st: &'static Strings,
 ) -> Vec<K8cRow> {
-    let ns_ok = |x: &str| ns.is_none_or(|f| f == x);
+    let ns_ok = |x: &str| scope.contains(x);
     let mut rows: Vec<K8cRow> = Vec::new();
 
     match world {
@@ -2801,7 +2802,7 @@ fn push_group(
 pub fn find_k8c_row(s: &K8cState, uid: &str, st: &'static Strings) -> Option<K8cRow> {
     [K8cWorld::Cluster, K8cWorld::Backups, K8cWorld::Ops]
         .into_iter()
-        .flat_map(|w| build_k8c_rows(s, w, false, None, &HashSet::new(), st))
+        .flat_map(|w| build_k8c_rows(s, w, false, &NsScope::All, &HashSet::new(), st))
         .find(|r| r.uid() == uid)
 }
 
@@ -4267,7 +4268,7 @@ mod tests {
             backups: vec![backup("daily-1700000000", Some(true))],
             ..K8cState::default()
         };
-        let rows = build_k8c_rows(&state, K8cWorld::Backups, false, None, &HashSet::new(), &FR);
+        let rows = build_k8c_rows(&state, K8cWorld::Backups, false, &NsScope::All, &HashSet::new(), &FR);
         let names: Vec<String> = rows.iter().map(K8cRow::name).collect();
         assert_eq!(
             names,
@@ -4461,7 +4462,7 @@ mod tests {
             remote_nodes: out.remote_nodes,
             ..K8cState::default()
         };
-        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &HashSet::new(), &FR);
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, &NsScope::All, &HashSet::new(), &FR);
         let names: Vec<String> = rows.iter().map(K8cRow::name).collect();
         assert_eq!(names, vec!["tw", "dc1", "tw-dc1-sts-0", "dc2", "10.1.0.2", "tw-dc2-sts-0"]);
         assert_eq!(rows.iter().map(K8cRow::depth).collect::<Vec<_>>(), vec![0, 1, 2, 1, 2, 2]);
@@ -4499,17 +4500,17 @@ mod tests {
             nodes: vec![node],
             ..K8cState::default()
         };
-        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &HashSet::new(), &FR);
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, &NsScope::All, &HashSet::new(), &FR);
         let names: Vec<String> = rows.iter().map(K8cRow::name).collect();
         assert_eq!(names, vec!["demo", "dc1", FR.k8c_grp_data_plane, "dc2", "dc2-sts-0"]);
         assert_eq!(rows.iter().map(K8cRow::depth).collect::<Vec<_>>(), vec![0, 1, 0, 1, 2]);
         assert!(matches!(rows[2], K8cRow::Group { count: 1, .. }));
 
         let folded: HashSet<String> = [rows[2].uid()].into_iter().collect();
-        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, None, &folded, &FR);
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, &NsScope::All, &folded, &FR);
         assert_eq!(rows.len(), 3);
 
-        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, Some("ns"), &HashSet::new(), &FR);
+        let rows = build_k8c_rows(&state, K8cWorld::Cluster, false, &NsScope::one("ns"), &HashSet::new(), &FR);
         assert_eq!(rows.len(), 2);
     }
 }

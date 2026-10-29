@@ -23,6 +23,7 @@ use kube::Client;
 use crate::events::{format_age, EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
 use crate::netpol::{list_netpols, NetPolResource};
+use crate::nsscope::{self, NsScope};
 use crate::secrets::TlsCert;
 
 // The standard label EndpointSlices carry to point back at the Service they belong to.
@@ -279,17 +280,17 @@ pub struct ServicesInventory {
     pub endpoints_error: Option<String>,
 }
 
-// Every Service of `namespace` (None = all namespaces) with the endpoints discovered from its
-// EndpointSlices. Only the Services themselves are a hard dependency.
-pub async fn services_inventory(client: &Client, namespace: &Option<String>) -> Result<ServicesInventory, String> {
+// Every Service of `scope` with the endpoints discovered from its EndpointSlices. Only the Services
+// themselves are a hard dependency.
+pub async fn services_inventory(client: &Client, scope: &NsScope) -> Result<ServicesInventory, String> {
     // Endpoints are enrichment (the ready/total column and the nested rows): if listing EndpointSlices
     // fails — e.g. the role can't read discovery.k8s.io — degrade to no endpoints rather than blanking
     // the whole Services list, which only needs the Services themselves.
-    let (endpoints, ep_summary, endpoints_error) = match list_endpoints(client, namespace).await {
+    let (endpoints, ep_summary, endpoints_error) = match list_endpoints(client, scope).await {
         Ok((rows, summary)) => (rows, summary, None),
         Err(e) => (Vec::new(), EndpointSummary::new(), Some(e)),
     };
-    let services = list_services(client, namespace, &ep_summary).await?;
+    let services = list_services(client, scope, &ep_summary).await?;
     Ok(ServicesInventory { services, endpoints, endpoints_error })
 }
 
@@ -301,14 +302,14 @@ pub struct IngressInventory {
     pub classes_error: Option<String>,
 }
 
-// Every Ingress of `namespace` with the state of each TLS Secret it names, plus the (cluster-wide)
+// Every Ingress of `scope` with the state of each TLS Secret it names, plus the (cluster-wide)
 // IngressClasses. `cache` spares the secrets read recently; pass an empty one to read them all.
 pub async fn ingress_inventory(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
     cache: &mut TlsCache,
 ) -> Result<IngressInventory, String> {
-    let mut ingresses = list_ingresses(client, namespace).await?;
+    let mut ingresses = list_ingresses(client, scope).await?;
     resolve_tls(client, &mut ingresses, cache).await;
     let (classes, classes_error) = match list_ingress_classes(client).await {
         Ok(v) => (v, None),
@@ -318,16 +319,16 @@ pub async fn ingress_inventory(
 }
 
 // List every Service + its backing endpoints, plus every Ingress and (cluster-scoped) IngressClass
-// in `namespace` (None = all namespaces). One fetch feeds both worlds so the UI toggles without a
-// reload; IngressClasses are always cluster-wide regardless of the namespace scope.
-pub async fn fetch_network(client: Client, namespace: Option<String>, state: SharedNetwork) {
+// in `scope`. One fetch feeds both worlds so the UI toggles without a reload; IngressClasses are
+// always cluster-wide regardless of the namespace scope.
+pub async fn fetch_network(client: Client, scope: NsScope, state: SharedNetwork) {
     {
         let mut s = state.lock().expect("network poisoned");
         s.loading = true;
         s.error = None;
     }
 
-    let svc = match services_inventory(&client, &namespace).await {
+    let svc = match services_inventory(&client, &scope).await {
         Ok(v) => v,
         Err(e) => {
             let mut s = state.lock().expect("network poisoned");
@@ -338,12 +339,12 @@ pub async fn fetch_network(client: Client, namespace: Option<String>, state: Sha
     };
 
     let mut cache = state.lock().expect("network poisoned").tls_cache.clone();
-    let ing = ingress_inventory(&client, &namespace, &mut cache).await.unwrap_or(IngressInventory {
+    let ing = ingress_inventory(&client, &scope, &mut cache).await.unwrap_or(IngressInventory {
         ingresses: Vec::new(),
         classes: Vec::new(),
         classes_error: None,
     });
-    let (netpols, netpol_error) = list_netpols(&client, &namespace).await;
+    let (netpols, netpol_error) = list_netpols(&client, &scope).await;
 
     let mut s = state.lock().expect("network poisoned");
     s.loading = false;
@@ -448,20 +449,15 @@ type EndpointSummary = HashMap<(String, String), (usize, usize)>;
 // Read EndpointSlices once: build the per-Service ready/total summary and the flat endpoint rows.
 async fn list_endpoints(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> Result<(Vec<EndpointRow>, EndpointSummary), String> {
-    let api: Api<EndpointSlice> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api
-        .list(&ListParams::default())
+    let slices: Vec<EndpointSlice> = nsscope::list(client, scope, &ListParams::default())
         .await
         .map_err(|e| e.to_string())?;
 
     let mut rows: Vec<EndpointRow> = Vec::new();
     let mut summary: EndpointSummary = HashMap::new();
-    for slice in &list.items {
+    for slice in &slices {
         let svc_ns = slice.metadata.namespace.clone().unwrap_or_default();
         let Some(svc_name) = slice
             .metadata
@@ -509,19 +505,14 @@ async fn list_endpoints(
 
 async fn list_services(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
     ep_summary: &EndpointSummary,
 ) -> Result<Vec<ServiceResource>, String> {
-    let api: Api<Service> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api
-        .list(&ListParams::default())
+    let items: Vec<Service> = nsscope::list(client, scope, &ListParams::default())
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut out: Vec<ServiceResource> = list.items.iter().map(|s| service_resource(s, ep_summary)).collect();
+    let mut out: Vec<ServiceResource> = items.iter().map(|s| service_resource(s, ep_summary)).collect();
     out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Ok(out)
 }
@@ -766,17 +757,12 @@ pub fn format_ingress_tls(tls: &[IngressTls], st: &Strings) -> Vec<(LineColor, S
 
 async fn list_ingresses(
     client: &Client,
-    namespace: &Option<String>,
+    scope: &NsScope,
 ) -> Result<Vec<IngressResource>, String> {
-    let api: Api<Ingress> = match namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    let list = api
-        .list(&ListParams::default())
+    let items: Vec<Ingress> = nsscope::list(client, scope, &ListParams::default())
         .await
         .map_err(|e| e.to_string())?;
-    let mut out: Vec<IngressResource> = list.items.iter().map(ingress_resource).collect();
+    let mut out: Vec<IngressResource> = items.iter().map(ingress_resource).collect();
     out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Ok(out)
 }

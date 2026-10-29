@@ -1401,7 +1401,7 @@ async fn check_storage(client: &Client, state: &SharedDiagnostic, run_id: u64, s
         return;
     };
     let store = new_storage_state();
-    fetch_storage(client.clone(), None, store.clone()).await;
+    fetch_storage(client.clone(), crate::nsscope::NsScope::All, store.clone()).await;
     let s = store.lock().expect("storage poisoned");
     let mut lines = Vec::new();
     let status = if let Some(e) = &s.error {

@@ -48,7 +48,7 @@ pub async fn secrets(
     };
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
-    match kdt::secrets::secrets(client, namespace).await {
+    match kdt::secrets::secrets(client, &namespace.into()).await {
         Ok(inv) => {
             let (total, tls, expired, expiring) = summary(&inv.secrets);
             axum::Json(serde_json::json!({
@@ -183,7 +183,7 @@ pub async fn configmaps(
     };
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
-    match kdt::configmaps::configmaps(client, namespace).await {
+    match kdt::configmaps::configmaps(client, &namespace.into()).await {
         Ok(items) => axum::Json(serde_json::json!({
             "configmaps": items
                 .iter()

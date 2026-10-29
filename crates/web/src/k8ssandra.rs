@@ -80,7 +80,7 @@ pub async fn list(
 
     // Déplié : le pliage est un état du navigateur, qui part de `fold_default`.
     let rows: Vec<serde_json::Value> =
-        build_k8c_rows(&inventory, query.world, query.problems, ns, &HashSet::new(), st)
+        build_k8c_rows(&inventory, query.world, query.problems, &ns.into(), &HashSet::new(), st)
             .iter()
             .map(|row| row_json(row, &inventory, st, now))
             .collect();
@@ -576,7 +576,7 @@ mod tests {
     fn une_ligne_de_run_porte_ce_que_le_navigateur_lit() {
         let inv = inventory();
         let st = lang_of("fr");
-        let rows = build_k8c_rows(&inv, K8cWorld::Backups, false, None, &HashSet::new(), st);
+        let rows = build_k8c_rows(&inv, K8cWorld::Backups, false, &kdt::nsscope::NsScope::All, &HashSet::new(), st);
         let run = rows
             .iter()
             .find(|r| matches!(r, K8cRow::Job(_)))
@@ -601,7 +601,7 @@ mod tests {
     fn un_schedule_s_ouvre_plie_et_offre_un_run() {
         let inv = inventory();
         let st = lang_of("en");
-        let rows = build_k8c_rows(&inv, K8cWorld::Backups, false, None, &HashSet::new(), st);
+        let rows = build_k8c_rows(&inv, K8cWorld::Backups, false, &kdt::nsscope::NsScope::All, &HashSet::new(), st);
         let v = row_json(&rows[0], &inv, st, 1_758_001_000);
         assert_eq!(v["row"], "schedule");
         assert_eq!(v["fold_default"], true);

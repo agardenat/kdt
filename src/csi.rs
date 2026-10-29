@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::events::{format_age, format_memory_bytes, EventRecord, LineColor, Severity};
 use crate::lang::{fill, Strings};
+use crate::nsscope::{self, NsScope};
 use crate::storage::{hints_severity, Hint, HintLevel};
 
 const SNAPSHOT_GROUP: &str = "snapshot.storage.k8s.io";
@@ -198,7 +199,7 @@ pub struct CsiRaw {
     pub snapshots_installed: bool,
 }
 
-pub async fn fetch_csi(client: &Client, namespace: &Option<String>) -> CsiRaw {
+pub async fn fetch_csi(client: &Client, scope: &NsScope) -> CsiRaw {
     let snapshot_kind = |kind: &'static str| async move {
         let gvk = GroupVersionKind::gvk(SNAPSHOT_GROUP, "v1", kind);
         discovery::pinned_kind(client, &gvk).await.ok().map(|(ar, _)| ar)
@@ -210,13 +211,9 @@ pub async fn fetch_csi(client: &Client, namespace: &Option<String>) -> CsiRaw {
     );
     let snapshots_installed = snap_ar.is_some();
 
-    let list_dyn = |ar: Option<kube::api::ApiResource>, ns: Option<String>| async move {
+    let list_dyn = |ar: Option<kube::api::ApiResource>, scope: NsScope| async move {
         let ar = ar?;
-        let api: Api<DynamicObject> = match ns {
-            Some(ns) => Api::namespaced_with(client.clone(), &ns, &ar),
-            None => Api::all_with(client.clone(), &ar),
-        };
-        api.list(&ListParams::default()).await.ok().map(|l| l.items)
+        nsscope::list_dyn(client, &scope, &ar, &ListParams::default()).await.ok()
     };
     let attachments = async {
         let api: Api<VolumeAttachment> = Api::all(client.clone());
@@ -241,9 +238,9 @@ pub async fn fetch_csi(client: &Client, namespace: &Option<String>) -> CsiRaw {
             .map(|l| l.items.into_iter().filter_map(|n| n.metadata.name).collect())
     };
     let (snap_classes, snapshots, contents, attachments, csi_nodes, drivers, nodes) = futures::join!(
-        list_dyn(class_ar, None),
-        list_dyn(snap_ar, namespace.clone()),
-        list_dyn(content_ar, None),
+        list_dyn(class_ar, NsScope::All),
+        list_dyn(snap_ar, scope.clone()),
+        list_dyn(content_ar, NsScope::All),
         attachments,
         csi_nodes,
         drivers,
@@ -439,7 +436,7 @@ fn attach_resource(va: &VolumeAttachment) -> AttachResource {
 
 /// Everything the CSI rules need besides their own objects: what the storage pass already read.
 pub struct CsiContext<'a> {
-    pub namespace: &'a Option<String>,
+    pub scope: &'a NsScope,
     // PV names, `None` when the PV list was refused.
     pub pvs: Option<&'a HashSet<String>>,
     // `namespace/name` of the claims in scope.
@@ -564,8 +561,8 @@ pub fn diagnose_csi(raw: CsiRaw, ctx: &CsiContext, st: &'static Strings) -> CsiD
             )));
         }
         // A content's snapshot can only be called missing where the snapshot list covers its
-        // namespace: scoped to one namespace, every other namespace's snapshot looks absent.
-        let observable = ctx.namespace.as_deref().is_none_or(|ns| ns == c.snapshot_ns);
+        // namespace: scoped to some namespaces, every other namespace's snapshot looks absent.
+        let observable = ctx.scope.contains(&c.snapshot_ns);
         if let (Some(snap), Some(known), true) = (&c.snapshot, &snapshot_keys, observable) {
             if !known.contains(snap) && c.deleting_since.is_none() {
                 let handle = if c.handle.is_empty() { "?" } else { c.handle.as_str() };
@@ -916,16 +913,16 @@ mod tests {
     fn ctx<'a>(
         pvs: Option<&'a HashSet<String>>,
         pvcs: &'a HashSet<String>,
-        ns: &'a Option<String>,
+        scope: &'a NsScope,
     ) -> CsiContext<'a> {
-        CsiContext { namespace: ns, pvs, pvcs }
+        CsiContext { scope, pvs, pvcs }
     }
 
     #[test]
     fn a_deleting_attachment_whose_pv_is_gone_is_a_ghost() {
         let pvs: HashSet<String> = ["pvc-live".to_string()].into();
         let pvcs = HashSet::new();
-        let ns = None;
+        let ns = NsScope::All;
         let raw = CsiRaw {
             attachments: Some(vec![
                 deleting(va("csi-1", "pvc-gone", "n1", true), "persistentvolume \"pvc-gone\" not found"),
@@ -947,7 +944,7 @@ mod tests {
     #[test]
     fn an_unread_pv_list_accuses_no_attachment() {
         let pvcs = HashSet::new();
-        let ns = None;
+        let ns = NsScope::All;
         let raw = CsiRaw {
             attachments: Some(vec![deleting(va("csi-1", "pvc-x", "n1", true), "boom")]),
             ..Default::default()
@@ -961,7 +958,7 @@ mod tests {
     fn attach_slots_are_counted_against_the_csinode_limit() {
         let pvs: HashSet<String> = (0..2).map(|i| format!("pv{i}")).collect();
         let pvcs = HashSet::new();
-        let ns = None;
+        let ns = NsScope::All;
         let mut node = CSINode::default();
         node.metadata.name = Some("n1".into());
         node.spec = CSINodeSpec {
@@ -1002,7 +999,7 @@ mod tests {
                 }),
             )
         };
-        let all = None;
+        let all = NsScope::All;
         let d = diagnose_csi(
             CsiRaw { contents: Some(vec![content()]), snapshots: Some(vec![]), ..Default::default() },
             &ctx(None, &pvcs, &all),
@@ -1012,7 +1009,7 @@ mod tests {
         assert_eq!(d.contents[0].restore_size, "1.0Gi");
         assert!(!d.cluster_hints.is_empty());
 
-        let other = Some("elsewhere".to_string());
+        let other = NsScope::one("elsewhere");
         let d = diagnose_csi(
             CsiRaw { contents: Some(vec![content()]), snapshots: Some(vec![]), ..Default::default() },
             &ctx(None, &pvcs, &other),
@@ -1024,7 +1021,7 @@ mod tests {
     #[test]
     fn a_failed_snapshot_says_why_and_a_missing_content_is_not_restorable() {
         let pvcs: HashSet<String> = ["app/data".to_string()].into();
-        let ns = None;
+        let ns = NsScope::All;
         let failed = snap(
             "app",
             "s1",

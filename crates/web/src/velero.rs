@@ -78,7 +78,7 @@ pub async fn list(
         query.world,
         query.group && query.world == VelWorld::Backups,
         query.problems,
-        ns,
+        &ns.into(),
         &HashSet::new(),
     );
     let rows: Vec<serde_json::Value> = rows_model
@@ -579,6 +579,7 @@ fn refused(e: String) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kdt::nsscope::NsScope;
     use kdt::velero::{VelBackup, VelSchedule};
 
     fn state() -> VeleroState {
@@ -624,7 +625,7 @@ mod tests {
     #[test]
     fn une_ligne_de_backup_porte_ce_que_le_navigateur_lit() {
         let inv = state();
-        let rows = build_vel_rows(&inv, VelWorld::Backups, true, false, None, &HashSet::new());
+        let rows = build_vel_rows(&inv, VelWorld::Backups, true, false, &NsScope::All, &HashSet::new());
         let backup = rows
             .iter()
             .find(|r| matches!(r, VelRow::Backup(b) if b.name == "nightly-20260906020000"))
@@ -647,7 +648,7 @@ mod tests {
     #[test]
     fn les_backups_orphelins_ont_leur_en_tete() {
         let inv = state();
-        let rows = build_vel_rows(&inv, VelWorld::Backups, true, false, None, &HashSet::new());
+        let rows = build_vel_rows(&inv, VelWorld::Backups, true, false, &NsScope::All, &HashSet::new());
         let header = rows
             .iter()
             .find(|r| matches!(r, VelRow::Orphans))
@@ -668,7 +669,7 @@ mod tests {
             level: kdt::velero::HintLevel::Danger,
             text: "812 objets sur 820".into(),
         }];
-        let rows = build_vel_rows(&inv, VelWorld::Backups, true, true, None, &HashSet::new());
+        let rows = build_vel_rows(&inv, VelWorld::Backups, true, true, &NsScope::All, &HashSet::new());
         assert!(rows.iter().any(|r| matches!(r, VelRow::Schedule(s) if s.name == "nightly")));
         assert!(rows
             .iter()

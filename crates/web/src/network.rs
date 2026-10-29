@@ -57,7 +57,7 @@ pub async fn services(
     };
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
-    let inventory = match kdt::svc::services_inventory(&client, &namespace).await {
+    let inventory = match kdt::svc::services_inventory(&client, &namespace.into()).await {
         Ok(inv) => inv,
         Err(e) => return refused("services", e),
     };
@@ -90,7 +90,7 @@ pub async fn ingress(
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
 
     let mut cache = TlsCache::new();
-    let inventory = match kdt::svc::ingress_inventory(&client, &namespace, &mut cache).await {
+    let inventory = match kdt::svc::ingress_inventory(&client, &namespace.into(), &mut cache).await {
         Ok(inv) => inv,
         Err(e) => return refused("ingress", e),
     };

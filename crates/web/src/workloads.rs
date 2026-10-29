@@ -50,7 +50,7 @@ pub async fn list(
     };
 
     let namespace = Some(query.ns.trim().to_string()).filter(|s| !s.is_empty());
-    let inventory = match kdt::pods::workloads(client, namespace).await {
+    let inventory = match kdt::pods::workloads(client, &namespace.into()).await {
         Ok(inv) => inv,
         // Le refus porte sur la liste des pods elle-même : sans elle il n'y a pas de vue, donc
         // c'est bien une erreur et non une liste vide qui ferait croire à un namespace désert.
