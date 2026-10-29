@@ -8,6 +8,22 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.11.0] — 2026-10-29
+
+- **feat(ns)** — portée sur plusieurs namespaces, comme Rancher et k9s : `:wl a b c` (ou
+  `-n a,b,c` au lancement, espaces et virgules indifférents) montre les trois namespaces à la fois.
+  Chaque namespace est lu par sa propre liste, en parallèle, jamais par une liste cluster-wide
+  filtrée : un utilisateur qui n'a des droits que sur quelques namespaces, un membre de projet
+  Rancher par exemple, obtient sa vue sans avoir le droit de lister tout le cluster.
+  - la complétion de la palette ne complète que le dernier mot et ne repropose pas les namespaces
+    déjà tapés ; après un espace, `Entrée` lance la commande telle quelle ;
+  - un namespace inconnu est signalé par un toast, sans casser la liste des autres ;
+  - `N` ajoute ou retire le namespace de la ligne à la portée (refusé sur le dernier), `n` la
+    remplace par ce seul namespace, `0` revient à tout le cluster ; dans la vue Events, `N` garde
+    les nodes du pod ;
+  - le bandeau affiche la portée (`a,b +N` au-delà de trois), les titres comptent sous la portée ;
+    `:rbac` prend l'union des rôles atteints par les RoleBindings de la portée.
+
 ## [2.10.1] — 2026-10-28
 
 - **fix(jump)** — avec `encode: true`, le relais `python3` du dernier saut est tapé en clair
