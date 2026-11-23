@@ -105,7 +105,9 @@ pub struct JumpConfig {
     /// The kubeconfig contexts reached through this jump.
     #[serde(default)]
     pub contexts: Vec<String>,
-    /// The first hop: a program and its arguments, run in a pseudo-terminal.
+    /// The first hop: a program and its arguments, run in a pseudo-terminal. Absent, a local `sh`
+    /// stands in, and the first line of `then` is the first real hop.
+    #[serde(default)]
     pub command: Vec<String>,
     /// The next hops: lines typed at each shell prompt, in order; `%u` is the account.
     #[serde(default)]
@@ -133,6 +135,16 @@ pub struct JumpConfig {
     pub spare: usize,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+}
+
+impl JumpConfig {
+    /// What starts the session: `command`, or a local shell for the hops of `then` to be typed into.
+    pub fn first_hop(&self) -> Vec<String> {
+        match self.command.is_empty() {
+            true => vec!["sh".to_string()],
+            false => self.command.clone(),
+        }
+    }
 }
 
 fn default_connect() -> String {
@@ -286,12 +298,16 @@ struct Jump {
 impl Jump {
     async fn new(cfg: JumpConfig) -> Result<Self> {
         let bad = |err: String| anyhow!(lang::fill(lang::active().jump_bad_config, &[("name", &cfg.name), ("err", &err)]));
-        if cfg.command.is_empty() {
-            return Err(bad("command: []".to_string()));
+        if cfg.command.is_empty() && cfg.then.iter().all(|l| l.trim().is_empty()) {
+            return Err(bad("command: [], then: []".to_string()));
         }
+        // No first hop of its own: the hops of `then` are typed into a local shell, where no ssh
+        // escape character sits in front of the stream.
+        let local = cfg.command.is_empty();
         let ready = Regex::new(&cfg.ready).map_err(|e| bad(format!("ready: {e}")))?;
         let prompt = Regex::new(&cfg.prompt).map_err(|e| bad(format!("prompt: {e}")))?;
         let escape = match cfg.escape.as_str() {
+            _ if local => None,
             "" | "none" => None,
             s if s.len() == 1 && s.is_ascii() => Some(s.as_bytes()[0]),
             s => return Err(bad(format!("escape: {s}"))),
@@ -393,12 +409,13 @@ impl Jump {
                 let _ = a.send(JumpEvent::Hop { n, total, what: what.to_string() });
             }
         };
-        hop(1, &self.cfg.command.join(" "));
+        let command = self.cfg.first_hop();
+        hop(1, &command.join(" "));
         let slot = self.slots.clone().acquire_owned().await?;
         let first_hop = self.first_hop.lock().await;
         let (pty, slave) = Pty::open()?;
-        let mut cmd = tokio::process::Command::new(&self.cfg.command[0]);
-        cmd.args(&self.cfg.command[1..])
+        let mut cmd = tokio::process::Command::new(&command[0]);
+        cmd.args(&command[1..])
             .env("TERM", "dumb")
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
@@ -414,7 +431,7 @@ impl Jump {
                 Ok(())
             });
         }
-        let child = cmd.spawn().with_context(|| self.cfg.command[0].clone())?;
+        let child = cmd.spawn().with_context(|| command[0].clone())?;
         drop(cmd);
         let mut session = Session { child, pty, _slot: slot };
         let mut screen = Screen::new();

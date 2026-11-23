@@ -49,6 +49,8 @@ pub struct Target<'a> {
     /// The context kdt is already on, when this screen checks a `:ctx` switch rather than a start:
     /// `q` then means staying there, not leaving kdt.
     pub stay: Option<&'a str>,
+    /// Shown on the failed screen: a config file set aside, whose missing jump may be the failure.
+    pub notice: Option<&'a str>,
 }
 
 // A reachability check, not a capability check: `/version` needs no RBAC, so a failure here is a
@@ -166,6 +168,15 @@ fn draw(f: &mut ratatui::Frame, state: &Probe, target: &Target<'_>) {
                 Span::raw("  "),
                 Span::styled(l, Style::default().fg(Color::Red)),
             ]));
+        }
+        if let Some(notice) = target.notice {
+            lines.push(Line::from(""));
+            for l in wrap(notice, text_width) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(l, Style::default().fg(Color::Yellow)),
+                ]));
+            }
         }
         lines.push(Line::from(""));
         for l in wrap(st.splash_hint, text_width) {

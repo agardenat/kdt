@@ -747,7 +747,7 @@ jumps:
 |---|---|---|
 | `name` | Name of the jump, used in messages | — |
 | `contexts` | Kubeconfig contexts reached through this jump (exact name) | `[]` |
-| `command` | First hop: program and arguments, run in a pseudo-terminal | — |
+| `command` | First hop: program and arguments, run in a pseudo-terminal; absent, the `then` lines are typed into a local `sh` (`escape` ignored) | local `sh` |
 | `then` | Next hops: one line typed at each prompt, in order, `%u` = account | `[]` |
 | `user` | Account that `%u` stands for in `then`; when absent it is asked once on the terminal | — |
 | `encode` | Escape the upstream and decode it with `python3` on the last hop, instead of `connect` | `false` |

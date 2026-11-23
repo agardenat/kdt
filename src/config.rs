@@ -43,6 +43,16 @@ pub struct FileConfig {
 // Load the config file, falling back to defaults when it is missing or malformed
 // (a parse error is logged but never fatal).
 pub fn load() -> FileConfig {
+    read().0
+}
+
+/// The config file that `load` had to set aside, and why: a fallback nobody sees leaves jumps and
+/// providers silently missing.
+pub fn invalid() -> Option<(PathBuf, String)> {
+    read().1
+}
+
+fn read() -> (FileConfig, Option<(PathBuf, String)>) {
     let path = config_path();
     migrate_json(&path);
     // A conversion that could not write leaves the JSON file in place: it is still read.
@@ -51,14 +61,14 @@ pub fn load() -> FileConfig {
         Ok(s) => (path, s),
         Err(_) => match std::fs::read_to_string(&legacy) {
             Ok(s) if !is_json(&path) => (legacy, s),
-            _ => return FileConfig::default(),
+            _ => return (FileConfig::default(), None),
         },
     };
     match parse(&path, &text) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => (cfg, None),
         Err(e) => {
             tracing::warn!(file = %path.display(), error = %e, "invalid config, falling back to defaults");
-            FileConfig::default()
+            (FileConfig::default(), Some((path, e)))
         }
     }
 }
@@ -340,5 +350,13 @@ mod tests {
     #[test]
     fn an_empty_yaml_file_is_an_empty_config() {
         assert!(parse(Path::new("config.yaml"), "\n").unwrap().jumps.is_empty());
+    }
+
+    #[test]
+    fn a_jump_without_command_leaves_the_others_usable() {
+        let text = "jumps:\n- name: a\n  contexts: [a]\n  command: [bastion, a]\n- name: b\n  contexts: [b]\n  then: [ssh b]\n";
+        let cfg = parse(Path::new("config.yaml"), text).unwrap();
+        assert_eq!(crate::jump::for_context(&cfg.jumps, "a").unwrap().command, ["bastion", "a"]);
+        assert_eq!(crate::jump::for_context(&cfg.jumps, "b").unwrap().first_hop(), ["sh"]);
     }
 }

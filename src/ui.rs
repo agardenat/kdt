@@ -12153,12 +12153,16 @@ pub async fn run(mut app: App, rebuild: impl Fn(Switch) -> App) -> Result<()> {
     // screen between the two would flash the shell. It returns as soon as the cluster answers, so a
     // healthy connection only ever shows a frame or two.
     let ns_label = app.ns_scope.label();
+    let notice = config::invalid().map(|(file, err)| {
+        lang::fill(lang::active().msg_config_invalid, &[("file", &file.display().to_string()), ("err", &err)])
+    });
     let target = crate::splash::Target {
         context: &app.context_label,
         cluster: &app.cluster_label,
         namespace: &ns_label,
         server: &app.api_url,
         stay: None,
+        notice: notice.as_deref(),
     };
     // A jump host opens first, in its own window: the probe would only time out without it.
     let jumps = config::load().jumps;
@@ -12180,6 +12184,9 @@ pub async fn run(mut app: App, rebuild: impl Fn(Switch) -> App) -> Result<()> {
             ratatui::restore();
             return Err(e);
         }
+    }
+    if let Some(notice) = notice {
+        app.clipboard_status = Some((std::time::Instant::now(), notice));
     }
     let result = loop {
         app.spawn_cluster_info_refresh();
@@ -12372,6 +12379,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
                         namespace: "all",
                         server: &api_url,
                         stay: Some(&app.context_label),
+                        notice: None,
                     };
                     let outcome = crate::splash::run(terminal, client.clone(), target).await?;
                     events = EventStream::new();

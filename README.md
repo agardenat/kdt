@@ -760,7 +760,7 @@ jumps:
 |---|---|---|
 | `name` | Nom du rebond, repris dans les messages | — |
 | `contexts` | Contextes du kubeconfig joints par ce rebond (nom exact) | `[]` |
-| `command` | Premier saut : programme et arguments, lancé dans un pseudo-terminal | — |
+| `command` | Premier saut : programme et arguments, lancé dans un pseudo-terminal ; absent, les lignes de `then` sont tapées dans un `sh` local (échappement `escape` ignoré) | `sh` local |
 | `then` | Sauts suivants : une ligne tapée à chaque invite, dans l'ordre, `%u` = compte | `[]` |
 | `user` | Compte que `%u` remplace dans `then` ; absent, il est demandé une fois sur le terminal | — |
 | `encode` | Échappe le flux montant et le décode par `python3` sur le dernier saut, à la place de `connect` | `false` |
