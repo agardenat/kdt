@@ -8,6 +8,17 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.12.0] — 2026-11-23
+
+- **fix(config)** — une erreur dans le fichier de config n'est plus ignorée en silence : kdt
+  retombait sur la config par défaut, sans rebonds ni fournisseurs IA, et un contexte joint par
+  rebond tentait l'apiserver en direct. Le fichier écarté et la cause s'affichent maintenant sur la
+  mire « cluster injoignable » puis dans la barre de messages.
+- **feat(jump)** — `command` devient facultatif : sans lui, les lignes de `then` sont tapées dans
+  un `sh` local (l'échappement `escape` est ignoré), pour un rebond qui n'est qu'un `ssh` direct.
+  Un rebond sans `command` ni `then` échoue seul à l'ouverture de son contexte, sans invalider le
+  reste du fichier.
+
 ## [2.11.0] — 2026-10-29
 
 - **feat(ns)** — portée sur plusieurs namespaces, comme Rancher et k9s : `:wl a b c` (ou
