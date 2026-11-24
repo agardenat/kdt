@@ -29,6 +29,7 @@ pub mod clip;
 pub mod clusterctx;
 pub mod config;
 pub mod csi;
+pub mod ctxalias;
 pub mod configmaps;
 pub mod connect;
 pub mod delete;
@@ -138,9 +139,10 @@ pub fn resolve_context_labels(explicit: Option<&str>) -> (String, String) {
 
 /// Les contextes que le kubeconfig déclare, dans son ordre — `KUBECONFIG` fusionné comme le fait
 /// kubectl. Vide si rien n'est lisible : le TUI n'a alors rien à proposer, sans que ce soit une
-/// erreur (un pod dans le cluster n'a pas de kubeconfig du tout).
+/// erreur (un pod dans le cluster n'a pas de kubeconfig du tout). Les `kdt-…` des sessions en
+/// cours n'y sont pas : y entrer empilerait un rebond sur un rebond.
 pub fn kube_contexts() -> Vec<String> {
     kube::config::Kubeconfig::read()
-        .map(|k| k.contexts.into_iter().map(|c| c.name).collect())
+        .map(|k| k.contexts.into_iter().filter(|c| !ctxalias::is_alias(c)).map(|c| c.name).collect())
         .unwrap_or_default()
 }

@@ -135,6 +135,10 @@ pub struct JumpConfig {
     pub spare: usize,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// Declare a `kdt-<context>` context in the kubeconfig for the session, through this jump's
+    /// proxy, so that `kubectl`, `helm`, `flux`… reach the cluster too.
+    #[serde(default = "default_alias")]
+    pub alias: bool,
 }
 
 impl JumpConfig {
@@ -167,6 +171,9 @@ fn default_spare() -> usize {
 }
 fn default_max_sessions() -> usize {
     12
+}
+fn default_alias() -> bool {
+    true
 }
 
 /// The jump a context goes through, if any.

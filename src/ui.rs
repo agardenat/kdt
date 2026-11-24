@@ -1918,6 +1918,9 @@ pub struct App {
     // screen before this session can be replaced by one on the other cluster.
     pending_context: Option<String>,
     cluster_info_handle: Option<JoinHandle<()>>,
+    // The `kdt-<context>` this session declared in the kubeconfig, for a context behind a jump:
+    // dropping it takes it out again.
+    kube_alias: Option<crate::ctxalias::Alias>,
 }
 
 /// A context the startup screen has vouched for: what `run` needs to build the next session.
@@ -2224,6 +2227,7 @@ impl App {
             kube_contexts: crate::kube_contexts(),
             pending_context: None,
             cluster_info_handle: None,
+            kube_alias: None,
         }
     }
 
@@ -2262,6 +2266,28 @@ impl App {
         }
         portfwd::stop_all(&self.forwards);
         self.close_edit_view();
+        self.kube_alias = None;
+    }
+
+    // A context behind a jump is declared for the other tools as `kdt-<context>`, through the same
+    // proxy, for as long as this session lasts.
+    fn open_kube_alias(&mut self) {
+        let jumps = config::load().jumps;
+        if !crate::jump::for_context(&jumps, &self.context_label).is_some_and(|j| j.alias) {
+            return;
+        }
+        let Some(url) = crate::jump::proxy_url_for(&self.context_label) else { return };
+        match crate::ctxalias::create(&self.context_label, &url) {
+            Ok(alias) => self.kube_alias = Some(alias),
+            Err(e) => {
+                let name = format!("kdt-{}", self.context_label);
+                let err = format!("{e:#}");
+                self.clipboard_status = Some((
+                    std::time::Instant::now(),
+                    lang::fill(lang::t(self.ai_language).msg_alias_failed, &[("name", &name), ("err", &err)]),
+                ));
+            }
+        }
     }
 
     // `:ctx` with a name: resolved against the kubeconfig here, so a typo is answered in the
@@ -12190,6 +12216,7 @@ pub async fn run(mut app: App, rebuild: impl Fn(Switch) -> App) -> Result<()> {
     }
     let result = loop {
         app.spawn_cluster_info_refresh();
+        app.open_kube_alias();
         match run_loop(&mut terminal, &mut app).await {
             Ok(Some(switch)) => {
                 app.shutdown();
@@ -12209,6 +12236,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let mut visible_rows: usize = 20;
+    // A closed terminal or a `kill` ends the session like `q` does: the kubeconfig gets its
+    // `kdt-<context>` back out, which an abrupt exit would leave behind.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
 
     loop {
         // `h` fires from every view, so its outcome is collected before anything mode-specific.
@@ -12409,6 +12441,8 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<Optio
                 None => break,
             },
             _ = tokio::signal::ctrl_c() => { app.should_quit = true; }
+            _ = sigterm.recv() => { app.should_quit = true; }
+            _ = sighup.recv() => { app.should_quit = true; }
         }
     }
     // The tasks would die with the process anyway; closing the sockets here means they are gone
@@ -17136,14 +17170,28 @@ fn cluster_banner_line(app: &App) -> Line<'static> {
     let label = Style::default().fg(SYS_DIM);
     let val = Style::default().fg(Color::Gray);
 
+    // Right after the cluster, where the line is never cut: the name to type for `kubectl`.
+    let alias: Vec<Span<'static>> = match &app.kube_alias {
+        Some(a) => vec![
+            Span::styled("   kubectl ", label),
+            Span::styled(a.name.clone(), Style::default().fg(Color::Yellow)),
+        ],
+        None => Vec::new(),
+    };
+
     if !info.loaded {
-        return Line::from(Span::styled("   cluster: chargement des infos…", label));
+        let mut spans = vec![Span::styled("   cluster: chargement des infos…", label)];
+        spans.extend(alias);
+        return Line::from(spans);
     }
 
     let version = info.server_version.clone().unwrap_or_else(|| "?".to_string());
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled("   cluster ", label),
         Span::styled(app.cluster_label.clone(), Style::default().fg(Color::Cyan)),
+    ];
+    spans.extend(alias);
+    spans.extend([
         Span::styled("   k8s ", label),
         Span::styled(version, val),
         Span::styled("   nodes ", label),
@@ -17157,7 +17205,7 @@ fn cluster_banner_line(app: &App) -> Line<'static> {
         } else {
             Span::styled("—", label)
         },
-    ];
+    ]);
 
     if info.metrics_available && info.cpu_alloc_milli > 0 {
         let cpu_pct = pct_local(info.cpu_use_milli, info.cpu_alloc_milli);

@@ -771,10 +771,24 @@ jumps:
 | `open_timeout` | Délai d'ouverture d'une session, en secondes, hors saisie | `120` |
 | `spare` | Sessions ouvertes d'avance jusqu'à l'invite finale | `2` |
 | `max_sessions` | Sessions ouvertes en même temps | `12` |
+| `alias` | Déclare `kdt-<contexte>` dans le kubeconfig le temps de la session | `true` |
 
 - **Une session par connexion** : un terminal ne porte qu'un flux, chaque connexion TCP du client en
   consomme une. Les sessions de réserve rendent une nouvelle connexion immédiate ; elles sont
   réouvertes en tâche de fond à mesure qu'elles servent.
+- **Contexte `kdt-<contexte>`** : tant que kdt tourne sur un contexte à rebond, le kubeconfig
+  déclare `kdt-<contexte>`, qui passe par le même proxy (`proxy-url`) ; `kubectl --context
+  kdt-prod-dc2 get pods`, `helm`, `flux`… joignent alors le cluster depuis un autre terminal. Son
+  nom est affiché dans le bandeau (`kubectl kdt-prod-dc2`). Le cluster d'origine y est recopié avec
+  le `proxy-url`, le user est celui du contexte d'origine (référencé, pas recopié). Les entrées sont
+  écrites dans le fichier qui déclare le contexte d'origine, sous le verrou `<fichier>.lock` de
+  kubectl, et portent une extension `kdt` (pid du processus) : kdt ne touche qu'à celles-là. Une
+  deuxième instance sur le même contexte prend `kdt-<contexte>-2`, et ainsi de suite ; un nom déjà
+  pris par une entrée sans cette marque est laissé tel quel. Les entrées sont retirées en quittant,
+  au `:ctx`, sur `SIGTERM` et à la fermeture du terminal ; celles d'un kdt tué (`kill -9`) le sont
+  à la prochaine écriture. Les `kdt-…` ne sont pas proposés par `:ctx`. Ces connexions comptent
+  dans `max_sessions` avec celles de kdt, qui en garde une dizaine ouvertes : au plafond, une
+  connexion attend qu'une session se libère, d'où un `max_sessions` plus large pour s'en servir.
 - **Compte** : un `%u` dans une ligne de `then` est remplacé par `user`, ou à défaut par un compte
   demandé une fois, en clair, dans la fenêtre d'ouverture, avant la première session. Il ne passe
   que s'il a la forme d'un nom de compte (lettres, chiffres, `. _ @ -`), et reste en mémoire comme
@@ -845,7 +859,9 @@ en anglais des deux côtés (`pod`, `node`, `taint`, `requests`…), comme les e
 - **Rebonds** : la commande de `command` et les lignes de `then` sont lancées telles qu'écrites.
   Le proxy SOCKS5 local écoute sur `127.0.0.1` et exige un jeton tiré au lancement, sans quoi
   n'importe quel processus local emprunterait le rebond ; les réponses aux questions ne vivent
-  qu'en mémoire. L'hôte de l'apiserver n'est tapé dans le shell distant que s'il a la forme d'un
+  qu'en mémoire. Avec `alias` (défaut), ce jeton est écrit dans le kubeconfig, dans le `proxy-url`
+  de `kdt-<contexte>`, le temps de la session : qui lit ce fichier emprunte le rebond, comme il
+  emprunte déjà les credentials qu'il contient. L'hôte de l'apiserver n'est tapé dans le shell distant que s'il a la forme d'un
   nom d'hôte ou d'une adresse.
 - **Rendu PDF** : le contenu IA est échappé avant évaluation comme markup Typst, les blocs de code
   passent par `raw()` — pas d'injection possible.
