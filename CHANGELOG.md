@@ -8,6 +8,13 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.13.1] — 2026-11-24
+
+- **fix(jump)** — `kubectl --context kdt-<contexte>` ne tombe plus au timeout derrière un bastion
+  lent : ses connexions (et celles de `E`) passent devant celles de kdt sur le premier saut, deux
+  sessions d'avance lui sont réservées tant que le contexte existe, et une connexion abandonnée
+  pendant son attente ne consomme plus de session de bastion.
+
 ## [2.13.0] — 2026-11-24
 
 - **feat(jump)** — un contexte joint par rebond est ouvert aux autres outils le temps de la
