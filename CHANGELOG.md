@@ -8,6 +8,19 @@ tag `v<version>` qui a déclenché sa publication.
 Les entrées jusqu'à la 1.24.0 incluse ont été reconstruites après coup depuis l'historique git :
 elles disent ce que chaque version a apporté, pas ce qui en avait été annoncé à l'époque.
 
+## [2.13.0] — 2026-11-24
+
+- **feat(jump)** — un contexte joint par rebond est ouvert aux autres outils le temps de la
+  session : kdt déclare `kdt-<contexte>` dans le kubeconfig, à travers le même proxy SOCKS5 à jeton
+  (`proxy-url`), et `kubectl --context kdt-<contexte>`, `helm`, `flux` joignent le cluster depuis un
+  autre terminal. Le nom est affiché dans le bandeau.
+  - le cluster d'origine est recopié avec le `proxy-url`, le user est référencé, pas recopié ;
+  - les entrées portent une extension `kdt` (pid du processus) : une deuxième instance prend
+    `kdt-<contexte>-2`, une entrée sans cette marque n'est jamais écrasée ;
+  - retirées en quittant, au `:ctx`, sur `SIGTERM` et à la fermeture du terminal ; celles d'un kdt
+    tué sont purgées à la prochaine écriture ; absentes de la liste de `:ctx` ;
+  - `jumps[].alias: false` désactive l'écriture ; ces connexions comptent dans `max_sessions`.
+
 ## [2.12.0] — 2026-11-23
 
 - **fix(config)** — une erreur dans le fichier de config n'est plus ignorée en silence : kdt
