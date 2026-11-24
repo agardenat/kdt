@@ -21,6 +21,9 @@ const DIM: Color = Color::Rgb(150, 150, 150);
 // text and the green/red status words, which is the one row that has to stay readable.
 const SELECTED_BG: Color = Color::Rgb(40, 48, 100);
 const SYS_DIM: Color = Color::Rgb(95, 95, 95);
+// Spares of a jump kept for `kubectl` & co. while `kdt-<context>` exists: one command opens two
+// connections (discovery, then the request).
+const CLI_SPARES: usize = 2;
 
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
@@ -2266,7 +2269,9 @@ impl App {
         }
         portfwd::stop_all(&self.forwards);
         self.close_edit_view();
-        self.kube_alias = None;
+        if self.kube_alias.take().is_some() {
+            crate::jump::reserve_for_cli(&self.context_label, 0);
+        }
     }
 
     // A context behind a jump is declared for the other tools as `kdt-<context>`, through the same
@@ -2278,7 +2283,10 @@ impl App {
         }
         let Some(url) = crate::jump::proxy_url_for(&self.context_label) else { return };
         match crate::ctxalias::create(&self.context_label, &url) {
-            Ok(alias) => self.kube_alias = Some(alias),
+            Ok(alias) => {
+                self.kube_alias = Some(alias);
+                crate::jump::reserve_for_cli(&self.context_label, CLI_SPARES);
+            }
             Err(e) => {
                 let name = format!("kdt-{}", self.context_label);
                 let err = format!("{e:#}");

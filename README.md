@@ -786,9 +786,14 @@ jumps:
   deuxième instance sur le même contexte prend `kdt-<contexte>-2`, et ainsi de suite ; un nom déjà
   pris par une entrée sans cette marque est laissé tel quel. Les entrées sont retirées en quittant,
   au `:ctx`, sur `SIGTERM` et à la fermeture du terminal ; celles d'un kdt tué (`kill -9`) le sont
-  à la prochaine écriture. Les `kdt-…` ne sont pas proposés par `:ctx`. Ces connexions comptent
-  dans `max_sessions` avec celles de kdt, qui en garde une dizaine ouvertes : au plafond, une
-  connexion attend qu'une session se libère, d'où un `max_sessions` plus large pour s'en servir.
+  à la prochaine écriture. Les `kdt-…` ne sont pas proposés par `:ctx`.
+- **Priorité aux commandes** : les sessions s'ouvrent une à une, et un login de bastion peut
+  prendre plusieurs secondes ; kdt seul en réclame une dizaine en démarrant. Les connexions de
+  `kdt-<contexte>` et de `E` passent devant les siennes, et deux sessions d'avance leur sont
+  réservées tant que le contexte existe (une commande `kubectl` ouvre deux connexions) : une
+  commande isolée part sans attendre de login. Une connexion abandonnée pendant son attente ne
+  coûte plus de session. Toutes comptent dans `max_sessions` : au plafond, une connexion attend
+  qu'une session se libère, d'où un `max_sessions` plus large que le défaut pour s'en servir.
 - **Compte** : un `%u` dans une ligne de `then` est remplacé par `user`, ou à défaut par un compte
   demandé une fois, en clair, dans la fenêtre d'ouverture, avant la première session. Il ne passe
   que s'il a la forme d'un nom de compte (lettres, chiffres, `. _ @ -`), et reste en mémoire comme

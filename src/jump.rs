@@ -74,8 +74,11 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::lang;
 
-/// The SOCKS user name: fixed, the token is what is checked.
+/// The SOCKS user name of kdt's own client: fixed, the token is what is checked.
 pub const USER: &str = "kdt";
+/// The SOCKS user name handed to the tools a person runs (`E`, the `kdt-<context>` context): their
+/// connections open a session before kdt's own background ones.
+pub const CLI_USER: &str = "kdt-cli";
 
 // How long a quiet terminal has to stay quiet before its last line is read as an invite: a banner
 // printed in several writes would otherwise be taken for a prompt at its first `$`.
@@ -193,9 +196,10 @@ impl Proxy {
         format!("socks5://{}", self.addr)
     }
 
-    /// The listener with its credentials, the form `HTTPS_PROXY` takes.
+    /// The listener with its credentials, the form `HTTPS_PROXY` and `proxy-url` take: for the
+    /// tools a person runs, which go first.
     pub fn url(&self) -> String {
-        format!("socks5://{USER}:{}@{}", self.token, self.addr)
+        format!("socks5://{CLI_USER}:{}@{}", self.token, self.addr)
     }
 }
 
@@ -213,6 +217,16 @@ pub fn proxy_url_for(context: &str) -> Option<String> {
     map.values()
         .find(|(j, _)| j.cfg.contexts.iter().any(|c| c == context))
         .map(|(j, _)| Proxy { addr: j.addr, token: j.token.clone() }.url())
+}
+
+/// Keep `n` spares of the context's jump for the tools a person runs (the `kdt-<context>` context),
+/// opened ahead and never taken by kdt's own connections; `0` gives them back.
+pub fn reserve_for_cli(context: &str, n: usize) {
+    let Ok(map) = registry().lock() else { return };
+    if let Some((j, _)) = map.values().find(|(j, _)| j.cfg.contexts.iter().any(|c| c == context)) {
+        j.reserve.store(n, Ordering::SeqCst);
+        j.refill();
+    }
 }
 
 /// Whether a session is already waiting at the last prompt, so that [`prepare`] would have nothing
@@ -234,7 +248,7 @@ pub async fn prepare(cfg: &JumpConfig, asker: Asker) -> Result<()> {
     }
     // Failed or abandoned half-way, a typed account is asked again next time rather than kept.
     let mut forget = ForgetAccount(Some(&jump.user));
-    let session = jump.open(Some(&asker)).await?;
+    let session = jump.open(Some(&asker), true).await?;
     forget.0 = None;
     jump.spares.lock().unwrap_or_else(|e| e.into_inner()).push(session);
     jump.prepared.send_replace(true);
@@ -300,6 +314,11 @@ struct Jump {
     // The first hop is started one at a time: a bastion CLI keeps caches and agents of its own, and
     // several of them starting at once corrupt each other's files.
     first_hop: tokio::sync::Mutex<()>,
+    // Connections of a person's tools waiting for the first hop: kdt's own give way to them.
+    urgent: AtomicUsize,
+    // Spares kdt's own connections leave alone, for those tools: a `kubectl` opens two
+    // connections, each would otherwise wait for a bastion login.
+    reserve: AtomicUsize,
 }
 
 impl Jump {
@@ -342,6 +361,8 @@ impl Jump {
             opening: AtomicUsize::new(0),
             prepared: tokio::sync::watch::Sender::new(false),
             first_hop: tokio::sync::Mutex::new(()),
+            urgent: AtomicUsize::new(0),
+            reserve: AtomicUsize::new(0),
         })
     }
 
@@ -351,8 +372,12 @@ impl Jump {
         !spares.is_empty()
     }
 
-    fn take_spare(&self) -> Option<Session> {
+    fn take_spare(&self, urgent: bool) -> Option<Session> {
         let mut spares = self.spares.lock().unwrap_or_else(|e| e.into_inner());
+        spares.retain_mut(Session::alive);
+        if !urgent && spares.len() <= self.reserve.load(Ordering::SeqCst) {
+            return None;
+        }
         while let Some(mut s) = spares.pop() {
             if s.alive() {
                 return Some(s);
@@ -361,14 +386,17 @@ impl Jump {
         None
     }
 
-    // Top the reserve back up, in the background, with the answers already given.
+    // Top the reserve back up, in the background, with the answers already given. The spares kept
+    // for a person's tools open first, like their connections.
     fn refill(self: &Arc<Self>) {
+        let reserve = self.reserve.load(Ordering::SeqCst);
         let have = self.spares.lock().unwrap_or_else(|e| e.into_inner()).len() + self.opening.load(Ordering::SeqCst);
-        for _ in have..self.cfg.spare {
+        for n in have..self.cfg.spare + reserve {
+            let urgent = n < reserve;
             self.opening.fetch_add(1, Ordering::SeqCst);
             let jump = self.clone();
             tokio::spawn(async move {
-                let opened = jump.open(None).await;
+                let opened = jump.open(None, urgent).await;
                 jump.opening.fetch_sub(1, Ordering::SeqCst);
                 match opened {
                     Ok(s) => jump.spares.lock().unwrap_or_else(|e| e.into_inner()).push(s),
@@ -380,21 +408,21 @@ impl Jump {
 
     // A session at the last prompt, turned into a stream to `host:port`. A spare that went stale
     // while waiting (idle timeout of a hop) is given one fresh replacement.
-    async fn stream(self: &Arc<Self>, host: &str, port: u16) -> Result<(Session, Vec<u8>)> {
+    async fn stream(self: &Arc<Self>, host: &str, port: u16, urgent: bool) -> Result<(Session, Vec<u8>)> {
         let _ = self.prepared.subscribe().wait_for(|done| *done).await;
-        if let Some(spare) = self.take_spare() {
+        if let Some(spare) = self.take_spare(urgent) {
             self.refill();
             match self.open_stream(spare, host, port).await {
                 Ok(s) => return Ok(s),
                 Err(e) => tracing::info!(jump = %self.cfg.name, error = %format!("{e:#}"), "spare session unusable, opening another"),
             }
         }
-        let session = self.open(None).await?;
+        let session = self.open(None, urgent).await?;
         self.refill();
         self.open_stream(session, host, port).await
     }
 
-    async fn open(&self, asker: Option<&Asker>) -> Result<Session> {
+    async fn open(&self, asker: Option<&Asker>, urgent: bool) -> Result<Session> {
         // Asked before anything starts: the hops' own timeouts do not run while a person types.
         let user = match self.cfg.then.iter().any(|l| l.contains("%u")) {
             true => Some(self.account(asker).await?),
@@ -419,7 +447,7 @@ impl Jump {
         let command = self.cfg.first_hop();
         hop(1, &command.join(" "));
         let slot = self.slots.clone().acquire_owned().await?;
-        let first_hop = self.first_hop.lock().await;
+        let first_hop = self.first_hop_turn(urgent).await;
         let (pty, slave) = Pty::open()?;
         let mut cmd = tokio::process::Command::new(&command[0]);
         cmd.args(&command[1..])
@@ -451,6 +479,32 @@ impl Jump {
             self.wait_ready(&mut session, &mut screen, asker).await?;
         }
         Ok(session)
+    }
+
+    // The first hop's turn. Sessions open one at a time, and a bastion login can take seconds: behind
+    // a burst of kdt's own connections, a `kubectl` would time out before its turn. Its connections
+    // go first; kdt's own, handed the turn while one waits, give it back and queue again.
+    async fn first_hop_turn(&self, urgent: bool) -> tokio::sync::MutexGuard<'_, ()> {
+        if urgent {
+            // Counted down by a guard: a client that leaves while queued drops this future.
+            struct Waiting<'a>(&'a AtomicUsize);
+            impl Drop for Waiting<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.urgent.fetch_add(1, Ordering::SeqCst);
+            let _waiting = Waiting(&self.urgent);
+            return self.first_hop.lock().await;
+        }
+        loop {
+            let turn = self.first_hop.lock().await;
+            if self.urgent.load(Ordering::SeqCst) == 0 {
+                return turn;
+            }
+            drop(turn);
+            tokio::task::yield_now().await;
+        }
     }
 
     // The account of the next hops: from the config, else the one typed earlier, else asked now.
@@ -637,7 +691,8 @@ async fn serve(jump: Arc<Jump>, mut tcp: TcpStream) -> Result<()> {
     let version = tcp.read_u8().await?;
     let user = read_field(&mut tcp).await?;
     let pass = read_field(&mut tcp).await?;
-    if version != 1 || user != USER.as_bytes() || pass != jump.token.as_bytes() {
+    let urgent = user == CLI_USER.as_bytes();
+    if version != 1 || !(urgent || user == USER.as_bytes()) || pass != jump.token.as_bytes() {
         tcp.write_all(&[1, 1]).await?;
         bail!("SOCKS credentials refused");
     }
@@ -672,7 +727,16 @@ async fn serve(jump: Arc<Jump>, mut tcp: TcpStream) -> Result<()> {
         reply(&mut tcp, 2).await;
         bail!(lang::fill(lang::active().jump_bad_target, &[("target", &host)]));
     }
-    let (session, first) = match jump.stream(&host, port).await {
+    // Sessions open one at a time and a first hop can take seconds: a client that gave up while
+    // queued must not cost one, or the queue fills with the dead and the living time out behind it.
+    let opened = tokio::select! {
+        s = jump.stream(&host, port, urgent) => s,
+        () = client_gone(&tcp) => {
+            tracing::debug!(jump = %jump.cfg.name, "client left before its session was open");
+            return Ok(());
+        }
+    };
+    let (session, first) = match opened {
         Ok(s) => s,
         Err(e) => {
             reply(&mut tcp, 1).await;
@@ -683,6 +747,16 @@ async fn serve(jump: Arc<Jump>, mut tcp: TcpStream) -> Result<()> {
     // Encoded, the upstream never carries an escape character for ssh to act on.
     let upstream = if jump.cfg.encode { Upstream::Encoded } else { Upstream::Raw(jump.escape) };
     relay(session, first, tcp, upstream).await
+}
+
+// A SOCKS client sends nothing between its request and the reply: end of stream here means it left.
+// Bytes sent early are left in place for the relay, and only the session's own outcome counts.
+async fn client_gone(tcp: &TcpStream) {
+    let mut b = [0u8; 1];
+    match tcp.peek(&mut b).await {
+        Ok(0) | Err(_) => {}
+        Ok(_) => std::future::pending().await,
+    }
 }
 
 async fn read_field(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
